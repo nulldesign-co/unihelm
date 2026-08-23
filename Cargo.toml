@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ferrum-core",
+    "crates/ferrum-config",
     "crates/ferrum-db",
     "crates/ferrum-ipc",
     "crates/ferrum-distro",
@@ -21,6 +22,7 @@ authors = ["farzam"]
 repository = "https://github.com/farzam/ferrum"
 
 [workspace.dependencies]
+ferrum-config = { path = "crates/ferrum-config" }
 ferrum-core = { path = "crates/ferrum-core" }
 ferrum-db = { path = "crates/ferrum-db" }
 ferrum-ipc = { path = "crates/ferrum-ipc" }

@@ -1,0 +1,49 @@
+# Default server.
+#
+# Every request whose Host matches no configured site lands here rather than
+# being served by whichever vhost nginx happened to parse first — which is how
+# an unrelated customer's site ends up answering for a domain nobody configured.
+#
+# This file also owns the two directives that may appear exactly once per
+# listening address in the whole configuration: `default_server` and, for QUIC,
+# `reuseport`. Per-site vhosts must never carry them.
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # ACME challenges must work before a site exists, so the webroot is served
+    # by the default server too.
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ acme_webroot }};
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 444;
+    }
+}
+
+server {
+    listen 443 ssl default_server{% if http3 %} reuseport{% endif %};
+    listen [::]:443 ssl default_server;
+{% if http3 %}
+    listen 443 quic default_server reuseport;
+    listen [::]:443 quic default_server;
+{% endif %}
+    http2 on;
+    server_name _;
+
+    # A self-signed certificate, because TLS on the default server has to be
+    # *something* and presenting another customer's certificate would be worse.
+    ssl_certificate     {{ default_cert }};
+    ssl_certificate_key {{ default_key }};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # 444 closes the connection without a response: an unconfigured host gets
+    # nothing to fingerprint.
+    return 444;
+}

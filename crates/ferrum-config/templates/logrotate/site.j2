@@ -1,0 +1,19 @@
+# Log rotation for {{ domain }}.
+#
+# Without this, a busy site fills the disk and takes every other site on the
+# server down with it — which is a panel's fault, not the customer's.
+
+{{ log_dir }}/*.log {
+    daily
+    rotate {{ keep_days }}
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 {{ user }} {{ group }}
+    sharedscripts
+    postrotate
+        # USR1 makes nginx reopen its log files without dropping connections.
+        [ -f /run/nginx.pid ] && kill -USR1 "$(cat /run/nginx.pid)" || true
+    endscript
+}

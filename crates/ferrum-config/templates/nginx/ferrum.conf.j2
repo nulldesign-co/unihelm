@@ -1,0 +1,16 @@
+# The entire footprint Ferrum has on nginx's own configuration: one include.
+#
+# Everything the panel writes lives under {{ nginx_dir }}/ and is generated. This
+# file exists so the panel never has to edit nginx.conf, sites-enabled, or any
+# other file the distribution owns — which is what makes `apt upgrade nginx` and
+# a panel upgrade independent of each other.
+
+# Websocket upgrade handling, needed by proxied sites and by the panel's own
+# vhost. It has to live at http level, and this is the only http-level file we
+# own — a per-server `map` is not valid nginx.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+include {{ nginx_dir }}/*.conf;
