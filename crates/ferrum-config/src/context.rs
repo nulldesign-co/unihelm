@@ -350,7 +350,7 @@ mod tests {
             "nginx/site.conf",
             &serde_json::json!({
                 "site": ctx,
-                "acme_webroot": paths::ACME_WEBROOT,
+                "acme_webroot": paths::acme_webroot(),
                 "maintenance_root": "/var/lib/ferrum/state/maintenance",
             }),
         )
@@ -627,7 +627,7 @@ mod tests {
             .render(
                 "nginx/catchall.conf",
                 &serde_json::json!({
-                    "acme_webroot": paths::ACME_WEBROOT,
+                    "acme_webroot": paths::acme_webroot(),
                     "default_cert": "/var/lib/ferrum/state/certs/_default/cert.pem",
                     "default_key": "/var/lib/ferrum/state/certs/_default/key.pem",
                     "http3": true,
@@ -650,7 +650,7 @@ mod tests {
         let out = set
             .render(
                 "nginx/ferrum.conf",
-                &serde_json::json!({ "nginx_dir": paths::NGINX_DIR }),
+                &serde_json::json!({ "nginx_dir": paths::nginx_dir() }),
             )
             .unwrap();
         assert!(out.contains("map $http_upgrade $connection_upgrade"));

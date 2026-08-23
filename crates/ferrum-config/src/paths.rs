@@ -227,12 +227,28 @@ mod tests {
 
     #[test]
     fn under_joins_relative_to_the_root_without_swallowing_it() {
-        // `Path::join` with an absolute argument *replaces* the base — the bug
-        // this helper exists to avoid.
         assert_eq!(under("/etc/nginx"), PathBuf::from("/etc/nginx"));
+
+        // The hazard `under` exists to avoid: `Path::join` with an absolute
+        // argument *replaces* the base rather than nesting under it. Built from
+        // a binding so this demonstrates the behaviour rather than tripping the
+        // lint that warns about writing it literally.
+        let absolute: &Path = Path::new("/etc/nginx");
         assert_eq!(
-            Path::new("/tmp/x").join("/etc/nginx"),
-            PathBuf::from("/etc/nginx")
+            Path::new("/tmp/x").join(absolute),
+            PathBuf::from("/etc/nginx"),
+            "a naive join silently discards the root"
+        );
+
+        // Trimming the leading separator first is what makes it nest, which is
+        // exactly what `under` does.
+        let trimmed = absolute
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        assert_eq!(
+            Path::new("/tmp/x").join(trimmed),
+            PathBuf::from("/tmp/x/etc/nginx")
         );
     }
 }
