@@ -6,9 +6,15 @@ not compile PHP on your server.
 Two Rust daemons under systemd, one SQLite file, and a React interface embedded
 in the binary. The full specification is [`FERRUM_SPEC_1.md`](FERRUM_SPEC_1.md).
 
-**Status: Phase 0 (walking skeleton).** Both daemons run, the privilege boundary
-works, and the panel serves a live dashboard. No stack components — nginx, PHP,
-databases — are managed yet; that is Phase 1.
+**Status: Phase 1 in progress.** Both daemons run, the privilege boundary works,
+and the panel installs nginx and PHP from pinned upstream repositories, creates
+PHP sites with their own Linux account and FPM pool, and issues Let's Encrypt
+certificates over HTTP-01 — all from the UI.
+
+Not yet: the file manager, the renewal scheduler, and the panel's own vhost.
+Databases and multi-tenancy are Phase 2. Nothing has been run on a real Debian
+or AlmaLinux server yet — the CI matrix that would prove it is written but has
+never executed.
 
 ## Why
 
@@ -50,9 +56,10 @@ sudo installer/install.sh --from ./target/release
 ```
 crates/
   ferrum-core/     domain types, validated newtypes, RBAC, error taxonomy
-  ferrum-db/       SQLite schema, migrations, tenant-scoped repositories
+  ferrum-db/       SQLite schema, migrations, tenant-scoped repositories, sealed secrets
   ferrum-ipc/      the framed protocol between the two daemons
-  ferrum-distro/   the only place OS differences live
+  ferrum-distro/   the only place OS differences live; pinned upstream repositories
+  ferrum-config/   templates, and the render/validate/activate/rollback engine
   ferrum-ops/      the operation registry — every privileged action
   ferrum-metrics/  the metrics collector
   ferrum-web/      unprivileged HTTP server + embedded UI   (binary)
@@ -74,12 +81,17 @@ docs/              operator, developer and API documentation
 4. **Authorization is checked twice**: once by the web process, once by the agent
    against the same tables.
 5. **Budgets are gates.** Binary size, bundle size and idle memory fail the build.
+6. **Never clobber a human's edit.** Generated files carry a hash header; a file
+   somebody changed is reported with a diff, not overwritten.
+7. **Repository keys are pinned by full fingerprint**, verified against the key
+   actually downloaded, before anything is written to `sources.list.d`.
 
 See [`docs/developer/contributing.md`](docs/developer/contributing.md).
 
 ## Documentation
 
 - [Architecture](docs/architecture.md) — the two-process design and why
+- [Configuration safety](docs/config-safety.md) — what happens when you edit a generated file
 - [Installing](docs/operator/install.md) — a real server, start to finish
 - [Error codes](docs/api/errors.md) — generated from the source
 - [Contributing](docs/developer/contributing.md) — the working agreement
