@@ -137,6 +137,8 @@ export const en = {
     deleteConfirm: "Delete site",
     purgeFiles: "Also delete the files",
     purgeFilesHint: "Removes the site's directory. This cannot be undone.",
+    issueCert: "Get certificate",
+    issueCertHint: "Requests a Let's Encrypt certificate. The domain must already point at this server.",
     noCert: "No certificate",
     certDays: "{{count}} day left",
     certDays_other: "{{count}} days left",

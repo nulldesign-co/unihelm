@@ -6,6 +6,7 @@
 //! product (spec §2.6).
 
 pub mod auth;
+pub mod certs;
 pub mod events;
 pub mod health;
 pub mod ops;
@@ -35,6 +36,8 @@ fn protected() -> Router<SharedState> {
             axum::routing::patch(sites::update).delete(sites::delete),
         )
         .route("/api/sites/{id}/drift", get(sites::drift))
+        .route("/api/sites/{id}/certificate", post(certs::issue))
+        .route("/api/certificates", get(certs::list))
         .route("/api/tasks", get(tasks::list))
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))

@@ -319,6 +319,8 @@ export const endpoints = {
   deleteSite: (id: number, purgeFiles: boolean) =>
     api.del<TaskAccepted>(`/api/sites/${id}?purge_files=${purgeFiles}`),
   siteDrift: (id: number) => api.get<DriftResponse>(`/api/sites/${id}/drift`),
+  issueCertificate: (id: number, staging: boolean) =>
+    api.post<TaskAccepted>(`/api/sites/${id}/certificate`, { staging }),
 };
 
 /** PHP versions the panel knows about, newest first. */

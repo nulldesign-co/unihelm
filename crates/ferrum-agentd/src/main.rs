@@ -125,10 +125,14 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
     // new work (spec §5.5).
     tasks::reconcile_on_start(&db).await;
 
+    let master_key = load_master_key(&args)?;
+
     // Templates are compiled here, so a broken one is a boot failure rather
     // than a 500 the first time somebody creates a site.
-    let services =
-        Arc::new(Services::new(distro, db).context("could not load the configuration templates")?);
+    let services = Arc::new(
+        Services::new(distro, db, master_key)
+            .context("could not load the configuration templates")?,
+    );
     let registry = Arc::new(OpRegistry::new(services));
     tracing::info!(operations = registry.len(), "operation registry loaded");
 
@@ -195,6 +199,42 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
     let _ = serving.await;
     watchdog.abort();
     Ok(())
+}
+
+/// Load the key that seals secrets at rest (spec §12 rule 6).
+///
+/// In production it must already exist: the installer generates it, and
+/// generating a new one here would silently orphan every secret sealed with the
+/// old one. A development instance keeps its own inside the scratch directory.
+fn load_master_key(args: &Args) -> Result<ferrum_db::MasterKey> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = match &args.dev {
+        Some(dir) => dir.join("secret.key"),
+        None => PathBuf::from(paths::SECRET_KEY),
+    };
+
+    if path.exists() {
+        return ferrum_db::MasterKey::load(&path)
+            .with_context(|| format!("could not read {}", path.display()));
+    }
+
+    if args.dev.is_none() {
+        anyhow::bail!(
+            "{} does not exist. The installer generates it; creating a new one here would \
+             orphan every secret already sealed with the old key.",
+            path.display()
+        );
+    }
+
+    let key = ferrum_db::MasterKey::generate();
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(key.to_hex().as_bytes())?;
+    tracing::info!(path = %path.display(), "generated a development master key");
+    Ok(key)
 }
 
 /// Make the panel database readable and writable by the unprivileged web user.

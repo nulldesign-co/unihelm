@@ -145,6 +145,8 @@ export const fa: Translations = {
     deleteConfirm: "حذف سایت",
     purgeFiles: "فایل‌ها هم حذف شوند",
     purgeFilesHint: "پوشه‌ی سایت پاک می‌شود. این کار برگشت‌پذیر نیست.",
+    issueCert: "دریافت گواهی",
+    issueCertHint: "گواهی Let's Encrypt درخواست می‌شود. دامنه باید از قبل به این سرور اشاره کند.",
     noCert: "بدون گواهی",
     certDays: "{{count}} روز مانده",
     certDays_other: "{{count}} روز مانده",

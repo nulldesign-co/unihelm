@@ -327,6 +327,67 @@ impl Db {
     }
 }
 
+/// The panel's ACME account for one directory (spec §11.5).
+///
+/// The credential contains the account's private key, so it is sealed with the
+/// master key before it is stored and never leaves the agent in the clear.
+#[derive(Debug, Clone)]
+pub struct AcmeAccount {
+    pub id: i64,
+    pub directory_url: String,
+    pub contact_email: String,
+    /// Still sealed. Open it with [`crate::MasterKey`].
+    pub credentials_sealed: String,
+}
+
+impl Db {
+    /// The stored account for a directory, if we have registered with it.
+    ///
+    /// Scoped by directory URL on purpose: a staging credential is useless
+    /// against production, and crossing them produces an authentication failure
+    /// that reads like a bug in the client.
+    pub async fn acme_account(&self, directory_url: &str) -> Result<Option<AcmeAccount>> {
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, directory_url, contact_email, credentials_encrypted
+             FROM acme_accounts WHERE directory_url = ?1",
+        )
+        .bind(directory_url)
+        .fetch_optional(self.pool())
+        .await?;
+
+        Ok(row.map(
+            |(id, directory_url, contact_email, credentials_sealed)| AcmeAccount {
+                id,
+                directory_url,
+                contact_email,
+                credentials_sealed,
+            },
+        ))
+    }
+
+    /// Store a newly registered account.
+    pub async fn save_acme_account(
+        &self,
+        directory_url: &str,
+        contact_email: &str,
+        credentials_sealed: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO acme_accounts (directory_url, contact_email, credentials_encrypted, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (directory_url) DO UPDATE SET
+                 contact_email = ?2, credentials_encrypted = ?3",
+        )
+        .bind(directory_url)
+        .bind(contact_email)
+        .bind(credentials_sealed)
+        .bind(to_sql_time(now()))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -653,6 +714,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.0, 0);
+    }
+
+    #[tokio::test]
+    async fn an_acme_account_is_stored_sealed_and_scoped_to_its_directory() {
+        let (db, _) = seed().await;
+        let key = crate::MasterKey::generate();
+        let sealed = key.seal_str("{\"account\":\"private key\"}").unwrap();
+
+        db.save_acme_account(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            "a@b.com",
+            &sealed,
+        )
+        .await
+        .unwrap();
+
+        // A staging credential must not be found for production.
+        assert!(
+            db.acme_account("https://acme-staging-v02.api.letsencrypt.org/directory")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let found = db
+            .acme_account("https://acme-v02.api.letsencrypt.org/directory")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.contact_email, "a@b.com");
+        assert!(!found.credentials_sealed.contains("private key"));
+        assert_eq!(
+            key.open_str(&found.credentials_sealed).unwrap(),
+            "{\"account\":\"private key\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_registering_replaces_the_stored_credential() {
+        let (db, _) = seed().await;
+        let url = "https://acme-v02.api.letsencrypt.org/directory";
+        db.save_acme_account(url, "old@example.com", "aaaa")
+            .await
+            .unwrap();
+        db.save_acme_account(url, "new@example.com", "bbbb")
+            .await
+            .unwrap();
+
+        let found = db.acme_account(url).await.unwrap().unwrap();
+        assert_eq!(found.contact_email, "new@example.com");
+        assert_eq!(found.credentials_sealed, "bbbb");
     }
 
     #[tokio::test]

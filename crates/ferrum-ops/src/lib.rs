@@ -16,6 +16,8 @@
 //! [`ferrum_distro::Cmd`]'s argv arrays, there is no path from an API request to
 //! a shell.
 
+pub mod acme;
+pub mod cert;
 pub mod metrics;
 pub mod php;
 pub mod provision;

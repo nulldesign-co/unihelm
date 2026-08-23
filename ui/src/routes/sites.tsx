@@ -170,6 +170,12 @@ function SiteActions({ site }: { site: SiteView }) {
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["sites"] });
 
+  const issueCert = useMutation({
+    mutationFn: () => endpoints.issueCertificate(site.id, false),
+    onSuccess: invalidate,
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
   const toggleMaintenance = useMutation({
     mutationFn: () => endpoints.updateSite(site.id, { maintenance_mode: !site.maintenance_mode }),
     onSuccess: invalidate,
@@ -187,6 +193,19 @@ function SiteActions({ site }: { site: SiteView }) {
 
   return (
     <>
+      {!site.has_certificate && site.status === "active" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => issueCert.mutate()}
+          disabled={issueCert.isPending}
+          title={t("sites.issueCertHint")}
+        >
+          {issueCert.isPending ? <Spinner /> : <Lock className="h-3.5 w-3.5" />}
+          {t("sites.issueCert")}
+        </Button>
+      ) : null}
+
       <Button
         variant="ghost"
         size="sm"

@@ -40,6 +40,8 @@ pub struct Services {
     pub metrics: Arc<Collector>,
     /// Renders, validates and activates every file the panel owns (spec §10.4).
     pub config: Arc<ConfigEngine>,
+    /// Seals secrets at rest: ACME account keys, DNS credentials (spec §12 rule 6).
+    pub master_key: Arc<ferrum_db::MasterKey>,
 }
 
 impl Services {
@@ -47,7 +49,7 @@ impl Services {
     ///
     /// A template that does not parse fails here, at startup, rather than the
     /// first time somebody creates a site.
-    pub fn new(distro: Distro, db: Db) -> Result<Self> {
+    pub fn new(distro: Distro, db: Db, master_key: ferrum_db::MasterKey) -> Result<Self> {
         let templates = TemplateSet::load().map_err(FerrumError::from)?;
         let config = ConfigEngine::new(templates)
             .with_revisions(crate::services::DbRevisions::new(db.clone()));
@@ -56,6 +58,7 @@ impl Services {
             db,
             metrics: Arc::new(Collector::new()),
             config: Arc::new(config),
+            master_key: Arc::new(master_key),
         })
     }
 }
@@ -104,6 +107,11 @@ impl OpContext {
     /// The configuration engine, for operations that write files the panel owns.
     pub fn config(&self) -> &ConfigEngine {
         &self.services.config
+    }
+
+    /// The key that seals secrets at rest.
+    pub fn master_key(&self) -> &ferrum_db::MasterKey {
+        &self.services.master_key
     }
 
     pub fn auth(&self) -> &AuthContext {
@@ -221,6 +229,8 @@ impl OpRegistry {
         registry.register(crate::site::Update);
         registry.register(crate::site::Delete);
         registry.register(crate::site::Drift);
+        registry.register(crate::cert::Issue);
+        registry.register(crate::cert::List);
         registry
     }
 
@@ -357,7 +367,10 @@ pub(crate) mod testing {
             .await
             .unwrap();
 
-        let services = Arc::new(Services::new(Distro::mock(), db).expect("templates compile"));
+        let services = Arc::new(
+            Services::new(Distro::mock(), db, ferrum_db::MasterKey::generate())
+                .expect("templates compile"),
+        );
         (OpRegistry::new(services), admin.id, customer.id)
     }
 

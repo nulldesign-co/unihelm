@@ -23,6 +23,14 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto
 # release build needs no system TLS library and `cargo deny` can keep banning
 # openssl-sys.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset"] }
+# ACME / Let's Encrypt. 0.8.5 is a hard floor: earlier versions treat a
+# challenge's `token` as a required field, and Let's Encrypt's dns-persist-01
+# challenge has none — so a single such challenge in an authorization fails
+# deserialization and kills the whole order, even for an HTTP-01-only client.
+instant-acme = { version = "0.8.5", features = ["rcgen", "time", "x509-parser"] }
+time = { workspace = true }
+x509-parser = "0.18.1"
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

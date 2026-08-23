@@ -20,6 +20,8 @@ time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom"] }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { workspace = true, features = ["test-util"] }
