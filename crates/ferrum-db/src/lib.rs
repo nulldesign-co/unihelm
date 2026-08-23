@@ -21,11 +21,16 @@
 //! call syntax.
 
 pub mod audit;
+pub mod certificates;
 pub mod models;
 pub mod password;
+pub mod revisions;
 pub mod scope;
 pub mod sessions;
 pub mod settings;
+pub mod sites;
+pub mod stack;
+pub mod subscriptions;
 pub mod tasks;
 pub mod users;
 
@@ -36,8 +41,13 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
+pub use certificates::{CertKind, CertStatus, Certificate};
 pub use models::*;
+pub use revisions::ConfigRevision;
 pub use scope::ScopeFilter;
+pub use sites::{NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPolicy};
+pub use stack::{ComponentStatus, StackComponent};
+pub use subscriptions::{Subscription, SubscriptionStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
