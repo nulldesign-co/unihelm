@@ -225,7 +225,7 @@ impl ConfigEngine {
                     rendered_by_task: request.task_id,
                 })
                 .await
-                .map_err(|e| ConfigError::RevisionStore(e))
+                .map_err(ConfigError::RevisionStore)
                 .map(Some)?,
             None => None,
         };
