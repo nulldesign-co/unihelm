@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ferrum_config::{ConfigEngine, TemplateSet};
 use ferrum_core::{AuthContext, ErrorCode, FerrumError, Permission, Result, TaskId, TenantScope};
 use ferrum_db::Db;
 use ferrum_distro::Distro;
@@ -37,15 +38,25 @@ pub struct Services {
     pub distro: Distro,
     pub db: Db,
     pub metrics: Arc<Collector>,
+    /// Renders, validates and activates every file the panel owns (spec §10.4).
+    pub config: Arc<ConfigEngine>,
 }
 
 impl Services {
-    pub fn new(distro: Distro, db: Db) -> Self {
-        Self {
+    /// Build the shared services, compiling every template on the way.
+    ///
+    /// A template that does not parse fails here, at startup, rather than the
+    /// first time somebody creates a site.
+    pub fn new(distro: Distro, db: Db) -> Result<Self> {
+        let templates = TemplateSet::load().map_err(FerrumError::from)?;
+        let config = ConfigEngine::new(templates)
+            .with_revisions(crate::services::DbRevisions::new(db.clone()));
+        Ok(Self {
             distro,
             db,
             metrics: Arc::new(Collector::new()),
-        }
+            config: Arc::new(config),
+        })
     }
 }
 
@@ -88,6 +99,11 @@ impl OpContext {
 
     pub fn metrics(&self) -> &Collector {
         &self.services.metrics
+    }
+
+    /// The configuration engine, for operations that write files the panel owns.
+    pub fn config(&self) -> &ConfigEngine {
+        &self.services.config
     }
 
     pub fn auth(&self) -> &AuthContext {
@@ -197,6 +213,14 @@ impl OpRegistry {
         registry.register(crate::svc::Status);
         registry.register(crate::svc::Action);
         registry.register(crate::metrics::Snapshot);
+        registry.register(crate::stack::Status);
+        registry.register(crate::stack::Install);
+        registry.register(crate::stack::Remove);
+        registry.register(crate::site::List);
+        registry.register(crate::site::Create);
+        registry.register(crate::site::Update);
+        registry.register(crate::site::Delete);
+        registry.register(crate::site::Drift);
         registry
     }
 
@@ -333,7 +357,7 @@ pub(crate) mod testing {
             .await
             .unwrap();
 
-        let services = Arc::new(Services::new(Distro::mock(), db));
+        let services = Arc::new(Services::new(Distro::mock(), db).expect("templates compile"));
         (OpRegistry::new(services), admin.id, customer.id)
     }
 

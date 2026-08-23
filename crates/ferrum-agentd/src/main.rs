@@ -114,7 +114,10 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
     // new work (spec §5.5).
     tasks::reconcile_on_start(&db).await;
 
-    let services = Arc::new(Services::new(distro, db));
+    // Templates are compiled here, so a broken one is a boot failure rather
+    // than a 500 the first time somebody creates a site.
+    let services =
+        Arc::new(Services::new(distro, db).context("could not load the configuration templates")?);
     let registry = Arc::new(OpRegistry::new(services));
     tracing::info!(operations = registry.len(), "operation registry loaded");
 

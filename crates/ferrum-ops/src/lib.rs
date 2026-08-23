@@ -17,8 +17,14 @@
 //! a shell.
 
 pub mod metrics;
+pub mod php;
+pub mod provision;
 pub mod registry;
+pub mod services;
+pub mod site;
+pub mod stack;
 pub mod svc;
 pub mod sys;
+pub mod tls;
 
 pub use registry::{Execution, OpContext, OpRegistry, Operation, Services, TypedOperation};
