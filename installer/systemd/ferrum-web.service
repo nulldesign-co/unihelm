@@ -1,0 +1,61 @@
+[Unit]
+Description=Ferrum panel web server
+Documentation=https://github.com/farzam/ferrum
+After=network-online.target ferrum-agentd.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=ferrum
+Group=ferrum
+ExecStart=/usr/local/ferrum/bin/ferrum-web --config /etc/ferrum/config.toml
+
+Restart=always
+RestartSec=2
+WatchdogSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+LogsDirectory=ferrum
+
+# This process is internet-facing and holds no privileges, so it gets the full
+# treatment (spec §5.5). Anything it needs, it asks the agent for.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Drop every capability: it needs none, and saying so makes that checkable.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The only writable paths. `/run/ferrum` is created by the agent, so it is
+# marked optional (`-`) rather than making web fail to start when the agent has
+# not come up yet.
+ReadWritePaths=/var/lib/ferrum /var/log/ferrum
+ReadWritePaths=-/run/ferrum
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ferrum-web
+
+[Install]
+WantedBy=multi-user.target

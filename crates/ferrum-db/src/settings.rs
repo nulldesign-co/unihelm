@@ -1,0 +1,164 @@
+//! Key/value panel settings (spec §9 `settings`).
+//!
+//! Values are JSON documents, read and written through serde, so a setting is a
+//! typed struct in code and a readable blob in the database.
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::{Db, DbError, Result, now, to_sql_time};
+
+/// Setting keys the panel itself uses. Free-form keys are allowed for plugins
+/// later, but core settings live here so a typo is a compile error.
+pub mod keys {
+    /// Panel display name, used in the UI and in notification templates.
+    pub const PANEL_NAME: &str = "panel.name";
+    /// Default locale for new accounts (`en` or `fa`).
+    pub const DEFAULT_LOCALE: &str = "panel.default_locale";
+    /// Audit retention in days.
+    pub const AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
+    /// Whether admins must have 2FA enabled.
+    pub const FORCE_ADMIN_2FA: &str = "security.force_admin_2fa";
+    /// Schema-independent marker for "the installer finished".
+    pub const SETUP_COMPLETE: &str = "setup.complete";
+}
+
+impl Db {
+    /// Read a setting, or `None` if it has never been written.
+    pub async fn get_setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value_json FROM settings WHERE key = ?1")
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await?;
+
+        match row {
+            None => Ok(None),
+            Some((json,)) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| DbError::Corrupt {
+                    field: "settings.value_json",
+                    detail: e.to_string(),
+                }),
+        }
+    }
+
+    /// Read a setting, falling back to `default` when unset **or unreadable**.
+    ///
+    /// A setting whose stored shape no longer matches the code should not stop
+    /// the panel from booting; the fallback is logged loudly instead.
+    pub async fn get_setting_or<T: DeserializeOwned>(&self, key: &str, default: T) -> T {
+        match self.get_setting::<T>(key).await {
+            Ok(Some(v)) => v,
+            Ok(None) => default,
+            Err(e) => {
+                tracing::warn!(key, error = %e, "unreadable setting; using the default");
+                default
+            }
+        }
+    }
+
+    pub async fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let json = serde_json::to_string(value).map_err(|e| DbError::Corrupt {
+            field: "settings.value_json",
+            detail: e.to_string(),
+        })?;
+        sqlx::query(
+            "INSERT INTO settings (key, value_json, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (key) DO UPDATE SET value_json = ?2, updated_at = ?3",
+        )
+        .bind(key)
+        .bind(json)
+        .bind(to_sql_time(now()))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_setting(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM settings WHERE key = ?1")
+            .bind(key)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Branding {
+        name: String,
+        accent: String,
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_and_upsert() {
+        let db = Db::open_memory().await.unwrap();
+        assert_eq!(
+            db.get_setting::<String>(keys::PANEL_NAME).await.unwrap(),
+            None
+        );
+
+        db.set_setting(keys::PANEL_NAME, &"Ferrum".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_setting::<String>(keys::PANEL_NAME).await.unwrap(),
+            Some("Ferrum".to_string())
+        );
+
+        db.set_setting(keys::PANEL_NAME, &"Panel".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_setting::<String>(keys::PANEL_NAME).await.unwrap(),
+            Some("Panel".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_settings_work() {
+        let db = Db::open_memory().await.unwrap();
+        let b = Branding {
+            name: "Acme Hosting".into(),
+            accent: "#3b82f6".into(),
+        };
+        db.set_setting("branding", &b).await.unwrap();
+        assert_eq!(
+            db.get_setting::<Branding>("branding").await.unwrap(),
+            Some(b)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setting_of_the_wrong_shape_falls_back_instead_of_breaking_boot() {
+        let db = Db::open_memory().await.unwrap();
+        db.set_setting(keys::AUDIT_RETENTION_DAYS, &"not a number".to_string())
+            .await
+            .unwrap();
+        assert!(
+            db.get_setting::<i64>(keys::AUDIT_RETENTION_DAYS)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_setting_or(keys::AUDIT_RETENTION_DAYS, 180i64).await,
+            180
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_key() {
+        let db = Db::open_memory().await.unwrap();
+        db.set_setting(keys::SETUP_COMPLETE, &true).await.unwrap();
+        db.delete_setting(keys::SETUP_COMPLETE).await.unwrap();
+        assert_eq!(
+            db.get_setting::<bool>(keys::SETUP_COMPLETE).await.unwrap(),
+            None
+        );
+    }
+}

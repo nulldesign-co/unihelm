@@ -1,0 +1,44 @@
+# cargo-deny configuration (spec §12 rule 9).
+#
+# The panel runs as root on other people's servers. Every dependency in this
+# tree is something we are asking them to trust, so the set is checked rather
+# than assumed.
+
+[advisories]
+# A known vulnerability in a dependency fails the build. There is no "we will
+# get to it" state for a security advisory in a root daemon.
+yanked = "deny"
+
+[licenses]
+# Permissive licences plus the ones with no practical distribution constraints.
+# The panel itself is AGPL; that is a choice about our code, not a licence we
+# can impose on dependencies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are weight we are paying for twice, against a 25 MB binary
+# budget — worth knowing about, not worth blocking a PR over.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[[bans.deny]]
+# `openssl-sys` drags in a C toolchain and a system library version we would
+# then have to track. TLS, when we need it, comes from rustls.
+name = "openssl-sys"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

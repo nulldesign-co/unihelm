@@ -1,0 +1,33 @@
+# Ferrum panel configuration.
+#
+# This file holds only what is needed to reach the database; everything else is
+# a setting in the panel, so changing it is an audited action rather than an SSH
+# session (spec §4.3). Unknown keys are rejected at startup, so a typo here is a
+# clear error and not a silently ignored line.
+
+[panel]
+# Where the panel listens. The default is loopback on purpose: exposing a fresh
+# install to the internet should be a decision somebody typed.
+listen = "127.0.0.1:8088"
+database = "/var/lib/ferrum/panel.db"
+state_dir = "/var/lib/ferrum/state"
+cli_socket = "/run/ferrum/web.sock"
+
+# Send session cookies with the Secure attribute. Turn this off only for plain
+# HTTP development — with it off, a session cookie can cross an unencrypted hop.
+secure_cookies = true
+
+[agent]
+socket = "/run/ferrum/agent.sock"
+# The unprivileged account ferrum-web runs as. The agent resolves this to a uid
+# at startup and refuses connections from any other account.
+web_user = "ferrum"
+# Task workers, plus one dedicated fast lane for service actions.
+workers = 2
+
+[log]
+# `error`, `warn`, `info`, `debug`, `trace`, or a full RUST_LOG filter such as
+# "info,ferrum_ops=debug".
+level = "info"
+# `json` for journald and log shipping, `text` when reading by eye.
+format = "json"

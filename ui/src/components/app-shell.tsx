@@ -1,0 +1,151 @@
+import { Link, useRouterState } from "@tanstack/react-router";
+import { Gauge, Languages, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+import { CommandPalette, type Command } from "@/components/command-palette";
+import { TaskDrawer } from "@/components/task-drawer";
+import { Button } from "@/components/ui/button";
+import { applyLanguage, LANGUAGES } from "@/i18n";
+import { useSession } from "@/lib/session";
+import { useTheme } from "@/lib/theme";
+import { cn } from "@/lib/utils";
+
+export function AppShell({ children }: { children: React.ReactNode }) {
+  const { t, i18n } = useTranslation();
+  const { user, signOut } = useSession();
+  const { theme, setTheme } = useTheme();
+  const [tasksOpen, setTasksOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+
+  const commands = useMemo<Command[]>(
+    () => [
+      { id: "tasks", label: t("tasks.title"), hint: "T", run: () => setTasksOpen(true) },
+      { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
+      { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, run: () => setTheme("dark") },
+      { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, run: () => setTheme("system") },
+      ...LANGUAGES.map((language) => ({
+        id: `lang-${language.code}`,
+        label: `${t("nav.language")}: ${language.label}`,
+        run: () => applyLanguage(language.code),
+      })),
+      { id: "sign-out", label: t("common.signOut"), run: () => void signOut() },
+    ],
+    [t, setTheme, signOut],
+  );
+
+  const nav = [{ to: "/", label: t("nav.dashboard"), icon: Gauge }];
+
+  return (
+    <div className="min-h-dvh bg-canvas">
+      <header className="sticky top-0 z-30 border-b border-border bg-surface/85 backdrop-blur">
+        <div className="mx-auto flex h-14 max-w-6xl items-center gap-4 px-4 sm:px-6">
+          <Link to="/" className="flex items-center gap-2 font-semibold tracking-tight text-ink">
+            <span
+              className="grid h-6 w-6 place-items-center rounded-md bg-accent text-[11px] font-bold text-on-accent"
+              aria-hidden
+            >
+              F
+            </span>
+            {t("common.appName")}
+          </Link>
+
+          <nav className="flex items-center gap-1" aria-label={t("nav.dashboard")}>
+            {nav.map((item) => (
+              <Link
+                key={item.to}
+                to={item.to}
+                className={cn(
+                  "rounded-lg px-3 py-1.5 text-sm transition-colors",
+                  pathname === item.to
+                    ? "bg-surface-muted font-medium text-ink"
+                    : "text-ink-muted hover:bg-surface-muted hover:text-ink",
+                )}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+
+          <div className="ms-auto flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setPaletteOpen(true)}
+              className="hidden gap-2 sm:inline-flex"
+              aria-keyshortcuts="Meta+K Control+K"
+            >
+              {t("common.search")}
+              <kbd className="rounded border border-border px-1 font-mono text-[10px] text-ink-subtle">⌘K</kbd>
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setTasksOpen(true)}
+              aria-label={t("tasks.title")}
+            >
+              <ListChecks className="h-4 w-4" />
+            </Button>
+
+            <ThemeToggle theme={theme} setTheme={setTheme} />
+
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={t("nav.language")}
+              onClick={() => {
+                const next = i18n.language === "fa" ? "en" : "fa";
+                applyLanguage(next);
+              }}
+            >
+              <Languages className="h-4 w-4" />
+            </Button>
+
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => void signOut()}
+              aria-label={t("common.signOut")}
+              title={user?.username}
+            >
+              <LogOut className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">{children}</main>
+
+      <TaskDrawer open={tasksOpen} onClose={() => setTasksOpen(false)} />
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} commands={commands} />
+    </div>
+  );
+}
+
+function ThemeToggle({
+  theme,
+  setTheme,
+}: {
+  theme: "light" | "dark" | "system";
+  setTheme: (theme: "light" | "dark" | "system") => void;
+}) {
+  const { t } = useTranslation();
+  const next = theme === "light" ? "dark" : theme === "dark" ? "system" : "light";
+  const Icon = theme === "light" ? Sun : theme === "dark" ? Moon : Monitor;
+  const label =
+    theme === "light" ? t("nav.themeLight") : theme === "dark" ? t("nav.themeDark") : t("nav.themeSystem");
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={() => setTheme(next)}
+      aria-label={`${t("nav.theme")}: ${label}`}
+      title={`${t("nav.theme")}: ${label}`}
+    >
+      <Icon className="h-4 w-4" />
+    </Button>
+  );
+}

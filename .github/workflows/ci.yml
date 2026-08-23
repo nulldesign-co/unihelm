@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are failures: the budgets and invariants only mean something if the
+  # build refuses to look away from them (spec §16.3).
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+      # Migrations are forward-only and checked in CI (spec §4.1): a changed
+      # checksum on an applied migration means somebody edited history.
+      - name: Migrations apply to a fresh database
+        run: cargo test -p ferrum-db migrations
+
+  security-gates:
+    name: Security gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The invariant that kills shell injection as a category (spec §12 rule 2).
+      - name: No shell string execution
+        run: bash tests/gates/no-shell.sh
+
+      - name: Shellcheck the installer
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck installer/*.sh tests/gates/*.sh
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Advisories, licences, bans and duplicate versions (spec §12 rule 9).
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  ui:
+    name: UI — typecheck, build, bundle budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - run: npm ci
+        working-directory: ui
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: ui
+
+      - name: Build
+        run: npm run build
+        working-directory: ui
+
+      - name: Bundle budget (≤ 350 KB gzipped, initial route)
+        run: bash tests/gates/budgets.sh bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/ferrum-web/ui-dist
+          retention-days: 3
+
+  budgets:
+    name: Budgets — binary size and idle memory
+    runs-on: ubuntu-latest
+    needs: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The real UI, so the binary size measured is the binary shipped.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/ferrum-web/ui-dist
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Binary size (≤ 25 MB each)
+        run: bash tests/gates/budgets.sh binaries
+
+      - name: Idle RSS (≤ 80 MB, web + agent combined)
+        run: bash tests/gates/budgets.sh rss
+
+  distros:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both families, both currently-supported majors (spec §7.1). Adding a
+        # distribution should mean adding a line here and nothing else.
+        image:
+          - debian:13
+          - debian:12
+          - ubuntu:24.04
+          - almalinux:10
+          - almalinux:9
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq
+            apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config
+          else
+            dnf install -y --setopt=install_weak_deps=False curl ca-certificates gcc make
+          fi
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --workspace
+
+      # Detection and the distro abstraction are the parts that differ per
+      # image; this proves the right backends are picked before anything else
+      # gets built on top of them (spec §7.2).
+      - name: Distro detection and backend selection
+        run: cargo test -p ferrum-distro
+
+      - name: Agent starts and validates its configuration
+        run: |
+          mkdir -p /tmp/fd
+          ./target/debug/ferrum-agentd --dev /tmp/fd --check

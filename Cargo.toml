@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ferrum-core",
+    "crates/ferrum-db",
+    "crates/ferrum-ipc",
+    "crates/ferrum-distro",
+    "crates/ferrum-ops",
+    "crates/ferrum-metrics",
+    "crates/ferrum-web",
+    "crates/ferrum-agentd",
+    "crates/ferrum-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+authors = ["farzam"]
+repository = "https://github.com/farzam/ferrum"
+
+[workspace.dependencies]
+ferrum-core = { path = "crates/ferrum-core" }
+ferrum-db = { path = "crates/ferrum-db" }
+ferrum-ipc = { path = "crates/ferrum-ipc" }
+ferrum-distro = { path = "crates/ferrum-distro" }
+ferrum-ops = { path = "crates/ferrum-ops" }
+ferrum-metrics = { path = "crates/ferrum-metrics" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "json", "time", "uuid"] }
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
+futures = "0.3"
+libc = "0.2"
+toml = "0.8"
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+
+# CI-enforced budgets (spec §3) depend on a small, stripped binary.
+# NOTE: panic stays `unwind` on purpose — ferrum-web wraps handlers in
+# CatchPanicLayer so one bad request cannot take the panel down.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = 1

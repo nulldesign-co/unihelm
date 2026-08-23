@@ -1,0 +1,22 @@
+[package]
+name = "ferrum-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrum"
+path = "src/main.rs"
+
+[dependencies]
+ferrum-core = { workspace = true }
+ferrum-db = { workspace = true }
+ferrum-distro = { workspace = true }
+ferrum-ipc = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

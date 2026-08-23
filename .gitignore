@@ -1,0 +1,13 @@
+/target
+**/node_modules
+/ui/dist
+# The built UI is embedded into the binary at compile time; keep the placeholder
+# so `rust-embed` always has a folder to read.
+/crates/ferrum-web/ui-dist/*
+!/crates/ferrum-web/ui-dist/index.html
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.env
+/tests/.tmp
