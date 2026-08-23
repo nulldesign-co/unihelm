@@ -8,7 +8,10 @@
 pub mod auth;
 pub mod events;
 pub mod health;
+pub mod ops;
 pub mod server;
+pub mod sites;
+pub mod stack;
 pub mod tasks;
 
 use axum::Router;
@@ -23,6 +26,15 @@ fn protected() -> Router<SharedState> {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/server/overview", get(server::overview))
         .route("/api/server/services", get(server::services))
+        .route("/api/stack", get(stack::status))
+        .route("/api/stack/install", post(stack::install))
+        .route("/api/stack/remove", post(stack::remove))
+        .route("/api/sites", get(sites::list).post(sites::create))
+        .route(
+            "/api/sites/{id}",
+            axum::routing::patch(sites::update).delete(sites::delete),
+        )
+        .route("/api/sites/{id}/drift", get(sites::drift))
         .route("/api/tasks", get(tasks::list))
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))

@@ -1,0 +1,26 @@
+name: Repository key pins
+
+# Vendors rotate signing keys. When one does, every install that adds that
+# repository starts failing the pin check — correctly, but with no warning. This
+# runs weekly so the rotation is noticed here rather than by a customer whose
+# install broke.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/ferrum-distro/src/repos.rs"
+      - "crates/ferrum-distro/src/pgp.rs"
+
+jobs:
+  verify:
+    name: Verify pins against the vendors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check every pinned fingerprint against the key being served
+        run: cargo run -p ferrum-distro --example verify-pins

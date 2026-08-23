@@ -814,6 +814,7 @@ dependencies = [
  "base64 0.23.1",
  "ferrum-core",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha1",

@@ -18,10 +18,21 @@
 //! install. Entries below carry every key in the vendor's published bundle so a
 //! rotation is not an outage.
 //!
-//! Anything marked [`Provenance::SingleSource`] was established by one automated
-//! pass and has **not** been independently confirmed by a second. Those must be
-//! re-verified against the vendor before a public release; the constant
-//! [`UNVERIFIED_PINS`] lists them so the check is not a matter of memory.
+//! Every pin below has been checked against the key material the vendor is
+//! actually serving, by Ferrum's own OpenPGP parser:
+//!
+//! ```text
+//! cargo run -p ferrum-distro --example verify-pins
+//! ```
+//!
+//! That proves the pin matches what is served *today*. It does **not** prove
+//! that what is served is the legitimate vendor key — a compromised mirror would
+//! serve its own, and we would faithfully pin that. The stronger assurance comes
+//! from a fingerprint the vendor publishes somewhere other than the key file
+//! itself, and [`UNVERIFIED_PINS`] lists the repositories where no such
+//! out-of-band value exists (or, for nginx, where the published value is not the
+//! key currently signing). Those want a human to confirm before a public
+//! release; the constant keeps that from being a matter of memory.
 
 use crate::detect::{DistroInfo, Family};
 use crate::pkg::RepoDefinition;
@@ -37,7 +48,18 @@ pub enum Provenance {
     SingleSource,
 }
 
-/// Repository ids whose pins still need a second pair of eyes.
+/// Repositories where no vendor-published fingerprint corroborates the key we
+/// pin, so the pin rests on the key material alone.
+///
+/// - `nginx` — the docs publish `573BFD6B…`, which is in the bundle but is *not*
+///   the key signing the repository today. The active signer has no published
+///   value to compare against.
+/// - `docker-ce` — Docker removed the fingerprint from its Debian and Ubuntu
+///   install docs entirely. (Its RPM fingerprint *is* still published, and
+///   matches.)
+/// - `php-sury` — the `Signed-By:` field and the keyring `.deb` both agree, but
+///   both come from the same origin as the key.
+/// - `php-remi` — `KEYS.txt` agrees, and again shares an origin with the key.
 ///
 /// A release checklist item, kept in code so it cannot be forgotten in a wiki.
 pub const UNVERIFIED_PINS: &[&str] = &["nginx", "docker-ce", "php-sury", "php-remi"];

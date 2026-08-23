@@ -21,5 +21,8 @@ sha2.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+# For the `verify-pins` example, which checks the pinned fingerprints against
+# what the vendors are serving today.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
