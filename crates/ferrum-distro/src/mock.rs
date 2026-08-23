@@ -28,6 +28,8 @@ pub struct Recorder {
     pub opened_ports: Vec<PortRule>,
     pub closed_ports: Vec<PortRule>,
     pub bans: Vec<IpAddr>,
+    pub added_repos: Vec<String>,
+    pub removed_repos: Vec<String>,
     pub labelled_paths: Vec<PathBuf>,
     pub log_lines: Vec<String>,
 }
@@ -139,9 +141,36 @@ impl PkgBackend for MockPkg {
             }))
     }
 
-    async fn add_repo(&self, repo: &RepoDefinition, log: &dyn LogSink) -> Result<()> {
+    async fn add_repo(
+        &self,
+        repo: &RepoDefinition,
+        key_material: &[u8],
+        _options: &[(String, String)],
+        log: &dyn LogSink,
+    ) -> Result<()> {
         repo.validate()?;
-        log.line(&format!("mock: added repo {}", repo.id));
+        // The mock must not be laxer than the real backend: an operation that
+        // passes here with an unpinned key would pass its tests and fail on a
+        // real server, which is the worst possible place to find out.
+        let matched = crate::pgp::verify_pinned(key_material, &repo.accepted_fingerprints)?;
+        log.line(&format!(
+            "mock: added repo {} signed by {}",
+            repo.id, matched.fingerprint
+        ));
+        self.rec
+            .lock()
+            .expect("recorder mutex")
+            .added_repos
+            .push(repo.id.clone());
+        Ok(())
+    }
+
+    async fn remove_repo(&self, repo_id: &str) -> Result<()> {
+        self.rec
+            .lock()
+            .expect("recorder mutex")
+            .removed_repos
+            .push(repo_id.to_string());
         Ok(())
     }
 }
@@ -396,6 +425,10 @@ pub fn mock_distro_with_recorder(family: Family) -> (Distro, SharedRecorder) {
         version_id: match family {
             Family::Debian => "13".into(),
             Family::Rhel => "10.0".into(),
+        },
+        codename: match family {
+            Family::Debian => "trixie".into(),
+            Family::Rhel => String::new(),
         },
         pretty_name: "mock distro".into(),
         family,

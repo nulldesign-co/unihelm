@@ -5,6 +5,8 @@
 //! updates somebody else's job — the single biggest operational difference from
 //! the panels that build PHP from source.
 
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -87,43 +89,44 @@ impl std::str::FromStr for PackageName {
 
 /// An upstream repository, with its signing key pinned by full fingerprint.
 ///
-/// Adding a repository is itself an audited operation (spec §7.3); the
-/// fingerprint is compared against the downloaded key before anything is written
-/// to `/etc/apt/sources.list.d` or `/etc/yum.repos.d`.
+/// Adding a repository is itself an audited operation (spec §7.3). The pinned
+/// fingerprints are compared against the key we actually download, before
+/// anything is written to `/etc/apt/sources.list.d` or `/etc/yum.repos.d`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoDefinition {
-    /// Short identifier, also the config filename stem: `nginx`, `sury-php`.
+    /// Short identifier, also the config filename stem: `nginx`, `php-sury`.
     pub id: String,
     pub display_name: String,
     /// Debian: the `deb` URI. RHEL: the `baseurl`.
     pub base_url: String,
-    /// Debian only: suite (`bookworm`) and components (`main`).
+    /// Debian only: the suite, which for every vendor we use is the codename.
     pub suite: Option<String>,
     pub components: Vec<String>,
     /// Where the signing key is published.
     pub gpg_key_url: String,
-    /// Full 40-hex-character fingerprint, no spaces. Verified before use.
-    pub gpg_fingerprint: String,
+    /// Full 40- or 64-hex-character fingerprints, any of which is acceptable.
+    ///
+    /// A list rather than one value because vendors publish bundles: nginx
+    /// serves three keys, and a rotation between them must not be an outage.
+    pub accepted_fingerprints: Vec<String>,
 }
 
 impl RepoDefinition {
-    /// Fingerprints are compared case-insensitively with spaces stripped, since
-    /// vendors publish them in the spaced, uppercase form.
-    pub fn normalised_fingerprint(&self) -> String {
-        self.gpg_fingerprint
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_uppercase()
-    }
-
     pub fn validate(&self) -> Result<()> {
-        let fp = self.normalised_fingerprint();
-        if fp.len() != 40 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+        if self.accepted_fingerprints.is_empty() {
             return Err(DistroError::InvalidName(format!(
-                "repo `{}` must pin a full 40-character GPG fingerprint",
+                "repo `{}` pins no signing key",
                 self.id
             )));
+        }
+        for raw in &self.accepted_fingerprints {
+            let fp = crate::pgp::normalise(raw);
+            if (fp.len() != 40 && fp.len() != 64) || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(DistroError::InvalidName(format!(
+                    "repo `{}` must pin full fingerprints; `{raw}` is not one",
+                    self.id
+                )));
+            }
         }
         for url in [&self.base_url, &self.gpg_key_url] {
             if !url.starts_with("https://") {
@@ -144,7 +147,24 @@ impl RepoDefinition {
                 self.id
             )));
         }
+        if let Some(suite) = &self.suite
+            && (suite.is_empty()
+                || !suite
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+        {
+            return Err(DistroError::InvalidName(format!(
+                "repo `{}` has an implausible suite `{suite}`",
+                self.id
+            )));
+        }
         Ok(())
+    }
+
+    /// Filename stem for the generated config, guaranteed not to escape its
+    /// directory because [`Self::validate`] constrains `id`.
+    pub fn file_stem(&self) -> String {
+        format!("ferrum-{}", self.id)
     }
 }
 
@@ -176,8 +196,21 @@ pub trait PkgBackend: Send + Sync {
     /// Installed state and available version for one package.
     async fn query(&self, package: &PackageName) -> Result<PackageStatus>;
 
-    /// Register an upstream repository after verifying its pinned key.
-    async fn add_repo(&self, repo: &RepoDefinition, log: &dyn LogSink) -> Result<()>;
+    /// Register an upstream repository.
+    ///
+    /// `key_material` is the raw bytes fetched from the repository's
+    /// `gpg_key_url`. Verification against the pinned fingerprints happens
+    /// *here*, so it cannot be skipped by a careless caller.
+    async fn add_repo(
+        &self,
+        repo: &RepoDefinition,
+        key_material: &[u8],
+        options: &[(String, String)],
+        log: &dyn LogSink,
+    ) -> Result<()>;
+
+    /// Remove a repository we previously added.
+    async fn remove_repo(&self, repo_id: &str) -> Result<()>;
 
     async fn is_installed(&self, package: &PackageName) -> Result<bool> {
         Ok(self.query(package).await?.installed)
@@ -302,19 +335,81 @@ impl PkgBackend for AptBackend {
         })
     }
 
-    async fn add_repo(&self, repo: &RepoDefinition, log: &dyn LogSink) -> Result<()> {
+    async fn add_repo(
+        &self,
+        repo: &RepoDefinition,
+        key_material: &[u8],
+        _options: &[(String, String)],
+        log: &dyn LogSink,
+    ) -> Result<()> {
         repo.validate()?;
-        // TODO(scope): Phase 1 (Stack Manager) implements key download +
-        // fingerprint verification + deb822 source file writing. Landing it here
-        // ahead of the module that uses it would be scope invented early, and an
-        // unverified key path is worse than none at all.
+
+        // The pin check, before anything reaches the filesystem.
+        let matched = crate::pgp::verify_pinned(key_material, &repo.accepted_fingerprints)?;
         log.line(&format!(
-            "would register {} from {}",
-            repo.id, repo.base_url
+            "verified {} signing key {}",
+            repo.display_name, matched.fingerprint
         ));
-        Err(DistroError::PackageFailed(
-            "repository registration lands with the Stack Manager in Phase 1".into(),
-        ))
+
+        let suite = repo.suite.clone().ok_or_else(|| {
+            DistroError::InvalidName(format!("repo `{}` needs a suite on this family", repo.id))
+        })?;
+
+        // apt reads armored keys from a `.asc` given to `Signed-By`, so there is
+        // no need to dearmor — and no need for `apt-key`, which is deprecated
+        // precisely because it made every key trusted for every repository.
+        let key_path = PathBuf::from(KEYRING_DIR).join(format!("{}.asc", repo.file_stem()));
+        write_root_file(&key_path, key_material, 0o644)?;
+
+        // deb822 format: it is the one that lets `Signed-By` scope a key to a
+        // single repository.
+        let sources = format!(
+            "# {}\n\
+             # Managed by Ferrum. Signing key pinned to {}.\n\
+             Types: deb\n\
+             URIs: {}\n\
+             Suites: {}\n\
+             Components: {}\n\
+             Architectures: {}\n\
+             Signed-By: {}\n",
+            repo.display_name,
+            matched.fingerprint,
+            repo.base_url,
+            suite,
+            repo.components.join(" "),
+            deb_arch(),
+            key_path.display(),
+        );
+
+        let sources_path =
+            PathBuf::from(APT_SOURCES_DIR).join(format!("{}.sources", repo.file_stem()));
+        write_root_file(&sources_path, sources.as_bytes(), 0o644)?;
+        log.line(&format!("wrote {}", sources_path.display()));
+
+        // A repository that is registered but whose index has not been fetched
+        // is a repository that does not work yet.
+        self.update_index(log).await?;
+        Ok(())
+    }
+
+    async fn remove_repo(&self, repo_id: &str) -> Result<()> {
+        let stem = format!("ferrum-{repo_id}");
+        for path in [
+            PathBuf::from(APT_SOURCES_DIR).join(format!("{stem}.sources")),
+            PathBuf::from(KEYRING_DIR).join(format!("{stem}.asc")),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(DistroError::PackageFailed(format!(
+                        "{}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -424,17 +519,125 @@ impl PkgBackend for DnfBackend {
         })
     }
 
-    async fn add_repo(&self, repo: &RepoDefinition, log: &dyn LogSink) -> Result<()> {
+    async fn add_repo(
+        &self,
+        repo: &RepoDefinition,
+        key_material: &[u8],
+        options: &[(String, String)],
+        log: &dyn LogSink,
+    ) -> Result<()> {
         repo.validate()?;
-        // TODO(scope): see AptBackend::add_repo — Phase 1.
+
+        let matched = crate::pgp::verify_pinned(key_material, &repo.accepted_fingerprints)?;
         log.line(&format!(
-            "would register {} from {}",
-            repo.id, repo.base_url
+            "verified {} signing key {}",
+            repo.display_name, matched.fingerprint
         ));
-        Err(DistroError::PackageFailed(
-            "repository registration lands with the Stack Manager in Phase 1".into(),
-        ))
+
+        let key_path = PathBuf::from(RPM_GPG_DIR).join(format!("RPM-GPG-KEY-{}", repo.file_stem()));
+        write_root_file(&key_path, key_material, 0o644)?;
+
+        // Import into rpm's own keyring as well. dnf would do this on first use,
+        // but it prompts, and doing it now means the import is an explicit,
+        // audited step rather than a surprise inside a package install.
+        Cmd::new("rpm")
+            .arg("--import")
+            .arg(&key_path)
+            .run_checked()
+            .await?;
+
+        let mut body = format!(
+            "# {}\n\
+             # Managed by Ferrum. Signing key pinned to {}.\n\
+             [{}]\n\
+             name={}\n\
+             baseurl={}\n\
+             enabled=1\n\
+             gpgcheck=1\n\
+             gpgkey=file://{}\n",
+            repo.display_name,
+            matched.fingerprint,
+            repo.file_stem(),
+            repo.display_name,
+            repo.base_url,
+            key_path.display(),
+        );
+        for (key, value) in options {
+            body.push_str(&format!("{key}={value}\n"));
+        }
+
+        let repo_path = PathBuf::from(YUM_REPOS_DIR).join(format!("{}.repo", repo.file_stem()));
+        write_root_file(&repo_path, body.as_bytes(), 0o644)?;
+        log.line(&format!("wrote {}", repo_path.display()));
+
+        self.update_index(log).await?;
+        Ok(())
     }
+
+    async fn remove_repo(&self, repo_id: &str) -> Result<()> {
+        let stem = format!("ferrum-{repo_id}");
+        for path in [
+            PathBuf::from(YUM_REPOS_DIR).join(format!("{stem}.repo")),
+            PathBuf::from(RPM_GPG_DIR).join(format!("RPM-GPG-KEY-{stem}")),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(DistroError::PackageFailed(format!(
+                        "{}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where each family expects a third-party signing key and its repository file.
+const APT_SOURCES_DIR: &str = "/etc/apt/sources.list.d";
+const KEYRING_DIR: &str = "/etc/apt/keyrings";
+const YUM_REPOS_DIR: &str = "/etc/yum.repos.d";
+const RPM_GPG_DIR: &str = "/etc/pki/rpm-gpg";
+
+/// The architecture name apt uses, which is not the kernel's name for it.
+fn deb_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Write a root-owned config file, creating its directory if needed.
+fn write_root_file(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| DistroError::PackageFailed(format!("{}: {e}", dir.display())))?;
+    }
+
+    // Same-directory temp plus rename, so a partially written repository file
+    // never exists for apt or dnf to read.
+    let mut temp = path.to_path_buf();
+    temp.as_mut_os_string().push(".ferrum-tmp");
+
+    let write = |temp: &Path| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(temp)?;
+        file.write_all(contents)?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.sync_all()
+    };
+
+    write(&temp).map_err(|e| DistroError::PackageFailed(format!("{}: {e}", temp.display())))?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        DistroError::PackageFailed(format!("{}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 fn check(out: CmdOutput) -> Result<CmdOutput> {
@@ -449,10 +652,22 @@ fn check(out: CmdOutput) -> Result<CmdOutput> {
 mod tests {
     use super::*;
 
+    fn repo(fingerprints: &[&str]) -> RepoDefinition {
+        RepoDefinition {
+            id: "nginx".into(),
+            display_name: "nginx.org".into(),
+            base_url: "https://nginx.org/packages/debian".into(),
+            suite: Some("bookworm".into()),
+            components: vec!["nginx".into()],
+            gpg_key_url: "https://nginx.org/keys/nginx_signing.key".into(),
+            accepted_fingerprints: fingerprints.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn package_names_reject_options_and_paths() {
         assert!(PackageName::parse("php8.3-fpm").is_ok());
-        assert!(PackageName::parse("nginx").is_ok());
+        assert!(PackageName::parse("php83-php-fpm").is_ok());
         assert!(PackageName::parse("gcc-c++").is_ok());
         for bad in [
             "",
@@ -471,49 +686,74 @@ mod tests {
         }
     }
 
-    fn repo(fp: &str) -> RepoDefinition {
-        RepoDefinition {
-            id: "nginx".into(),
-            display_name: "nginx.org".into(),
-            base_url: "https://nginx.org/packages/debian".into(),
-            suite: Some("bookworm".into()),
-            components: vec!["nginx".into()],
-            gpg_key_url: "https://nginx.org/keys/nginx_signing.key".into(),
-            gpg_fingerprint: fp.into(),
-        }
-    }
-
     #[test]
-    fn repo_requires_a_full_pinned_fingerprint() {
-        let full = "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62";
-        assert!(repo(full).validate().is_ok());
-        // Spaced, uppercase — how vendors publish it.
+    fn a_repo_must_pin_at_least_one_full_fingerprint() {
         assert!(
-            repo("573B FD6B 3D8F BC64 1079 A6AB ABF5 BD82 7BD9 BF62")
+            repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"])
                 .validate()
                 .is_ok()
         );
-        // A short key id is exactly the thing that makes pinning worthless.
-        assert!(repo("7BD9BF62").validate().is_err());
-        assert!(repo("").validate().is_err());
+        // Spaced and lowercase forms are how vendors publish them.
         assert!(
-            repo("ZZZZFD6B3D8FBC641079A6ABABF5BD827BD9BF62")
+            repo(&["573B FD6B 3D8F BC64 1079 A6AB ABF5 BD82 7BD9 BF62"])
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            repo(&[]).validate().is_err(),
+            "a repo with no pin must be refused"
+        );
+        // A short key id is forgeable.
+        assert!(repo(&["7BD9BF62"]).validate().is_err());
+        assert!(
+            repo(&["ZZZZFD6B3D8FBC641079A6ABABF5BD827BD9BF62"])
                 .validate()
                 .is_err()
         );
     }
 
     #[test]
-    fn repo_requires_https() {
-        let mut r = repo("573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62");
+    fn a_bundle_of_pins_is_allowed() {
+        // nginx ships three keys; all three are legitimate.
+        let r = repo(&[
+            "8540A6F18833A80E9C1653A42FD21310B49F6B46",
+            "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62",
+            "9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3",
+        ]);
+        assert!(r.validate().is_ok());
+    }
+
+    #[test]
+    fn repo_requires_https_for_both_urls() {
+        let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
         r.base_url = "http://nginx.org/packages/debian".into();
+        assert!(r.validate().is_err());
+
+        let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
+        r.gpg_key_url = "http://nginx.org/keys/nginx_signing.key".into();
         assert!(r.validate().is_err());
     }
 
     #[test]
-    fn repo_id_cannot_escape_into_a_filename() {
-        let mut r = repo("573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62");
+    fn a_repo_id_or_suite_cannot_escape_into_a_path() {
+        let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
         r.id = "../../etc/cron.d/evil".into();
         assert!(r.validate().is_err());
+
+        let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
+        r.suite = Some("../../..".into());
+        assert!(r.validate().is_err());
+
+        assert_eq!(
+            repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]).file_stem(),
+            "ferrum-nginx"
+        );
+    }
+
+    #[test]
+    fn the_apt_architecture_name_is_not_the_kernel_name() {
+        // `uname -m` says x86_64; apt wants amd64. Getting this wrong produces a
+        // repository that resolves nothing.
+        assert!(matches!(deb_arch(), "amd64" | "arm64"));
     }
 }

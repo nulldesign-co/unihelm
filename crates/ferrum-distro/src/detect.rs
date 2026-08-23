@@ -64,6 +64,11 @@ pub struct DistroInfo {
     pub id: String,
     /// `VERSION_ID`: `13`, `24.04`, `10`.
     pub version_id: String,
+    /// `VERSION_CODENAME`: `trixie`, `noble`, `resolute`. Empty on RHEL family.
+    ///
+    /// Debian-family repositories are addressed by codename, not by number, so
+    /// this is not cosmetic — without it we cannot build a sources entry.
+    pub codename: String,
     pub pretty_name: String,
     pub family: Family,
     pub arch: Arch,
@@ -93,6 +98,8 @@ impl DistroInfo {
         let mut id = String::new();
         let mut id_like = String::new();
         let mut version_id = String::new();
+        let mut codename = String::new();
+        let mut ubuntu_codename = String::new();
         let mut pretty_name = String::new();
 
         for line in text.lines() {
@@ -113,6 +120,11 @@ impl DistroInfo {
                 "ID" => id = value.to_ascii_lowercase(),
                 "ID_LIKE" => id_like = value.to_ascii_lowercase(),
                 "VERSION_ID" => version_id = value,
+                "VERSION_CODENAME" => codename = value.to_ascii_lowercase(),
+                // On Ubuntu derivatives (Mint, Pop) VERSION_CODENAME is the
+                // derivative's own name and no upstream repository has a suite
+                // for it; UBUNTU_CODENAME names the Ubuntu release underneath.
+                "UBUNTU_CODENAME" => ubuntu_codename = value.to_ascii_lowercase(),
                 "PRETTY_NAME" => pretty_name = value,
                 _ => {}
             }
@@ -132,9 +144,14 @@ impl DistroInfo {
             pretty_name = format!("{id} {version_id}");
         }
 
+        if !ubuntu_codename.is_empty() {
+            codename = ubuntu_codename;
+        }
+
         Ok(Self {
             id,
             version_id,
+            codename,
             pretty_name,
             family,
             arch,
@@ -299,6 +316,25 @@ VERSION_ID="10.0""#,
             parse("VERSION_ID=1").is_err(),
             "an os-release with no ID is unusable"
         );
+    }
+
+    #[test]
+    fn the_codename_is_captured_because_apt_suites_need_it() {
+        let info = parse("ID=debian\nVERSION_ID=13\nVERSION_CODENAME=trixie").unwrap();
+        assert_eq!(info.codename, "trixie");
+        let info = parse("ID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION_CODENAME=resolute").unwrap();
+        assert_eq!(info.codename, "resolute");
+    }
+
+    #[test]
+    fn an_ubuntu_derivative_uses_the_ubuntu_codename_underneath() {
+        // Linux Mint 22 reports VERSION_CODENAME=wilma, but no upstream
+        // repository publishes a `wilma` suite — `noble` is the one to use.
+        let info = parse(
+            "ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID=\"22\"\nVERSION_CODENAME=wilma\nUBUNTU_CODENAME=noble",
+        )
+        .unwrap();
+        assert_eq!(info.codename, "noble");
     }
 
     #[test]

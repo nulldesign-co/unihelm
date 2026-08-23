@@ -15,14 +15,18 @@ pub mod detect;
 pub mod exec;
 pub mod fw;
 pub mod mock;
+pub mod pgp;
 pub mod pkg;
+pub mod repos;
 pub mod sec;
 pub mod svc;
 
 pub use detect::{Arch, DistroInfo, Family, SupportStatus};
 pub use exec::{Cmd, CmdOutput};
 pub use fw::{FwBackend, PortRule, Proto};
+pub use pgp::{KeyFingerprint, verify_pinned};
 pub use pkg::{PackageName, PkgBackend, RepoDefinition};
+pub use repos::{Provenance, ResolvedRepo, catalogue};
 pub use sec::{SecModule, SecModuleKind};
 pub use svc::{ManagedUnit, SvcBackend, UnitName, UnitState, UnitStatus};
 
