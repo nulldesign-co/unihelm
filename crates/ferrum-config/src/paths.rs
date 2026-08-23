@@ -4,54 +4,114 @@
 //! never edit `nginx.conf`, a distro's `sites-enabled`, or a stock pool file —
 //! the single line we add to the distribution's configuration is an `include`,
 //! and that line is the entire footprint of the panel on files we do not own.
+//!
+//! # The development root
+//!
+//! Every path here is resolved under a root that defaults to `/`. A development
+//! instance sets it to a scratch directory with [`set_root`], which makes the
+//! whole chain — rendering a vhost, validating it, recording a revision, rolling
+//! it back — exercisable on a laptop without root and without touching `/etc`.
+//! In production the root is never set and these are the absolute paths above.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ferrum_core::PhpVersion;
 use ferrum_distro::Family;
 
-/// Directory holding our nginx includes.
-pub const NGINX_DIR: &str = "/etc/nginx/ferrum.d";
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// The one line we add to the distribution's `nginx.conf`, via its own
-/// `conf.d` drop-in directory so even that is not an edit to a stock file.
-pub const NGINX_HOOK: &str = "/etc/nginx/conf.d/ferrum.conf";
+/// Root every managed path under `dir` instead of `/`.
+///
+/// Callable once, before anything resolves a path. Returns `false` if a root was
+/// already set, which is a programming error rather than something to recover
+/// from — half the panel writing to one prefix and half to another would be
+/// worse than either.
+pub fn set_root(dir: impl Into<PathBuf>) -> bool {
+    ROOT.set(dir.into()).is_ok()
+}
+
+/// The configured root, or `/`.
+pub fn root() -> &'static Path {
+    ROOT.get()
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| Path::new("/"))
+}
+
+/// Resolve an absolute path under the configured root.
+fn under(absolute: &str) -> PathBuf {
+    let trimmed = absolute.trim_start_matches('/');
+    root().join(trimmed)
+}
+
+/// Directory holding our nginx includes.
+pub fn nginx_dir() -> PathBuf {
+    under("/etc/nginx/ferrum.d")
+}
+
+/// The one line we add to the distribution's `nginx.conf`, via its own `conf.d`
+/// drop-in directory so even that is not an edit to a stock file.
+pub fn nginx_hook() -> PathBuf {
+    under("/etc/nginx/conf.d/ferrum.conf")
+}
 
 /// Where nginx writes per-site logs.
-pub const SITE_LOG_DIR: &str = "/var/log/ferrum/sites";
+///
+/// Outside the tenant home, so a tenant cannot delete or forge their own access
+/// log and a full home quota does not stop nginx logging.
+pub fn site_log_root() -> PathBuf {
+    under("/var/log/ferrum/sites")
+}
 
 /// Webroot for ACME http-01 challenges, shared by every site.
-pub const ACME_WEBROOT: &str = "/var/lib/ferrum/state/acme";
+pub fn acme_webroot() -> PathBuf {
+    under("/var/lib/ferrum/state/acme")
+}
 
 /// Issued certificates.
-pub const CERT_DIR: &str = "/var/lib/ferrum/state/certs";
+pub fn cert_root() -> PathBuf {
+    under("/var/lib/ferrum/state/certs")
+}
 
 /// The self-signed certificate the catch-all server and a fresh panel use.
-pub const DEFAULT_CERT_DIR: &str = "/var/lib/ferrum/state/certs/_default";
+pub fn default_cert_dir() -> PathBuf {
+    cert_root().join("_default")
+}
+
+/// The page shown while a site is in maintenance mode.
+pub fn maintenance_root() -> PathBuf {
+    under("/var/lib/ferrum/state/maintenance")
+}
+
+/// Per-site FPM sockets. Under `/run`, so they are recreated on boot and never
+/// leave a stale socket behind.
+pub fn fpm_socket_dir() -> PathBuf {
+    under("/run/ferrum/fpm")
+}
 
 pub fn nginx_site(domain: &str) -> PathBuf {
-    PathBuf::from(NGINX_DIR).join(format!("site-{domain}.conf"))
+    nginx_dir().join(format!("site-{domain}.conf"))
 }
 
 pub fn nginx_catchall() -> PathBuf {
     // `00-` so it sorts first and really is the default server.
-    PathBuf::from(NGINX_DIR).join("00-catchall.conf")
+    nginx_dir().join("00-catchall.conf")
 }
 
 pub fn nginx_panel() -> PathBuf {
-    PathBuf::from(NGINX_DIR).join("01-panel.conf")
+    nginx_dir().join("01-panel.conf")
 }
 
 pub fn site_log_dir(domain: &str) -> PathBuf {
-    PathBuf::from(SITE_LOG_DIR).join(domain)
+    site_log_root().join(domain)
 }
 
 pub fn logrotate_site(domain: &str) -> PathBuf {
-    PathBuf::from("/etc/logrotate.d").join(format!("ferrum-{domain}"))
+    under("/etc/logrotate.d").join(format!("ferrum-{domain}"))
 }
 
 pub fn cert_dir(domain: &str) -> PathBuf {
-    PathBuf::from(CERT_DIR).join(domain)
+    cert_root().join(domain)
 }
 
 /// Directory the distribution's PHP-FPM reads pool files from.
@@ -61,9 +121,9 @@ pub fn cert_dir(domain: &str) -> PathBuf {
 pub fn fpm_pool_dir(family: Family, version: PhpVersion) -> PathBuf {
     match family {
         // Sury/Debian: /etc/php/8.3/fpm/pool.d/
-        Family::Debian => PathBuf::from(format!("/etc/php/{}/fpm/pool.d", version.as_str())),
+        Family::Debian => under(&format!("/etc/php/{}/fpm/pool.d", version.as_str())),
         // Remi/RHEL: /etc/opt/remi/php83/php-fpm.d/
-        Family::Rhel => PathBuf::from(format!("/etc/opt/remi/php{}/php-fpm.d", version.compact())),
+        Family::Rhel => under(&format!("/etc/opt/remi/php{}/php-fpm.d", version.compact())),
     }
 }
 
@@ -72,6 +132,9 @@ pub fn fpm_pool_file(family: Family, version: PhpVersion, site: &str) -> PathBuf
 }
 
 /// The `php-fpm` binary for a version, for `-t` config tests.
+///
+/// Not rooted: this is a program to execute, resolved from the trusted binary
+/// directories, not a file we write.
 pub fn fpm_binary(family: Family, version: PhpVersion) -> String {
     match family {
         Family::Debian => format!("php-fpm{}", version.as_str()),
@@ -79,18 +142,13 @@ pub fn fpm_binary(family: Family, version: PhpVersion) -> String {
     }
 }
 
-/// Per-site FPM socket. Under `/run`, so it is recreated on boot and never
-/// leaves a stale socket behind.
 pub fn fpm_socket(site: &str, version: PhpVersion) -> PathBuf {
-    PathBuf::from(format!(
-        "/run/ferrum/fpm/{site}-php{}.sock",
-        version.compact()
-    ))
+    fpm_socket_dir().join(format!("{site}-php{}.sock", version.compact()))
 }
 
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
-    PathBuf::from("/home").join(linux_user)
+    under("/home").join(linux_user)
 }
 
 pub fn site_root(linux_user: &str, domain: &str) -> PathBuf {
@@ -104,6 +162,10 @@ pub fn site_public(linux_user: &str, domain: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These tests run in the same process, so the root is whatever it defaults
+    // to — `/`. `set_root` is exercised by the dev-mode integration path, where
+    // it is called before anything else.
 
     #[test]
     fn fpm_layouts_differ_by_family() {
@@ -146,10 +208,31 @@ mod tests {
         // The panel's entire footprint on files it does not own is one include.
         for path in [nginx_site("a.com"), nginx_catchall(), nginx_panel()] {
             assert!(
-                path.starts_with(NGINX_DIR),
+                path.starts_with(nginx_dir()),
                 "{path:?} escaped the managed directory"
             );
         }
-        assert_eq!(NGINX_HOOK, "/etc/nginx/conf.d/ferrum.conf");
+        assert_eq!(
+            nginx_hook().to_str().unwrap(),
+            "/etc/nginx/conf.d/ferrum.conf"
+        );
+    }
+
+    #[test]
+    fn logs_live_outside_the_tenant_home() {
+        let log_dir = site_log_dir("example.com");
+        assert!(!log_dir.starts_with("/home"), "{log_dir:?}");
+        assert!(log_dir.starts_with("/var/log/ferrum"));
+    }
+
+    #[test]
+    fn under_joins_relative_to_the_root_without_swallowing_it() {
+        // `Path::join` with an absolute argument *replaces* the base — the bug
+        // this helper exists to avoid.
+        assert_eq!(under("/etc/nginx"), PathBuf::from("/etc/nginx"));
+        assert_eq!(
+            Path::new("/tmp/x").join("/etc/nginx"),
+            PathBuf::from("/etc/nginx")
+        );
     }
 }

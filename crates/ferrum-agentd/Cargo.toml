@@ -10,6 +10,7 @@ name = "ferrum-agentd"
 path = "src/main.rs"
 
 [dependencies]
+ferrum-config = { workspace = true }
 ferrum-core = { workspace = true }
 ferrum-db = { workspace = true }
 ferrum-distro = { workspace = true }

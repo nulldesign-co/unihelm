@@ -727,6 +727,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "ferrum-config",
  "ferrum-core",
  "ferrum-db",
  "ferrum-distro",

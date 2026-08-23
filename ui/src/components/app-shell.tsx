@@ -1,5 +1,5 @@
-import { Link, useRouterState } from "@tanstack/react-router";
-import { Gauge, Languages, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
+import { Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -18,10 +18,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [tasksOpen, setTasksOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const navigate = useNavigate();
 
   const commands = useMemo<Command[]>(
     () => [
       { id: "tasks", label: t("tasks.title"), hint: "T", run: () => setTasksOpen(true) },
+      { id: "go-dashboard", label: t("nav.dashboard"), run: () => void navigate({ to: "/" }) },
+      { id: "go-sites", label: t("nav.sites"), run: () => void navigate({ to: "/sites" }) },
+      { id: "go-stack", label: t("nav.stack"), run: () => void navigate({ to: "/stack" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
       { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, run: () => setTheme("dark") },
       { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, run: () => setTheme("system") },
@@ -32,10 +36,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       })),
       { id: "sign-out", label: t("common.signOut"), run: () => void signOut() },
     ],
-    [t, setTheme, signOut],
+    [t, setTheme, signOut, navigate],
   );
 
-  const nav = [{ to: "/", label: t("nav.dashboard"), icon: Gauge }];
+  const nav = [
+    { to: "/", label: t("nav.dashboard"), icon: Gauge },
+    { to: "/sites", label: t("nav.sites"), icon: Globe },
+    { to: "/stack", label: t("nav.stack"), icon: Layers },
+  ];
 
   return (
     <div className="min-h-dvh bg-canvas">

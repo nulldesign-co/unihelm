@@ -69,6 +69,17 @@ fn main() -> Result<()> {
 async fn run(args: Args, config: FerrumConfig) -> Result<()> {
     let dev_mode = args.dev.is_some();
 
+    // A development instance writes its managed files under the scratch
+    // directory instead of /etc and /var, so the whole chain — render, validate,
+    // record a revision, roll back — can be exercised without root.
+    if let Some(dir) = &args.dev {
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("could not create {}", root.display()))?;
+        ferrum_config::paths::set_root(&root);
+        tracing::info!(root = %root.display(), "managed files are rooted here (dev mode)");
+    }
+
     if !dev_mode && !is_root() {
         anyhow::bail!(
             "ferrum-agentd must run as root (it is the privileged half of the panel); \

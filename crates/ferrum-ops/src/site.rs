@@ -341,7 +341,7 @@ pub async fn render_pool(
     let family = distro.info.family;
 
     // The socket directory must exist before FPM tries to bind in it.
-    std::fs::create_dir_all("/run/ferrum/fpm")
+    std::fs::create_dir_all(paths::fpm_socket_dir())
         .map_err(|e| FerrumError::internal(format!("could not create the FPM socket dir: {e}")))?;
 
     let mut pool = PoolContext::new(
@@ -410,8 +410,8 @@ pub async fn render_vhost(
             template: "nginx/site.conf",
             context: serde_json::json!({
                 "site": context,
-                "acme_webroot": paths::ACME_WEBROOT,
-                "maintenance_root": "/var/lib/ferrum/state/maintenance",
+                "acme_webroot": paths::acme_webroot(),
+                "maintenance_root": paths::maintenance_root(),
             }),
             service: "nginx",
             validator: &NginxValidator,
@@ -931,8 +931,8 @@ impl TypedOperation for Drift {
             "nginx/site.conf",
             &serde_json::json!({
                 "site": context,
-                "acme_webroot": paths::ACME_WEBROOT,
-                "maintenance_root": "/var/lib/ferrum/state/maintenance",
+                "acme_webroot": paths::acme_webroot(),
+                "maintenance_root": paths::maintenance_root(),
             }),
         )?;
 

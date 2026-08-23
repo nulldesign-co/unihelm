@@ -10,6 +10,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { DashboardPage } from "@/routes/dashboard";
 import { LoginPage } from "@/routes/login";
+import { SitesPage } from "@/routes/sites";
+import { StackPage } from "@/routes/stack";
 
 /**
  * One gate for the whole app.
@@ -45,7 +47,19 @@ const dashboardRoute = createRoute({
   component: DashboardPage,
 });
 
-const routeTree = rootRoute.addChildren([dashboardRoute]);
+const sitesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sites",
+  component: SitesPage,
+});
+
+const stackRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/stack",
+  component: StackPage,
+});
+
+const routeTree = rootRoute.addChildren([dashboardRoute, sitesRoute, stackRoute]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });
 

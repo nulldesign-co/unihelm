@@ -321,28 +321,26 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
 
     // A self-signed certificate for the catch-all. It is not meant to be
     // trusted; it exists so TLS on the default server is *something*.
-    let default_certs = std::path::Path::new(paths::DEFAULT_CERT_DIR);
-    if !crate::tls::certificate_present(default_certs) {
-        crate::tls::write_self_signed(default_certs, &[])?;
+    let default_certs = paths::default_cert_dir();
+    if !crate::tls::certificate_present(&default_certs) {
+        crate::tls::write_self_signed(&default_certs, &[])?;
         ctx.log("generated a self-signed certificate for the default server");
     }
 
     // The ACME webroot has to exist before the first challenge, and be readable
     // by nginx.
-    std::fs::create_dir_all(
-        std::path::Path::new(paths::ACME_WEBROOT).join(".well-known/acme-challenge"),
-    )
-    .map_err(|e| FerrumError::internal(format!("could not create the ACME webroot: {e}")))?;
-    std::fs::create_dir_all(paths::SITE_LOG_DIR)
+    std::fs::create_dir_all(paths::acme_webroot().join(".well-known/acme-challenge"))
+        .map_err(|e| FerrumError::internal(format!("could not create the ACME webroot: {e}")))?;
+    std::fs::create_dir_all(paths::site_log_root())
         .map_err(|e| FerrumError::internal(format!("could not create the log directory: {e}")))?;
 
     // The include hook. Written with no validator: nginx may not be running yet,
     // and `nginx -t` on a tree that does not include this file cannot test it.
     engine
         .apply(ApplyRequest {
-            file: ManagedFile::nginx(paths::NGINX_HOOK),
+            file: ManagedFile::nginx(paths::nginx_hook()),
             template: "nginx/ferrum.conf",
-            context: serde_json::json!({ "nginx_dir": paths::NGINX_DIR }),
+            context: serde_json::json!({ "nginx_dir": paths::nginx_dir() }),
             service: "nginx",
             validator: &SkipValidation,
             reloader: &NoReload,
@@ -358,7 +356,7 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
             file: ManagedFile::nginx(paths::nginx_catchall()),
             template: "nginx/catchall.conf",
             context: serde_json::json!({
-                "acme_webroot": paths::ACME_WEBROOT,
+                "acme_webroot": paths::acme_webroot(),
                 "default_cert": default_certs.join("fullchain.pem"),
                 "default_key": default_certs.join("privkey.pem"),
                 // HTTP/3 needs UDP/443 open; enabling it by default would make

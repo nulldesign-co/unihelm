@@ -86,6 +86,9 @@ export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) }),
+  patch: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: "PATCH", body: body === undefined ? undefined : JSON.stringify(body) }),
+  del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
 // ---------------------------------------------------------------------------
@@ -207,6 +210,91 @@ export interface TaskLogLine {
   line: string;
 }
 
+// --- stack ------------------------------------------------------------------
+
+export type ComponentState =
+  | "absent"
+  | "installing"
+  | "installed"
+  | "failed"
+  | "removing";
+
+export interface StackComponentView {
+  slug: string;
+  display_name: string;
+  status: ComponentState;
+  installed_version: string | null;
+  last_error: string | null;
+  unit_state: string;
+  unit_active: boolean;
+}
+
+export interface StackResponse {
+  components: StackComponentView[];
+  unverified_pins: string[];
+}
+
+// --- sites ------------------------------------------------------------------
+
+export type SiteKind = "php" | "static" | "proxy" | "redirect";
+export type SiteState = "provisioning" | "active" | "suspended" | "failed";
+
+export interface SiteView {
+  id: number;
+  domain: string;
+  site_type: SiteKind;
+  php_version: string | null;
+  root_dir: string;
+  status: SiteState;
+  force_https: boolean;
+  http3: boolean;
+  maintenance_mode: boolean;
+  client_max_body_size: string;
+  custom_nginx_snippet: string | null;
+  php_ini_overrides: string | null;
+  rate_limit_enabled: boolean;
+  aliases: string[];
+  linux_user: string;
+  has_certificate: boolean;
+  certificate_expires_in_days?: number;
+}
+
+export interface SitesResponse {
+  sites: SiteView[];
+}
+
+export interface DriftResponse {
+  path: string;
+  state: string;
+  diff: { line: number; kind: "same" | "added" | "removed"; text: string }[];
+}
+
+/** A long-running operation's receipt. */
+export interface TaskAccepted {
+  task_id: string;
+  task_url: string;
+}
+
+export interface CreateSiteRequest {
+  domain: string;
+  site_type: SiteKind;
+  php_version?: string;
+  with_www?: boolean;
+  proxy_port?: number;
+  redirect_target?: string;
+}
+
+export interface UpdateSiteRequest {
+  php_version?: string;
+  force_https?: boolean;
+  http3?: boolean;
+  maintenance_mode?: boolean;
+  client_max_body_size?: string;
+  custom_nginx_snippet?: string | null;
+  php_ini_overrides?: string | null;
+  rate_limit_enabled?: boolean;
+}
+
 export const endpoints = {
   login: (username: string, password: string) =>
     api.post<SessionResponse>("/api/auth/login", { username, password }),
@@ -217,4 +305,24 @@ export const endpoints = {
   tasks: () => api.get<TaskListResponse>("/api/tasks"),
   taskLogs: (id: string, afterSeq = 0) =>
     api.get<{ lines: TaskLogLine[] }>(`/api/tasks/${id}/logs?after_seq=${afterSeq}`),
+
+  stack: () => api.get<StackResponse>("/api/stack"),
+  installComponent: (component: { component: "nginx" } | { component: "php"; version: string }) =>
+    api.post<TaskAccepted>("/api/stack/install", component),
+  removeComponent: (component: { component: "nginx" } | { component: "php"; version: string }) =>
+    api.post<TaskAccepted>("/api/stack/remove", component),
+
+  sites: () => api.get<SitesResponse>("/api/sites"),
+  createSite: (body: CreateSiteRequest) => api.post<TaskAccepted>("/api/sites", body),
+  updateSite: (id: number, body: UpdateSiteRequest) =>
+    api.patch<TaskAccepted>(`/api/sites/${id}`, body),
+  deleteSite: (id: number, purgeFiles: boolean) =>
+    api.del<TaskAccepted>(`/api/sites/${id}?purge_files=${purgeFiles}`),
+  siteDrift: (id: number) => api.get<DriftResponse>(`/api/sites/${id}/drift`),
 };
+
+/** PHP versions the panel knows about, newest first. */
+export const PHP_VERSIONS = ["8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"] as const;
+
+/** Versions upstream no longer patches — shown with a warning. */
+export const EOL_PHP_VERSIONS = new Set(["8.2", "8.1", "8.0", "7.4"]);
