@@ -212,6 +212,18 @@ pub trait PkgBackend: Send + Sync {
     /// Remove a repository we previously added.
     async fn remove_repo(&self, repo_id: &str) -> Result<()>;
 
+    /// Put a repository's prerequisite in place before adding it.
+    ///
+    /// Third-party repositories depend on libraries the distribution keeps
+    /// outside its default set. Satisfying that here, with the reason logged,
+    /// is the difference between a working install and a dependency error that
+    /// never names what is missing.
+    async fn ensure_prerequisite(
+        &self,
+        prerequisite: &crate::repos::Prerequisite,
+        log: &dyn LogSink,
+    ) -> Result<()>;
+
     async fn is_installed(&self, package: &PackageName) -> Result<bool> {
         Ok(self.query(package).await?.installed)
     }
@@ -389,6 +401,19 @@ impl PkgBackend for AptBackend {
         // A repository that is registered but whose index has not been fetched
         // is a repository that does not work yet.
         self.update_index(log).await?;
+        Ok(())
+    }
+
+    async fn ensure_prerequisite(
+        &self,
+        prerequisite: &crate::repos::Prerequisite,
+        log: &dyn LogSink,
+    ) -> Result<()> {
+        // Debian-family repositories we use are self-contained; nothing here
+        // needs an extra archive enabled.
+        log.line(&format!(
+            "no prerequisite needed on this family for {prerequisite:?}"
+        ));
         Ok(())
     }
 
@@ -572,6 +597,80 @@ impl PkgBackend for DnfBackend {
 
         self.update_index(log).await?;
         Ok(())
+    }
+
+    async fn ensure_prerequisite(
+        &self,
+        prerequisite: &crate::repos::Prerequisite,
+        log: &dyn LogSink,
+    ) -> Result<()> {
+        use crate::repos::Prerequisite;
+
+        match prerequisite {
+            Prerequisite::DistroPackage(name) => {
+                let package = PackageName::parse(name)?;
+                // Already there? `dnf install` would be a no-op, but saying so
+                // is cheaper and reads better in a task log.
+                if self
+                    .query(&package)
+                    .await
+                    .map(|s| s.installed)
+                    .unwrap_or(false)
+                {
+                    log.line(&format!("{name} is already installed"));
+                    return Ok(());
+                }
+                log.line(&format!("installing {name} (required by this repository)"));
+                let out = self
+                    .dnf()
+                    .arg("install")
+                    .arg(package.as_str())
+                    .run_streaming(|l| log.line(l))
+                    .await?;
+                check(out).map(|_| ())
+            }
+
+            Prerequisite::EnableRepo(name) => {
+                // Best effort. The repository is named differently on RHEL
+                // proper than on its rebuilds, and an install that does not
+                // actually need it should not fail because of a name.
+                if !crate::exec::program_available("dnf") {
+                    return Ok(());
+                }
+                let attempt = Cmd::new("dnf")
+                    .args(["-y", "config-manager", "--set-enabled"])
+                    .arg(name)
+                    .run()
+                    .await;
+
+                match attempt {
+                    Ok(out) if out.success() => {
+                        log.line(&format!("enabled the `{name}` repository"));
+                    }
+                    _ => {
+                        // `dnf config-manager` lives in dnf-plugins-core, which a
+                        // minimal install may not have.
+                        let plugins = PackageName::parse("dnf-plugins-core")?;
+                        let _ = self.dnf().arg("install").arg(plugins.as_str()).run().await;
+                        let retry = Cmd::new("dnf")
+                            .args(["-y", "config-manager", "--set-enabled"])
+                            .arg(name)
+                            .run()
+                            .await;
+                        match retry {
+                            Ok(out) if out.success() => {
+                                log.line(&format!("enabled the `{name}` repository"))
+                            }
+                            _ => log.line(&format!(
+                                "could not enable `{name}`; continuing, since not every \
+                                 package needs it"
+                            )),
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn remove_repo(&self, repo_id: &str) -> Result<()> {

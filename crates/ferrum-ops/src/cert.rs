@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use ferrum_config::paths;
-use ferrum_core::{FerrumError, Permission, Result, SiteId};
+use ferrum_core::{ErrorCode, FerrumError, Permission, Result, SiteId};
 use ferrum_db::{CertKind, Certificate};
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +182,25 @@ impl TypedOperation for Issue {
         let linux_user = ferrum_core::LinuxUser::parse(&subscription.linux_user)?;
         crate::site::render_vhost(ctx, &site, &linux_user).await?;
 
+        // nginx holds certificates in memory from the moment it loads them, so
+        // replacing the files on disk changes nothing until it is told to look
+        // again. And the vhost text does not change on a renewal — same paths,
+        // same options — so the config engine correctly reports "nothing to do"
+        // and skips the reload. Without this line every renewal would appear to
+        // succeed while the expiring certificate stayed live, which is the
+        // failure that only shows up ninety days later.
+        {
+            use ferrum_config::apply::Reloader;
+            let reloader = crate::services::UnitReloader::nginx(ctx.distro());
+            reloader.reload().await.map_err(|e| {
+                FerrumError::new(
+                    ErrorCode::ConfigRollback,
+                    format!("the certificate is on disk but nginx would not reload: {e}"),
+                )
+            })?;
+            ctx.log("nginx reloaded onto the new certificate");
+        }
+
         let days_valid = (issued.not_after - ferrum_db::now()).whole_days();
         ctx.log(format!("{} is now served over HTTPS", site.domain));
 
@@ -260,7 +279,6 @@ pub fn renewal_backoff(failure_count: i64) -> time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_core::ErrorCode;
 
     #[test]
     fn the_renewal_backoff_grows_and_then_stops() {

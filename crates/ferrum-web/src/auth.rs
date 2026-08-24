@@ -148,6 +148,48 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Should this response's session cookie carry `Secure`?
+///
+/// `Secure` means the browser will only ever send the cookie back over HTTPS.
+/// That is what we want across a network — and it is exactly wrong for the
+/// panel's own default deployment, where it listens on loopback and an operator
+/// reaches it through an SSH tunnel. There, the cookie would be set and never
+/// sent back, so the login screen simply reappears after a successful login with
+/// nothing to explain why.
+///
+/// The connection tells us which situation we are in:
+///
+/// - `X-Forwarded-Proto: https` — a TLS-terminating proxy in front of us, so the
+///   browser really is on HTTPS. `Secure`.
+/// - the peer is loopback and there is no forwarded protocol — reached directly
+///   over a tunnel. The bytes never left the machine, so `Secure` buys nothing
+///   and costs the ability to log in at all.
+/// - anything else — a real network hop with no TLS in front. Keep `Secure`:
+///   handing out a session cookie in clear over a network is the thing this
+///   attribute exists to prevent, and the startup warning tells the operator to
+///   put TLS in front.
+pub fn cookie_secure(policy: bool, headers: &HeaderMap, peer: Option<&SocketAddr>) -> bool {
+    if !policy {
+        return false;
+    }
+    if headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proto| {
+            proto
+                .split(',')
+                .next()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+        })
+    {
+        return true;
+    }
+    if peer.is_some_and(|addr| addr.ip().is_loopback()) {
+        return false;
+    }
+    true
+}
+
 /// Build the session cookie.
 pub fn session_cookie(token: String, secure: bool, ttl: Duration) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
@@ -246,6 +288,51 @@ mod tests {
         assert!(!constant_time_eq("abc", "ab"));
         assert!(!constant_time_eq("", "a"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn a_loopback_connection_gets_a_cookie_it_can_actually_send_back() {
+        // The panel's own default: loopback listener, reached over an SSH
+        // tunnel. A Secure cookie there is set and never returned, so login
+        // silently fails with the form simply reappearing.
+        let loopback: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        assert!(!cookie_secure(true, &HeaderMap::new(), Some(&loopback)));
+
+        let v6: SocketAddr = "[::1]:54321".parse().unwrap();
+        assert!(!cookie_secure(true, &HeaderMap::new(), Some(&v6)));
+    }
+
+    #[test]
+    fn a_tls_terminating_proxy_still_gets_a_secure_cookie() {
+        // nginx in front of us proxies from loopback, but the browser is on
+        // HTTPS — the cookie must stay Secure.
+        let loopback: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(cookie_secure(true, &headers, Some(&loopback)));
+
+        // A proxy chain sends a list; the left-most entry is the browser's hop.
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+        assert!(cookie_secure(true, &headers, Some(&loopback)));
+
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!cookie_secure(true, &headers, Some(&loopback)));
+    }
+
+    #[test]
+    fn a_real_network_hop_keeps_secure_even_though_it_breaks_plain_http() {
+        // Handing a session cookie out in clear over a network is exactly what
+        // this attribute prevents. The operator gets a startup warning telling
+        // them to put TLS in front.
+        let remote: SocketAddr = "203.0.113.5:41234".parse().unwrap();
+        assert!(cookie_secure(true, &HeaderMap::new(), Some(&remote)));
+        assert!(cookie_secure(true, &HeaderMap::new(), None));
+    }
+
+    #[test]
+    fn turning_the_policy_off_overrides_everything() {
+        let remote: SocketAddr = "203.0.113.5:41234".parse().unwrap();
+        assert!(!cookie_secure(false, &HeaderMap::new(), Some(&remote)));
     }
 
     #[test]

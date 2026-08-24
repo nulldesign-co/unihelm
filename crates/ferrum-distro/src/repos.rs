@@ -100,6 +100,24 @@ fn remi_key(major: u32) -> Option<&'static str> {
     }
 }
 
+/// Something that must be in place before a repository's packages will resolve.
+///
+/// Third-party repositories routinely depend on libraries the distribution keeps
+/// somewhere other than its default set. Remi's `php8X-php-gd`, for instance,
+/// needs `libraqm` and `libimagequant`, which live in EPEL — without it the
+/// install fails with a dependency error that says nothing about EPEL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prerequisite {
+    /// A package from the distribution's own signed repositories, such as
+    /// `epel-release`. No pin needed: it is signed by the distribution.
+    DistroPackage(&'static str),
+    /// A repository the distribution ships but leaves disabled, such as `crb`.
+    ///
+    /// Best-effort: its name differs between RHEL and its rebuilds, and a
+    /// missing one should not stop an install that might not need it.
+    EnableRepo(&'static str),
+}
+
 /// A repository, resolved for one specific machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRepo {
@@ -109,6 +127,8 @@ pub struct ResolvedRepo {
     pub source: String,
     /// Extra `key = value` lines for a `.repo` file (RHEL only).
     pub options: Vec<(String, String)>,
+    /// What must be enabled first for this repository's packages to resolve.
+    pub prerequisites: Vec<Prerequisite>,
 }
 
 /// nginx from nginx.org.
@@ -167,6 +187,8 @@ pub fn nginx(info: &DistroInfo) -> Result<ResolvedRepo, String> {
             Family::Rhel => vec![("module_hotfixes".into(), "true".into())],
             Family::Debian => Vec::new(),
         },
+        // nginx.org's package is self-contained.
+        prerequisites: Vec::new(),
     })
 }
 
@@ -191,6 +213,7 @@ pub fn php(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                      the keyring shipped in debsuryorg-archive-keyring.deb"
                 .into(),
             options: Vec::new(),
+            prerequisites: Vec::new(),
         }),
 
         Family::Rhel => {
@@ -226,6 +249,13 @@ pub fn php(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                      matches the entry in https://rpms.remirepo.net/KEYS.txt"
                 ),
                 options: Vec::new(),
+                // Remi's own repository header says its dependencies live "in
+                // base repository or in EPEL". Without EPEL, php8X-php-gd fails
+                // on libraqm/libimagequant with an error that never mentions it.
+                prerequisites: vec![
+                    Prerequisite::DistroPackage("epel-release"),
+                    Prerequisite::EnableRepo("crb"),
+                ],
             })
         }
     }
@@ -258,6 +288,7 @@ pub fn docker(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                          there is no vendor-published value to compare against"
                     .into(),
                 options: Vec::new(),
+                prerequisites: Vec::new(),
             })
         }
         Family::Rhel => {
@@ -282,6 +313,7 @@ pub fn docker(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                          and confirmed against the served key material"
                     .into(),
                 options: Vec::new(),
+                prerequisites: Vec::new(),
             })
         }
     }
@@ -510,6 +542,32 @@ mod tests {
                 assert!(repo.definition.gpg_key_url.starts_with("https://"));
             }
         }
+    }
+
+    #[test]
+    fn remi_declares_the_epel_dependency_that_its_packages_actually_have() {
+        // Found the hard way on a real AlmaLinux 9: php83-php-gd needs libgd,
+        // which needs libraqm and libimagequant, which are in EPEL. Without this
+        // the install fails with a dependency error that never says "EPEL".
+        let repo = php(&rhel("9", Arch::X86_64)).unwrap();
+        assert!(
+            repo.prerequisites
+                .contains(&Prerequisite::DistroPackage("epel-release")),
+            "Remi needs EPEL: {:?}",
+            repo.prerequisites
+        );
+        assert!(
+            repo.prerequisites
+                .contains(&Prerequisite::EnableRepo("crb"))
+        );
+
+        // The Debian side needs nothing extra.
+        assert!(
+            php(&debian("trixie", "debian", "13"))
+                .unwrap()
+                .prerequisites
+                .is_empty()
+        );
     }
 
     #[test]

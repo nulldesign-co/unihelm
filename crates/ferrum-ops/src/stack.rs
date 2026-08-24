@@ -261,6 +261,13 @@ async fn install_component(
         ));
     }
 
+    // Whatever this repository's packages depend on, first. Doing it after would
+    // mean the install fails on a missing library with an error that never names
+    // the archive it lives in.
+    for prerequisite in &repo.prerequisites {
+        distro.pkg.ensure_prerequisite(prerequisite, log).await?;
+    }
+
     let key = fetch_key(&repo.definition.gpg_key_url).await?;
     ctx.log(format!("fetched {} bytes of key material", key.len()));
     distro
@@ -327,10 +334,24 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
         ctx.log("generated a self-signed certificate for the default server");
     }
 
-    // The ACME webroot has to exist before the first challenge, and be readable
-    // by nginx.
-    std::fs::create_dir_all(paths::acme_webroot().join(".well-known/acme-challenge"))
+    // The ACME webroot has to exist before the first challenge, and nginx's
+    // *workers* have to be able to reach it at request time.
+    //
+    // This is not the same as reading a certificate: nginx opens those as root
+    // during a reload, before dropping privileges. A challenge file is fetched
+    // by a worker running as `nginx`, and `/var/lib/ferrum` is 0750 ferrum:ferrum
+    // — so without this the CA gets a 404 and nginx logs
+    // `stat() failed (13: Permission denied)` where nobody looks.
+    //
+    // `o+x` grants traversal, not listing. `panel.db` (0640) and private keys
+    // (0600) stay unreadable to everyone else either way.
+    let challenge_dir = paths::acme_webroot().join(".well-known/acme-challenge");
+    std::fs::create_dir_all(&challenge_dir)
         .map_err(|e| FerrumError::internal(format!("could not create the ACME webroot: {e}")))?;
+    make_traversable(&[paths::data_dir(), paths::state_dir()])?;
+    set_mode(&paths::acme_webroot(), 0o755)?;
+    set_mode(&challenge_dir, 0o755)?;
+
     std::fs::create_dir_all(paths::site_log_root())
         .map_err(|e| FerrumError::internal(format!("could not create the log directory: {e}")))?;
 
@@ -485,6 +506,31 @@ impl TypedOperation for Remove {
     }
 }
 
+/// Add the execute bit for "other" so a service running as another account can
+/// traverse into a subdirectory, without being able to list what is there.
+fn make_traversable(dirs: &[std::path::PathBuf]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for dir in dirs {
+        let Ok(metadata) = std::fs::metadata(dir) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o001 == 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o001)).map_err(
+                |e| FerrumError::internal(format!("could not chmod {}: {e}", dir.display())),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| FerrumError::internal(format!("could not chmod {}: {e}", path.display())))
+}
+
 /// Download a repository's signing key.
 ///
 /// Bounded and short-timeout: this runs inside a task the user is watching, and
@@ -542,6 +588,42 @@ async fn fetch_key(url: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traversal_is_granted_without_granting_a_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        make_traversable(std::slice::from_ref(&target)).unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o751,
+            "expected traverse-only for other, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o004,
+            0,
+            "`other` must not be able to list the directory"
+        );
+    }
+
+    #[test]
+    fn making_a_directory_traversable_twice_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_traversable(std::slice::from_ref(&target)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 
     #[test]
     fn component_slugs_are_stable_and_distinct() {

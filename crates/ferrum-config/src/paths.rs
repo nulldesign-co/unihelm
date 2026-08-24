@@ -63,9 +63,19 @@ pub fn site_log_root() -> PathBuf {
     under("/var/log/ferrum/sites")
 }
 
+/// The panel's data directory.
+pub fn data_dir() -> PathBuf {
+    under("/var/lib/ferrum")
+}
+
+/// Rendered configs, ACME account keys, certificates.
+pub fn state_dir() -> PathBuf {
+    under("/var/lib/ferrum/state")
+}
+
 /// Webroot for ACME http-01 challenges, shared by every site.
 pub fn acme_webroot() -> PathBuf {
-    under("/var/lib/ferrum/state/acme")
+    state_dir().join("acme")
 }
 
 /// Issued certificates.

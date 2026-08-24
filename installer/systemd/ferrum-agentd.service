@@ -39,7 +39,14 @@ LogsDirectory=ferrum
 # This process is root by design (spec §5.1), so the hardening here is about
 # reducing what "root" reaches, not pretending it is unprivileged.
 NoNewPrivileges=no
-ProtectHome=read-only
+
+# ProtectHome is deliberately NOT set. Creating a tenant's home directory is
+# this daemon's job — `ProtectHome=read-only` makes `useradd --create-home` fail
+# with a bare "cannot create directory", which is a hardening setting silently
+# breaking the feature it was supposed to protect. `ferrum-web`, which must never
+# see a tenant's files, sets ProtectHome=yes instead; that is where the setting
+# belongs.
+ProtectHome=no
 ProtectClock=yes
 ProtectKernelLogs=yes
 ProtectHostname=yes

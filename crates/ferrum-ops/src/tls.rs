@@ -38,6 +38,13 @@ pub fn write_self_signed(dir: &Path, names: &[String]) -> Result<()> {
     dn.push(DnType::OrganizationName, "Ferrum (self-signed)");
     params.distinguished_name = dn;
 
+    // rcgen's default validity is 1975 to 4096, which works but looks like a
+    // bug in every certificate viewer and confuses expiry monitoring. An hour of
+    // backdating absorbs clock skew between the panel and whatever inspects it.
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::hours(1);
+    params.not_after = now + time::Duration::days(3650);
+
     let cert = params
         .self_signed(&key)
         .map_err(|e| FerrumError::internal(format!("could not self-sign: {e}")))?;
@@ -96,6 +103,7 @@ fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use x509_parser::prelude::FromDer;
 
     #[test]
     fn a_self_signed_pair_is_written_with_the_issued_layout() {
@@ -112,6 +120,33 @@ mod tests {
         assert!(
             dir.path().join("chain.pem").is_file(),
             "stapling needs a trusted-cert file"
+        );
+    }
+
+    #[test]
+    fn the_certificate_has_a_plausible_validity_window() {
+        // rcgen defaults to 1975..4096, which is valid but reads as a bug and
+        // breaks expiry monitoring.
+        let dir = tempfile::tempdir().unwrap();
+        write_self_signed(dir.path(), &["example.com".into()]).unwrap();
+
+        let pem = std::fs::read_to_string(dir.path().join("fullchain.pem")).unwrap();
+        let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+        let (_, cert) = x509_parser::prelude::X509Certificate::from_der(&parsed.contents).unwrap();
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+
+        assert!(not_before <= now, "the certificate must already be valid");
+        assert!(
+            now - not_before < 7200,
+            "backdated by an hour, not by fifty years"
+        );
+        let years = (not_after - now) / (365 * 24 * 3600);
+        assert!(
+            (9..=11).contains(&years),
+            "expected roughly ten years, got {years}"
         );
     }
 

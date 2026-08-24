@@ -22,6 +22,7 @@ preflight_check_root() {
   if [ "$(id -u)" -ne 0 ]; then
     _fail "must be run as root"
   fi
+  return 0
 }
 
 preflight_check_os() {
@@ -62,6 +63,7 @@ preflight_check_os() {
       esac
       ;;
   esac
+  return 0
 }
 
 preflight_check_arch() {
@@ -70,12 +72,14 @@ preflight_check_arch() {
     x86_64 | aarch64 | arm64) ;;
     *) _fail "architecture $FERRUM_ARCH is not supported (x86_64 and aarch64 only)" ;;
   esac
+  return 0
 }
 
 preflight_check_systemd() {
   if [ ! -d /run/systemd/system ]; then
     _fail "systemd is required (spec §1.3); this system is not running it"
   fi
+  return 0
 }
 
 preflight_check_cgroups() {
@@ -84,6 +88,7 @@ preflight_check_cgroups() {
   if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
     _fail "cgroups v2 unified hierarchy is required; boot with systemd.unified_cgroup_hierarchy=1"
   fi
+  return 0
 }
 
 preflight_check_memory() {
@@ -95,6 +100,7 @@ preflight_check_memory() {
   elif [ "$mb" -lt 1800 ]; then
     _warn "${mb} MB of RAM — enough for the panel, tight for a full stack"
   fi
+  return 0
 }
 
 preflight_check_disk() {
@@ -105,6 +111,7 @@ preflight_check_disk() {
   elif [ "$mb" -lt "$MIN_DISK_MB" ]; then
     _fail "${mb} MB free on /var; Ferrum needs at least 10 GB"
   fi
+  return 0
 }
 
 preflight_check_conflicts() {
@@ -116,8 +123,16 @@ preflight_check_conflicts() {
     fi
   done
   for panel in /usr/local/cpanel /opt/psa /www/server/panel; do
-    [ -d "$panel" ] && _warn "another control panel is installed at $panel"
+    if [ -d "$panel" ]; then
+      _warn "another control panel is installed at $panel"
+    fi
   done
+
+  # Every check function must succeed. A bare `[ -d x ] && warn` as the last
+  # statement returns 1 on a *clean* server, which under `set -e` killed the
+  # installer silently — the failure mode nobody sees until it is on somebody
+  # else's machine.
+  return 0
 }
 
 preflight_run() {

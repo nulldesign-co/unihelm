@@ -73,10 +73,22 @@ async fn main() -> Result<()> {
         );
     }
 
+    let addr: SocketAddr = config.panel.listen.parse().expect("validated at load");
+
     if !config.panel.secure_cookies {
         tracing::warn!(
-            "secure_cookies is off — session cookies will be sent over plain HTTP. \
+            "secure_cookies is off — session cookies may be sent over plain HTTP. \
              Development only."
+        );
+    } else if !addr.ip().is_loopback() {
+        // The cookie will carry `Secure`, so a browser will refuse to send it
+        // back over plain http. Without TLS in front, every login appears to
+        // succeed and then bounces straight back to the login form.
+        tracing::warn!(
+            %addr,
+            "listening on a non-loopback address: put TLS in front of the panel, or \
+             logins will not stick — the session cookie is marked Secure and a browser \
+             will not return it over plain HTTP"
         );
     }
 
@@ -90,9 +102,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let addr: SocketAddr = config.panel.listen.parse().expect("validated at load");
     let state = Arc::new(AppState::new(db, config));
-
     let app = build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr)

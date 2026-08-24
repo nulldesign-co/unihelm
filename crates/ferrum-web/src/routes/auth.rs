@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::auth::{
-    CurrentUser, check_rate_limits, clearing_cookie, client_ip, request_id, session_cookie,
-    verify_or_burn,
+    CurrentUser, check_rate_limits, clearing_cookie, client_ip, cookie_secure, request_id,
+    session_cookie, verify_or_burn,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
@@ -172,11 +172,8 @@ pub async fn login(
         .await
         .map_err(ApiError::from)?;
 
-    let jar = jar.add(session_cookie(
-        issued.token,
-        state.config.panel.secure_cookies,
-        DEFAULT_TTL,
-    ));
+    let secure = cookie_secure(state.config.panel.secure_cookies, &headers, Some(&peer));
+    let jar = jar.add(session_cookie(issued.token, secure, DEFAULT_TTL));
     Ok((
         jar,
         Json(LoginResponse {
@@ -215,7 +212,8 @@ pub async fn logout(
         .await
         .map_err(ApiError::from)?;
 
-    let jar = jar.add(clearing_cookie(state.config.panel.secure_cookies));
+    let secure = cookie_secure(state.config.panel.secure_cookies, &headers, Some(&peer));
+    let jar = jar.add(clearing_cookie(secure));
     Ok((jar, Json(serde_json::json!({ "ok": true }))))
 }
 

@@ -29,6 +29,7 @@ pub struct Recorder {
     pub closed_ports: Vec<PortRule>,
     pub bans: Vec<IpAddr>,
     pub added_repos: Vec<String>,
+    pub prerequisites: Vec<String>,
     pub removed_repos: Vec<String>,
     pub labelled_paths: Vec<PathBuf>,
     pub log_lines: Vec<String>,
@@ -171,6 +172,20 @@ impl PkgBackend for MockPkg {
             .expect("recorder mutex")
             .removed_repos
             .push(repo_id.to_string());
+        Ok(())
+    }
+
+    async fn ensure_prerequisite(
+        &self,
+        prerequisite: &crate::repos::Prerequisite,
+        log: &dyn LogSink,
+    ) -> Result<()> {
+        log.line(&format!("mock: satisfied {prerequisite:?}"));
+        self.rec
+            .lock()
+            .expect("recorder mutex")
+            .prerequisites
+            .push(format!("{prerequisite:?}"));
         Ok(())
     }
 }
