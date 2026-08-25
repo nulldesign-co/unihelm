@@ -1,0 +1,37 @@
+{# One tenant's resource ceiling (spec §6.3): a systemd slice whose [Slice]
+   directives systemd writes into the tenant cgroup's controller files —
+   MemoryMax → memory.max, CPUQuota → cpu.max, TasksMax → pids.max,
+   IOWeight → io.weight. The kernel enforces them from then on; the panel's
+   only job is keeping this file truthful. Rendered by ferrum_ops::slices. #}
+[Unit]
+Description=Ferrum tenant {{ slice.linux_user }} resource limits
+
+[Slice]
+{# Accounting is on explicitly rather than trusting DefaultMemoryAccounting=
+   and friends: the per-tenant usage numbers (spec §11.11) read these counters,
+   and a distro that ships accounting off would silently blank them. #}
+MemoryAccounting=yes
+CPUAccounting=yes
+TasksAccounting=yes
+IOAccounting=yes
+{% if slice.memory_max_mb %}
+{# MemoryHigh reclaims and throttles before MemoryMax's OOM kill, so a tenant
+   brushing their ceiling slows down before anything of theirs dies. #}
+MemoryHigh={{ slice.memory_high_mb }}M
+MemoryMax={{ slice.memory_max_mb }}M
+{# A memory cap that can spill into swap is not a cap — it converts one
+   tenant's overrun into everybody's disk latency. #}
+MemorySwapMax=0
+{% endif %}
+{% if slice.cpu_quota_pct %}
+{# Percent of one CPU: 200% means two full cores (spec §6.2 cpu_pct). #}
+CPUQuota={{ slice.cpu_quota_pct }}%
+{% endif %}
+{% if slice.pids_max %}
+{# pids.max is the fork-bomb ceiling: counts processes AND kernel threads. #}
+TasksMax={{ slice.pids_max }}
+{% endif %}
+{% if slice.io_weight %}
+{# Proportional, not a cap: only bites while the disk is contended. #}
+IOWeight={{ slice.io_weight }}
+{% endif %}

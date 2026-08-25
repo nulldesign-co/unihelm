@@ -156,6 +156,29 @@ pub fn fpm_socket(site: &str, version: PhpVersion) -> PathBuf {
     fpm_socket_dir().join(format!("{site}-php{}.sock", version.compact()))
 }
 
+/// Where administrator-installed systemd units live — and therefore ours: the
+/// panel acts as the administrator's hands, so its units go where an operator
+/// would look for them, not into `/usr/lib/systemd` where packages install
+/// theirs (and where a package upgrade could clobber them).
+pub fn systemd_system_dir() -> PathBuf {
+    under("/etc/systemd/system")
+}
+
+/// A unit file the panel owns, by its full file name (`ferrum-ft_ab.slice`).
+pub fn systemd_unit(unit_file_name: &str) -> PathBuf {
+    systemd_system_dir().join(unit_file_name)
+}
+
+/// A drop-in decorating `unit_file_name` without editing it: systemd merges
+/// every `<unit>.d/*.conf` over the unit file itself. This is how the panel
+/// places a unit into a tenant slice (spec §6.3) while the unit file stays
+/// whole for whoever else manages it.
+pub fn systemd_dropin(unit_file_name: &str, dropin_file_name: &str) -> PathBuf {
+    systemd_system_dir()
+        .join(format!("{unit_file_name}.d"))
+        .join(dropin_file_name)
+}
+
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
     under("/home").join(linux_user)
