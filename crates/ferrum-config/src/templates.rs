@@ -52,6 +52,8 @@ const TEMPLATES: &[(&str, &str)] = &[
     (
         "systemd/tenant-dropin.conf",
         include_str!("../templates/systemd/tenant-dropin.conf.j2"),
+    ),
+    (
         "nginx/adminer.conf",
         include_str!("../templates/nginx/adminer.conf.j2"),
     ),
