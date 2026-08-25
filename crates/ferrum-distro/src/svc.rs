@@ -109,10 +109,21 @@ impl ManagedUnit {
                 format!("php{}-php-fpm.service", version.compact())
             }
 
+            // Both families use `mariadb.service` — the vendor packages ship it
+            // and the distro packages alias `mysql.service`/`mysqld.service` to
+            // it, so there is nothing to resolve per family.
             (ManagedUnit::MariaDb, _) => "mariadb.service".to_string(),
-            // TODO(scope): PGDG ships versioned units on RHEL (postgresql-16).
-            // Phase 2 owns PostgreSQL; resolve the installed major then.
-            (ManagedUnit::PostgreSql, _) => "postgresql.service".to_string(),
+
+            // Debian's postgresql-common ships an umbrella `postgresql.service`
+            // that pulls up every `postgresql@<major>-<cluster>` instance; PGDG
+            // on RHEL ships only versioned units (`postgresql-17.service`) and
+            // no umbrella, so the major has to be named here. It comes from the
+            // same constant that selects the repository tree (spec §11.4;
+            // versioning becomes a config value together with that constant).
+            (ManagedUnit::PostgreSql, Family::Debian) => "postgresql.service".to_string(),
+            (ManagedUnit::PostgreSql, Family::Rhel) => {
+                format!("postgresql-{}.service", crate::repos::POSTGRES_MAJOR)
+            }
 
             (ManagedUnit::KvStore, Family::Debian) => "redis-server.service".to_string(),
             (ManagedUnit::KvStore, Family::Rhel) => "redis.service".to_string(),
@@ -429,6 +440,27 @@ mod tests {
         };
         assert_eq!(u.unit_name(Family::Debian).as_str(), "php8.3-fpm.service");
         assert_eq!(u.unit_name(Family::Rhel).as_str(), "php83-php-fpm.service");
+    }
+
+    #[test]
+    fn database_unit_names_resolve_per_family() {
+        assert_eq!(
+            ManagedUnit::MariaDb.unit_name(Family::Debian).as_str(),
+            "mariadb.service"
+        );
+        assert_eq!(
+            ManagedUnit::MariaDb.unit_name(Family::Rhel).as_str(),
+            "mariadb.service"
+        );
+        // Debian has the umbrella unit; PGDG on RHEL ships only versioned ones.
+        assert_eq!(
+            ManagedUnit::PostgreSql.unit_name(Family::Debian).as_str(),
+            "postgresql.service"
+        );
+        assert_eq!(
+            ManagedUnit::PostgreSql.unit_name(Family::Rhel).as_str(),
+            format!("postgresql-{}.service", crate::repos::POSTGRES_MAJOR)
+        );
     }
 
     #[test]
