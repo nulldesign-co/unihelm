@@ -34,6 +34,8 @@ pub const MAX_EDITABLE: u64 = 16 * 1024 * 1024;
 pub fn run() -> i32 {
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
 
     let call = match read_call(&mut reader) {
         Ok(call) => call,
@@ -45,24 +47,40 @@ pub fn run() -> i32 {
                 },
                 &mut io::empty(),
                 0,
+                &mut out,
             );
             return 2;
         }
     };
 
-    match dispatch(&call, &mut reader) {
+    match serve_one(&call, &mut reader, &mut out) {
         Ok(()) => 0,
-        Err(e) => {
-            let _ = write_reply(
-                &FsReply::Err {
-                    kind: e.kind,
-                    message: e.message,
-                },
-                &mut io::empty(),
-                0,
-            );
-            0
-        }
+        Err(_) => 2,
+    }
+}
+
+/// Handle one parsed request: dispatch it and write exactly one reply to `out`.
+///
+/// Operation failures become an `FsReply::Err` on `out` and an `Ok(())` here;
+/// the returned error is reserved for a broken transport. This is the seam
+/// [`super::run_local`] uses to run the helper in-process — the dev-mode and
+/// test path, where the agent is not root and has no privilege to drop.
+pub fn serve_one(
+    call: &FsCall,
+    payload: &mut impl BufRead,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match dispatch(call, payload, out) {
+        Ok(()) => Ok(()),
+        Err(e) => write_reply(
+            &FsReply::Err {
+                kind: e.kind,
+                message: e.message,
+            },
+            &mut io::empty(),
+            0,
+            out,
+        ),
     }
 }
 
@@ -96,31 +114,36 @@ pub fn read_call(reader: &mut impl BufRead) -> io::Result<FsCall> {
     serde_json::from_slice(&line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
+fn dispatch(call: &FsCall, payload: &mut impl BufRead, out: &mut impl Write) -> SafeResult<()> {
     let home = call.home.as_path();
 
     match &call.request {
         FsRequest::List { path, show_hidden } => {
             let dir = safepath::resolve(home, path)?;
             let entries = list(&dir, *show_hidden)?;
-            reply_data(FsData::Entries(entries))
+            reply_data(FsData::Entries(entries), out)
         }
 
         FsRequest::Stat { path } => {
             let target = safepath::resolve(home, path)?;
             let entry = entry_for(&target)?;
-            reply_data(FsData::Entry(entry))
+            reply_data(FsData::Entry(entry), out)
         }
 
-        FsRequest::Read { path, max_bytes } => {
+        FsRequest::Read {
+            path,
+            max_bytes,
+            offset,
+        } => {
             let target = safepath::resolve(home, path)?;
-            read_file(&target, (*max_bytes).min(MAX_EDITABLE))
+            read_file(&target, (*max_bytes).min(MAX_EDITABLE), *offset, out)
         }
 
         FsRequest::Write {
             path,
             len,
             create_parents,
+            append,
         } => {
             let (dir, name) = if *create_parents {
                 make_parents(home, path)?
@@ -128,8 +151,12 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
                 safepath::resolve_new(home, path)?
             };
             let target = safepath::child(&dir, &name)?;
-            write_file(&target, *len, payload)?;
-            reply_data(FsData::Done)
+            if *append {
+                append_file(&target, *len, payload)?;
+            } else {
+                write_file(&target, *len, payload)?;
+            }
+            reply_data(FsData::Done, out)
         }
 
         FsRequest::Mkdir { path } => {
@@ -137,7 +164,7 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
             let target = safepath::child(&dir, &name)?;
             std::fs::create_dir(target.as_path())
                 .map_err(|e| SafeError::io(target.as_path(), &e))?;
-            reply_data(FsData::Entry(entry_for(&target)?))
+            reply_data(FsData::Entry(entry_for(&target)?), out)
         }
 
         FsRequest::Rename { from, to } => {
@@ -152,7 +179,7 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
             }
             std::fs::rename(source.as_path(), dest.as_path())
                 .map_err(|e| SafeError::io(source.as_path(), &e))?;
-            reply_data(FsData::Entry(entry_for(&dest)?))
+            reply_data(FsData::Entry(entry_for(&dest)?), out)
         }
 
         FsRequest::Copy { from, to } => {
@@ -166,7 +193,7 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
                 ));
             }
             let bytes = copy_tree(&source, &dest)?;
-            reply_data(FsData::Bytes(bytes))
+            reply_data(FsData::Bytes(bytes), out)
         }
 
         FsRequest::Remove { path } => {
@@ -178,7 +205,7 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
                 ));
             }
             remove_tree(&target)?;
-            reply_data(FsData::Done)
+            reply_data(FsData::Done, out)
         }
 
         FsRequest::Chmod {
@@ -189,18 +216,18 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
             let target = safepath::resolve(home, path)?;
             let mode = safe_mode(*mode)?;
             chmod_tree(&target, mode, *recursive)?;
-            reply_data(FsData::Done)
+            reply_data(FsData::Done, out)
         }
 
         FsRequest::Search { root, query, limit } => {
             let dir = safepath::resolve(home, root)?;
             let entries = search(&dir, &query.to_lowercase(), (*limit).min(2000))?;
-            reply_data(FsData::Entries(entries))
+            reply_data(FsData::Entries(entries), out)
         }
 
         FsRequest::Usage { path } => {
             let target = safepath::resolve(home, path)?;
-            reply_data(FsData::Bytes(usage(&target)))
+            reply_data(FsData::Bytes(usage(&target)), out)
         }
 
         FsRequest::Compress {
@@ -211,16 +238,16 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead) -> SafeResult<()> {
         } => {
             let dir = safepath::resolve(home, root)?;
             let (parent, name) = safepath::resolve_new(home, archive_path)?;
-            let out = safepath::child(&parent, &name)?;
-            let bytes = archive::compress(&dir, entries, &out, *format)?;
-            reply_data(FsData::Bytes(bytes))
+            let target = safepath::child(&parent, &name)?;
+            let bytes = archive::compress(&dir, entries, &target, *format)?;
+            reply_data(FsData::Bytes(bytes), out)
         }
 
         FsRequest::Extract { archive: src, dest } => {
             let source = safepath::resolve(home, src)?;
             let target = safepath::resolve(home, dest)?;
             let (files, bytes) = archive::extract(&source, &target)?;
-            reply_data(FsData::Extracted { files, bytes })
+            reply_data(FsData::Extracted { files, bytes }, out)
         }
     }
 }
@@ -309,7 +336,9 @@ fn entry_for(path: &SafePath) -> SafeResult<FsEntry> {
     })
 }
 
-fn read_file(path: &SafePath, max_bytes: u64) -> SafeResult<()> {
+fn read_file(path: &SafePath, max_bytes: u64, offset: u64, out: &mut impl Write) -> SafeResult<()> {
+    use std::io::Seek;
+
     let meta = std::fs::metadata(path.as_path()).map_err(|e| SafeError::io(path.as_path(), &e))?;
     if meta.is_dir() {
         return Err(SafeError::new(
@@ -319,19 +348,26 @@ fn read_file(path: &SafePath, max_bytes: u64) -> SafeResult<()> {
     }
 
     let size = meta.len();
-    let take = size.min(max_bytes);
-    let truncated = size > take;
+    // An offset past the end is an empty read, not an error: the chunked
+    // downloader learns it is done the same way `read(2)` callers do.
+    let start = offset.min(size);
+    let take = (size - start).min(max_bytes);
+    let truncated = start + take < size;
 
     let mut file =
         std::fs::File::open(path.as_path()).map_err(|e| SafeError::io(path.as_path(), &e))?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|e| SafeError::io(path.as_path(), &e))?;
     let mut buffer = Vec::with_capacity(take as usize);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(take)
         .read_to_end(&mut buffer)
         .map_err(|e| SafeError::io(path.as_path(), &e))?;
 
     // A truncated read can cut a multi-byte character in half, which would look
     // like a binary file. Judge on the whole prefix minus at most three bytes.
+    // (A non-zero offset can start mid-character too; the editor always reads
+    // from zero, and a chunked download does not care about this flag.)
     let judged = if truncated {
         &buffer[..buffer.len().saturating_sub(3)]
     } else {
@@ -351,6 +387,7 @@ fn read_file(path: &SafePath, max_bytes: u64) -> SafeResult<()> {
         },
         &mut buffer.as_slice(),
         len,
+        out,
     )
     .map_err(|e| SafeError::io(path.as_path(), &e))
 }
@@ -380,6 +417,37 @@ fn write_file(path: &SafePath, len: u64, payload: &mut impl BufRead) -> SafeResu
         let _ = std::fs::remove_file(&temp);
         SafeError::io(path.as_path(), &e)
     })
+}
+
+/// Append a chunk to an existing file (or start one), for resumable uploads.
+///
+/// No temp-and-rename here: append semantics are the caller saying "the file is
+/// being built across calls", so a failed chunk is simply re-sent at the same
+/// offset. `O_NOFOLLOW` closes the gap between [`safepath::resolve_new`]'s
+/// symlink check and this open — a link planted in between makes the open fail
+/// instead of redirecting the write.
+fn append_file(path: &SafePath, len: u64, payload: &mut impl BufRead) -> SafeResult<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path.as_path())
+        .map_err(|e| SafeError::io(path.as_path(), &e))?;
+
+    let mut remaining = len;
+    let mut buffer = vec![0u8; CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(CHUNK as u64) as usize;
+        payload
+            .read_exact(&mut buffer[..want])
+            .map_err(|e| SafeError::io(path.as_path(), &e))?;
+        file.write_all(&buffer[..want])
+            .map_err(|e| SafeError::io(path.as_path(), &e))?;
+        remaining -= want as u64;
+    }
+    file.flush().map_err(|e| SafeError::io(path.as_path(), &e))
 }
 
 /// Resolve a path, creating any missing directories along the way.
@@ -624,7 +692,7 @@ fn usage(path: &SafePath) -> u64 {
 // framing
 // ---------------------------------------------------------------------------
 
-fn reply_data(data: FsData) -> SafeResult<()> {
+fn reply_data(data: FsData, out: &mut impl Write) -> SafeResult<()> {
     write_reply(
         &FsReply::Ok {
             data,
@@ -632,19 +700,23 @@ fn reply_data(data: FsData) -> SafeResult<()> {
         },
         &mut io::empty(),
         0,
+        out,
     )
     .map_err(|e| SafeError::new(FsErrorKind::Io, e.to_string()))
 }
 
-fn write_reply(reply: &FsReply, payload: &mut impl Read, payload_len: u64) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+fn write_reply(
+    reply: &FsReply,
+    payload: &mut impl Read,
+    payload_len: u64,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let line = serde_json::to_string(reply)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     if payload_len > 0 {
-        io::copy(&mut payload.take(payload_len), &mut out)?;
+        io::copy(&mut payload.take(payload_len), out)?;
     }
     out.flush()
 }

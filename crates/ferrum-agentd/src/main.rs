@@ -49,6 +49,14 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // The file-manager helper re-exec (spec §5.2 rule 3) is dispatched before
+    // clap, config, tracing — before *anything*. The helper's argv is fixed by
+    // the agent itself, and every line of code that runs before the privilege
+    // drop is code that runs as root on behalf of a tenant request.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--fs-helper")) {
+        std::process::exit(fs_helper_main());
+    }
+
     let args = Args::parse();
     let config = load_config(&args)?;
     init_tracing(&config);
@@ -393,6 +401,139 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+// ---------------------------------------------------------------------------
+// --fs-helper: the privilege-dropping child (spec §5.2 rule 3, §11.7)
+// ---------------------------------------------------------------------------
+
+/// Entry point for `ferrum-agentd --fs-helper --uid N --gid N --home PATH`.
+///
+/// The contract is brutal on purpose: parse three arguments, drop to the
+/// tenant, and only then hand control to `ferrum_ops::fsops::helper::run()`,
+/// which reads the actual request from stdin. **Nothing is dispatched before
+/// the drop succeeds** — a request never gets to run a single filesystem call
+/// as root. Failures are written to stderr and reported by exit code; the
+/// parent treats a non-zero exit as fatal regardless of anything on stdout.
+fn fs_helper_main() -> i32 {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let parsed = match parse_fs_helper_args(&args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("fs-helper: {msg}");
+            return 2;
+        }
+    };
+    if let Err(msg) = drop_privileges(parsed.uid, parsed.gid) {
+        eprintln!("fs-helper: {msg}");
+        return 3;
+    }
+    ferrum_ops::fsops::helper::run()
+}
+
+#[derive(Debug)]
+struct FsHelperArgs {
+    uid: u32,
+    gid: u32,
+    /// Parsed and validated for shape, but the operative home is the one in
+    /// the stdin request — the argv copy exists so `ps` shows whose helper
+    /// this is when one ever hangs.
+    #[allow(dead_code)]
+    home: PathBuf,
+}
+
+/// Parse `--uid N --gid N --home PATH`, all three required.
+///
+/// uid and gid 0 are refused here *and* re-checked in [`drop_privileges`]:
+/// "drop to root" is not a drop, and an agent bug that computed uid 0 must
+/// die loudly, not run a tenant's request with full privilege.
+fn parse_fs_helper_args(args: &[std::ffi::OsString]) -> std::result::Result<FsHelperArgs, String> {
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut home: Option<PathBuf> = None;
+
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        let value = iter
+            .next()
+            .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))?;
+        match flag.to_str() {
+            Some("--uid") => {
+                uid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--uid must be an integer")?,
+                );
+            }
+            Some("--gid") => {
+                gid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--gid must be an integer")?,
+                );
+            }
+            Some("--home") => home = Some(PathBuf::from(value)),
+            other => {
+                return Err(format!(
+                    "unexpected argument `{}`",
+                    other.unwrap_or("<non-utf8>")
+                ));
+            }
+        }
+    }
+
+    let uid = uid.ok_or("--uid is required")?;
+    let gid = gid.ok_or("--gid is required")?;
+    let home = home.ok_or("--home is required")?;
+    if uid == 0 || gid == 0 {
+        return Err("refusing to run as uid/gid 0: that is not a privilege drop".into());
+    }
+    if !home.is_absolute() {
+        return Err("--home must be an absolute path".into());
+    }
+    Ok(FsHelperArgs { uid, gid, home })
+}
+
+/// Become the tenant, irreversibly, or die.
+///
+/// Order matters and is fixed: `setgroups` and `setgid` while still root
+/// (both are root-only calls), then `setuid` last — the call that burns the
+/// bridge. Afterwards the drop is *proven*, not assumed: `setuid(0)` must
+/// fail. If it succeeds, the saved-uid was left behind (the classic
+/// setuid-ordering bug) and the process is still secretly root — that is not
+/// an error to report, it is a state to abort from.
+fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
+    if uid == 0 || gid == 0 {
+        return Err("refusing to run as uid/gid 0".into());
+    }
+
+    // SAFETY: plain libc syscalls on integers; every result is checked.
+    unsafe {
+        if libc::setgroups(1, &gid) != 0 {
+            return Err(format!(
+                "setgroups failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::setgid(gid) != 0 {
+            return Err(format!("setgid({gid}) failed: {}", std::io::Error::last_os_error()));
+        }
+        if libc::setuid(uid) != 0 {
+            return Err(format!("setuid({uid}) failed: {}", std::io::Error::last_os_error()));
+        }
+
+        // The proof. On a correct drop the kernel refuses to give root back.
+        if libc::setuid(0) == 0 {
+            eprintln!("fs-helper: root could be re-acquired after the drop; aborting");
+            std::process::abort();
+        }
+        if libc::geteuid() != uid || libc::getegid() != gid {
+            return Err("the privilege drop did not land on the expected ids".into());
+        }
+    }
+    Ok(())
+}
+
 fn init_tracing(config: &FerrumConfig) {
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -443,5 +584,63 @@ async fn wait_for_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
         _ = term.recv() => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    // `drop_privileges` itself needs root to exercise; what a test *can* prove
+    // is that the argument boundary never hands it a root target or a
+    // half-specified one. The drop's own proof — setuid(0) failing afterwards
+    // — runs on every real invocation, in production, every time.
+
+    #[test]
+    fn helper_args_parse_when_complete() {
+        let parsed = parse_fs_helper_args(&argv(&[
+            "--uid", "1001", "--gid", "1001", "--home", "/home/ft_ab12",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.uid, 1001);
+        assert_eq!(parsed.gid, 1001);
+        assert_eq!(parsed.home, PathBuf::from("/home/ft_ab12"));
+    }
+
+    #[test]
+    fn a_root_uid_or_gid_is_refused_before_any_drop_is_attempted() {
+        for (uid, gid) in [("0", "1001"), ("1001", "0"), ("0", "0")] {
+            let err = parse_fs_helper_args(&argv(&[
+                "--uid", uid, "--gid", gid, "--home", "/home/x",
+            ]))
+            .unwrap_err();
+            assert!(err.contains("not a privilege drop"), "{uid}/{gid}: {err}");
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_helper_args_are_refused() {
+        for args in [
+            &["--uid", "1001", "--gid", "1001"][..], // no home
+            &["--uid", "1001", "--home", "/h"][..],  // no gid
+            &["--gid", "1001", "--home", "/h"][..],  // no uid
+            &["--uid", "abc", "--gid", "1", "--home", "/h"][..],
+            &["--uid", "-4", "--gid", "1", "--home", "/h"][..],
+            &["--uid", "1001", "--gid", "1001", "--home", "relative/home"][..],
+            &["--uid", "1001", "--gid", "1001", "--home", "/h", "--extra", "x"][..],
+            &["--uid"][..],
+        ] {
+            assert!(parse_fs_helper_args(&argv(args)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn drop_privileges_refuses_root_targets_outright() {
+        assert!(drop_privileges(0, 1001).is_err());
+        assert!(drop_privileges(1001, 0).is_err());
     }
 }

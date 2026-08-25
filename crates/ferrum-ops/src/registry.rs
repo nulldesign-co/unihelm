@@ -231,6 +231,22 @@ impl OpRegistry {
         registry.register(crate::site::Drift);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
+        registry.register(crate::fsops::ops::List);
+        registry.register(crate::fsops::ops::Stat);
+        registry.register(crate::fsops::ops::Read);
+        registry.register(crate::fsops::ops::Write);
+        registry.register(crate::fsops::ops::Mkdir);
+        registry.register(crate::fsops::ops::Rename);
+        registry.register(crate::fsops::ops::Copy);
+        registry.register(crate::fsops::ops::Delete);
+        registry.register(crate::fsops::ops::Chmod);
+        registry.register(crate::fsops::ops::Search);
+        registry.register(crate::fsops::ops::Compress);
+        registry.register(crate::fsops::ops::Extract);
+        registry.register(crate::fsops::ops::TrashList);
+        registry.register(crate::fsops::ops::TrashRestore);
+        registry.register(crate::fsops::ops::TrashPurge);
+        registry.register(crate::fsops::ops::Usage);
         registry
     }
 

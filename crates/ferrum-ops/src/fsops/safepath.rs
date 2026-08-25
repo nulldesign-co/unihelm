@@ -122,6 +122,17 @@ pub fn resolve(home: &Path, path: &Path) -> SafeResult<SafePath> {
 /// Creating a file means proving the directory it goes in is inside the home;
 /// the name itself is checked for the shapes a name must never have.
 pub fn resolve_new(home: &Path, path: &Path) -> SafeResult<(SafePath, String)> {
+    // The trailing form matters for a create: `sites/` and `sites/.` name a
+    // directory-to-be, not a file. `Path`'s components normalise both away, so
+    // this check reads the raw text — the name being created is whatever
+    // follows the last separator, and it must be a real name.
+    let raw = path
+        .to_str()
+        .ok_or_else(|| SafeError::new(FsErrorKind::Invalid, "path is not UTF-8"))?;
+    if let Some(last) = raw.rsplit('/').next() {
+        reject_bad_component(last)?;
+    }
+
     let root = home_root(home)?;
     let relative = relative_to(&root, path)?;
     let mut components = split(&relative);

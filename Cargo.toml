@@ -31,7 +31,17 @@ ferrum-ops = { path = "crates/ferrum-ops" }
 ferrum-metrics = { path = "crates/ferrum-metrics" }
 
 anyhow = "1"
+# File-manager content crosses the op JSON as base64 chunks (spec §11.7).
+base64 = "0.22.1"
+# Archive formats for fs.compress / fs.extract (spec §11.7). Extraction is
+# zip-bomb and path-traversal guarded in ferrum-ops::fsops::archive.
+# zip is default-features = false: the defaults pull AES, bzip2, lzma, ppmd and
+# xz — attack surface and binary size for formats the file manager never emits.
+flate2 = "1.1.9"
+tar = "0.4.46"
 thiserror = "2"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
+zstd = "0.13.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process", "fs"] }
