@@ -947,6 +947,7 @@ dependencies = [
  "ferrum-metrics",
  "hex",
  "instant-acme",
+ "rand 0.8.7",
  "rcgen",
  "reqwest",
  "rustls",

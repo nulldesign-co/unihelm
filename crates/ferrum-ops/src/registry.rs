@@ -235,6 +235,13 @@ impl OpRegistry {
         registry.register(crate::adminer::Status);
         registry.register(crate::adminer::Enable::default());
         registry.register(crate::adminer::Disable);
+        registry.register(crate::db::List);
+        registry.register(crate::db::Create);
+        registry.register(crate::db::Drop);
+        registry.register(crate::db::UserCreate);
+        registry.register(crate::db::UserDrop);
+        registry.register(crate::db::UserPassword);
+        registry.register(crate::db::Grant);
         registry
     }
 

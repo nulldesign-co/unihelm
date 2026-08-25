@@ -19,6 +19,7 @@
 pub mod acme;
 pub mod adminer;
 pub mod cert;
+pub mod db;
 pub mod fpm;
 pub mod metrics;
 pub mod panel;

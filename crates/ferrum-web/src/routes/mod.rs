@@ -5,6 +5,7 @@
 //! API honest: if a feature is missing from the API, it is missing from the
 //! product (spec §2.6).
 
+pub mod adminer;
 pub mod auth;
 pub mod certs;
 pub mod databases;
@@ -56,8 +57,26 @@ fn protected() -> Router<SharedState> {
         .merge(files::router())
         .route(
             "/api/databases/adminer",
-            get(databases::adminer_status).post(databases::adminer_set),
+            get(adminer::adminer_status).post(adminer::adminer_set),
         )
+        .route(
+            "/api/databases",
+            get(databases::list).post(databases::create),
+        )
+        .route(
+            "/api/databases/{id}",
+            axum::routing::delete(databases::drop),
+        )
+        .route("/api/databases/users", post(databases::user_create))
+        .route(
+            "/api/databases/users/{username}",
+            axum::routing::delete(databases::user_drop),
+        )
+        .route(
+            "/api/databases/users/{username}/password",
+            post(databases::user_password),
+        )
+        .route("/api/databases/grants", post(databases::grant))
 }
 
 /// Routes reachable without a session.
