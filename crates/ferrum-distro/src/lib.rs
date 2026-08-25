@@ -108,10 +108,9 @@ impl Distro {
             Family::Rhel => Arc::new(pkg::DnfBackend::new()),
         };
         let svc: Arc<dyn SvcBackend> = Arc::new(svc::SystemdBackend::new(info.family));
-        let fw: Arc<dyn FwBackend> = match info.family {
-            Family::Debian => Arc::new(fw::NftablesBackend::new()),
-            Family::Rhel => Arc::new(fw::FirewalldBackend::new()),
-        };
+        // By what is installed, not by family. A RHEL box without firewall-cmd
+        // must not announce `fw: firewalld` — it did, on a live server.
+        let fw: Arc<dyn FwBackend> = fw::detect(info.family);
         let sec: Arc<dyn SecModule> = sec::detect_sec_module(info.family);
 
         Ok(Self {

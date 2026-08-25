@@ -13,6 +13,7 @@ use ferrum_config::managed::ManagedFile;
 use ferrum_config::paths;
 use ferrum_core::{ErrorCode, FerrumError, Permission, PhpVersion, Result};
 use ferrum_db::ComponentStatus;
+use ferrum_distro::fw::{PortRule, Proto};
 use ferrum_distro::svc::ManagedUnit;
 use ferrum_distro::{Distro, PackageName};
 use serde::{Deserialize, Serialize};
@@ -296,6 +297,11 @@ async fn install_component(
     if component == StackComponent::Nginx {
         bootstrap_nginx(ctx).await?;
     }
+    if let StackComponent::Php { version } = component {
+        // Before it starts, so the stock `www` pool never gets to spawn a
+        // single worker as the web server user.
+        crate::fpm::retire_and_log(ctx, version).await;
+    }
 
     // 4. Start it, and make it come back after a reboot.
     let unit = component.unit().unit_name(distro.info.family);
@@ -394,7 +400,51 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
         .await?;
 
     ctx.log("default server configured");
+
+    // The web ports. An nginx that is running but unreachable is the single
+    // most confusing state a new panel can be in, and it is what the operator
+    // gets on a distro image that ships firewalld enabled with only SSH open.
+    open_web_ports(ctx).await;
+
     Ok(())
+}
+
+/// Open 80 and 443, if there is a firewall to open them in.
+///
+/// Deliberately never fatal. A firewall that refuses the change must not undo an
+/// otherwise-successful nginx install, and a host with no firewall at all is not
+/// an error — the ports are already reachable there. Either way the task log
+/// says exactly what happened, because "why can I not reach my site" is
+/// answered by that line.
+async fn open_web_ports(ctx: &OpContext) {
+    let fw = &ctx.distro().fw;
+
+    match fw.is_active().await {
+        Ok(true) => {}
+        Ok(false) => {
+            ctx.log(format!(
+                "no active firewall ({}); ports 80 and 443 need no change",
+                fw.name()
+            ));
+            return;
+        }
+        Err(e) => {
+            ctx.log(format!("could not query the firewall ({e}); leaving it alone"));
+            return;
+        }
+    }
+
+    for (port, what) in [(80u16, "http"), (443, "https")] {
+        let rule = PortRule::anywhere(port, Proto::Tcp, what);
+        match fw.open_port(&rule).await {
+            Ok(()) => ctx.log(format!("opened {port}/tcp in {}", fw.name())),
+            Err(e) => ctx.log(format!(
+                "could not open {port}/tcp in {}: {e} — the site will not be \
+                 reachable from outside until this port is open",
+                fw.name()
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -234,22 +234,37 @@ impl TypedOperation for Create {
         let linux_user = ferrum_core::LinuxUser::parse(&subscription.linux_user)?;
         let root_dir = paths::site_public(linux_user.as_str(), input.domain.as_str());
 
+        let wanted = NewSite {
+            subscription_id: subscription.id,
+            domain: input.domain.clone(),
+            site_type,
+            php_version,
+            root_dir: root_dir.to_string_lossy().into_owned(),
+            proxy_port: input.proxy_port,
+            redirect_target: input
+                .redirect_target
+                .as_ref()
+                .map(|d| format!("https://{d}")),
+        };
+
         // The row first: a failure after this point has somewhere to be recorded.
-        let site = db
-            .create_site(NewSite {
-                subscription_id: subscription.id,
-                domain: input.domain.clone(),
-                site_type,
-                php_version,
-                root_dir: root_dir.to_string_lossy().into_owned(),
-                proxy_port: input.proxy_port,
-                redirect_target: input
-                    .redirect_target
-                    .as_ref()
-                    .map(|d| format!("https://{d}")),
-            })
-            .await
-            .map_err(FerrumError::from)?;
+        //
+        // If the domain is already ours and its last attempt failed, this is a
+        // retry, not a conflict. Anything else — an active site, another
+        // tenant's failed one, an alias — stays a conflict, because reclaiming
+        // those would be a way to take somebody else's domain.
+        let site = match retryable_site(ctx, &input.domain, subscription.id).await? {
+            Some(existing) => {
+                ctx.log(format!(
+                    "retrying {}, whose last attempt failed",
+                    existing.domain
+                ));
+                db.reclaim_failed_site(existing.id, &wanted)
+                    .await
+                    .map_err(FerrumError::from)?
+            }
+            None => db.create_site(wanted).await.map_err(FerrumError::from)?,
+        };
 
         if input.with_www
             && let Ok(www) = input.domain.with_www()
@@ -344,6 +359,10 @@ pub async fn render_pool(
     std::fs::create_dir_all(paths::fpm_socket_dir())
         .map_err(|e| FerrumError::internal(format!("could not create the FPM socket dir: {e}")))?;
 
+    // A package upgrade puts the stock `www` pool back, so this is checked
+    // whenever we are about to reload FPM anyway rather than once at install.
+    crate::fpm::retire_and_log(ctx, version).await;
+
     let mut pool = PoolContext::new(
         &site.domain,
         linux_user.as_str(),
@@ -375,6 +394,51 @@ pub async fn render_pool(
         site.domain
     ));
     Ok(())
+}
+
+/// Is this create request a retry of a failed site we already own?
+///
+/// Returns the row to reclaim, `None` if the domain is free, and an error if it
+/// belongs to something we must not take over. The error is the whole point of
+/// the function: "`example.com` is already a site" tells an operator nothing
+/// about what to do next, whereas naming the state does.
+async fn retryable_site(
+    ctx: &OpContext,
+    domain: &ferrum_core::Domain,
+    subscription_id: ferrum_core::SubscriptionId,
+) -> Result<Option<Site>> {
+    let db = ctx.db();
+
+    // Global, not the caller's scope: a domain taken by a tenant this caller
+    // cannot see is still taken, and answering "free" would produce a duplicate
+    // `server_name` that nginx resolves by parse order.
+    let Some(existing) = db
+        .sites(&ferrum_core::TenantScope::Global)
+        .by_domain(domain.as_str())
+        .await
+        .map_err(FerrumError::from)?
+    else {
+        return Ok(None);
+    };
+
+    if existing.subscription_id != subscription_id {
+        return Err(FerrumError::new(
+            ErrorCode::DomainAlreadyExists,
+            format!("`{domain}` already belongs to another subscription"),
+        ));
+    }
+
+    match existing.status {
+        SiteStatus::Failed => Ok(Some(existing)),
+        SiteStatus::Provisioning => Err(FerrumError::new(
+            ErrorCode::Conflict,
+            format!("`{domain}` is still being provisioned; wait for that task to finish"),
+        )),
+        SiteStatus::Active | SiteStatus::Suspended => Err(FerrumError::new(
+            ErrorCode::DomainAlreadyExists,
+            format!("`{domain}` is already a site; delete it first if you want to recreate it"),
+        )),
+    }
 }
 
 /// Render and activate a site's nginx vhost.

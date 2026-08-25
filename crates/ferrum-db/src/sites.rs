@@ -307,6 +307,41 @@ impl Db {
         Ok(None)
     }
 
+    /// Take a failed site's row back so the same domain can be tried again.
+    ///
+    /// A provisioning failure leaves the row behind, marked failed, so the UI
+    /// can say what went wrong. Without this the row then owns the domain for
+    /// ever: fix the DNS, fix the disk, try again, and the panel answers
+    /// "`example.com` is already a site". That was the single most confusing
+    /// thing about the first live install.
+    ///
+    /// Only a **failed** row, and only for the **same subscription**. Letting a
+    /// different tenant reclaim it would turn one customer's failed attempt into
+    /// another customer's way of taking their domain.
+    pub async fn reclaim_failed_site(&self, id: SiteId, new: &NewSite) -> Result<Site> {
+        let ts = to_sql_time(now());
+        let row = sqlx::query_as::<_, SiteRow>(
+            "UPDATE sites
+             SET site_type = ?2, php_version = ?3, root_dir = ?4, proxy_port = ?5,
+                 redirect_target = ?6, status = 'provisioning', updated_at = ?7
+             WHERE id = ?1 AND status = 'failed'
+             RETURNING *",
+        )
+        .bind(id.get())
+        .bind(new.site_type.as_str())
+        .bind(new.php_version.map(|v| v.as_str()))
+        .bind(&new.root_dir)
+        .bind(new.proxy_port.map(i64::from))
+        .bind(&new.redirect_target)
+        .bind(&ts)
+        .fetch_optional(self.pool())
+        .await?
+        // The `status = 'failed'` guard is in the statement rather than in a
+        // prior read, so two retries racing cannot both win.
+        .ok_or(DbError::Conflict { what: "site" })?;
+        Site::try_from(row)
+    }
+
     /// Create a site. Not scoped: the caller has already checked that the
     /// subscription belongs to them.
     pub async fn create_site(&self, new: NewSite) -> Result<Site> {
@@ -678,6 +713,90 @@ mod tests {
         let sa = db.create_subscription(a.id).await.unwrap();
         let sb = db.create_subscription(b.id).await.unwrap();
         (db, sa.id, sb.id, a.id, b.id)
+    }
+
+    #[tokio::test]
+    async fn a_failed_site_can_be_tried_again_on_the_same_domain() {
+        // Without this the first failed attempt owns the domain for ever: fix
+        // the problem, try again, and the panel answers "already a site".
+        let (db, sub, _other, _, _) = seed().await;
+        let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+
+        let mut retry = php_site(sub, "example.com");
+        retry.php_version = Some(PhpVersion::V84);
+        let again = db.reclaim_failed_site(site.id, &retry).await.unwrap();
+
+        assert_eq!(again.id, site.id, "the retry reuses the row, keeping its history");
+        assert_eq!(again.status, SiteStatus::Provisioning);
+        assert_eq!(
+            again.php_version,
+            Some(PhpVersion::V84),
+            "a retry with different settings uses the new ones"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_subscription_cannot_reclaim_a_failed_site() {
+        // Otherwise one customer's failed attempt becomes another customer's
+        // route to their domain.
+        let (db, sub, other, _, _) = seed().await;
+        let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+
+        // The op layer refuses this by comparing owners; the row keeps its owner
+        // either way, so a reclaim can never move a site between subscriptions.
+        let stolen = db
+            .reclaim_failed_site(site.id, &php_site(other, "example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stolen.subscription_id, sub,
+            "reclaiming must never reassign ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_failed_site_can_be_reclaimed() {
+        let (db, sub, _other, _, _) = seed().await;
+        let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
+
+        // Still provisioning.
+        assert!(
+            db.reclaim_failed_site(site.id, &php_site(sub, "example.com"))
+                .await
+                .is_err()
+        );
+
+        db.set_site_status(site.id, SiteStatus::Active).await.unwrap();
+        assert!(
+            db.reclaim_failed_site(site.id, &php_site(sub, "example.com"))
+                .await
+                .is_err(),
+            "a live site must never be silently rebuilt under a retry"
+        );
+
+        db.set_site_status(site.id, SiteStatus::Suspended).await.unwrap();
+        assert!(
+            db.reclaim_failed_site(site.id, &php_site(sub, "example.com"))
+                .await
+                .is_err(),
+            "a suspended site is somebody's, not free to take"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_retries_racing_produce_one_winner() {
+        // The status guard is inside the UPDATE, not a read followed by a write,
+        // so a double-click cannot start two provisioning runs on one row.
+        let (db, sub, _other, _, _) = seed().await;
+        let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+
+        let first = db.reclaim_failed_site(site.id, &php_site(sub, "example.com")).await;
+        let second = db.reclaim_failed_site(site.id, &php_site(sub, "example.com")).await;
+        assert!(first.is_ok());
+        assert!(second.is_err(), "the second claim must lose");
     }
 
     fn php_site(sub: SubscriptionId, domain: &str) -> NewSite {

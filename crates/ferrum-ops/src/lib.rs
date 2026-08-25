@@ -18,6 +18,7 @@
 
 pub mod acme;
 pub mod cert;
+pub mod fpm;
 pub mod metrics;
 pub mod php;
 pub mod provision;
