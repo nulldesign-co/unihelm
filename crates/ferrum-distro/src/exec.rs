@@ -14,7 +14,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use ferrum_core::{ErrorCode, FerrumError};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::{DistroError, Result};
@@ -76,6 +76,10 @@ pub struct Cmd {
     timeout: Duration,
     /// Run with a cleared environment plus only what `env` sets.
     clear_env: bool,
+    /// Bytes written to the child's stdin, then closed. `None` means stdin is
+    /// `/dev/null`, which stays the default: a command that unexpectedly reads
+    /// stdin should see EOF, not hang.
+    stdin: Option<Vec<u8>>,
 }
 
 impl Cmd {
@@ -88,6 +92,7 @@ impl Cmd {
             env: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             clear_env: true,
+            stdin: None,
         }
     }
 
@@ -123,6 +128,20 @@ impl Cmd {
         self
     }
 
+    /// Feed `data` to the child on stdin, then close the pipe so it sees EOF.
+    ///
+    /// This is how SQL reaches `mariadb` and `psql` (spec §11.4): on stdin the
+    /// statements never appear in `/proc/<pid>/cmdline`, in `ps` output or in a
+    /// task log the way a `-e "..."` argument would — which matters, because
+    /// some of those statements carry passwords. The data is written before any
+    /// output is read; that cannot deadlock as long as it fits the pipe buffer,
+    /// so keep payloads small (SQL batches are; a gigabyte import is not and
+    /// must stream through a file instead).
+    pub fn stdin_data(mut self, data: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(data.into());
+        self
+    }
+
     /// Human-readable form for logs and task output. **Display only** — it is
     /// never parsed back into a command.
     pub fn display(&self) -> String {
@@ -149,11 +168,29 @@ impl Cmd {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        cmd.stdin(Stdio::null());
+        cmd.stdin(if self.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
         Ok(cmd)
+    }
+
+    /// Write the configured stdin bytes and close the pipe.
+    async fn feed_stdin(&self, child: &mut tokio::process::Child) -> Result<()> {
+        if let Some(data) = &self.stdin {
+            let mut sink = child.stdin.take().expect("stdin was piped in build()");
+            sink.write_all(data).await.map_err(|e| DistroError::Spawn {
+                program: self.program.clone(),
+                source: e,
+            })?;
+            // Dropping `sink` closes the pipe; without the EOF, clients that
+            // read until end-of-input (both SQL clients do) would wait forever.
+        }
+        Ok(())
     }
 
     /// Run to completion, capturing output. A non-zero exit is returned as data,
@@ -163,10 +200,11 @@ impl Cmd {
         let mut cmd = self.build()?;
         tracing::debug!(cmd = %self.display(), "exec");
 
-        let child = cmd.spawn().map_err(|e| DistroError::Spawn {
+        let mut child = cmd.spawn().map_err(|e| DistroError::Spawn {
             program: self.program.clone(),
             source: e,
         })?;
+        self.feed_stdin(&mut child).await?;
 
         let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(r) => r.map_err(|e| DistroError::Spawn {
@@ -223,6 +261,7 @@ impl Cmd {
             program: self.program.clone(),
             source: e,
         })?;
+        self.feed_stdin(&mut child).await?;
 
         let stdout = child.stdout.take().expect("stdout was piped in build()");
         let stderr = child.stderr.take().expect("stderr was piped in build()");
@@ -408,6 +447,31 @@ mod tests {
             .unwrap();
         assert!(out.success());
         assert_eq!(lines, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test]
+    async fn stdin_data_reaches_the_child_and_then_eof() {
+        // `cat` copies stdin to stdout and exits only on EOF, so this asserts
+        // both halves of the contract: the bytes arrive, and the pipe closes.
+        let out = Cmd::new("cat")
+            .stdin_data("SELECT 1;\n")
+            .timeout(Duration::from_secs(5))
+            .run()
+            .await
+            .unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout, "SELECT 1;\n");
+    }
+
+    #[tokio::test]
+    async fn without_stdin_data_a_reading_child_sees_eof_not_a_hang() {
+        let out = Cmd::new("cat")
+            .timeout(Duration::from_secs(5))
+            .run()
+            .await
+            .unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout, "");
     }
 
     #[tokio::test]

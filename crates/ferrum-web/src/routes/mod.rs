@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod certs;
+pub mod databases;
 pub mod events;
 pub mod health;
 pub mod ops;
@@ -42,6 +43,24 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
+        .route(
+            "/api/databases",
+            get(databases::list).post(databases::create),
+        )
+        .route(
+            "/api/databases/{id}",
+            axum::routing::delete(databases::drop),
+        )
+        .route("/api/databases/users", post(databases::user_create))
+        .route(
+            "/api/databases/users/{username}",
+            axum::routing::delete(databases::user_drop),
+        )
+        .route(
+            "/api/databases/users/{username}/password",
+            post(databases::user_password),
+        )
+        .route("/api/databases/grants", post(databases::grant))
 }
 
 /// Routes reachable without a session.

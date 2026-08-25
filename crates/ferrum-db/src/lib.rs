@@ -22,6 +22,7 @@
 
 pub mod audit;
 pub mod certificates;
+pub mod databases;
 pub mod models;
 pub mod password;
 pub mod revisions;
@@ -44,6 +45,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
+pub use databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 pub use models::*;
 pub use revisions::ConfigRevision;
 pub use scheduler::ScheduledJob;

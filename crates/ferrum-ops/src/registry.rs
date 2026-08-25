@@ -231,6 +231,13 @@ impl OpRegistry {
         registry.register(crate::site::Drift);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
+        registry.register(crate::db::List);
+        registry.register(crate::db::Create);
+        registry.register(crate::db::Drop);
+        registry.register(crate::db::UserCreate);
+        registry.register(crate::db::UserDrop);
+        registry.register(crate::db::UserPassword);
+        registry.register(crate::db::Grant);
         registry
     }
 

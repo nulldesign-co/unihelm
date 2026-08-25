@@ -12,6 +12,8 @@ ferrum-db = { workspace = true }
 ferrum-distro = { workspace = true }
 ferrum-metrics = { workspace = true }
 async-trait = { workspace = true }
+# Show-once database passwords (spec §11.4): thread_rng is a CSPRNG.
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
