@@ -57,6 +57,10 @@ pub struct Subscription {
     pub home_dir: String,
     pub status: SubscriptionStatus,
     pub suspended_reason: Option<String>,
+    /// When the current suspension began; the clock the delete grace period
+    /// runs from (spec §6.4). `None` whenever the subscription is active.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub suspended_at: Option<time::OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
@@ -70,6 +74,7 @@ pub struct SubscriptionRow {
     pub home_dir: String,
     pub status: String,
     pub suspended_reason: Option<String>,
+    pub suspended_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -86,6 +91,7 @@ impl TryFrom<SubscriptionRow> for Subscription {
             home_dir: r.home_dir,
             status: SubscriptionStatus::parse(&r.status)?,
             suspended_reason: r.suspended_reason,
+            suspended_at: r.suspended_at.as_deref().map(from_sql_time).transpose()?,
             created_at: from_sql_time(&r.created_at)?,
         })
     }
@@ -185,14 +191,25 @@ impl Db {
         status: SubscriptionStatus,
         reason: Option<&str>,
     ) -> Result<()> {
+        let ts = to_sql_time(now());
+        // `suspended_at` follows the status (spec §6.4): stamped whenever the
+        // subscription stops being active, cleared the moment it is again — so
+        // a reinstated tenant never carries a stale suspension clock into a
+        // later delete grace-period calculation.
+        let suspended_at = match status {
+            SubscriptionStatus::Active => None,
+            SubscriptionStatus::Suspended | SubscriptionStatus::PendingDelete => Some(ts.clone()),
+        };
         sqlx::query(
-            "UPDATE subscriptions SET status = ?2, suspended_reason = ?3, updated_at = ?4
+            "UPDATE subscriptions
+             SET status = ?2, suspended_reason = ?3, suspended_at = ?4, updated_at = ?5
              WHERE id = ?1",
         )
         .bind(id.get())
         .bind(status.as_str())
         .bind(reason)
-        .bind(to_sql_time(now()))
+        .bind(suspended_at)
+        .bind(&ts)
         .execute(self.pool())
         .await?;
         Ok(())
@@ -379,6 +396,40 @@ mod tests {
         let second = db.default_subscription_for(alice).await.unwrap();
         assert_ne!(second.id, first.id);
         assert!(second.status.can_serve());
+    }
+
+    #[tokio::test]
+    async fn suspension_stamps_a_clock_and_reinstatement_clears_it() {
+        // The delete grace period (spec §6.4) counts from `suspended_at`, so a
+        // subscription that was suspended, reinstated and suspended again must
+        // carry the *latest* suspension time and an active one must carry none.
+        let (db, alice, _) = seed().await;
+        let sub = db.create_subscription(alice).await.unwrap();
+        assert!(sub.suspended_at.is_none());
+
+        db.set_subscription_status(sub.id, SubscriptionStatus::Suspended, Some("unpaid"))
+            .await
+            .unwrap();
+        let suspended = db
+            .subscriptions(&TenantScope::Global)
+            .by_id(sub.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(suspended.suspended_at.is_some());
+        assert_eq!(suspended.suspended_reason.as_deref(), Some("unpaid"));
+
+        db.set_subscription_status(sub.id, SubscriptionStatus::Active, None)
+            .await
+            .unwrap();
+        let reinstated = db
+            .subscriptions(&TenantScope::Global)
+            .by_id(sub.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reinstated.suspended_at.is_none(), "no stale clock");
+        assert!(reinstated.suspended_reason.is_none());
     }
 
     #[tokio::test]

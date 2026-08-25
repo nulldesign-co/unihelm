@@ -22,6 +22,7 @@ pub mod fpm;
 pub mod metrics;
 pub mod panel;
 pub mod php;
+pub mod plan;
 pub mod provision;
 pub mod registry;
 pub mod services;

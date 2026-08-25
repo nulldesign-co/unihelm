@@ -25,6 +25,7 @@ pub mod certificates;
 pub mod models;
 pub mod panel;
 pub mod password;
+pub mod plans;
 pub mod revisions;
 pub mod scheduler;
 pub mod scope;
@@ -46,6 +47,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
 pub use models::*;
+pub use plans::{NewPlan, Plan, PlanUpdate};
 pub use revisions::ConfigRevision;
 pub use scheduler::ScheduledJob;
 pub use scope::ScopeFilter;

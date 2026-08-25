@@ -233,6 +233,14 @@ impl TypedOperation for Create {
             ));
         }
 
+        // Plan enforcement (spec §6.2): a subscription at its plan's site limit
+        // is refused here, before a row, a Linux account or a single file
+        // exists. `max_dbs` is enforced the same way by the database module on
+        // its side; a subscription without a plan stays unlimited (the Phase 1
+        // behavior). Failed sites do not count, so the reclaim-and-retry path
+        // below still works at the limit.
+        crate::plan::enforce_site_limit(ctx.db(), &subscription).await?;
+
         let linux_user = ferrum_core::LinuxUser::parse(&subscription.linux_user)?;
         let root_dir = paths::site_public(linux_user.as_str(), input.domain.as_str());
 
@@ -449,8 +457,27 @@ pub async fn render_vhost(
     site: &Site,
     linux_user: &ferrum_core::LinuxUser,
 ) -> Result<()> {
+    render_vhost_mode(ctx, site, linux_user, false).await
+}
+
+/// [`render_vhost`], with the maintenance page optionally forced on regardless
+/// of the site's own toggle.
+///
+/// This is the suspension path (spec §6.4): suspending a subscription must not
+/// overwrite the tenant's own `maintenance_mode` flag in the database — that
+/// would clobber their setting on reinstatement — so the override lives only
+/// in the rendered output, and unsuspending re-renders from the stored flags.
+pub async fn render_vhost_mode(
+    ctx: &OpContext,
+    site: &Site,
+    linux_user: &ferrum_core::LinuxUser,
+    force_maintenance: bool,
+) -> Result<()> {
     let db = ctx.db();
     let mut context = site_context(site, linux_user)?;
+    if force_maintenance {
+        context.maintenance_mode = true;
+    }
 
     let aliases: Vec<String> = db
         .sites(&ferrum_core::TenantScope::Global)

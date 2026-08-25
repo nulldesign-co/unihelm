@@ -232,6 +232,13 @@ impl OpRegistry {
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
         registry.register(crate::panel::Issue);
+        registry.register(crate::plan::List);
+        registry.register(crate::plan::Create);
+        registry.register(crate::plan::Update);
+        registry.register(crate::plan::Delete);
+        registry.register(crate::plan::Assign);
+        registry.register(crate::plan::Suspend::live());
+        registry.register(crate::plan::Unsuspend::live());
         registry
     }
 

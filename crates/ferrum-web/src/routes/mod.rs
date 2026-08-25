@@ -12,6 +12,7 @@ pub mod health;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
+pub mod plans;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -49,6 +50,14 @@ fn protected() -> Router<SharedState> {
             "/api/server/panel-tls",
             get(panel_tls::status).post(panel_tls::issue),
         )
+        .route("/api/plans", get(plans::list).post(plans::create))
+        .route(
+            "/api/plans/{id}",
+            axum::routing::patch(plans::update).delete(plans::delete),
+        )
+        .route("/api/plans/{id}/assign", post(plans::assign))
+        .route("/api/subscriptions/{id}/suspend", post(plans::suspend))
+        .route("/api/subscriptions/{id}/unsuspend", post(plans::unsuspend))
 }
 
 /// Routes reachable without a session.
