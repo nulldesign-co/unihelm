@@ -11,6 +11,7 @@ pub mod events;
 pub mod health;
 pub mod openapi;
 pub mod ops;
+pub mod panel_tls;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -44,6 +45,10 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
         .route("/api/openapi.json", get(openapi::document))
+        .route(
+            "/api/server/panel-tls",
+            get(panel_tls::status).post(panel_tls::issue),
+        )
 }
 
 /// Routes reachable without a session.
