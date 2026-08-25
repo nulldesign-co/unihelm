@@ -60,9 +60,13 @@ pub enum Provenance {
 /// - `php-sury` — the `Signed-By:` field and the keyring `.deb` both agree, but
 ///   both come from the same origin as the key.
 /// - `php-remi` — `KEYS.txt` agrees, and again shares an origin with the key.
+/// - `pgdg` — the *deb* key's fingerprint is published on the PostgreSQL wiki
+///   and is corroborated, but the per-architecture *rpm* keys are published
+///   nowhere except download.postgresql.org itself — the same origin that
+///   serves the repository they sign.
 ///
 /// A release checklist item, kept in code so it cannot be forgotten in a wiki.
-pub const UNVERIFIED_PINS: &[&str] = &["nginx", "docker-ce", "php-sury", "php-remi"];
+pub const UNVERIFIED_PINS: &[&str] = &["nginx", "docker-ce", "php-sury", "php-remi", "pgdg"];
 
 /// nginx.org publishes three keys in one file.
 ///
@@ -100,6 +104,42 @@ fn remi_key(major: u32) -> Option<&'static str> {
     }
 }
 
+/// The MariaDB series the panel installs. `11.8` is the current long-term
+/// support series (maintained until mid-2030), which is what a hosting server
+/// wants — rolling releases EOL in one year.
+///
+/// A constant for now; it becomes a config value when the panel grows per-server
+/// engine version selection (spec §11.4 lists engines, not versions). Everything
+/// downstream already takes the series as a parameter, so only this default
+/// moves.
+pub const MARIADB_SERIES: &str = "11.8";
+
+/// The PostgreSQL major the panel installs. 17 is the newest major with a full
+/// year of point releases behind it and PGDG coverage on every distro/arch in
+/// the v1 support matrix (verified against the live repository trees).
+///
+/// Like [`MARIADB_SERIES`], a documented constant until engine versioning
+/// becomes a config value.
+pub const POSTGRES_MAJOR: u32 = 17;
+
+/// "MariaDB Server" signing key, RSA-4096, created 2023. One key signs both the
+/// deb and the rpm repositories, served from supplychain.mariadb.com.
+///
+/// The fingerprint is published in MariaDB's own documentation
+/// (mariadb.com/kb/en/gpg/), a different host from the one serving the key —
+/// which is what lets this pin count as corroborated.
+const MARIADB_KEY: &str = "177F4010FE56CA3336300305F1656F24C74CD1D8";
+
+/// PGDG's apt key ("PostgreSQL Debian Repository"), the long-lived `ACCC4CF8`
+/// key whose full fingerprint the PostgreSQL wiki publishes.
+const PGDG_DEB_KEY: &str = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8";
+
+/// PGDG signs its RPM repositories with a *different key per architecture* —
+/// pinning only the x86_64 key would reject every package on an arm64 server.
+/// The resolver picks by [`DistroInfo::arch`].
+const PGDG_RPM_X86_64_KEY: &str = "D4BF08AE67A0B4C7A1DBCCD240BCA2B408B40D20";
+const PGDG_RPM_AARCH64_KEY: &str = "B031F89FC983E98262906B6E177B343BB9738825";
+
 /// Something that must be in place before a repository's packages will resolve.
 ///
 /// Third-party repositories routinely depend on libraries the distribution keeps
@@ -116,6 +156,14 @@ pub enum Prerequisite {
     /// Best-effort: its name differs between RHEL and its rebuilds, and a
     /// missing one should not stop an install that might not need it.
     EnableRepo(&'static str),
+    /// An AppStream module stream to disable, such as `postgresql`.
+    ///
+    /// PGDG's own install instructions include `dnf module disable postgresql`:
+    /// with the module's default stream active, `dnf` can resolve a bare
+    /// dependency on the distribution's build instead of the repository we just
+    /// pinned. Best-effort, because EL10 removed modularity entirely — there the
+    /// command fails and there is nothing to disable.
+    DisableModule(&'static str),
 }
 
 /// A repository, resolved for one specific machine.
@@ -319,12 +367,170 @@ pub fn docker(info: &DistroInfo) -> Result<ResolvedRepo, String> {
     }
 }
 
+/// MariaDB Server, from MariaDB plc's own repository (spec §7.3).
+///
+/// The URLs deliberately use `dlm.mariadb.com` — the "download manager" host
+/// that MariaDB's own `mariadb_repo_setup` script writes — and **never** the
+/// mirror round-robins (`mirror.mariadb.org`, the `downloads.mariadb.org`
+/// redirectors). The round-robins hand consecutive requests to different
+/// volunteer mirrors, and a mirror mid-sync serves metadata that references
+/// packages it does not have yet: the install fails on a 404 or a checksum
+/// mismatch that no retry fixes, because the retry lands on yet another mirror.
+/// `dlm.mariadb.com` instead redirects every request into one signed,
+/// versioned CDN snapshot (`…/11.8/` resolves to a single point release like
+/// `…/11.8/11.8.9/…`), so the metadata and the packages of one transaction
+/// always come from the same atomic snapshot.
+pub fn mariadb(info: &DistroInfo, series: &str) -> Result<ResolvedRepo, String> {
+    // The series lands in a URL path; refuse anything that is not `NN.N`-shaped
+    // rather than trusting a future config value to be well-formed.
+    if series.is_empty()
+        || !series.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || series.contains("..")
+    {
+        return Err(format!("`{series}` is not a plausible MariaDB series"));
+    }
+
+    let fingerprints = vec![MARIADB_KEY.to_string()];
+    // One key signs both families (unlike Docker), served from a host separate
+    // from the repository itself.
+    let gpg_key_url = "https://supplychain.mariadb.com/MariaDB-Server-GPG-KEY".to_string();
+
+    let definition = match info.family {
+        Family::Debian => {
+            let path = if info.id == "ubuntu" {
+                "ubuntu"
+            } else {
+                "debian"
+            };
+            RepoDefinition {
+                id: "mariadb".into(),
+                display_name: format!("MariaDB Server {series}"),
+                base_url: format!("https://dlm.mariadb.com/repo/mariadb-server/{series}/repo/{path}"),
+                suite: Some(require_codename(info)?),
+                components: vec!["main".into()],
+                gpg_key_url,
+                accepted_fingerprints: fingerprints,
+            }
+        }
+        Family::Rhel => {
+            let major = require_major(info)?;
+            RepoDefinition {
+                id: "mariadb".into(),
+                display_name: format!("MariaDB Server {series}"),
+                // Major substituted, `$releasever` never written: on RHEL proper
+                // it expands to `9.6`, a directory upstream does not have.
+                base_url: format!(
+                    "https://dlm.mariadb.com/repo/mariadb-server/{series}/yum/rhel/{major}/{}",
+                    arch_dir(info)
+                ),
+                suite: None,
+                components: Vec::new(),
+                gpg_key_url,
+                accepted_fingerprints: fingerprints,
+            }
+        }
+    };
+
+    Ok(ResolvedRepo {
+        definition,
+        provenance: Provenance::Corroborated,
+        source: "fingerprint published in MariaDB's documentation \
+                 (https://mariadb.com/kb/en/gpg/), confirmed against the key served at \
+                 https://supplychain.mariadb.com/MariaDB-Server-GPG-KEY"
+            .into(),
+        options: match info.family {
+            // Verbatim from the `.repo` file mariadb_repo_setup writes. Without
+            // it, dnf's modular filtering on EL lets the distribution's own
+            // `mariadb` AppStream module shadow this repository's packages, and
+            // the install fails with "all matches were filtered out".
+            Family::Rhel => vec![("module_hotfixes".into(), "1".into())],
+            Family::Debian => Vec::new(),
+        },
+        prerequisites: Vec::new(),
+    })
+}
+
+/// PostgreSQL from PGDG — apt.postgresql.org / download.postgresql.org
+/// (spec §7.3), for [`POSTGRES_MAJOR`].
+pub fn pgdg(info: &DistroInfo) -> Result<ResolvedRepo, String> {
+    match info.family {
+        Family::Debian => Ok(ResolvedRepo {
+            definition: RepoDefinition {
+                id: "pgdg".into(),
+                display_name: format!("PostgreSQL {POSTGRES_MAJOR} (PGDG)"),
+                // One archive serves every suite; the major is selected by
+                // package name (`postgresql-17`), not by URL.
+                base_url: "https://apt.postgresql.org/pub/repos/apt".into(),
+                suite: Some(format!("{}-pgdg", require_codename(info)?)),
+                components: vec!["main".into()],
+                gpg_key_url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc".into(),
+                accepted_fingerprints: vec![PGDG_DEB_KEY.to_string()],
+            },
+            provenance: Provenance::Corroborated,
+            source: "fingerprint published on https://wiki.postgresql.org/wiki/Apt, \
+                     confirmed against the key served at \
+                     https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+                .into(),
+            options: Vec::new(),
+            prerequisites: Vec::new(),
+        }),
+
+        Family::Rhel => {
+            let major = require_major(info)?;
+            // Per-architecture signing keys: the x86_64 pin rejects every
+            // aarch64 package and vice versa, so the arch picks the key.
+            let (key_file, fingerprint) = match info.arch {
+                crate::detect::Arch::X86_64 => ("PGDG-RPM-GPG-KEY-RHEL", PGDG_RPM_X86_64_KEY),
+                crate::detect::Arch::Aarch64 => {
+                    ("PGDG-RPM-GPG-KEY-AARCH64-RHEL", PGDG_RPM_AARCH64_KEY)
+                }
+            };
+            Ok(ResolvedRepo {
+                definition: RepoDefinition {
+                    id: "pgdg".into(),
+                    display_name: format!("PostgreSQL {POSTGRES_MAJOR} (PGDG)"),
+                    // EL major substituted for the same `$releasever` reason as
+                    // nginx and MariaDB.
+                    base_url: format!(
+                        "https://download.postgresql.org/pub/repos/yum/{POSTGRES_MAJOR}/redhat/rhel-{major}-{}",
+                        arch_dir(info)
+                    ),
+                    suite: None,
+                    components: Vec::new(),
+                    gpg_key_url: format!(
+                        "https://download.postgresql.org/pub/repos/yum/keys/{key_file}"
+                    ),
+                    accepted_fingerprints: vec![fingerprint.to_string()],
+                },
+                // The rpm keys are published only by the host that serves the
+                // packages they sign; see UNVERIFIED_PINS.
+                provenance: Provenance::SingleSource,
+                source: format!(
+                    "key material served at \
+                     https://download.postgresql.org/pub/repos/yum/keys/{key_file}; \
+                     PGDG publishes no out-of-band fingerprint for its rpm keys"
+                ),
+                options: Vec::new(),
+                // PGDG's own EL9 instructions disable the distro module first;
+                // best-effort because EL10 has no modularity (see the variant).
+                prerequisites: vec![Prerequisite::DisableModule("postgresql")],
+            })
+        }
+    }
+}
+
 /// Every repository Ferrum knows how to add on this machine.
 pub fn catalogue(info: &DistroInfo) -> Vec<ResolvedRepo> {
-    [nginx(info), php(info), docker(info)]
-        .into_iter()
-        .flatten()
-        .collect()
+    [
+        nginx(info),
+        php(info),
+        mariadb(info, MARIADB_SERIES),
+        pgdg(info),
+        docker(info),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn require_codename(info: &DistroInfo) -> Result<String, String> {
@@ -567,6 +773,201 @@ mod tests {
                 .unwrap()
                 .prerequisites
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn mariadb_uses_the_download_manager_host_never_a_mirror_round_robin() {
+        // The mirror round-robins serve inconsistent mid-sync snapshots; the
+        // dlm host resolves a series to one atomic point-release snapshot.
+        for info in [
+            debian("trixie", "debian", "13"),
+            debian("noble", "ubuntu", "24.04"),
+            rhel("9", Arch::X86_64),
+        ] {
+            let repo = mariadb(&info, MARIADB_SERIES).unwrap();
+            assert!(
+                repo.definition
+                    .base_url
+                    .starts_with("https://dlm.mariadb.com/repo/mariadb-server/"),
+                "{}",
+                repo.definition.base_url
+            );
+            assert!(!repo.definition.base_url.contains("mirror"));
+        }
+    }
+
+    #[test]
+    fn mariadb_pins_one_key_for_both_package_formats() {
+        // Unlike Docker, MariaDB signs deb and rpm with the same 2023 key.
+        let deb = mariadb(&debian("trixie", "debian", "13"), MARIADB_SERIES).unwrap();
+        let rpm = mariadb(&rhel("9", Arch::X86_64), MARIADB_SERIES).unwrap();
+        assert_eq!(
+            deb.definition.accepted_fingerprints,
+            rpm.definition.accepted_fingerprints
+        );
+        assert_eq!(
+            deb.definition.accepted_fingerprints,
+            vec![MARIADB_KEY.to_string()]
+        );
+    }
+
+    #[test]
+    fn mariadb_on_rhel_substitutes_the_major_and_sets_module_hotfixes() {
+        let repo = mariadb(&rhel("10", Arch::Aarch64), MARIADB_SERIES).unwrap();
+        assert!(
+            repo.definition
+                .base_url
+                .ends_with("/yum/rhel/10/aarch64"),
+            "{}",
+            repo.definition.base_url
+        );
+        // Without this, the distro's mariadb AppStream module filters the
+        // repository's packages out of every transaction.
+        assert!(
+            repo.options
+                .iter()
+                .any(|(k, v)| k == "module_hotfixes" && v == "1")
+        );
+    }
+
+    #[test]
+    fn mariadb_debian_and_ubuntu_get_their_own_trees() {
+        let deb = mariadb(&debian("trixie", "debian", "13"), MARIADB_SERIES).unwrap();
+        assert!(deb.definition.base_url.ends_with("/repo/debian"));
+        assert_eq!(deb.definition.suite.as_deref(), Some("trixie"));
+        assert_eq!(deb.definition.components, vec!["main".to_string()]);
+
+        let ubu = mariadb(&debian("noble", "ubuntu", "24.04"), MARIADB_SERIES).unwrap();
+        assert!(ubu.definition.base_url.ends_with("/repo/ubuntu"));
+        assert_eq!(ubu.definition.suite.as_deref(), Some("noble"));
+    }
+
+    #[test]
+    fn a_hostile_mariadb_series_cannot_reach_a_url() {
+        // The series becomes a URL path segment; a config value must not be able
+        // to redirect the panel to a different repository tree.
+        for bad in ["", "11.8/evil", "../10.6", "11.8 main", "11..8"] {
+            assert!(
+                mariadb(&debian("trixie", "debian", "13"), bad).is_err(),
+                "series `{bad}` should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn pgdg_apt_suite_is_the_codename_with_the_pgdg_suffix() {
+        let repo = pgdg(&debian("trixie", "debian", "13")).unwrap();
+        assert_eq!(
+            repo.definition.base_url,
+            "https://apt.postgresql.org/pub/repos/apt"
+        );
+        assert_eq!(repo.definition.suite.as_deref(), Some("trixie-pgdg"));
+        assert_eq!(
+            repo.definition.accepted_fingerprints,
+            vec![PGDG_DEB_KEY.to_string()]
+        );
+    }
+
+    #[test]
+    fn pgdg_rpm_keys_are_chosen_per_architecture() {
+        // PGDG signs each architecture's rpm repository with its own key; the
+        // wrong pin would reject every package on that machine.
+        let x86 = pgdg(&rhel("9", Arch::X86_64)).unwrap();
+        let a64 = pgdg(&rhel("9", Arch::Aarch64)).unwrap();
+        assert_ne!(
+            x86.definition.accepted_fingerprints,
+            a64.definition.accepted_fingerprints
+        );
+        assert_eq!(
+            x86.definition.accepted_fingerprints,
+            vec![PGDG_RPM_X86_64_KEY.to_string()]
+        );
+        assert_eq!(
+            a64.definition.accepted_fingerprints,
+            vec![PGDG_RPM_AARCH64_KEY.to_string()]
+        );
+        assert!(x86.definition.gpg_key_url.ends_with("PGDG-RPM-GPG-KEY-RHEL"));
+        assert!(
+            a64.definition
+                .gpg_key_url
+                .ends_with("PGDG-RPM-GPG-KEY-AARCH64-RHEL")
+        );
+
+        // And neither rpm key is the deb key.
+        let deb = pgdg(&debian("trixie", "debian", "13")).unwrap();
+        assert_ne!(
+            deb.definition.accepted_fingerprints,
+            x86.definition.accepted_fingerprints
+        );
+    }
+
+    #[test]
+    fn pgdg_rpm_baseurl_names_the_postgres_major_and_the_el_major() {
+        let repo = pgdg(&rhel("10", Arch::X86_64)).unwrap();
+        assert_eq!(
+            repo.definition.base_url,
+            format!(
+                "https://download.postgresql.org/pub/repos/yum/{POSTGRES_MAJOR}/redhat/rhel-10-x86_64"
+            )
+        );
+        // The distro's own postgresql module must not shadow PGDG's packages.
+        assert!(
+            repo.prerequisites
+                .contains(&Prerequisite::DisableModule("postgresql"))
+        );
+    }
+
+    #[test]
+    fn no_baseurl_smuggles_a_dnf_variable() {
+        // `$releasever` on RHEL proper expands to `9.6`, which upstream trees do
+        // not have; every resolver substitutes the major instead. This test is
+        // the tripwire for anyone re-introducing the variable.
+        for info in [
+            debian("trixie", "debian", "13"),
+            rhel("9", Arch::X86_64),
+            rhel("9", Arch::Aarch64),
+            rhel("10", Arch::X86_64),
+            rhel("10", Arch::Aarch64),
+        ] {
+            for repo in catalogue(&info) {
+                assert!(
+                    !repo.definition.base_url.contains('$'),
+                    "{} leaves a dnf variable in `{}`",
+                    repo.definition.id,
+                    repo.definition.base_url
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_database_repos_are_part_of_the_catalogue() {
+        // `verify-pins` and the audit path both walk the catalogue; an entry
+        // that resolves but is not listed there is an entry nobody verifies.
+        for info in [debian("trixie", "debian", "13"), rhel("9", Arch::X86_64)] {
+            let ids: Vec<String> = catalogue(&info)
+                .iter()
+                .map(|r| r.definition.id.clone())
+                .collect();
+            assert!(ids.contains(&"mariadb".to_string()), "{ids:?}");
+            assert!(ids.contains(&"pgdg".to_string()), "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn single_sourced_rpm_pgdg_is_declared_unverified() {
+        // The deb key is corroborated by the PostgreSQL wiki; the per-arch rpm
+        // keys are not corroborated by anything off download.postgresql.org.
+        // The release checklist must see that.
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let repo = pgdg(&rhel("9", arch)).unwrap();
+            assert_eq!(repo.provenance, Provenance::SingleSource);
+            assert!(UNVERIFIED_PINS.contains(&repo.definition.id.as_str()));
+        }
+        assert_eq!(
+            pgdg(&debian("trixie", "debian", "13")).unwrap().provenance,
+            Provenance::Corroborated
         );
     }
 

@@ -16,8 +16,11 @@ async fn main() {
     let targets = [
         ("Debian 13", debian("trixie", "debian", "13")),
         ("Ubuntu 24.04", debian("noble", "ubuntu", "24.04")),
-        ("AlmaLinux 9", rhel("9")),
-        ("AlmaLinux 10", rhel("10")),
+        ("AlmaLinux 9", rhel("9", Arch::X86_64)),
+        ("AlmaLinux 10", rhel("10", Arch::X86_64)),
+        // PGDG signs each RPM architecture with its own key, so the aarch64
+        // pin is only exercised by an aarch64 target.
+        ("AlmaLinux 9 (aarch64)", rhel("9", Arch::Aarch64)),
     ];
 
     let client = reqwest::Client::builder()
@@ -105,14 +108,14 @@ fn debian(codename: &str, id: &str, version: &str) -> DistroInfo {
     }
 }
 
-fn rhel(major: &str) -> DistroInfo {
+fn rhel(major: &str, arch: Arch) -> DistroInfo {
     DistroInfo {
         id: "almalinux".into(),
         version_id: format!("{major}.0"),
         codename: String::new(),
         pretty_name: format!("AlmaLinux {major}"),
         family: Family::Rhel,
-        arch: Arch::X86_64,
+        arch,
         has_systemd: true,
         has_cgroups_v2: true,
     }

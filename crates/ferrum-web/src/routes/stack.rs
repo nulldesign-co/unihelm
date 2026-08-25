@@ -49,6 +49,11 @@ pub enum ComponentRequest {
         #[schema(value_type = String, example = "8.3")]
         version: PhpVersion,
     },
+    // The database engines (spec §11.4). Mirrors `StackComponent` in
+    // ferrum-ops: the web layer re-states the whitelist so a request for an
+    // unknown component dies here, before it ever crosses the IPC boundary.
+    Mariadb,
+    Postgres,
 }
 
 impl ComponentRequest {
@@ -58,6 +63,8 @@ impl ComponentRequest {
             ComponentRequest::Php { version } => {
                 json!({ "component": "php", "version": version.as_str() })
             }
+            ComponentRequest::Mariadb => json!({ "component": "mariadb" }),
+            ComponentRequest::Postgres => json!({ "component": "postgres" }),
         }
     }
 
@@ -65,6 +72,8 @@ impl ComponentRequest {
         match self {
             ComponentRequest::Nginx => "nginx".into(),
             ComponentRequest::Php { version } => format!("php{}", version.as_str()),
+            ComponentRequest::Mariadb => "mariadb".into(),
+            ComponentRequest::Postgres => "postgres".into(),
         }
     }
 }

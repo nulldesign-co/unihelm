@@ -670,6 +670,29 @@ impl PkgBackend for DnfBackend {
                 }
                 Ok(())
             }
+
+            Prerequisite::DisableModule(name) => {
+                // Best effort, deliberately: EL10's dnf5 removed modularity, so
+                // `dnf module` is not even a subcommand there — and a module
+                // that does not exist needs no disabling. On EL9 this is the
+                // step PGDG's own instructions require, so a real failure is
+                // still worth a log line the operator can find.
+                let attempt = Cmd::new("dnf")
+                    .args(["-y", "module", "disable"])
+                    .arg(name)
+                    .run()
+                    .await;
+                match attempt {
+                    Ok(out) if out.success() => {
+                        log.line(&format!("disabled the `{name}` module stream"));
+                    }
+                    _ => log.line(&format!(
+                        "could not disable the `{name}` module stream; continuing — \
+                         this distribution may have no modularity at all"
+                    )),
+                }
+                Ok(())
+            }
         }
     }
 

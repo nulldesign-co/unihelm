@@ -14,8 +14,9 @@ use ferrum_config::paths;
 use ferrum_core::{ErrorCode, FerrumError, Permission, PhpVersion, Result};
 use ferrum_db::ComponentStatus;
 use ferrum_distro::fw::{PortRule, Proto};
+use ferrum_distro::repos::{MARIADB_SERIES, POSTGRES_MAJOR};
 use ferrum_distro::svc::ManagedUnit;
-use ferrum_distro::{Distro, PackageName};
+use ferrum_distro::{Cmd, Distro, Family, PackageName};
 use serde::{Deserialize, Serialize};
 
 use crate::php::{PhpExt, packages_for};
@@ -31,6 +32,10 @@ use crate::services::{NginxValidator, NoReload, SkipValidation, UnitReloader};
 pub enum StackComponent {
     Nginx,
     Php { version: PhpVersion },
+    /// MariaDB, the default database engine (spec §11.4).
+    Mariadb,
+    /// PostgreSQL from PGDG (spec §11.4).
+    Postgres,
 }
 
 impl StackComponent {
@@ -39,6 +44,8 @@ impl StackComponent {
         match self {
             StackComponent::Nginx => "nginx".into(),
             StackComponent::Php { version } => format!("php{}", version.as_str()),
+            StackComponent::Mariadb => "mariadb".into(),
+            StackComponent::Postgres => "postgres".into(),
         }
     }
 
@@ -46,6 +53,10 @@ impl StackComponent {
         match self {
             StackComponent::Nginx => "Nginx".into(),
             StackComponent::Php { version } => format!("PHP {}", version.as_str()),
+            // The version the panel would install is part of the offer the UI
+            // makes, not an implementation detail — show it.
+            StackComponent::Mariadb => format!("MariaDB {MARIADB_SERIES}"),
+            StackComponent::Postgres => format!("PostgreSQL {POSTGRES_MAJOR}"),
         }
     }
 
@@ -55,20 +66,63 @@ impl StackComponent {
         let resolved = match self {
             StackComponent::Nginx => ferrum_distro::repos::nginx(info),
             StackComponent::Php { .. } => ferrum_distro::repos::php(info),
+            StackComponent::Mariadb => ferrum_distro::repos::mariadb(info, MARIADB_SERIES),
+            StackComponent::Postgres => ferrum_distro::repos::pgdg(info),
         };
         resolved.map_err(|e| FerrumError::new(ErrorCode::UnsupportedDistro, e))
     }
 
     fn packages(self, distro: &Distro, extensions: &[PhpExt]) -> Result<Vec<PackageName>> {
         match self {
-            StackComponent::Nginx => {
-                Ok(vec![PackageName::parse("nginx").map_err(|e| {
-                    FerrumError::new(ErrorCode::InvalidInput, e.to_string())
-                })?])
-            }
+            StackComponent::Nginx => parse_packages(&["nginx"]),
             StackComponent::Php { version } => {
                 packages_for(distro.info.family, version, extensions)
             }
+            StackComponent::Mariadb => match distro.info.family {
+                // Package names verified against the live 11.8 repository
+                // indexes on both families.
+                //
+                // The `*-compat` pair is listed explicitly because nothing
+                // depends on it: since 11.x the binaries are `mariadb` /
+                // `mariadbd`, and the compat packages are what still provides
+                // the `mysql`/`mysqld` entry points that most applications,
+                // scripts and health checks actually invoke.
+                Family::Debian => parse_packages(&[
+                    "mariadb-server",
+                    "mariadb-client",
+                    "mariadb-backup",
+                    "mariadb-server-compat",
+                    "mariadb-client-compat",
+                ]),
+                // Capital M, deliberately: MariaDB plc names its own RPMs
+                // `MariaDB-*` precisely so they stay distinct from Red Hat's
+                // lowercase `mariadb-*` AppStream packages. Asking dnf for the
+                // lowercase names here would install the distribution's older
+                // build instead of the repository we just pinned.
+                Family::Rhel => parse_packages(&[
+                    "MariaDB-server",
+                    "MariaDB-client",
+                    "MariaDB-backup",
+                    "MariaDB-server-compat",
+                    "MariaDB-client-compat",
+                ]),
+            },
+            StackComponent::Postgres => match distro.info.family {
+                // PGDG apt selects the major by package name; `postgresql-17`
+                // pulls the server, `postgresql-client-17` the tools.
+                Family::Debian => parse_packages(&[
+                    &format!("postgresql-{POSTGRES_MAJOR}"),
+                    &format!("postgresql-client-{POSTGRES_MAJOR}"),
+                ]),
+                // PGDG rpm naming: `postgresql17-server` is the daemon,
+                // `postgresql17` the client, `-contrib` the standard extension
+                // set (pg_stat_statements et al.) a hosting box wants anyway.
+                Family::Rhel => parse_packages(&[
+                    &format!("postgresql{POSTGRES_MAJOR}-server"),
+                    &format!("postgresql{POSTGRES_MAJOR}"),
+                    &format!("postgresql{POSTGRES_MAJOR}-contrib"),
+                ]),
+            },
         }
     }
 
@@ -76,8 +130,20 @@ impl StackComponent {
         match self {
             StackComponent::Nginx => ManagedUnit::Nginx,
             StackComponent::Php { version } => ManagedUnit::PhpFpm { version },
+            StackComponent::Mariadb => ManagedUnit::MariaDb,
+            StackComponent::Postgres => ManagedUnit::PostgreSql,
         }
     }
+}
+
+fn parse_packages(names: &[&str]) -> Result<Vec<PackageName>> {
+    names
+        .iter()
+        .map(|n| {
+            PackageName::parse(n)
+                .map_err(|e| FerrumError::new(ErrorCode::InvalidInput, e.to_string()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +195,10 @@ impl TypedOperation for Status {
                 .iter()
                 .map(|&version| StackComponent::Php { version }),
         );
+        // The database engines (spec §11.4) — listed after the web stack, the
+        // order the UI presents them in.
+        candidates.push(StackComponent::Mariadb);
+        candidates.push(StackComponent::Postgres);
 
         let mut components = Vec::new();
         for candidate in candidates {
@@ -302,11 +372,32 @@ async fn install_component(
         // single worker as the web server user.
         crate::fpm::retire_and_log(ctx, version).await;
     }
+    if component == StackComponent::Postgres {
+        // On EL the versioned unit refuses to start until initdb has run;
+        // Debian's postgresql-common already created the cluster in postinst.
+        bootstrap_postgres(ctx).await?;
+    }
+    if component == StackComponent::Mariadb && distro.info.family == Family::Rhel {
+        // `MariaDB-server` only *recommends* the SELinux policy package, and
+        // weak-dependency installation can be disabled host-wide. On an
+        // enforcing host a missing policy surfaces later as mysterious
+        // `mysqld_safe` denials — say so now, in the task log, where the
+        // operator will actually look. Warn, never fail: a lab VM with SELinux
+        // permissive is not a broken install.
+        warn_if_mysql_selinux_missing(ctx).await;
+    }
 
     // 4. Start it, and make it come back after a reboot.
     let unit = component.unit().unit_name(distro.info.family);
     distro.svc.enable(&unit, true).await?;
     ctx.log(format!("{unit} enabled and started"));
+
+    // 4b. For a database, "started" is not "ready": both engines accept the
+    // systemd start-up notification before they accept connections on a slow
+    // first boot (InnoDB initialisation, crash recovery). Handing the operator
+    // a component marked installed that refuses connections would make every
+    // follow-up step (create database, create user) fail confusingly.
+    wait_until_ready(ctx, component).await?;
 
     // 5. Report the version actually installed, not the one we asked for.
     let installed_version = distro
@@ -445,6 +536,136 @@ async fn open_web_ports(ctx: &OpContext) {
             )),
         }
     }
+}
+
+/// What PostgreSQL needs before its unit can start.
+///
+/// On the RHEL family the PGDG packages install binaries and a unit but **no
+/// data directory** — `postgresql-17.service` exits immediately with
+/// "Directory /var/lib/pgsql/17/data is missing or empty" until initdb has run.
+/// PGDG ships a setup script for exactly this, and its argv is the documented
+/// install step: `/usr/pgsql-17/bin/postgresql-17-setup initdb`.
+///
+/// On the Debian family there is nothing to do: postgresql-common's postinst
+/// creates and starts the default `main` cluster during package installation.
+async fn bootstrap_postgres(ctx: &OpContext) -> Result<()> {
+    if ctx.distro().info.family != Family::Rhel {
+        ctx.log("postgresql-common created the default cluster during package install");
+        return Ok(());
+    }
+
+    // The marker initdb itself writes. Present means a previous install (or the
+    // operator) already initialised this directory — running initdb again would
+    // fail on the non-empty directory, and must not, because reinstalling a
+    // component is idempotent (spec §11.1).
+    let marker = format!("/var/lib/pgsql/{POSTGRES_MAJOR}/data/PG_VERSION");
+    if std::path::Path::new(&marker).exists() {
+        ctx.log("data directory already initialised; skipping initdb");
+        return Ok(());
+    }
+
+    ctx.log("initialising the PostgreSQL data directory");
+    Cmd::new(format!(
+        "/usr/pgsql-{POSTGRES_MAJOR}/bin/postgresql-{POSTGRES_MAJOR}-setup"
+    ))
+    .arg("initdb")
+    .run_checked()
+    .await
+    .map_err(FerrumError::from)?;
+    ctx.log("initdb complete");
+    Ok(())
+}
+
+/// Warn when the SELinux policy for MariaDB did not come along. Never fatal.
+async fn warn_if_mysql_selinux_missing(ctx: &OpContext) {
+    // `rpm -q` exits non-zero for "not installed"; that is data here, not an
+    // error, so `run` rather than `run_checked`.
+    match Cmd::new("rpm").args(["-q", "mysql-selinux"]).run().await {
+        Ok(out) if out.success() => {
+            ctx.log(format!("SELinux policy present: {}", out.trimmed_stdout()));
+        }
+        _ => ctx.log(
+            "warning: mysql-selinux is not installed — on an SELinux-enforcing host, \
+             MariaDB may be denied access to its own files. Install it from the \
+             distribution's repositories.",
+        ),
+    }
+}
+
+/// One readiness attempt for a database component. `None` for components whose
+/// systemd "active" already means "serving" (nginx, php-fpm).
+///
+/// Both probes run as root over the local socket and need no credentials:
+/// MariaDB's root account authenticates via `unix_socket` on a fresh install,
+/// and `pg_isready` only sends an empty startup packet.
+fn readiness_probe(component: StackComponent, family: Family) -> Option<Cmd> {
+    match component {
+        StackComponent::Mariadb => Some(
+            // `--no-defaults` first (it must be the first argument to any
+            // MySQL-family tool): the probe must not be steered by an
+            // /etc/my.cnf or ~/.my.cnf an operator left behind.
+            Cmd::new("mariadb").args([
+                "--no-defaults",
+                "--protocol=socket",
+                "--user=root",
+                "--connect-timeout=3",
+                "--execute",
+                "SELECT 1",
+            ]),
+        ),
+        StackComponent::Postgres => Some(match family {
+            // Debian's postgresql-client-common puts a version-routing
+            // `pg_isready` on PATH; PGDG on EL installs only versioned paths.
+            Family::Debian => Cmd::new("pg_isready").arg("--quiet"),
+            Family::Rhel => {
+                Cmd::new(format!("/usr/pgsql-{POSTGRES_MAJOR}/bin/pg_isready")).arg("--quiet")
+            }
+        }),
+        StackComponent::Nginx | StackComponent::Php { .. } => None,
+    }
+}
+
+/// Poll a component's readiness probe until it answers, with bounded backoff.
+///
+/// The schedule (500 ms doubling, capped at 5 s, 12 attempts) allows roughly
+/// 45 seconds — generous enough for InnoDB's first-boot initialisation on a
+/// 1 GB VPS, small enough that a genuinely broken service fails the task while
+/// somebody is still watching it.
+async fn wait_until_ready(ctx: &OpContext, component: StackComponent) -> Result<()> {
+    const ATTEMPTS: u32 = 12;
+    let Some(probe) = readiness_probe(component, ctx.distro().info.family) else {
+        return Ok(());
+    };
+
+    let mut delay = Duration::from_millis(500);
+    let mut last_failure = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match probe.run().await {
+            Ok(out) if out.success() => {
+                ctx.log(format!(
+                    "{} is accepting connections (attempt {attempt})",
+                    component.display_name()
+                ));
+                return Ok(());
+            }
+            Ok(out) => last_failure = out.failure_text(),
+            // A missing binary or spawn failure is as retryable as a refused
+            // connection here — and if it persists, the final error says why.
+            Err(e) => last_failure = e.to_string(),
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(5));
+        }
+    }
+
+    Err(FerrumError::new(
+        ErrorCode::ServiceActionFailed,
+        format!(
+            "{} started but never became ready to accept connections: {last_failure}",
+            component.display_name()
+        ),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -686,11 +907,16 @@ mod tests {
             "php8.3"
         );
 
+        assert_eq!(StackComponent::Mariadb.slug(), "mariadb");
+        assert_eq!(StackComponent::Postgres.slug(), "postgres");
+
         let mut slugs: Vec<String> = PhpVersion::ALL
             .iter()
             .map(|&version| StackComponent::Php { version }.slug())
             .collect();
         slugs.push(StackComponent::Nginx.slug());
+        slugs.push(StackComponent::Mariadb.slug());
+        slugs.push(StackComponent::Postgres.slug());
         let unique: std::collections::HashSet<_> = slugs.iter().collect();
         assert_eq!(
             unique.len(),
@@ -708,6 +934,8 @@ mod tests {
             serde_json::from_str::<StackComponent>(r#"{"component":"php","version":"8.3"}"#)
                 .is_ok()
         );
+        assert!(serde_json::from_str::<StackComponent>(r#"{"component":"mariadb"}"#).is_ok());
+        assert!(serde_json::from_str::<StackComponent>(r#"{"component":"postgres"}"#).is_ok());
         for bad in [
             r#"{"component":"backdoor"}"#,
             r#"{"component":"php","version":"9.9"}"#,
@@ -761,12 +989,160 @@ mod tests {
                 StackComponent::Php {
                     version: PhpVersion::V83,
                 },
+                StackComponent::Mariadb,
+                StackComponent::Postgres,
             ] {
                 let repo = component.repo(&distro).unwrap();
                 assert!(!repo.definition.accepted_fingerprints.is_empty());
                 repo.definition.validate().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn mariadb_packages_are_capital_m_on_el_and_include_the_compat_pair() {
+        // Lowercase names on EL would resolve to the distribution's own
+        // AppStream build, not the pinned vendor repository.
+        let (rhel, _) = ferrum_distro::mock::mock_distro_with_recorder(ferrum_distro::Family::Rhel);
+        let names: Vec<String> = StackComponent::Mariadb
+            .packages(&rhel, &[])
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert!(names.contains(&"MariaDB-server".to_string()), "{names:?}");
+        assert!(names.contains(&"MariaDB-backup".to_string()));
+        // The `mysql`/`mysqld` entry points live only here; nothing pulls them
+        // in as a dependency.
+        assert!(names.contains(&"MariaDB-server-compat".to_string()));
+        assert!(names.contains(&"MariaDB-client-compat".to_string()));
+        assert!(
+            !names.iter().any(|n| n.starts_with("mariadb-")),
+            "no lowercase names on EL: {names:?}"
+        );
+
+        let debian = Distro::mock();
+        let names: Vec<String> = StackComponent::Mariadb
+            .packages(&debian, &[])
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert!(names.contains(&"mariadb-server".to_string()));
+        assert!(names.contains(&"mariadb-server-compat".to_string()));
+        assert!(names.contains(&"mariadb-client-compat".to_string()));
+        assert!(
+            !names.iter().any(|n| n.starts_with("MariaDB-")),
+            "no capital names on Debian: {names:?}"
+        );
+    }
+
+    #[test]
+    fn postgres_packages_follow_each_familys_naming() {
+        let debian = Distro::mock();
+        let names: Vec<String> = StackComponent::Postgres
+            .packages(&debian, &[])
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                format!("postgresql-{POSTGRES_MAJOR}"),
+                format!("postgresql-client-{POSTGRES_MAJOR}")
+            ]
+        );
+
+        let (rhel, _) = ferrum_distro::mock::mock_distro_with_recorder(ferrum_distro::Family::Rhel);
+        let names: Vec<String> = StackComponent::Postgres
+            .packages(&rhel, &[])
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                format!("postgresql{POSTGRES_MAJOR}-server"),
+                format!("postgresql{POSTGRES_MAJOR}"),
+                format!("postgresql{POSTGRES_MAJOR}-contrib")
+            ]
+        );
+    }
+
+    #[test]
+    fn database_components_resolve_the_units_the_vendor_packages_ship() {
+        assert_eq!(
+            StackComponent::Mariadb
+                .unit()
+                .unit_name(Family::Debian)
+                .as_str(),
+            "mariadb.service"
+        );
+        assert_eq!(
+            StackComponent::Mariadb
+                .unit()
+                .unit_name(Family::Rhel)
+                .as_str(),
+            "mariadb.service"
+        );
+        // PGDG on EL has no umbrella unit — only the versioned one exists.
+        assert_eq!(
+            StackComponent::Postgres
+                .unit()
+                .unit_name(Family::Debian)
+                .as_str(),
+            "postgresql.service"
+        );
+        assert_eq!(
+            StackComponent::Postgres
+                .unit()
+                .unit_name(Family::Rhel)
+                .as_str(),
+            format!("postgresql-{POSTGRES_MAJOR}.service")
+        );
+    }
+
+    #[test]
+    fn readiness_probes_exist_only_for_the_database_engines() {
+        // For nginx and php-fpm, systemd "active" already means "serving".
+        assert!(readiness_probe(StackComponent::Nginx, Family::Debian).is_none());
+        assert!(
+            readiness_probe(
+                StackComponent::Php {
+                    version: PhpVersion::V83
+                },
+                Family::Rhel
+            )
+            .is_none()
+        );
+
+        let mariadb = readiness_probe(StackComponent::Mariadb, Family::Debian)
+            .unwrap()
+            .display();
+        // `--no-defaults` must be the first argument or the client ignores it —
+        // and then an operator's stray ~/.my.cnf can steer the probe.
+        assert!(
+            mariadb.starts_with("mariadb --no-defaults"),
+            "{mariadb}"
+        );
+        assert!(mariadb.contains("SELECT 1"));
+        assert!(mariadb.contains("--protocol=socket"));
+
+        let deb = readiness_probe(StackComponent::Postgres, Family::Debian)
+            .unwrap()
+            .display();
+        assert_eq!(deb, "pg_isready --quiet");
+        // PGDG on EL installs no `pg_isready` on PATH; only the versioned
+        // directory exists.
+        let el = readiness_probe(StackComponent::Postgres, Family::Rhel)
+            .unwrap()
+            .display();
+        assert_eq!(
+            el,
+            format!("/usr/pgsql-{POSTGRES_MAJOR}/bin/pg_isready --quiet")
+        );
     }
 
     #[tokio::test]
