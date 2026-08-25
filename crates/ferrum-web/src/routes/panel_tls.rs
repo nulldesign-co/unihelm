@@ -15,6 +15,7 @@ use ferrum_db::CertStatus;
 use ferrum_db::audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use utoipa::ToSchema;
 use std::net::SocketAddr;
 
 use crate::auth::{CurrentUser, client_ip};
@@ -22,7 +23,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::routes::ops;
 use crate::state::SharedState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IssueRequest {
     /// Must already resolve to this server, or the HTTP-01 challenge fails.
     pub domain: String,
@@ -36,6 +37,18 @@ pub struct IssueRequest {
 
 /// `POST /api/server/panel-tls` — issue the panel's certificate. Long
 /// operation, so the answer is 202 with a task id.
+#[utoipa::path(
+    post,
+    path = "/api/server/panel-tls",
+    tag = "server",
+    request_body = IssueRequest,
+    security(("session_cookie" = []), ("csrf_header" = [])),
+    responses(
+        (status = 202, description = "Issuance queued; poll the task", body = super::ops::TaskAccepted),
+        (status = 400, description = "`invalid_domain` / `invalid_input`", body = crate::error::ApiErrorBody),
+        (status = 403, description = "`permission_denied`", body = crate::error::ApiErrorBody),
+    ),
+)]
 pub async fn issue(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -90,13 +103,14 @@ pub async fn issue(
     .await
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StatusResponse {
     /// The domain the panel is (or is being) served on; absent until the
     /// first `panel.tls.issue`.
     pub domain: Option<String>,
     /// Status of the panel's certificate row: the active one when it exists,
     /// otherwise the newest attempt — so a failed issuance is visible here.
+    #[schema(value_type = Option<String>, example = "active")]
     pub certificate_status: Option<CertStatus>,
     /// Days until the certificate expires; negative once it has passed.
     pub days_remaining: Option<i64>,
@@ -106,6 +120,16 @@ pub struct StatusResponse {
 }
 
 /// `GET /api/server/panel-tls` — the panel's domain and certificate health.
+#[utoipa::path(
+    get,
+    path = "/api/server/panel-tls",
+    tag = "server",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Domain and certificate health", body = StatusResponse),
+        (status = 403, description = "`permission_denied`", body = crate::error::ApiErrorBody),
+    ),
+)]
 pub async fn status(
     State(state): State<SharedState>,
     current: CurrentUser,

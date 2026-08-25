@@ -44,6 +44,8 @@ use crate::auth::CurrentUser;
         super::sites::update,
         super::sites::delete,
         super::sites::drift,
+        super::panel_tls::issue,
+        super::panel_tls::status,
         super::certs::issue,
         super::certs::list,
         super::tasks::list,
