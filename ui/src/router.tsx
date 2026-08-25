@@ -10,6 +10,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { DashboardPage } from "@/routes/dashboard";
 import { LoginPage } from "@/routes/login";
+import { SiteDetailPage } from "@/routes/site-detail";
 import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
 
@@ -53,13 +54,24 @@ const sitesRoute = createRoute({
   component: SitesPage,
 });
 
+const siteDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sites/$siteId",
+  component: SiteDetailPage,
+});
+
 const stackRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/stack",
   component: StackPage,
 });
 
-const routeTree = rootRoute.addChildren([dashboardRoute, sitesRoute, stackRoute]);
+const routeTree = rootRoute.addChildren([
+  dashboardRoute,
+  sitesRoute,
+  siteDetailRoute,
+  stackRoute,
+]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });
 
