@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod certs;
 pub mod events;
+pub mod files;
 pub mod health;
 pub mod openapi;
 pub mod ops;
@@ -49,6 +50,9 @@ fn protected() -> Router<SharedState> {
             "/api/server/panel-tls",
             get(panel_tls::status).post(panel_tls::issue),
         )
+        // The file manager brings its own routes and its own body limit
+        // (file content rides inside JSON there — see files::MAX_BODY_BYTES).
+        .merge(files::router())
 }
 
 /// Routes reachable without a session.
