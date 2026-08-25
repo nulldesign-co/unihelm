@@ -31,6 +31,7 @@ ferrum-ops = { path = "crates/ferrum-ops" }
 ferrum-metrics = { path = "crates/ferrum-metrics" }
 
 anyhow = "1"
+base64 = "0.22.1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

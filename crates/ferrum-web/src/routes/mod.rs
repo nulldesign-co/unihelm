@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod certs;
 pub mod events;
+pub mod files;
 pub mod health;
 pub mod ops;
 pub mod server;
@@ -42,6 +43,9 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
+        // The file manager brings its own routes and its own body limit
+        // (file content rides inside JSON there — see files::MAX_BODY_BYTES).
+        .merge(files::router())
 }
 
 /// Routes reachable without a session.
