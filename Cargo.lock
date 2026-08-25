@@ -946,6 +946,7 @@ dependencies = [
  "ferrum-distro",
  "ferrum-metrics",
  "instant-acme",
+ "libc",
  "rcgen",
  "reqwest",
  "rustls",

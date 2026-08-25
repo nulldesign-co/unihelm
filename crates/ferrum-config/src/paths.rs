@@ -156,9 +156,15 @@ pub fn fpm_socket(site: &str, version: PhpVersion) -> PathBuf {
     fpm_socket_dir().join(format!("{site}-php{}.sock", version.compact()))
 }
 
+/// The parent of every tenant home — the directory whose filesystem disk
+/// quotas are detected on and enforced against (spec §6.3).
+pub fn home_root() -> PathBuf {
+    under("/home")
+}
+
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
-    under("/home").join(linux_user)
+    home_root().join(linux_user)
 }
 
 pub fn site_root(linux_user: &str, domain: &str) -> PathBuf {

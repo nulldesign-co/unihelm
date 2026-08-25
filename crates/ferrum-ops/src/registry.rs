@@ -231,6 +231,9 @@ impl OpRegistry {
         registry.register(crate::site::Drift);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
+        registry.register(crate::quota::Set);
+        registry.register(crate::quota::Usage);
+        registry.register(crate::quota::Backend);
         registry
     }
 

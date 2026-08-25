@@ -10,6 +10,7 @@ pub mod certs;
 pub mod events;
 pub mod health;
 pub mod ops;
+pub mod quota;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -42,6 +43,7 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
+        .route("/api/server/quota-backend", get(quota::backend))
 }
 
 /// Routes reachable without a session.
