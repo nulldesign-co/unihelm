@@ -24,6 +24,7 @@ pub mod php;
 pub mod provision;
 pub mod registry;
 pub mod services;
+pub mod sftp;
 pub mod site;
 pub mod stack;
 pub mod svc;

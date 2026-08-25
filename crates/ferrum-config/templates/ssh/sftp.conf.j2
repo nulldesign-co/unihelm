@@ -1,0 +1,5 @@
+Match Group {{ sftp_group }}
+    ChrootDirectory %h
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no

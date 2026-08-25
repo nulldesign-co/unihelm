@@ -156,6 +156,16 @@ pub fn fpm_socket(site: &str, version: PhpVersion) -> PathBuf {
     fpm_socket_dir().join(format!("{site}-php{}.sock", version.compact()))
 }
 
+/// The sshd drop-in carrying the chrooted-SFTP `Match Group` block (spec §6).
+///
+/// `sshd_config.d` rather than an edit to `sshd_config` itself, for the same
+/// reason as the nginx hook: the panel's entire footprint on a stock file is
+/// zero — both families ship an `Include /etc/ssh/sshd_config.d/*.conf` in
+/// their stock `sshd_config`.
+pub fn sshd_dropin() -> PathBuf {
+    under("/etc/ssh/sshd_config.d/50-ferrum.conf")
+}
+
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
     under("/home").join(linux_user)

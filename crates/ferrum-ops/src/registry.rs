@@ -231,6 +231,8 @@ impl OpRegistry {
         registry.register(crate::site::Drift);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
+        registry.register(crate::sftp::Enable);
+        registry.register(crate::sftp::Disable);
         registry
     }
 
