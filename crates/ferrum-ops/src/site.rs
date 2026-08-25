@@ -24,7 +24,9 @@ use crate::registry::{Execution, OpContext, TypedOperation};
 use crate::services::{FpmValidator, NginxValidator, UnitReloader};
 
 /// How much memory a site's PHP pool may assume, until plans arrive in Phase 2.
-const DEFAULT_POOL_MEMORY_MB: u32 = 512;
+/// Shared with the tenant-slice module so pool sizing and slice limits draw
+/// from one budget (spec §6.3; see `slices` for why FPM is sized, not sliced).
+const DEFAULT_POOL_MEMORY_MB: u32 = crate::slices::DEFAULT_TENANT_MEMORY_MB;
 
 // ---------------------------------------------------------------------------
 // site.list
@@ -326,7 +328,7 @@ async fn provision_site(
         .map_err(FerrumError::from)?
         .ok_or_else(|| FerrumError::internal("the subscription vanished mid-provision"))?;
 
-    provision::ensure_tenant_user(&distro, linux_user, &subscription.home_dir, false, log).await?;
+    provision::ensure_tenant_user(ctx, linux_user, &subscription.home_dir, false).await?;
     provision::ensure_site_dirs(&distro, linux_user, &domain, log).await?;
     provision::write_placeholder(linux_user, &domain).await?;
 

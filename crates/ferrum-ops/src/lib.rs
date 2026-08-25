@@ -25,6 +25,7 @@ pub mod provision;
 pub mod registry;
 pub mod services;
 pub mod site;
+pub mod slices;
 pub mod stack;
 pub mod svc;
 pub mod sys;

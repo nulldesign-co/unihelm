@@ -45,6 +45,14 @@ const TEMPLATES: &[(&str, &str)] = &[
         "php/pool.conf",
         include_str!("../templates/php/pool.conf.j2"),
     ),
+    (
+        "systemd/tenant.slice",
+        include_str!("../templates/systemd/tenant.slice.j2"),
+    ),
+    (
+        "systemd/tenant-dropin.conf",
+        include_str!("../templates/systemd/tenant-dropin.conf.j2"),
+    ),
 ];
 
 pub struct TemplateSet {

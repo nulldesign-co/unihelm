@@ -24,6 +24,9 @@ use ferrum_core::{Domain, LinuxUser, Result};
 use ferrum_distro::pkg::LogSink;
 use ferrum_distro::{Cmd, Distro, Family};
 
+use crate::registry::OpContext;
+use crate::slices::{self, TenantSlice};
+
 /// The account nginx runs as, per family.
 ///
 /// nginx.org's packages use `nginx` on both families; the Debian archive's own
@@ -48,47 +51,60 @@ const SITE_DIRS: &[(&str, u32)] = &[
     ("private", 0o700),
 ];
 
-/// Create the tenant's Linux account if it does not exist.
+/// Create the tenant's Linux account if it does not exist, and make sure its
+/// resource slice does (spec §6.3).
 ///
 /// Idempotent: re-provisioning an existing tenant must not fail, because the
 /// site-create path calls this every time and a retried task has to converge.
 pub async fn ensure_tenant_user(
-    distro: &Distro,
+    ctx: &OpContext,
     user: &LinuxUser,
     home: &str,
     can_ssh: bool,
-    log: &dyn LogSink,
 ) -> Result<()> {
+    let distro = ctx.distro();
+    let log = ctx.log_sink();
+
     if user_exists(user).await {
         log.line(&format!("account {user} already exists"));
-        return Ok(());
+    } else {
+        // No shell unless the plan grants one (spec §6.3). A tenant who cannot
+        // log in cannot be tricked into running anything.
+        let shell = if can_ssh {
+            "/bin/bash"
+        } else {
+            nologin_path(distro)
+        };
+
+        Cmd::new("useradd")
+            .args([
+                "--create-home",
+                "--home-dir",
+                home,
+                "--shell",
+                shell,
+                "--comment",
+                "Ferrum tenant",
+            ])
+            .arg("--")
+            .arg(user.as_str())
+            .run_checked()
+            .await?;
+        log.line(&format!("created account {user}"));
+
+        apply_home_permissions(distro, user, home).await?;
     }
 
-    // No shell unless the plan grants one (spec §6.3). A tenant who cannot log
-    // in cannot be tricked into running anything.
-    let shell = if can_ssh {
-        "/bin/bash"
-    } else {
-        nologin_path(distro)
-    };
-
-    Cmd::new("useradd")
-        .args([
-            "--create-home",
-            "--home-dir",
-            home,
-            "--shell",
-            shell,
-            "--comment",
-            "Ferrum tenant",
-        ])
-        .arg("--")
-        .arg(user.as_str())
-        .run_checked()
-        .await?;
-    log.line(&format!("created account {user}"));
-
-    apply_home_permissions(distro, user, home).await?;
+    // The slice is applied on every pass, not only when the account is
+    // created: an account provisioned by an older panel gains its slice the
+    // next time anything touches it, and a task retried after a crash between
+    // useradd and here still converges. Re-applying identical limits is a
+    // no-op inside the config engine, so the steady-state cost is one hash
+    // comparison. Default limits until plans (spec §6.2) supply real ones —
+    // and a failure is a real failure: limits are enforcement, not decoration
+    // (spec §6.3), so a tenant must not silently provision without their
+    // slice.
+    slices::apply_tenant_slice(ctx, user, &TenantSlice::default()).await?;
     Ok(())
 }
 
