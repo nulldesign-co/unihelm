@@ -222,9 +222,15 @@ pub fn nginx_adminer() -> PathBuf {
 /// (3000/8080-class ports).
 pub const ADMINER_LOOPBACK_PORT: u16 = 8806;
 
+/// The parent of every tenant home — the directory whose filesystem disk
+/// quotas are detected on and enforced against (spec §6.3).
+pub fn home_root() -> PathBuf {
+    under("/home")
+}
+
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
-    under("/home").join(linux_user)
+    home_root().join(linux_user)
 }
 
 pub fn site_root(linux_user: &str, domain: &str) -> PathBuf {

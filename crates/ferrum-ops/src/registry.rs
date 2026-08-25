@@ -258,6 +258,9 @@ impl OpRegistry {
         registry.register(crate::fsops::ops::TrashRestore);
         registry.register(crate::fsops::ops::TrashPurge);
         registry.register(crate::fsops::ops::Usage);
+        registry.register(crate::quota::Set);
+        registry.register(crate::quota::Usage);
+        registry.register(crate::quota::Backend);
         registry
     }
 

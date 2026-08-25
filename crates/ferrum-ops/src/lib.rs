@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod panel;
 pub mod php;
 pub mod provision;
+pub mod quota;
 pub mod registry;
 pub mod services;
 pub mod site;

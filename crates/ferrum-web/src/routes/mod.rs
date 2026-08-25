@@ -15,6 +15,7 @@ pub mod health;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
+pub mod quota;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -77,6 +78,7 @@ fn protected() -> Router<SharedState> {
             post(databases::user_password),
         )
         .route("/api/databases/grants", post(databases::grant))
+        .route("/api/server/quota-backend", get(quota::backend))
 }
 
 /// Routes reachable without a session.
