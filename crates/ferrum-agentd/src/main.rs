@@ -10,6 +10,7 @@
 //! reconciles whatever was in flight (spec §5.5).
 
 mod handler;
+mod scheduler;
 mod tasks;
 
 use std::path::PathBuf;
@@ -153,7 +154,8 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
     let server = IpcServer::bind(&config.agent.socket, owner, policy)
         .with_context(|| format!("could not bind {}", config.agent.socket.display()))?;
 
-    let agent = Arc::new(Agent::new(registry, TaskBus::new()));
+    let bus = TaskBus::new();
+    let agent = Arc::new(Agent::new(registry.clone(), bus.clone()));
     let factory = Arc::new(AgentFactory { agent });
 
     notify::ready();
@@ -191,12 +193,27 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
         })
     };
 
+    // The scheduler (spec §10.2). Certificate renewal lives here, so a panel
+    // left alone for three months still has working certificates.
+    let scheduling = {
+        let mut rx = shutdown_rx.clone();
+        let scheduler = crate::scheduler::Scheduler::new(registry, bus);
+        tokio::spawn(async move {
+            scheduler
+                .run(async move {
+                    let _ = rx.changed().await;
+                })
+                .await;
+        })
+    };
+
     wait_for_signal().await;
     tracing::info!("shutting down");
     notify::stopping();
     let _ = shutdown_tx.send(true);
 
     let _ = serving.await;
+    let _ = scheduling.await;
     watchdog.abort();
     Ok(())
 }

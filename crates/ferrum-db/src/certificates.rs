@@ -51,6 +51,14 @@ impl CertKind {
 pub enum CertStatus {
     Pending,
     Active,
+    /// A newer certificate for the same site has taken over.
+    ///
+    /// Kept rather than deleted so the history of what was served when is still
+    /// there, but excluded from renewal — otherwise every re-issue would add
+    /// another certificate that the scheduler dutifully renews for ever,
+    /// multiplying ACME orders for one domain (found on a live server: one site
+    /// had three "active" certificates for the same name).
+    Superseded,
     Expired,
     Failed,
     Revoked,
@@ -61,6 +69,7 @@ impl CertStatus {
         match self {
             CertStatus::Pending => "pending",
             CertStatus::Active => "active",
+            CertStatus::Superseded => "superseded",
             CertStatus::Expired => "expired",
             CertStatus::Failed => "failed",
             CertStatus::Revoked => "revoked",
@@ -71,6 +80,7 @@ impl CertStatus {
         Ok(match s {
             "pending" => CertStatus::Pending,
             "active" => CertStatus::Active,
+            "superseded" => CertStatus::Superseded,
             "expired" => CertStatus::Expired,
             "failed" => CertStatus::Failed,
             "revoked" => CertStatus::Revoked,
@@ -198,7 +208,17 @@ impl Db {
         Certificate::try_from(row)
     }
 
-    /// Mark a certificate issued and clear any previous failure.
+    /// Mark a certificate issued, clear any previous failure, and retire whatever
+    /// it replaces.
+    ///
+    /// The retiring half is not cosmetic. Each issuance inserts a new row, so
+    /// without it a site that has been re-issued three times has three rows the
+    /// renewal scheduler considers live and renews separately — three ACME
+    /// orders for one domain, every cycle, against a CA that rate-limits by
+    /// domain. This was found on a live server, not in a test.
+    ///
+    /// Both statements share one transaction: a crash between them would
+    /// otherwise leave either two active certificates or none.
     pub async fn certificate_issued(
         &self,
         id: i64,
@@ -207,10 +227,13 @@ impl Db {
         not_after: time::OffsetDateTime,
     ) -> Result<()> {
         let ts = to_sql_time(now());
+        let mut tx = self.begin().await?;
+
         sqlx::query(
             "UPDATE certificates
              SET status = 'active', issuer = ?2, not_before = ?3, not_after = ?4,
-                 issued_at = ?5, last_error = NULL, failure_count = 0, updated_at = ?5
+                 issued_at = ?5, last_error = NULL, failure_count = 0,
+                 next_attempt_at = NULL, updated_at = ?5
              WHERE id = ?1",
         )
         .bind(id)
@@ -218,8 +241,25 @@ impl Db {
         .bind(to_sql_time(not_before))
         .bind(to_sql_time(not_after))
         .bind(&ts)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+
+        // Only rows for the same site. A certificate with no site is the panel's
+        // own, and there is exactly one of those.
+        sqlx::query(
+            "UPDATE certificates
+             SET status = 'superseded', updated_at = ?2
+             WHERE id != ?1
+               AND site_id IS NOT NULL
+               AND site_id = (SELECT site_id FROM certificates WHERE id = ?1)
+               AND status IN ('active', 'pending', 'expired')",
+        )
+        .bind(id)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -276,22 +316,58 @@ impl Db {
     ///
     /// Ordered by expiry so the most urgent goes first, and bounded so one
     /// scheduler tick cannot try to renew a thousand certificates at once.
-    pub async fn certificates_due_for_renewal(
+    ///
+    /// Four filters, each of which exists because leaving it out breaks
+    /// something real:
+    ///
+    /// * `auto_renew` — the operator turned it off on purpose.
+    /// * `kind = 'le'` — we cannot renew a certificate we did not issue.
+    /// * `status` — a superseded row is history, not work (see
+    ///   [`Db::certificate_issued`]); an expired one is the most urgent case
+    ///   there is, so it stays in.
+    /// * `next_attempt_at` — a failing certificate must wait out its backoff.
+    ///   Let's Encrypt allows five failed validations per identifier per hour,
+    ///   so a site with a broken DNS record retrying every tick would spend the
+    ///   whole server's budget by itself.
+    pub async fn certificates_to_renew(
         &self,
         within: Duration,
         limit: i64,
     ) -> Result<Vec<Certificate>> {
         let cutoff = to_sql_time(now() + within);
+        let ts = to_sql_time(now());
         let rows = sqlx::query_as::<_, CertificateRow>(
             "SELECT * FROM certificates
-             WHERE auto_renew = 1 AND kind = 'le' AND not_after IS NOT NULL AND not_after <= ?1
-             ORDER BY not_after ASC LIMIT ?2",
+             WHERE auto_renew = 1
+               AND kind = 'le'
+               AND status IN ('active', 'expired')
+               AND not_after IS NOT NULL
+               AND not_after <= ?1
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
+             ORDER BY not_after ASC
+             LIMIT ?3",
         )
         .bind(cutoff)
+        .bind(ts)
         .bind(limit.clamp(1, 200))
         .fetch_all(self.pool())
         .await?;
         rows.into_iter().map(Certificate::try_from).collect()
+    }
+
+    /// Hold a certificate back until `at`, after a failed renewal.
+    pub async fn set_certificate_next_attempt(
+        &self,
+        id: i64,
+        at: time::OffsetDateTime,
+    ) -> Result<()> {
+        sqlx::query("UPDATE certificates SET next_attempt_at = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(id)
+            .bind(to_sql_time(at))
+            .bind(to_sql_time(now()))
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
 
     /// Mark every certificate whose expiry has passed, so the UI stops claiming
@@ -435,6 +511,37 @@ mod tests {
             .await
             .unwrap();
         (db, site.id)
+    }
+
+    /// A second site, so a test can prove one site's issuance leaves another
+    /// alone.
+    async fn seed_site(db: &Db, domain: &str) -> SiteId {
+        let user = db
+            .users(&TenantScope::Global)
+            .create(NewUser {
+                role: Role::Customer,
+                email: Email::parse(&format!("u-{domain}@example.com")).unwrap(),
+                username: Username::parse(&domain.replace('.', "")).unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+        let sub = db.create_subscription(user.id).await.unwrap();
+        db.create_site(NewSite {
+            subscription_id: sub.id,
+            domain: Domain::parse(domain).unwrap(),
+            site_type: SiteType::Php,
+            php_version: Some(PhpVersion::V83),
+            root_dir: format!("/home/y/sites/{domain}/public"),
+            proxy_port: None,
+            redirect_target: None,
+        })
+        .await
+        .unwrap()
+        .id
     }
 
     async fn issue(db: &Db, id: i64, days: i64) {
@@ -604,10 +711,103 @@ mod tests {
         );
 
         let due = db
-            .certificates_due_for_renewal(Duration::days(30), 10)
+            .certificates_to_renew(Duration::days(30), 10)
             .await
             .unwrap();
         assert_eq!(due.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn issuing_again_retires_the_certificate_it_replaces() {
+        // Found on a live server: one site, three rows, all "active". The
+        // scheduler would have renewed each of them separately for ever.
+        let (db, site) = seed().await;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let c = db
+                .create_certificate(
+                    Some(site),
+                    CertKind::Le,
+                    &["example.com".into()],
+                    "/certs/example.com",
+                )
+                .await
+                .unwrap();
+            issue(&db, c.id, 20).await;
+            ids.push(c.id);
+        }
+
+        let due = db.certificates_to_renew(Duration::days(30), 10).await.unwrap();
+        assert_eq!(due.len(), 1, "one site must produce one renewal, not three");
+        assert_eq!(due[0].id, *ids.last().unwrap(), "the newest is the one served");
+
+        let all = db.certificates_for(&TenantScope::Global).await.unwrap();
+        assert_eq!(all.len(), 3, "the older rows are retired, not deleted");
+        assert_eq!(
+            all.iter().filter(|c| c.status == CertStatus::Superseded).count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn one_site_being_reissued_does_not_disturb_another() {
+        let (db, site) = seed().await;
+        let other = seed_site(&db, "other.example").await;
+        let keep = db
+            .create_certificate(Some(other), CertKind::Le, &["other.example".into()], "/certs/o")
+            .await
+            .unwrap();
+        issue(&db, keep.id, 20).await;
+
+        let mine = db
+            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .await
+            .unwrap();
+        issue(&db, mine.id, 20).await;
+
+        let statuses: Vec<_> = db
+            .certificates_for(&TenantScope::Global)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.status))
+            .collect();
+        assert!(statuses.contains(&(keep.id, CertStatus::Active)), "{statuses:?}");
+        assert!(statuses.contains(&(mine.id, CertStatus::Active)), "{statuses:?}");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_in_its_backoff_window_is_not_retried() {
+        let (db, site) = seed().await;
+        let cert = db
+            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .await
+            .unwrap();
+        issue(&db, cert.id, 10).await;
+        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+
+        db.set_certificate_next_attempt(cert.id, now() + Duration::hours(1)).await.unwrap();
+        assert!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().is_empty());
+
+        // And a successful issuance clears the hold, so the next cycle is normal.
+        issue(&db, cert.id, 90).await;
+        db.set_certificate_next_attempt(cert.id, now() - Duration::minutes(1)).await.unwrap();
+        issue(&db, cert.id, 10).await;
+        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_expired_certificate_is_still_offered_for_renewal() {
+        // Past its expiry is the most urgent case there is, not a reason to
+        // stop trying.
+        let (db, site) = seed().await;
+        let cert = db
+            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .await
+            .unwrap();
+        issue(&db, cert.id, -5).await;
+        db.expire_stale_certificates().await.unwrap();
+        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -624,7 +824,7 @@ mod tests {
             .unwrap();
         issue(&db, cert.id, 5).await;
         assert_eq!(
-            db.certificates_due_for_renewal(Duration::days(30), 10)
+            db.certificates_to_renew(Duration::days(30), 10)
                 .await
                 .unwrap()
                 .len(),
@@ -633,7 +833,7 @@ mod tests {
 
         db.set_certificate_auto_renew(cert.id, false).await.unwrap();
         assert!(
-            db.certificates_due_for_renewal(Duration::days(30), 10)
+            db.certificates_to_renew(Duration::days(30), 10)
                 .await
                 .unwrap()
                 .is_empty()
@@ -666,7 +866,7 @@ mod tests {
             "we cannot renew a certificate we did not issue"
         );
         assert!(
-            db.certificates_due_for_renewal(Duration::days(30), 10)
+            db.certificates_to_renew(Duration::days(30), 10)
                 .await
                 .unwrap()
                 .is_empty()

@@ -284,6 +284,37 @@ impl AuthContext {
         }
     }
 
+    /// The context the agent's own scheduler acts under (spec §10.2).
+    ///
+    /// Certificate renewals, metric rollups and retention sweeps have no user
+    /// behind them, but they still need an identity for the audit trail and for
+    /// the operations they invoke.
+    ///
+    /// This cannot be forged from outside. Every context arriving over the IPC
+    /// socket is re-derived against the `users` table before an operation runs,
+    /// and [`Self::SYSTEM_ACTOR`] is not a row anybody can create — the id is
+    /// below the first `AUTOINCREMENT` value, so the lookup fails and the
+    /// request is refused (spec §12 rule 4).
+    pub fn system(reason: &str) -> Self {
+        Self {
+            actor_user_id: Self::SYSTEM_ACTOR,
+            acting_role: Role::Admin,
+            tenant_scope: TenantScope::Global,
+            impersonator_id: None,
+            permissions: Role::Admin.default_permissions().iter().copied().collect(),
+            request_id: format!("scheduler-{reason}"),
+        }
+    }
+
+    /// The actor id the scheduler uses. Never a real account: SQLite's
+    /// `AUTOINCREMENT` starts at 1, so nothing can ever occupy it.
+    pub const SYSTEM_ACTOR: UserId = UserId(0);
+
+    /// Is this the agent acting on its own behalf rather than for a user?
+    pub fn is_system(&self) -> bool {
+        self.actor_user_id == Self::SYSTEM_ACTOR
+    }
+
     /// Intersect the current permissions with `allowed`.
     ///
     /// Only ever narrows: a plan flag or an account override cannot grant a
@@ -435,6 +466,19 @@ mod tests {
             customer_id: UserId(9),
         };
         assert!(!reseller.contains(&cust));
+    }
+
+    #[test]
+    fn the_system_context_can_act_but_is_not_a_real_account() {
+        let system = AuthContext::system("cert.renew");
+        assert!(system.is_system());
+        assert!(system.has(Permission::SiteManage), "renewals need to re-render a vhost");
+        assert!(system.tenant_scope.is_global());
+        // Id 0 is below SQLite's first AUTOINCREMENT value, so no user row can
+        // ever occupy it — which is what makes a forged system context fail the
+        // agent's database re-check.
+        assert_eq!(system.actor_user_id, UserId(0));
+        assert!(!ctx(Role::Admin, TenantScope::Global).is_system());
     }
 
     #[test]
