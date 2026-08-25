@@ -116,3 +116,8 @@ Your final structured report must include: branch name, what works, what is
 stubbed, exact registration/route lines you added to shared files, new
 workspace deps, new error codes, test count and result, and anything the
 integrator must do by hand.
+
+## Integrator log (running)
+- openapi completeness test greps `.route("...")` only — merged sub-routers
+  (files::router()) are invisible to it. /api/files/* is undocumented; extend
+  the doc + test in the wave-2 cleanup.
