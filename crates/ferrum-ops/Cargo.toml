@@ -12,6 +12,9 @@ ferrum-db = { workspace = true }
 ferrum-distro = { workspace = true }
 ferrum-metrics = { workspace = true }
 async-trait = { workspace = true }
+# Verifying the Adminer download against its pinned sha256 (spec §11.4).
+hex = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

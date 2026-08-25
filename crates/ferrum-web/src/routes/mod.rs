@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod certs;
+pub mod databases;
 pub mod events;
 pub mod health;
 pub mod ops;
@@ -42,6 +43,10 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
+        .route(
+            "/api/databases/adminer",
+            get(databases::adminer_status).post(databases::adminer_set),
+        )
 }
 
 /// Routes reachable without a session.

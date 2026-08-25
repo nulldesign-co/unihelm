@@ -1,0 +1,44 @@
+# Adminer — the panel's database browser (spec §11.4).
+#
+# This server block listens on 127.0.0.1 and nowhere else, on purpose. nginx
+# cannot check a Ferrum panel session, so any non-loopback listen would hand a
+# database login screen to the whole internet. Until the panel's authenticated
+# proxy ships, reaching this port requires being on the server already — and a
+# local process that can reach it still needs valid database credentials, which
+# is exactly what it needs to talk to the database directly.
+
+server {
+    # A literal address:port, not `localhost` and not a bare port: one socket,
+    # unaffected by resolver configuration, and never a wildcard bind.
+    listen 127.0.0.1:{{ adminer.port }};
+    server_name _;
+
+    root {{ adminer.root }};
+
+    access_log {{ adminer.log_dir }}/access.log combined;
+    error_log  {{ adminer.log_dir }}/error.log warn;
+
+    # Adminer imports SQL dumps through POST; keep this in line with the pool's
+    # own post_max_size or uploads fail with an nginx 413 the pool never sees.
+    client_max_body_size {{ adminer.max_body_size }};
+
+    # Adminer is one script that serves everything — its CSS, its JS, its
+    # POST endpoints — from `/` with query strings. So exactly one URL is
+    # routed, to exactly one file, named absolutely. There is no try_files, no
+    # regex over user-supplied paths, and nothing else in the root to probe.
+    location = / {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME {{ adminer.script }};
+        fastcgi_param SCRIPT_NAME /;
+        fastcgi_pass unix:{{ adminer.socket }};
+        fastcgi_read_timeout {{ adminer.timeout }};
+        fastcgi_buffer_size 32k;
+        fastcgi_buffers 16 16k;
+        fastcgi_busy_buffers_size 64k;
+    }
+
+    # Everything that is not `/` does not exist here.
+    location / {
+        return 404;
+    }
+}

@@ -231,6 +231,9 @@ impl OpRegistry {
         registry.register(crate::site::Drift);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
+        registry.register(crate::adminer::Status);
+        registry.register(crate::adminer::Enable::default());
+        registry.register(crate::adminer::Disable);
         registry
     }
 

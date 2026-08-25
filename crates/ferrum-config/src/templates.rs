@@ -45,6 +45,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "php/pool.conf",
         include_str!("../templates/php/pool.conf.j2"),
     ),
+    (
+        "nginx/adminer.conf",
+        include_str!("../templates/nginx/adminer.conf.j2"),
+    ),
 ];
 
 pub struct TemplateSet {
