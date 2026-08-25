@@ -354,6 +354,31 @@ pub fn program_available(program: &str) -> bool {
     resolve_program(program).is_ok()
 }
 
+/// Re-exec the *currently running binary* with a fixed argv, handing back the
+/// raw `tokio::process::Command` so the caller can wire byte pipes to it.
+///
+/// This exists for the file-manager helper (spec §5.2 rule 3): the agent
+/// re-execs itself as `ferrum-agentd --fs-helper ...`, which drops to the
+/// tenant's uid before touching a byte, and the exchange is a binary
+/// stdin/stdout protocol that [`Cmd`]'s collected-text API cannot carry.
+/// Constructing the `Command` here keeps the repo invariant that
+/// `Command::new` appears only in this module (see `tests/gates/no-shell.sh`).
+/// There is deliberately no program parameter: the only thing this function
+/// will ever start is the binary that is already running, so a caller cannot
+/// use it to reach anything else.
+pub fn reexec_current(args: &[OsString]) -> Result<Command> {
+    let exe = std::env::current_exe().map_err(|e| DistroError::Spawn {
+        program: "current_exe".into(),
+        source: e,
+    })?;
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    // The child inherits nothing: the helper needs no environment, and passing
+    // one along would be a channel we would have to audit.
+    cmd.env_clear();
+    Ok(cmd)
+}
+
 impl From<DistroError> for FerrumError {
     fn from(e: DistroError) -> Self {
         let code = match &e {

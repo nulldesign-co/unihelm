@@ -43,6 +43,10 @@ pub enum FsRequest {
     Read {
         path: PathBuf,
         max_bytes: u64,
+        /// Byte offset to start from. This is what makes a chunked download of
+        /// a file larger than one call's budget possible (spec §11.7 AC).
+        #[serde(default)]
+        offset: u64,
     },
     /// Write a file. The request payload carries the content.
     Write {
@@ -50,6 +54,11 @@ pub enum FsRequest {
         len: u64,
         /// Create the parent directories if they are missing.
         create_parents: bool,
+        /// Append to the file instead of replacing it — the second and later
+        /// chunks of a resumable upload (spec §11.7 AC: a 2 GB upload must
+        /// work in constant memory, so it arrives as appended chunks).
+        #[serde(default)]
+        append: bool,
     },
     Mkdir {
         path: PathBuf,
@@ -247,6 +256,7 @@ mod tests {
                 path: PathBuf::from("/home/ft_x/a.txt"),
                 len: 12,
                 create_parents: false,
+                append: false,
             },
             payload_len: 12,
         };
@@ -254,6 +264,21 @@ mod tests {
         assert!(!line.contains('\n'), "the frame is one line: {line}");
         let back: FsCall = serde_json::from_str(&line).unwrap();
         assert_eq!(back.payload_len, 12);
+    }
+
+    #[test]
+    fn offset_and_append_default_off_for_old_frames() {
+        // An agent one version behind must still speak to a newer helper: the
+        // new fields deserialise to their do-nothing values when absent.
+        let read: FsRequest =
+            serde_json::from_str(r#"{"op":"read","path":"/h/a.txt","max_bytes":100}"#).unwrap();
+        assert!(matches!(read, FsRequest::Read { offset: 0, .. }));
+
+        let write: FsRequest = serde_json::from_str(
+            r#"{"op":"write","path":"/h/a.txt","len":1,"create_parents":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(write, FsRequest::Write { append: false, .. }));
     }
 
     #[test]

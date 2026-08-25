@@ -17,10 +17,16 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 # Show-once database passwords (spec §11.4): thread_rng is a CSPRNG.
 rand = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+zip = { workspace = true }
+zstd = { workspace = true }
 # `aws_lc_rs` is the backend instant-acme also uses, so the two share one
 # crypto provider rather than pulling in both ring and aws-lc-rs.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
