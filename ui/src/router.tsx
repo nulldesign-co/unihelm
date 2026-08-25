@@ -9,6 +9,7 @@ import { AppShell } from "@/components/app-shell";
 import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { DashboardPage } from "@/routes/dashboard";
+import { FilesPage, validateFilesSearch } from "@/routes/files";
 import { LoginPage } from "@/routes/login";
 import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
@@ -59,7 +60,16 @@ const stackRoute = createRoute({
   component: StackPage,
 });
 
-const routeTree = rootRoute.addChildren([dashboardRoute, sitesRoute, stackRoute]);
+const filesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/files",
+  component: FilesPage,
+  // The current directory rides in `?path=…` so reloads and shared links land
+  // in the same folder (spec §11.7).
+  validateSearch: validateFilesSearch,
+});
+
+const routeTree = rootRoute.addChildren([dashboardRoute, sitesRoute, stackRoute, filesRoute]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });
 

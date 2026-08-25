@@ -1,5 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -26,6 +26,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       { id: "go-dashboard", label: t("nav.dashboard"), run: () => void navigate({ to: "/" }) },
       { id: "go-sites", label: t("nav.sites"), run: () => void navigate({ to: "/sites" }) },
       { id: "go-stack", label: t("nav.stack"), run: () => void navigate({ to: "/stack" }) },
+      { id: "go-files", label: t("nav.files"), run: () => void navigate({ to: "/files" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
       { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, run: () => setTheme("dark") },
       { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, run: () => setTheme("system") },
@@ -42,6 +43,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const nav = [
     { to: "/", label: t("nav.dashboard"), icon: Gauge },
     { to: "/sites", label: t("nav.sites"), icon: Globe },
+    { to: "/files", label: t("nav.files"), icon: FolderOpen },
     { to: "/stack", label: t("nav.stack"), icon: Layers },
   ];
 
