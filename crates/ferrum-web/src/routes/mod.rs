@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod certs;
+pub mod databases;
 pub mod events;
 pub mod files;
 pub mod health;
@@ -53,6 +54,10 @@ fn protected() -> Router<SharedState> {
         // The file manager brings its own routes and its own body limit
         // (file content rides inside JSON there — see files::MAX_BODY_BYTES).
         .merge(files::router())
+        .route(
+            "/api/databases/adminer",
+            get(databases::adminer_status).post(databases::adminer_set),
+        )
 }
 
 /// Routes reachable without a session.

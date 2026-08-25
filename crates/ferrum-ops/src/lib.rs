@@ -17,6 +17,7 @@
 //! a shell.
 
 pub mod acme;
+pub mod adminer;
 pub mod cert;
 pub mod fpm;
 pub mod metrics;

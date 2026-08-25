@@ -179,6 +179,49 @@ pub fn systemd_dropin(unit_file_name: &str, dropin_file_name: &str) -> PathBuf {
         .join(dropin_file_name)
 }
 
+/// Where the panel-managed Adminer single-file app lives (spec §11.4).
+///
+/// Under the panel's own data directory, not under any tenant's home and not
+/// under a webroot nginx already serves: the file is reachable only through
+/// the dedicated loopback server block that points at it explicitly.
+pub fn adminer_dir() -> PathBuf {
+    under("/var/lib/ferrum/adminer")
+}
+
+/// The Adminer script itself. Root-owned 0644: the FPM pool that executes it
+/// must never be able to replace it.
+pub fn adminer_php() -> PathBuf {
+    adminer_dir().join("adminer.php")
+}
+
+/// Scratch space for the Adminer pool (uploads, sessions). Owned by the pool's
+/// runtime user, and inside `adminer_dir` so `open_basedir` covers it.
+pub fn adminer_tmp_dir() -> PathBuf {
+    adminer_dir().join("tmp")
+}
+
+/// Logs for the Adminer pool and vhost, beside the per-site logs.
+pub fn adminer_log_dir() -> PathBuf {
+    under("/var/log/ferrum/adminer")
+}
+
+/// The nginx server block that serves Adminer on loopback.
+///
+/// `02-` so it sorts with the panel's own infrastructure files, after the
+/// catch-all and panel vhosts and before any `site-*.conf`.
+pub fn nginx_adminer() -> PathBuf {
+    nginx_dir().join("02-adminer.conf")
+}
+
+/// The loopback port Adminer is served on (spec §11.4).
+///
+/// Not a filesystem path, but it lives with them for the same reason they are
+/// centralised: the agent (which renders the vhost) and the web process (which
+/// reports the URL) must agree on one value. 8806 collides with neither the
+/// panel's own 127.0.0.1:8088 nor anything a hosted app plausibly binds
+/// (3000/8080-class ports).
+pub const ADMINER_LOOPBACK_PORT: u16 = 8806;
+
 /// A tenant's home, and the standard layout inside it (spec §4.3).
 pub fn tenant_home(linux_user: &str) -> PathBuf {
     under("/home").join(linux_user)
