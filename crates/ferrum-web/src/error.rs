@@ -9,9 +9,21 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use ferrum_core::{ErrorCode, FerrumError};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// The JSON body of every error response.
-#[derive(Debug, Serialize)]
+///
+/// This struct doubles as the OpenAPI model for the `FER-xxxx` envelope
+/// (spec §13): every documented error response references it, so the shape is
+/// written down exactly once.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(example = json!({
+    "code": "FER-1201",
+    "slug": "invalid_domain",
+    "message": "domain labels cannot start with a hyphen",
+    "field": "domain",
+    "request_id": "0f3a1c2e"
+}))]
 pub struct ApiErrorBody {
     /// `FER-1402`
     pub code: String,

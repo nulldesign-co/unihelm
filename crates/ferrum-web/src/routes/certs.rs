@@ -9,12 +9,26 @@ use ferrum_db::audit::NewAuditEntry;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
+use utoipa::ToSchema;
 
 use crate::auth::{CurrentUser, client_ip};
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::routes::ops;
 use crate::state::SharedState;
 
+/// Every certificate the caller's scope can see.
+#[utoipa::path(
+    get,
+    path = "/api/certificates",
+    tag = "certificates",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Certificate rows with expiry and renewal state", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `site.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn list(
     State(state): State<SharedState>,
     current: CurrentUser,
@@ -27,7 +41,7 @@ pub async fn list(
     Ok(Json(data))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct IssueRequest {
     /// Use the staging directory. Its root is not publicly trusted, so this is
     /// for proving the flow works, not for a live site.
@@ -37,6 +51,22 @@ pub struct IssueRequest {
     pub contact_email: Option<String>,
 }
 
+/// Request a Let's Encrypt certificate for a site (HTTP-01).
+#[utoipa::path(
+    post,
+    path = "/api/sites/{id}/certificate",
+    tag = "certificates",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "Site id")),
+    request_body = IssueRequest,
+    responses(
+        (status = 202, description = "Issuance queued; poll the task", body = ops::TaskAccepted),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site in this tenant's scope", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn issue(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

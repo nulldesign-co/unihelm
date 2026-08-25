@@ -9,13 +9,26 @@ use ferrum_db::audit::NewAuditEntry;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
+use utoipa::ToSchema;
 
 use crate::auth::{CurrentUser, client_ip};
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::routes::ops;
 use crate::state::SharedState;
 
 /// What the panel can install, and what it already has.
+#[utoipa::path(
+    get,
+    path = "/api/stack",
+    tag = "stack",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Installed and installable components, per the agent", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn status(
     State(state): State<SharedState>,
     current: CurrentUser,
@@ -28,11 +41,14 @@ pub async fn status(
     Ok(Json(data))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "component", rename_all = "snake_case")]
 pub enum ComponentRequest {
     Nginx,
-    Php { version: PhpVersion },
+    Php {
+        #[schema(value_type = String, example = "8.3")]
+        version: PhpVersion,
+    },
 }
 
 impl ComponentRequest {
@@ -53,12 +69,27 @@ impl ComponentRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallRequest {
     #[serde(flatten)]
     pub component: ComponentRequest,
 }
 
+/// Install a stack component.
+#[utoipa::path(
+    post,
+    path = "/api/stack/install",
+    tag = "stack",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = InstallRequest,
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn install(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -89,6 +120,22 @@ pub async fn install(
     .await
 }
 
+/// Remove a stack component.
+#[utoipa::path(
+    post,
+    path = "/api/stack/remove",
+    tag = "stack",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = InstallRequest,
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 409, description = "`dependents_exist`: sites still use this component", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn remove(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

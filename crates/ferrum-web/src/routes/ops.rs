@@ -10,12 +10,13 @@ use axum::response::{IntoResponse, Response};
 use ferrum_core::AuthContext;
 use ferrum_ipc::frame::ResponseBody;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 
 /// A long-running operation's receipt.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TaskAccepted {
     pub task_id: String,
     /// Where to watch it. The UI opens the task drawer on this.

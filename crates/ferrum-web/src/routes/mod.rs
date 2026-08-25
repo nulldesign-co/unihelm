@@ -9,6 +9,7 @@ pub mod auth;
 pub mod certs;
 pub mod events;
 pub mod health;
+pub mod openapi;
 pub mod ops;
 pub mod server;
 pub mod sites;
@@ -42,6 +43,7 @@ fn protected() -> Router<SharedState> {
         .route("/api/tasks/{id}", get(tasks::detail))
         .route("/api/tasks/{id}/logs", get(tasks::logs))
         .route("/api/events", get(events::stream))
+        .route("/api/openapi.json", get(openapi::document))
 }
 
 /// Routes reachable without a session.

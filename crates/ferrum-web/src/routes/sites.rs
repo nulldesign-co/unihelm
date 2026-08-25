@@ -9,13 +9,15 @@ use ferrum_db::audit::NewAuditEntry;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{CurrentUser, client_ip};
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::routes::ops;
 use crate::state::SharedState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListQuery {
     #[serde(default)]
     pub limit: Option<i64>,
@@ -23,6 +25,20 @@ pub struct ListQuery {
     pub offset: Option<i64>,
 }
 
+/// List the sites this caller's tenant scope can see.
+#[utoipa::path(
+    get,
+    path = "/api/sites",
+    tag = "sites",
+    security(("session_cookie" = [])),
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Site rows, tenant-scoped by the agent", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `site.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn list(
     State(state): State<SharedState>,
     current: CurrentUser,
@@ -42,12 +58,14 @@ pub async fn list(
     Ok(Json(data))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRequest {
     pub domain: String,
+    /// `php`, `static`, …
     #[serde(default = "default_type")]
     pub site_type: String,
     #[serde(default)]
+    #[schema(value_type = Option<String>, example = "8.3")]
     pub php_version: Option<PhpVersion>,
     #[serde(default)]
     pub with_www: bool,
@@ -63,6 +81,23 @@ fn default_type() -> String {
     "php".into()
 }
 
+/// Create a site.
+#[utoipa::path(
+    post,
+    path = "/api/sites",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = CreateRequest,
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 400, description = "`invalid_domain`", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 409, description = "`domain_already_exists`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn create(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -112,9 +147,10 @@ pub async fn create(
     .await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRequest {
     #[serde(default)]
+    #[schema(value_type = Option<String>, example = "8.3")]
     pub php_version: Option<PhpVersion>,
     #[serde(default)]
     pub force_https: Option<bool>,
@@ -126,8 +162,10 @@ pub struct UpdateRequest {
     pub client_max_body_size: Option<String>,
     /// `Some(None)` clears the snippet; absent leaves it alone.
     #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
     pub custom_nginx_snippet: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
+    #[schema(value_type = Option<String>)]
     pub php_ini_overrides: Option<Option<String>>,
     #[serde(default)]
     pub rate_limit_enabled: Option<bool>,
@@ -145,6 +183,23 @@ where
     serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
+/// Change a site's settings. Absent fields are left alone.
+#[utoipa::path(
+    patch,
+    path = "/api/sites/{id}",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "Site id")),
+    request_body = UpdateRequest,
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site in this tenant's scope", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn update(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -198,13 +253,30 @@ pub async fn update(
     ops::invoke(&state, &current.auth, "site.update", input).await
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct DeleteQuery {
     /// Also remove the site's files. Off unless asked for explicitly.
     #[serde(default)]
     pub purge_files: bool,
 }
 
+/// Delete a site, optionally purging its files.
+#[utoipa::path(
+    delete,
+    path = "/api/sites/{id}",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "Site id"), DeleteQuery),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site in this tenant's scope", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn delete(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -239,6 +311,20 @@ pub async fn delete(
 }
 
 /// Has somebody edited this site's generated vhost?
+#[utoipa::path(
+    get,
+    path = "/api/sites/{id}/drift",
+    tag = "sites",
+    security(("session_cookie" = [])),
+    params(("id" = i64, Path, description = "Site id")),
+    responses(
+        (status = 200, description = "Drift verdict for the site's rendered config", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `site.read`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
 pub async fn drift(
     State(state): State<SharedState>,
     Path(id): Path<i64>,

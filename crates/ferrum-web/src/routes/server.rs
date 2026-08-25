@@ -5,9 +5,10 @@ use axum::extract::State;
 use ferrum_core::Permission;
 use serde::Serialize;
 use serde_json::json;
+use utoipa::ToSchema;
 
 use crate::auth::CurrentUser;
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::state::SharedState;
 
 /// The units the dashboard shows. Sent to the agent as `ManagedUnit` values, so
@@ -23,7 +24,7 @@ fn dashboard_units() -> Vec<serde_json::Value> {
     ]
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct Overview {
     /// Whether the agent answered. The rest of the payload is absent when it did
     /// not, rather than silently stale.
@@ -39,6 +40,17 @@ pub struct Overview {
 }
 
 /// Everything the dashboard needs in one round trip.
+#[utoipa::path(
+    get,
+    path = "/api/server/overview",
+    tag = "server",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Metrics and system facts; partial when the agent is unreachable", body = Overview),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+    ),
+)]
 pub async fn overview(
     State(state): State<SharedState>,
     current: CurrentUser,
@@ -90,7 +102,7 @@ pub async fn overview(
     Ok(Json(overview))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ServicesResponse {
     pub services: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +110,17 @@ pub struct ServicesResponse {
 }
 
 /// Status of every service the panel manages.
+#[utoipa::path(
+    get,
+    path = "/api/server/services",
+    tag = "server",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "One entry per managed unit", body = ServicesResponse),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+    ),
+)]
 pub async fn services(
     State(state): State<SharedState>,
     current: CurrentUser,

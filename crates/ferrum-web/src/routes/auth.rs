@@ -10,15 +10,16 @@ use ferrum_db::audit::NewAuditEntry;
 use ferrum_db::sessions::DEFAULT_TTL;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use utoipa::ToSchema;
 
 use crate::auth::{
     CurrentUser, check_rate_limits, clearing_cookie, client_ip, cookie_secure, request_id,
     session_cookie, verify_or_burn,
 };
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::state::SharedState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
@@ -27,7 +28,7 @@ pub struct LoginRequest {
     // does nothing.
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct LoginResponse {
     pub user: UserView,
     /// The token that must accompany every state-changing request.
@@ -39,7 +40,7 @@ pub struct LoginResponse {
 /// A separate struct from [`ferrum_db::models::User`] on purpose: the model
 /// carries `pass_hash` and `totp_secret`, and the way to guarantee those never
 /// reach a response is for the response type not to have them (spec §12 rule 6).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UserView {
     pub id: i64,
     pub username: String,
@@ -70,6 +71,21 @@ impl UserView {
     }
 }
 
+/// Sign in with a username and password.
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    tag = "auth",
+    security(()),
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Signed in; the session cookie rides on this response", body = LoginResponse),
+        (status = 401, description = "`invalid_credentials`", body = ApiErrorBody),
+        (status = 403, description = "`account_suspended`", body = ApiErrorBody),
+        (status = 429, description = "`rate_limited`: too many attempts from this IP or for this account", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: the account requires TOTP, which this build cannot verify", body = ApiErrorBody),
+    ),
+)]
 pub async fn login(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -183,6 +199,19 @@ pub async fn login(
     ))
 }
 
+/// Revoke the current session.
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "auth",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "Session revoked", body = serde_json::Value,
+            example = json!({ "ok": true })),
+        (status = 401, description = "`session_invalid` / `session_expired`", body = ApiErrorBody),
+        (status = 403, description = "`csrf_invalid`", body = ApiErrorBody),
+    ),
+)]
 pub async fn logout(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -218,6 +247,16 @@ pub async fn logout(
 }
 
 /// The current session's account, used by the UI on every page load.
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    tag = "auth",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The signed-in account and its CSRF token", body = LoginResponse),
+        (status = 401, description = "`session_invalid` / `session_expired`", body = ApiErrorBody),
+    ),
+)]
 pub async fn me(current: CurrentUser) -> Json<LoginResponse> {
     Json(LoginResponse {
         user: UserView::from(&current.user, current.session.impersonator_id.is_some()),
