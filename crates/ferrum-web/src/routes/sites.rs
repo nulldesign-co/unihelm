@@ -153,6 +153,9 @@ pub struct UpdateRequest {
     #[schema(value_type = Option<String>, example = "8.3")]
     pub php_version: Option<PhpVersion>,
     #[serde(default)]
+    #[schema(value_type = Option<String>, example = "redirect_to_www")]
+    pub www_policy: Option<String>,
+    #[serde(default)]
     pub force_https: Option<bool>,
     #[serde(default)]
     pub http3: Option<bool>,
@@ -237,6 +240,9 @@ pub async fn update(
     put!(http3);
     put!(maintenance_mode);
     put!(rate_limit_enabled);
+    if let Some(v) = body.www_policy {
+        object.insert("www_policy".into(), json!(v));
+    }
     if let Some(v) = body.php_version {
         object.insert("php_version".into(), json!(v.as_str()));
     }

@@ -184,7 +184,11 @@ fn build_router(state: state::SharedState) -> Router {
         .fallback(ui::serve)
         .layer(security_headers)
         .layer(CompressionLayer::new())
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // The file manager carries file content in its JSON, so it gets its
+        // own, larger cap (routes::files::MAX_BODY_BYTES); this outer layer
+        // would otherwise win, because outer layers see the body first.
+        .layer(RequestBodyLimitLayer::new(routes::files::MAX_BODY_BYTES))
+        .route_layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
                 // One id per request, threaded through the IPC frame, the task
