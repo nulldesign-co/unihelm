@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Globe, Lock, LockOpen, Plus, Wrench } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { ExternalLink, Globe, Lock, LockOpen, Plus, Wrench } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -108,15 +109,28 @@ function SiteRow({ site }: { site: SiteView }) {
         </Badge>
 
         <div className="min-w-0 flex-1">
-          <a
-            href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
-            target="_blank"
-            rel="noreferrer noopener"
-            dir="ltr"
-            className="truncate font-medium text-ink hover:text-accent"
-          >
-            {site.domain}
-          </a>
+          {/* The domain goes to the detail page; the little arrow opens the
+              live site. Managing a site is what this list is for — visiting it
+              is the secondary act. */}
+          <span className="flex items-center gap-1.5">
+            <Link
+              to="/sites/$siteId"
+              params={{ siteId: String(site.id) }}
+              dir="ltr"
+              className="truncate font-medium text-ink hover:text-accent"
+            >
+              {site.domain}
+            </Link>
+            <a
+              href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="shrink-0 text-ink-subtle hover:text-accent"
+              aria-label={site.domain}
+            >
+              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+            </a>
+          </span>
           <p dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
             {site.root_dir}
           </p>
