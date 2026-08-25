@@ -23,6 +23,7 @@
 pub mod audit;
 pub mod certificates;
 pub mod models;
+pub mod panel;
 pub mod password;
 pub mod revisions;
 pub mod scheduler;

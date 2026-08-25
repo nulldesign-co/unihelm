@@ -172,8 +172,14 @@ impl Scheduler {
 
         for certificate in due {
             let Some(site_id) = certificate.site_id else {
-                // The panel's own certificate has no site; it is renewed by its
-                // own path once that exists.
+                // The panel's own certificate has no site; it renews through
+                // `panel.tls.issue`, which re-renders the panel vhost and
+                // reloads nginx (spec §11.5).
+                match self.renew_panel(&certificate).await {
+                    Ok(true) => renewed += 1,
+                    Ok(false) => {}
+                    Err(()) => failed += 1,
+                }
                 continue;
             };
 
@@ -270,6 +276,137 @@ impl Scheduler {
                 Err(e.detail)
             }
         }
+    }
+
+    /// Renew the panel's own certificate (site_id NULL) through
+    /// `panel.tls.issue`, as a real Task under the system identity.
+    ///
+    /// `Ok(true)` renewed, `Ok(false)` skipped on purpose, `Err(())` failed —
+    /// with the backoff bookkeeping already done, so the caller only counts.
+    async fn renew_panel(&self, certificate: &ferrum_db::Certificate) -> Result<bool, ()> {
+        let db = self.db().clone();
+
+        // The domain of record is the setting, not the row. If an operator
+        // re-pointed the panel since this row was issued, renewing the old
+        // name would spend rate-limit budget on a domain the panel no longer
+        // uses — and the new domain already has its own row.
+        let stored: Option<String> = db
+            .get_setting(ferrum_db::panel::DOMAIN_KEY)
+            .await
+            .ok()
+            .flatten();
+        let domain = match (stored, certificate.domains.first()) {
+            (Some(setting), Some(row)) if setting != *row => {
+                tracing::info!(
+                    certificate = certificate.id,
+                    row_domain = %row,
+                    panel_domain = %setting,
+                    "panel domain changed; retiring the old certificate from renewal"
+                );
+                let _ = db.set_certificate_auto_renew(certificate.id, false).await;
+                return Ok(false);
+            }
+            (Some(setting), _) => setting,
+            // No setting but a live NULL-site LE row: keep the working
+            // certificate alive rather than letting it lapse over lost state.
+            (None, Some(row)) => row.clone(),
+            (None, None) => {
+                tracing::warn!(
+                    certificate = certificate.id,
+                    "a panel certificate with no domains cannot be renewed"
+                );
+                let _ = db.set_certificate_auto_renew(certificate.id, false).await;
+                return Ok(false);
+            }
+        };
+
+        // Parse before any task exists: a corrupt stored domain is a renewal
+        // failure like any other, with the same backoff.
+        let parsed = match ferrum_core::Domain::parse(&domain) {
+            Ok(d) => d,
+            Err(e) => {
+                self.panel_renewal_failed(certificate, &e.detail).await;
+                return Err(());
+            }
+        };
+
+        let task_id = TaskId::new();
+        let created = db
+            .create_task(NewTask {
+                id: task_id,
+                op: "panel.tls.issue".into(),
+                input: serde_json::json!({ "domain": domain, "renewal": true }),
+                // No user did this; the audit trail says so.
+                actor_user_id: None,
+                subscription_id: None,
+                cancellable: false,
+                // Safe to run again: a duplicate order costs rate-limit budget
+                // but cannot corrupt anything.
+                idempotent: true,
+                request_id: Some(format!("scheduler-renew-panel-{domain}")),
+            })
+            .await;
+        if let Err(e) = created {
+            tracing::warn!(error = %e, "could not create the panel renewal task");
+            return Err(());
+        }
+        if let Err(e) = db.start_task(task_id).await {
+            tracing::warn!(error = %e, "could not start the panel renewal task");
+            return Err(());
+        }
+
+        let log: Arc<dyn LogSink> = Arc::new(TaskLog {
+            db: db.clone(),
+            task_id,
+            bus: self.bus.clone(),
+        });
+
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("cert.renew"),
+        )
+        .with_task(task_id, log);
+
+        let result = ferrum_ops::panel::Issue
+            .run(
+                &ctx,
+                ferrum_ops::panel::IssueInput {
+                    domain: parsed,
+                    contact_email: None,
+                    staging: false,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _ = db.finish_task_ok(task_id).await;
+                Ok(true)
+            }
+            Err(e) => {
+                let _ = db.finish_task_failed(task_id, &e).await;
+                self.panel_renewal_failed(certificate, &e.detail).await;
+                Err(())
+            }
+        }
+    }
+
+    /// Backoff bookkeeping for a failed panel renewal — on the row that is
+    /// actually due, not the fresh attempt row `panel.tls.issue` recorded its
+    /// own failure on.
+    async fn panel_renewal_failed(&self, certificate: &ferrum_db::Certificate, error: &str) {
+        let db = self.db();
+        let backoff = ferrum_ops::cert::renewal_backoff(certificate.failure_count);
+        let next = ferrum_db::now() + backoff;
+        let _ = db.set_certificate_next_attempt(certificate.id, next).await;
+        let _ = db.certificate_failed(certificate.id, error).await;
+
+        tracing::warn!(
+            certificate = certificate.id,
+            error = %error,
+            retry_in_minutes = backoff.whole_minutes(),
+            "panel certificate renewal failed"
+        );
     }
 
     async fn expire_stale_certificates(&self) -> Result<String, String> {
