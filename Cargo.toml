@@ -16,7 +16,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Raised from 1.85 when `zip` 8 arrived with the file manager: it declares
+# rust-version 1.88, and a workspace claiming less than its dependencies is a
+# claim that fails on the first machine that believes it. Spec §4.1 puts the
+# floor at latest-stable-minus-two, which is well above this.
+rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 authors = ["farzam"]
 repository = "https://github.com/farzam/ferrum"
