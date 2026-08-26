@@ -121,3 +121,9 @@ integrator must do by hand.
 - openapi completeness test greps `.route("...")` only — merged sub-routers
   (files::router()) are invisible to it. /api/files/* is undocumented; extend
   the doc + test in the wave-2 cleanup.
+- Migration numbers 0007-0012 are still unallocated after wave 1 (cron, dns,
+  backups, node-apps, monitoring, sentinel did not finish). Wave 2 keeps the
+  original allocation so nothing renumbers.
+- Union-merging two branches that both appended to the same Rust file lost a
+  closing brace twice (paths.rs, templates.rs tuple). Always `cargo build`
+  immediately after a union resolve, never trust the merge.
