@@ -263,6 +263,13 @@ impl OpRegistry {
         registry.register(crate::quota::Backend);
         registry.register(crate::sftp::Enable);
         registry.register(crate::sftp::Disable);
+        registry.register(crate::plan::List);
+        registry.register(crate::plan::Create);
+        registry.register(crate::plan::Update);
+        registry.register(crate::plan::Delete);
+        registry.register(crate::plan::Assign);
+        registry.register(crate::plan::Suspend::live());
+        registry.register(crate::plan::Unsuspend::live());
         registry
     }
 

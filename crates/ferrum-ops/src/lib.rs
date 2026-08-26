@@ -25,6 +25,7 @@ pub mod fsops;
 pub mod metrics;
 pub mod panel;
 pub mod php;
+pub mod plan;
 pub mod provision;
 pub mod quota;
 pub mod registry;

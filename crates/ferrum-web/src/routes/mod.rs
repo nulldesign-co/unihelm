@@ -16,6 +16,7 @@ pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
 pub mod quota;
+pub mod plans;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -79,6 +80,14 @@ fn protected() -> Router<SharedState> {
         )
         .route("/api/databases/grants", post(databases::grant))
         .route("/api/server/quota-backend", get(quota::backend))
+        .route("/api/plans", get(plans::list).post(plans::create))
+        .route(
+            "/api/plans/{id}",
+            axum::routing::patch(plans::update).delete(plans::delete),
+        )
+        .route("/api/plans/{id}/assign", post(plans::assign))
+        .route("/api/subscriptions/{id}/suspend", post(plans::suspend))
+        .route("/api/subscriptions/{id}/unsuspend", post(plans::unsuspend))
 }
 
 /// Routes reachable without a session.

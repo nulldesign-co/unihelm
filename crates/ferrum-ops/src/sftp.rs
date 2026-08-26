@@ -988,6 +988,7 @@ mod tests {
             home_dir: "/home/ft_abc12345".into(),
             status: ferrum_db::SubscriptionStatus::Active,
             suspended_reason: None,
+            suspended_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
         };
         assert_eq!(

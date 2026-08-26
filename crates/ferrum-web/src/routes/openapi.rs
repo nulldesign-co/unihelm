@@ -47,6 +47,13 @@ use crate::auth::CurrentUser;
         super::panel_tls::issue,
         super::panel_tls::status,
         super::quota::backend,
+        super::plans::list,
+        super::plans::create,
+        super::plans::update,
+        super::plans::delete,
+        super::plans::assign,
+        super::plans::suspend,
+        super::plans::unsuspend,
         super::certs::issue,
         super::certs::list,
         super::tasks::list,
@@ -60,6 +67,8 @@ use crate::auth::CurrentUser;
         (name = "server", description = "Host metrics and managed services"),
         (name = "stack", description = "Installing and removing stack components"),
         (name = "sites", description = "Site CRUD and config drift"),
+        (name = "plans", description = "Plan limits, feature flags and assignment"),
+        (name = "subscriptions", description = "Suspension lifecycle"),
         (name = "certificates", description = "TLS issuance and inventory"),
         (name = "tasks", description = "Long-running work: polling and logs"),
         (name = "meta", description = "The API describing itself"),
@@ -154,7 +163,8 @@ mod tests {
         "/api/dns",
         "/api/backups",
         "/api/apps",
-        "/api/plans",
+        // `/api/plans` is deliberately absent: the plans area is annotated and
+        // documented, so drift detection covers it again.
         "/api/firewall",
     ];
 
