@@ -49,6 +49,17 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     ("cert.expire-stale", Duration::hours(1), Duration::minutes(5)),
     ("session.purge", Duration::hours(24), Duration::hours(1)),
     ("audit.purge", Duration::hours(24), Duration::hours(1)),
+    // Sentinel, the brute-force defence (spec §11.9). A minute is the slowest
+    // cadence that still stops a password spray before it finishes: at the
+    // default six failures in ten minutes, a scan a minute means the attacker
+    // gets at most one extra minute of guesses after crossing the line.
+    //
+    // The job is registered unconditionally, and it is *disabled* by default —
+    // `sentinel.enabled` is false on a fresh install, and `sentinel_tick`
+    // returns before reading anything while it is. Registering it either way
+    // means turning Sentinel on in the UI takes effect on the next tick rather
+    // than needing an agent restart.
+    ("sentinel.scan", Duration::seconds(60), Duration::seconds(5)),
 ];
 
 pub struct Scheduler {
@@ -139,6 +150,7 @@ impl Scheduler {
             "cert.expire-stale" => self.expire_stale_certificates().await,
             "session.purge" => self.purge_sessions().await,
             "audit.purge" => self.purge_audit().await,
+            "sentinel.scan" => self.sentinel_scan().await,
             // A job left in the database by an older version. Not an error; it
             // simply has no handler any more.
             other => {
@@ -443,6 +455,32 @@ impl Scheduler {
             .await;
         let n = db.purge_audit(days).await.map_err(|e| e.to_string())?;
         Ok(if n == 0 { String::new() } else { format!("purged {n} audit row(s)") })
+    }
+
+    // -----------------------------------------------------------------------
+    // Sentinel
+    // -----------------------------------------------------------------------
+
+    /// One Sentinel pass (spec §11.9).
+    ///
+    /// No task row and no `TaskLog`, unlike a renewal: this runs every minute
+    /// and is silent on the overwhelming majority of ticks, so giving each one
+    /// a task would bury the tasks a human actually started under a thousand
+    /// empty rows a day. The bans it *does* place are recorded in
+    /// `sentinel_bans` and in the audit trail, which is where somebody looking
+    /// for "why was this address blocked" would go anyway.
+    ///
+    /// While `sentinel.enabled` is false — the default on a fresh install —
+    /// this returns immediately without reading the journal at all, so the job
+    /// existing in the schedule costs a settings lookup and nothing more.
+    async fn sentinel_scan(&self) -> Result<String, String> {
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("sentinel.scan"),
+        );
+        ferrum_ops::fwops::sentinel_tick(&ctx)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -21,6 +21,26 @@ pub mod keys {
     pub const FORCE_ADMIN_2FA: &str = "security.force_admin_2fa";
     /// Schema-independent marker for "the installer finished".
     pub const SETUP_COMPLETE: &str = "setup.complete";
+
+    // -- Sentinel, the built-in brute-force defence (spec §11.9) -------------
+    //
+    // Defaults live in `ferrum_ops::fwops::SentinelSettings`, not here, because
+    // an *absent* key must read as the default: seeding rows at install time
+    // would mean an upgrade could never change a default it had already
+    // written into every database.
+
+    /// Master switch. **Defaults to false** — a fresh install must never start
+    /// banning addresses before its operator has told it which ones matter.
+    pub const SENTINEL_ENABLED: &str = "sentinel.enabled";
+    /// Failed SSH authentications within the window that earn a ban.
+    pub const SENTINEL_SSH_THRESHOLD: &str = "sentinel.ssh_threshold";
+    /// How far back each scan looks, in minutes.
+    pub const SENTINEL_WINDOW_MINUTES: &str = "sentinel.window_minutes";
+    /// How long a ban lasts, in minutes.
+    pub const SENTINEL_BAN_MINUTES: &str = "sentinel.ban_minutes";
+    /// Addresses and CIDRs Sentinel must never ban, on top of the built-in
+    /// refusals (loopback, this host's own addresses, the caller's address).
+    pub const SENTINEL_ALLOWLIST: &str = "sentinel.allowlist";
 }
 
 impl Db {

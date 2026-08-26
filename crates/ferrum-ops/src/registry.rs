@@ -270,6 +270,14 @@ impl OpRegistry {
         registry.register(crate::plan::Assign);
         registry.register(crate::plan::Suspend::live());
         registry.register(crate::plan::Unsuspend::live());
+        registry.register(crate::fwops::PortOpen);
+        registry.register(crate::fwops::PortClose);
+        registry.register(crate::fwops::Rules);
+        registry.register(crate::fwops::Ban);
+        registry.register(crate::fwops::Unban);
+        registry.register(crate::fwops::Bans);
+        registry.register(crate::fwops::SettingsGet);
+        registry.register(crate::fwops::SettingsSet);
         registry
     }
 
