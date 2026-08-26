@@ -261,6 +261,8 @@ impl OpRegistry {
         registry.register(crate::quota::Set);
         registry.register(crate::quota::Usage);
         registry.register(crate::quota::Backend);
+        registry.register(crate::sftp::Enable);
+        registry.register(crate::sftp::Disable);
         registry
     }
 

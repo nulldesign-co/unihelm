@@ -46,6 +46,7 @@ use crate::auth::CurrentUser;
         super::sites::drift,
         super::panel_tls::issue,
         super::panel_tls::status,
+        super::quota::backend,
         super::certs::issue,
         super::certs::list,
         super::tasks::list,

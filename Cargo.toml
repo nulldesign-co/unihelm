@@ -60,6 +60,9 @@ toml = "0.8"
 rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
+# sha512-crypt for /etc/shadow: sshd/PAM verify tenant SFTP passwords through
+# crypt(3), which cannot read the panel's argon2 hashes (see ops::sftp).
+sha-crypt = "0.6.0"
 
 # CI-enforced budgets (spec §3) depend on a small, stripped binary.
 # NOTE: panic stays `unwind` on purpose — ferrum-web wraps handlers in

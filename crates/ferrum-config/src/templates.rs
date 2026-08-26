@@ -57,6 +57,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         "nginx/adminer.conf",
         include_str!("../templates/nginx/adminer.conf.j2"),
     ),
+    (
+        "ssh/sftp.conf",
+        include_str!("../templates/ssh/sftp.conf.j2"),
+    ),
 ];
 
 pub struct TemplateSet {

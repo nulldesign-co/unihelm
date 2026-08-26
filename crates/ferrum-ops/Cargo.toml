@@ -40,6 +40,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # deserialization and kills the whole order, even for an HTTP-01-only client.
 instant-acme = { version = "0.8.5", features = ["rcgen", "time", "x509-parser"] }
 time = { workspace = true }
+# Salt generation for the sha512-crypt hashes below.
+# sha512-crypt hashes for `usermod --password`: /etc/shadow must hold a hash
+# crypt(3) understands, and the panel's argon2 hashes are not that (sftp.rs).
+sha-crypt = { workspace = true }
 x509-parser = "0.18.1"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
 

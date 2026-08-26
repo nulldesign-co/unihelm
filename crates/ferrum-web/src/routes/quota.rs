@@ -18,6 +18,17 @@ use crate::state::SharedState;
 
 /// Which rung of the quota enforcement ladder this server landed on:
 /// XFS project quotas, ext4 user quotas, or the unenforced du fallback.
+#[utoipa::path(
+    get,
+    path = "/api/server/quota-backend",
+    tag = "server",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The detected quota backend and why", body = serde_json::Value),
+        (status = 403, description = "`permission_denied`", body = crate::error::ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = crate::error::ApiErrorBody),
+    ),
+)]
 pub async fn backend(
     State(state): State<SharedState>,
     current: CurrentUser,
