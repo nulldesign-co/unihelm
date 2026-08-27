@@ -754,3 +754,203 @@ The mirror image: mark the subscription active first, then re-render each site
 from its own stored flags. That last detail matters — a site the tenant had put
 into maintenance mode themselves comes back in maintenance, because suspension
 never rewrote their settings.
+
+## Firewall and Sentinel
+
+The backend is the truth and the database is the intent. Every read merges the
+two and flags the difference, because a rule the panel believes in and the
+firewall has never heard of is exactly the state an operator needs told about.
+On a host with no firewall at all the backend is `none`, and these operations
+say so rather than reporting a success they did not achieve.
+
+### `fw.port.open`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `port`; `proto` — `tcp` or `udp`; `source` — optional CIDR, absent means anywhere; `comment` — optional |
+
+Opens a port in whichever backend owns the ruleset, then records the intent.
+That order matters: a rule recorded but never applied would make the panel
+claim a hole exists that does not. `source` is a literal address or CIDR, never
+a hostname — a rule whose meaning depends on DNS at apply time is a rule nobody
+can audit.
+
+### `fw.port.close`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | the same fields as `fw.port.open` |
+
+Removes a rule **the panel created**. Rules the operator wrote by hand are
+never touched: every rule Ferrum adds carries a `ferrum:` comment, and that
+mark is what tells them apart.
+
+### `fw.rules`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | none |
+
+The merged view: the backend's live rules, the panel's recorded intent, and a
+drift flag on each. Also reports which backend was detected and whether it is
+actually running — a stopped firewall with rules in it protects nothing.
+
+### `fw.ban`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `ip`; `minutes` — absent means the configured default, `0` means permanent; `reason`; `client_ip` — filled in by the web layer from the live connection |
+
+Drops an address at the firewall and records the ban with its expiry. Bans go
+into an ipset or an nft set rather than one rule each, because Sentinel can
+accumulate thousands and a thousand rules is a linear scan per packet.
+
+`client_ip` exists for one reason: **the operator cannot ban themselves.** That
+address, loopback, and the server's own addresses are all refused. A panel that
+lets an admin lock themselves out of the machine over the network has turned a
+security feature into an outage.
+
+### `fw.unban`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `ip` |
+
+Lifts a ban in the backend and closes the record. An address the backend has
+already expired is not an error — that is the state we wanted.
+
+### `fw.bans`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `limit` — optional |
+
+Recorded bans, plus an `unrecorded` list of addresses the backend is blocking
+that the panel has no row for. Those are somebody else's rules or a leftover
+from a previous install, and listing them separately is how an operator finds
+out why an address they never banned cannot reach the box.
+
+### `sentinel.settings`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | none |
+
+Sentinel's configuration: `enabled`, `ssh_threshold`, `window_minutes`,
+`ban_minutes`.
+
+### `sentinel.settings.set`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `enabled`, `ssh_threshold`, `window_minutes`, `ban_minutes` |
+
+The switch that turns the brute-force defence on. **Off on a fresh install**,
+deliberately: the scan runs every minute either way, but returns before reading
+anything while `enabled` is false. A panel that starts banning addresses before
+anybody asked it to is a panel that eventually bans its own operator during
+setup.
+
+## Alerts and notifications
+
+An alert is a *span*, not an event: it opens when a reading crosses the
+threshold and closes when it comes back past it by a hysteresis band. Only the
+edges of that span send a message, which is why a disk sitting at 90% produces
+one notification and not one a minute. The "one open event per rule and
+subject" rule is a partial unique index in the database rather than application
+logic, so two overlapping evaluation passes cannot both open one.
+
+### `alert.rules.list`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | none |
+
+Every rule, the currently open events, and the list of rule kinds this build
+understands.
+
+### `alert.rules.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `kind` — `disk_pct`, `mem_pct`, `load`, `service_down`, `cert_expiry_days`; `target` — the mount point or unit the rule is about, where the kind takes one; `threshold`; `enabled` |
+
+Creates or updates a rule. Thresholds that could never stop firing are refused
+(a disk rule at 0%, a certificate rule at 90 days on a 90-day certificate), and
+so is a `target` on a kind that has nothing to target.
+
+### `alert.events.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `limit` — optional; `open_only` |
+
+Alert history. `server_read` rather than `server_manage` because this is
+dashboard content — the secrets live behind the channel operations below.
+
+### `alert.channels.list`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | none |
+
+Configured notifiers. The sealed configuration is `#[serde(skip)]`, so a
+webhook URL or a bot token cannot leave through this operation even by mistake.
+
+### `alert.channels.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `id` — absent creates; `kind` — `webhook` or `telegram`; `label`; the channel's configuration |
+
+Creates or updates a notifier. The configuration is sealed with the master key
+before it is stored. A Telegram bot token is validated on the way in **and** on
+the way out: it is interpolated into the request path, so a token containing a
+slash or a question mark would aim the request somewhere else entirely, and a
+hand-edited database row must not be able to do that.
+
+### `alert.channels.delete`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `id` |
+
+### `alert.channels.test`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `id` |
+
+Sends one message through the channel and reports whether it was delivered. The
+point is to find out that a webhook is wrong now, rather than at three in the
+morning when the disk fills.
