@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod apps;
 pub mod auth;
 pub mod certs;
+pub mod cron;
 pub mod databases;
 pub mod events;
 pub mod files;
@@ -108,6 +109,11 @@ fn protected() -> Router<SharedState> {
         .route("/api/apps/{id}", axum::routing::delete(apps::delete))
         .route("/api/apps/{id}/restart", post(apps::restart))
         .route("/api/apps/{id}/logs", get(apps::logs))
+        .route("/api/cron", get(cron::list).post(cron::create))
+        .route(
+            "/api/cron/{id}",
+            axum::routing::put(cron::update).delete(cron::delete),
+        )
 }
 
 /// Routes reachable without a session.

@@ -20,6 +20,7 @@ pub mod acme;
 pub mod adminer;
 pub mod alerts;
 pub mod cert;
+pub mod cron;
 pub mod db;
 pub mod fpm;
 pub mod fsops;
