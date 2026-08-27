@@ -22,6 +22,7 @@ pub mod cert;
 pub mod db;
 pub mod fpm;
 pub mod fsops;
+pub mod fwops;
 pub mod metrics;
 pub mod panel;
 pub mod php;
