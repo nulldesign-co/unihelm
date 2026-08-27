@@ -137,6 +137,18 @@ pub fn fpm_pool_dir(family: Family, version: PhpVersion) -> PathBuf {
     }
 }
 
+/// Where MariaDB reads drop-in configuration from.
+///
+/// Both families include a directory rather than expecting edits to the main
+/// file, which is what lets the panel own one file completely and never touch
+/// the distribution's (spec §10.4).
+pub fn mysql_conf_d(family: Family) -> PathBuf {
+    match family {
+        Family::Debian => under("/etc/mysql/mariadb.conf.d"),
+        Family::Rhel => under("/etc/my.cnf.d"),
+    }
+}
+
 pub fn fpm_pool_file(family: Family, version: PhpVersion, site: &str) -> PathBuf {
     fpm_pool_dir(family, version).join(format!("ferrum-{site}.conf"))
 }

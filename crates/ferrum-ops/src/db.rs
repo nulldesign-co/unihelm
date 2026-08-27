@@ -95,6 +95,15 @@ fn shell() -> Arc<dyn DbShell> {
     Arc::new(SystemShell)
 }
 
+/// Run one job through the installed shell.
+///
+/// The public entry point for modules outside this one — `harden` uses it to
+/// run the post-install SQL — so they get the same argv discipline, the same
+/// secret handling, and the same test recorder.
+pub async fn run_sql(job: &SqlJob) -> Result<CmdOutput> {
+    execute(shell().as_ref(), job).await
+}
+
 /// Run a job and turn a non-zero exit into an error — with the client's own
 /// diagnostics when they are safe to show, and without them when the statement
 /// carried a credential (both engines echo parts of a failing statement).

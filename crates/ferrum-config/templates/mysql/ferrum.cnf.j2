@@ -1,0 +1,19 @@
+[mariadbd]
+# Loopback only.
+#
+# The MariaDB.org packages ship with `bind_address` unset, which means every
+# interface. On a hosting server with no firewall — the honest common case, and
+# what a live AlmaLinux box actually did — that puts the database on the public
+# internet the moment it starts.
+#
+# Remote access stays a supported feature (spec §11.6); it is just no longer
+# the default you wake up in. Turning it on means changing this managed file and
+# opening a firewall port, both of which the panel audits.
+bind-address = 127.0.0.1
+
+# Match accounts by address, never by reverse DNS.
+#
+# With name resolution on, every connection costs a DNS lookup and every
+# host-based grant depends on what the resolver says at that moment. A slow
+# resolver becomes a slow login; a wrong PTR becomes a wrong grant.
+skip-name-resolve = ON

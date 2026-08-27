@@ -76,6 +76,39 @@ impl Validator for FpmValidator {
     }
 }
 
+/// `mariadbd --help --verbose`, which parses the whole configuration and exits.
+///
+/// MariaDB has no dedicated config-test flag. This is the documented stand-in:
+/// it reads every file and drop-in and fails on a bad option, without touching
+/// the data directory or binding a port — so a typo in a managed drop-in is
+/// caught before the restart instead of by it.
+pub struct MariaDbValidator;
+
+#[async_trait]
+impl Validator for MariaDbValidator {
+    fn name(&self) -> &'static str {
+        "mariadbd --help --verbose"
+    }
+
+    async fn validate(&self) -> Result<(), String> {
+        match Cmd::new("mariadbd")
+            .args(["--help", "--verbose"])
+            .run()
+            .await
+        {
+            Ok(out) if out.success() => Ok(()),
+            Ok(out) => Err(out.failure_text()),
+            // Not installed yet: the config engine writes the drop-in before
+            // the first start on a fresh install, and a validator that fails
+            // for "the binary is missing" would block that.
+            Err(e) => {
+                tracing::debug!(error = %e, "mariadbd not runnable; skipping validation");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Reload a managed unit.
 pub struct UnitReloader {
     distro: Distro,
@@ -92,6 +125,16 @@ impl UnitReloader {
             distro: distro.clone(),
             unit: ManagedUnit::Nginx,
             action: SvcAction::Reload,
+        }
+    }
+
+    /// MariaDB has no reload that re-reads `bind-address`: the listener is
+    /// bound at start-up, so making it loopback-only means a restart.
+    pub fn mariadb(distro: &Distro) -> Self {
+        Self {
+            distro: distro.clone(),
+            unit: ManagedUnit::MariaDb,
+            action: SvcAction::Restart,
         }
     }
 

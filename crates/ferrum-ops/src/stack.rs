@@ -367,6 +367,10 @@ async fn install_component(
     if component == StackComponent::Nginx {
         bootstrap_nginx(ctx).await?;
     }
+    // A database the panel installed is a database the panel is answerable for.
+    if component == StackComponent::Mariadb {
+        crate::harden::mariadb(ctx).await?;
+    }
     if let StackComponent::Php { version } = component {
         // Before it starts, so the stock `www` pool never gets to spawn a
         // single worker as the web server user.

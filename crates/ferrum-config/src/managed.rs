@@ -336,6 +336,16 @@ impl ManagedFile {
         }
     }
 
+    /// A MariaDB drop-in. Read by `mariadbd` as root before it drops to the
+    /// `mysql` user, and hash-commented like the rest of the my.cnf family.
+    pub fn mysql(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: 0o644,
+            comment_style: CommentStyle::Hash,
+        }
+    }
+
     pub fn state(&self) -> FileState {
         inspect(&self.path)
     }

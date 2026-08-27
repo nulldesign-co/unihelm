@@ -62,6 +62,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../templates/nginx/adminer.conf.j2"),
     ),
     (
+        "mysql/ferrum.cnf",
+        include_str!("../templates/mysql/ferrum.cnf.j2"),
+    ),
+    (
         "ssh/sftp.conf",
         include_str!("../templates/ssh/sftp.conf.j2"),
     ),
