@@ -954,3 +954,147 @@ hand-edited database row must not be able to do that.
 Sends one message through the channel and reports whether it was delivered. The
 point is to find out that a webhook is wrong now, rather than at three in the
 morning when the disk fills.
+
+## Node applications
+
+A Node app is four things that have to agree: a **row** (which owns the port), a
+**directory** in the tenant's home, a **systemd unit** running as the tenant
+inside the tenant's slice, and — optionally — a **reverse-proxy vhost** in front
+of it. `app.create` builds them in that order and unwinds in the reverse one,
+because the state that hurts is the half-created app: a port marked taken with
+nothing listening, or a unit nobody has a row for.
+
+The port is allocated *inside* the `INSERT`, not read-then-written. The vhost has
+to name the port before anything has ever bound it, so "bind and see what you
+get" is not available; two concurrent creates must therefore not be able to
+compute the same answer, and `port INTEGER NOT NULL UNIQUE` means that even if
+they do, exactly one insert survives. Freed ports are reused — smallest free
+number in 20000–25000 — because leaking one per deleted app would exhaust the
+range after 5001 create/delete cycles on a box hosting three apps.
+
+Everything a tenant supplies is validated twice: once by the newtypes
+(`AppName`, `TenantPath`, `Domain`) at deserialization, and again against
+*systemd's* own syntax on the way into the unit file. A unit file is a place
+where one unescaped newline turns a value into a directive and where `%` is a
+specifier expanded before anything else reads the line, so the template only
+interpolates — it makes no decisions.
+
+### `app.list`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | immediate |
+| Input | `limit` *(optional i64, default 100)*, `offset` *(optional i64, default 0)* |
+
+Every app visible in the caller's tenant scope, each with its stored row (name,
+entry, port, `NODE_ENV`, proxy site id), the systemd unit it maps to, that
+unit's current state and its resident memory. The state comes from systemd
+rather than from the row on purpose: the row says what the panel intended, and
+an app that crash-looped overnight is exactly the case where those two differ.
+A unit systemd has never heard of reports `not_found` instead of failing the
+listing, so one broken app cannot blank the page.
+
+### `app.create`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | task — not cancellable, **not** idempotent |
+| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |
+
+Allocates a port, creates `<home>/apps/<name>` owned by the tenant at `0750`,
+writes the slice drop-in, writes and verifies the unit, enables it (so a reboot
+brings the app back — spec §11.6) and starts it. With `proxy_domain` it then
+calls `site.create` with `SiteType::Proxy` pointing at the allocated port.
+
+The order is the design. The slice drop-in is written **before the first
+start**, so an app is never outside its tenant's memory and CPU ceiling, not
+even for a second — `MemoryMax` on the unit is the app's own ceiling, the slice
+is the tenant's. The vhost is written **last**, because pointing a proxy at a
+port nothing is listening on 502s for as long as the start takes. On any
+failure the operation unwinds in reverse — disable, remove the unit files,
+delete the row — but deliberately leaves the app *directory* alone: it may
+already hold the tenant's code, and deleting somebody's source because their
+app failed to start is not a trade this panel makes.
+
+Publishing calls the existing site machinery rather than rendering a
+node-flavoured vhost, so domain-conflict detection, the plan's site limit, the
+nginx validate/rollback cycle and logrotate all keep working from one
+implementation. It also requires `site_manage` **in addition to** `node_apps`:
+creating a site is creating a site, whichever operation asks for it.
+
+Three refusals are worth knowing about, because each is a systemd rule rather
+than a Ferrum preference:
+
+- `PORT` and `NODE_ENV` cannot appear in `env`. The panel sets both, systemd
+  keeps the *last* assignment of a name, and a tenant override would either
+  break the proxy wiring or contradict the stored row. The panel's two are also
+  emitted first, so even a value that slipped past validation could not shadow
+  them.
+- A value containing `"`, `\`, a newline or any control character is refused
+  outright rather than escaped. The escape rules differ between systemd's quoted
+  and unquoted forms, and a value that needs them is a configuration mistake
+  worth naming. Whitespace is fine — the assignment is quoted whole — and `%` is
+  escaped to `%%`, so a threshold of `100%h` reaches the app as `100%h` and not
+  as `100/root`.
+- An `entry` containing a space, `%`, a quote or `$` is refused: `TenantPath`
+  already blocks traversal and control characters, but `ExecStart` would split
+  on the space and expand the specifier. Rename the file.
+
+`app.create` also refuses, naming what to install, when there is no `node`
+binary in the system directories — it will not add a package repository as a
+side effect of creating an app. The plan's `can_node_apps` flag is checked
+against the **target** subscription, which is a different question from the
+caller's permission whenever an admin or reseller creates an app for a
+customer. Not idempotent: it makes an account, a directory and a port
+allocation, so a re-run is a second attempt rather than a converging one.
+
+### `app.delete`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | task — not cancellable, idempotent |
+| Input | `app_id` |
+
+`systemctl disable --now`, then the unit file and its slice drop-in, then the
+row — stop serving before removing what was served, and free the port *last* so
+the next app cannot be handed a number a stale service still binds. A unit that
+is already gone is logged and stepped over rather than failing the delete:
+deletes get retried, and the row must still go.
+
+The app's proxy site is deliberately left standing, and its id is returned as
+`orphaned_site_id` so the UI can offer to remove it. Deleting a tenant's domain
+as a side effect of removing an application is the kind of surprise a panel does
+not get to spring; `site.delete` is one click away.
+
+### `app.restart`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | task — not cancellable, idempotent |
+| Input | `app_id` |
+
+`systemctl restart` on the app's unit. A task rather than an immediate
+operation because restart waits for the unit to stop and come back, which for an
+app with open connections is seconds. A missing unit gets a sentence saying the
+unit file is gone and the app should be recreated, rather than systemd's "Unit
+not found" — the two failures look identical from the outside and have entirely
+different fixes.
+
+### `app.logs`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | immediate |
+| Input | `app_id`; `lines` *(optional u32, default 200, clamped to 1–2000)* |
+
+The tail of the app's journal, as lines. The security property is in what the
+input *cannot* say: there is no field here that names a unit. The unit is
+derived from a row the caller's scope could already see, so no caller can read
+`sshd.service`'s journal through an app they own. The line cap bounds one IPC
+frame rather than the operator's access to their logs — the journal itself keeps
+far more, and a narrower window is one more request away.

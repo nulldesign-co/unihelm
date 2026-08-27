@@ -66,6 +66,11 @@ use crate::auth::CurrentUser;
         super::alerts::channels_set,
         super::alerts::channels_delete,
         super::alerts::channels_test,
+        super::apps::list,
+        super::apps::create,
+        super::apps::delete,
+        super::apps::restart,
+        super::apps::logs,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -79,6 +84,7 @@ use crate::auth::CurrentUser;
         (name = "certificates", description = "TLS issuance and inventory"),
         (name = "tasks", description = "Long-running work: polling and logs"),
         (name = "alerts", description = "Alert rules, alert history and notifier channels"),
+        (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -180,9 +186,8 @@ mod tests {
         "/api/cron",
         "/api/dns",
         "/api/backups",
-        "/api/apps",
-        // `/api/plans` is deliberately absent: the plans area is annotated and
-        // documented, so drift detection covers it again.
+        // `/api/plans` and `/api/apps` are deliberately absent: both areas are
+        // annotated and documented, so drift detection covers them again.
         "/api/firewall",
     ];
 
