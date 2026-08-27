@@ -22,6 +22,8 @@ pub mod rbac;
 pub use config::{FerrumConfig, LogFormat};
 pub use error::{ErrorCode, FerrumError, Result};
 pub use ids::{PlanId, SiteId, SubscriptionId, TaskId, UserId};
-pub use newtypes::{DbName, Domain, Email, LinuxUser, PhpVersion, Port, TenantPath, Username};
+pub use newtypes::{
+    AppName, DbName, Domain, Email, LinuxUser, PhpVersion, Port, TenantPath, Username,
+};
 pub use plan::{CountedResource, PlanFeatures, PlanLimits, QuotaUsage};
 pub use rbac::{AuthContext, Permission, Role, TenantScope};

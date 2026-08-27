@@ -1,0 +1,59 @@
+{# One tenant Node application (spec §11.6): a systemd service running as the
+   tenant, inside the tenant's slice (the Slice= assignment is a drop-in this
+   template deliberately does not carry — see ferrum_ops::slices). Rendered by
+   ferrum_ops::nodeapp.
+
+   Every value interpolated here has been through a validated newtype: AppName
+   for the name, LinuxUser for the account, TenantPath plus an extra
+   unit-safety pass for the entry, and pre-formatted `Environment=` payloads
+   built (and %-escaped) in Rust, because systemd's quoting rules are not
+   something a template should be trusted to get right. #}
+[Unit]
+Description=Ferrum Node app {{ app.name }} ({{ app.linux_user }})
+{# The app almost certainly talks to something. network-online.target is the
+   one that actually waits for an address, unlike network.target. #}
+After=network-online.target
+Wants=network-online.target
+{# StartLimit* live in [Unit], not [Service]: systemd moved them there in v229
+   and only still parses the [Service] spelling for compatibility, with a
+   warning that `systemd-analyze verify` reports. Paired with Restart=always
+   below, they stop a crash loop on a syntax error after five failures in a
+   minute, so one broken app cannot spin a core or drown the journal. #}
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={{ app.linux_user }}
+Group={{ app.linux_user }}
+WorkingDirectory={{ app.working_dir }}
+ExecStart={{ app.node_binary }} {{ app.entry_path }}
+{% for line in app.environment %}
+Environment={{ line }}
+{% endfor %}
+{# A delay before each retry, so a crash loop leaves the journal readable; the
+   ceiling on those retries is the [Unit] StartLimit pair above. #}
+Restart=always
+RestartSec=2s
+{% if app.memory_max_mb %}
+{# The app's own ceiling, inside (never above) the tenant slice's. The kernel
+   OOM-kills the app, not the server (spec §11.6 AC). #}
+MemoryMax={{ app.memory_max_mb }}M
+{% endif %}
+{# Explicit rather than relying on the default, because `app.logs` reads the
+   journal and a distro that redirected output elsewhere would make the log
+   viewer silently empty. #}
+StandardOutput=journal
+StandardError=journal
+
+{# Hardening. Deliberately NOT ProtectHome: the application and its
+   node_modules live in the tenant's home, so hiding /home would leave nothing
+   to execute. NoNewPrivileges closes every setuid path out of the tenant
+   account; ProtectSystem=full makes /usr, /boot and /etc read-only, which a
+   web app never legitimately writes to. #}
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

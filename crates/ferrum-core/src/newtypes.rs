@@ -563,6 +563,65 @@ impl Port {
 }
 
 // ---------------------------------------------------------------------------
+// AppName
+// ---------------------------------------------------------------------------
+
+/// The name of a tenant's Node application (spec §11.6).
+///
+/// This one string ends up in three places that each have their own idea of
+/// what a dangerous character is, so the alphabet is the intersection of all
+/// three:
+///
+/// - a **systemd unit name** (`ferrum-app-<user>-<name>.service`), where a
+///   newline would end the `Description=` line and start a directive of the
+///   attacker's choosing, and where `%` is a specifier systemd expands;
+/// - a **filesystem path** (`<home>/apps/<name>`), where `/` and `..` would
+///   leave the tenant's home;
+/// - the **argv of `systemctl`**, where argv arrays already make quoting moot
+///   but a leading `-` would still be read as an option.
+///
+/// `[a-z0-9][a-z0-9_-]*`, 1–32 characters, lowercased on the way in. Nothing
+/// in that alphabet needs quoting anywhere, which is the point: the type is the
+/// proof, not a promise made at each of the three call sites.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AppName(String);
+
+impl AppName {
+    pub fn parse(input: &str) -> Result<Self> {
+        let s = input.trim().to_ascii_lowercase();
+        if s.is_empty() || s.len() > 32 {
+            return Err(
+                err(ErrorCode::InvalidInput, "app name must be 1-32 characters").with_field("name"),
+            );
+        }
+        let first = s.bytes().next().unwrap();
+        if !first.is_ascii_alphanumeric() {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "app name must start with a letter or digit",
+            )
+            .with_field("name"));
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        {
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "app name may only contain a-z, 0-9, underscore and hyphen",
+            )
+            .with_field("name"));
+        }
+        Ok(Self(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Boilerplate: Display / AsRef / TryFrom / Into for every string newtype
 // ---------------------------------------------------------------------------
 
@@ -594,7 +653,7 @@ macro_rules! string_newtype_impls {
     )*};
 }
 
-string_newtype_impls!(Domain, LinuxUser, Username, Email, DbName, TenantPath);
+string_newtype_impls!(AppName, Domain, LinuxUser, Username, Email, DbName, TenantPath);
 
 impl fmt::Display for PhpVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -844,6 +903,61 @@ mod tests {
                 .as_str(),
             "example.com"
         );
+    }
+
+    #[test]
+    fn app_name_accepts_ordinary_names_and_lowercases() {
+        assert_eq!(AppName::parse("Blog").unwrap().as_str(), "blog");
+        assert_eq!(AppName::parse(" api-v2 ").unwrap().as_str(), "api-v2");
+        assert_eq!(AppName::parse("next_app3").unwrap().as_str(), "next_app3");
+    }
+
+    #[test]
+    fn app_name_rejects_everything_that_would_escape_a_unit_file_or_a_path() {
+        // Each of these is a live hazard somewhere the name is used: the first
+        // group would write directives into the generated unit, the second
+        // would leave `<home>/apps/`, `%h` is a systemd specifier that expands,
+        // and a leading `-` reads as an option in argv.
+        for bad in [
+            "",
+            "a b",
+            "app\nExecStart=/bin/sh",
+            "app\rReboot",
+            "app\0",
+            "app;reboot",
+            "app$(id)",
+            "app\"quoted\"",
+            "../../etc/systemd/system/evil",
+            "apps/blog",
+            "a%hb",
+            "-flag",
+            "_leading",
+            "app.service",
+            "app@1",
+            &"a".repeat(33),
+        ] {
+            assert!(
+                AppName::parse(bad).is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn app_names_compose_into_valid_unit_names_and_paths() {
+        // The reason the alphabet is what it is: every accepted name has to
+        // survive being pasted into a unit file name and a path without
+        // quoting or escaping.
+        for name in ["a", "blog", "api-v2", "next_app3", &"z".repeat(32)] {
+            let app = AppName::parse(name).unwrap();
+            let unit = format!("ferrum-app-ft_abc12345-{app}.service");
+            assert!(
+                unit.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+                "`{unit}` contains something systemd would have to quote"
+            );
+            assert!(!app.as_str().contains('/'));
+        }
     }
 
     #[test]

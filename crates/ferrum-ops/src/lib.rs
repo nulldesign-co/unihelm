@@ -25,6 +25,7 @@ pub mod fpm;
 pub mod fsops;
 pub mod fwops;
 pub mod metrics;
+pub mod nodeapp;
 pub mod panel;
 pub mod php;
 pub mod plan;

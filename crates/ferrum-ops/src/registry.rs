@@ -285,6 +285,11 @@ impl OpRegistry {
         registry.register(crate::alerts::ChannelsSet);
         registry.register(crate::alerts::ChannelsDelete);
         registry.register(crate::alerts::ChannelsTest::live());
+        registry.register(crate::nodeapp::List);
+        registry.register(crate::nodeapp::Create::live());
+        registry.register(crate::nodeapp::Delete);
+        registry.register(crate::nodeapp::Restart);
+        registry.register(crate::nodeapp::Logs);
         registry
     }
 
