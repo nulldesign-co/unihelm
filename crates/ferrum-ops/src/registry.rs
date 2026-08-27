@@ -270,6 +270,13 @@ impl OpRegistry {
         registry.register(crate::plan::Assign);
         registry.register(crate::plan::Suspend::live());
         registry.register(crate::plan::Unsuspend::live());
+        registry.register(crate::alerts::RulesList);
+        registry.register(crate::alerts::RulesSet);
+        registry.register(crate::alerts::EventsList);
+        registry.register(crate::alerts::ChannelsList);
+        registry.register(crate::alerts::ChannelsSet);
+        registry.register(crate::alerts::ChannelsDelete);
+        registry.register(crate::alerts::ChannelsTest::live());
         registry
     }
 
