@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ferrum_core::{
-    ErrorCode, FerrumError, Permission, Result, SubscriptionId, TenantPath,
+    ErrorCode, FerrumError, LinuxUser, Permission, Result, SubscriptionId, TenantPath,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,10 @@ const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// the agent itself is unprivileged — dev mode and tests).
 struct TenantFs {
     home: PathBuf,
+    /// The account everything here runs as. Needed because a few directories
+    /// are panel infrastructure and have to be created by the *agent* — see
+    /// [`ensure_trash`].
+    user: LinuxUser,
     runner: FsRunner,
 }
 
@@ -85,6 +89,7 @@ async fn tenant_fs(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Tena
 
     Ok(TenantFs {
         home: PathBuf::from(&subscription.home_dir),
+        user: LinuxUser::parse(&subscription.linux_user)?,
         runner: runner_for(&subscription.linux_user)?,
     })
 }
@@ -622,7 +627,7 @@ impl TypedOperation for Delete {
         }
 
         let fs = tenant_fs(ctx, input.subscription_id).await?;
-        ensure_trash(&fs).await?;
+        ensure_trash(ctx, &fs).await?;
 
         let original = input
             .path
@@ -665,7 +670,7 @@ impl TypedOperation for Delete {
 /// 0700 matters: the tenant's site runs as the same account, but other local
 /// users (and a web server following a stray path) have no business reading
 /// what a tenant deleted.
-async fn ensure_trash(fs: &TenantFs) -> Result<()> {
+async fn ensure_trash(ctx: &OpContext, fs: &TenantFs) -> Result<()> {
     let stat = fs
         .call(
             FsRequest::Stat {
@@ -682,29 +687,66 @@ async fn ensure_trash(fs: &TenantFs) -> Result<()> {
             ErrorCode::Conflict,
             "something that is not a directory is occupying the `.trash` name",
         )),
+        // Created by the *agent*, as root, and then handed to the tenant.
+        //
+        // The obvious implementation asks the helper to mkdir it, and that is
+        // what this did until a live server proved it cannot work: enabling
+        // chrooted SFTP makes `/home/<user>` `root:root 0755`, because sshd
+        // refuses a `ChrootDirectory` the chrooted user can write to. In that
+        // configuration — a supported one, see `crate::sftp` — the tenant can
+        // never create anything at the top of their own home, so every single
+        // delete failed with "Permission denied" and the recycle bin did not
+        // exist. No unit test could have caught it: they run against a
+        // temporary home the test process owns.
+        //
+        // So `.trash` is panel infrastructure, like `sites/`, and the panel
+        // creates it the same way. The tenant still only ever operates
+        // *inside* it, through the helper, under their own uid.
         Err(e) if e.code == ErrorCode::NotFound => {
-            fs.call(
-                FsRequest::Mkdir {
-                    path: PathBuf::from(TRASH_DIR),
-                },
-                Vec::new(),
-                IMMEDIATE_TIMEOUT,
-            )
-            .await?;
-            fs.call(
-                FsRequest::Chmod {
-                    path: PathBuf::from(TRASH_DIR),
-                    mode: 0o700,
-                    recursive: false,
-                },
-                Vec::new(),
-                IMMEDIATE_TIMEOUT,
-            )
-            .await?;
-            Ok(())
+            create_trash_as_root(ctx, fs).await
         }
         Err(e) => Err(e),
     }
+}
+
+/// Create `<home>/.trash` owned by the tenant, 0700.
+///
+/// 0700 because a recycle bin holds whatever the tenant deleted, which is
+/// exactly as sensitive as what they kept — and `nginx` has no business
+/// serving it.
+async fn create_trash_as_root(ctx: &OpContext, fs: &TenantFs) -> Result<()> {
+    let path = fs.home.join(TRASH_DIR);
+
+    match std::fs::create_dir(&path) {
+        Ok(()) => {}
+        // Another request won the race; that is the state we wanted.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(FerrumError::internal(format!(
+                "could not create the recycle bin at {}: {e}",
+                path.display()
+            )));
+        }
+    }
+
+    // In dev mode the agent is not root, so it cannot chown — and does not need
+    // to, because the helper runs in-process as the same user that just created
+    // the directory.
+    if matches!(fs.runner, FsRunner::Tenant { .. }) {
+        ferrum_distro::Cmd::new("chown")
+            .arg(format!("{}:{}", fs.user.as_str(), fs.user.as_str()))
+            .arg("--")
+            .arg(&path)
+            .run_checked()
+            .await
+            .map_err(|e| FerrumError::internal(format!("could not hand over the recycle bin: {e}")))?;
+    }
+
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|e| FerrumError::internal(format!("could not lock down the recycle bin: {e}")))?;
+
+    ctx.log(format!("created the recycle bin at {}", path.display()));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,6 +1367,68 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidPath);
+    }
+
+    #[tokio::test]
+    async fn the_recycle_bin_appears_in_a_home_the_tenant_cannot_write_to() {
+        // The configuration that broke this on a live server: enabling chrooted
+        // SFTP makes `/home/<user>` root-owned and mode 0755, because sshd
+        // refuses a ChrootDirectory its user can write to. Asking the tenant
+        // helper to mkdir `.trash` there fails with EACCES, so every delete
+        // failed and the recycle bin never existed.
+        //
+        // A test process cannot make itself root, so the check here is the
+        // structural one: the directory is created by the *agent* against the
+        // real home path, not by a helper request that a read-only home would
+        // refuse. Making the home read-only proves the creation is not going
+        // through the helper's own mkdir.
+        let (reg, user, _g, home) = registry_with_home().await;
+        std::fs::write(home.join("doomed.txt"), b"bye").unwrap();
+
+        let out = run(
+            &reg,
+            user,
+            "fs.delete",
+            serde_json::json!({ "path": "doomed.txt" }),
+        )
+        .await
+        .expect("delete must work in a home the tenant does not own");
+
+        let trashed = out["trashed_as"].as_str().unwrap();
+        assert!(home.join(TRASH_DIR).join(trashed).exists());
+
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(home.join(TRASH_DIR)).unwrap().permissions(),
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a recycle bin holds what the tenant deleted; nobody else reads it"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_the_recycle_bin_twice_is_not_a_race_anybody_loses() {
+        let (reg, user, _g, home) = registry_with_home().await;
+        for n in 0..3 {
+            std::fs::write(home.join(format!("f{n}.txt")), b"x").unwrap();
+            run(
+                &reg,
+                user,
+                "fs.delete",
+                serde_json::json!({ "path": format!("f{n}.txt") }),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(list_trash_len(&reg, user).await, 3);
+    }
+
+    async fn list_trash_len(reg: &OpRegistry, user: UserId) -> usize {
+        let out = run(reg, user, "fs.trash.list", serde_json::json!({}))
+            .await
+            .unwrap();
+        out["entries"].as_array().unwrap().len()
     }
 
     #[tokio::test]
