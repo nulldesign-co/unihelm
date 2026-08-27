@@ -141,7 +141,17 @@ mod tests {
     /// sees the `mod.rs` it was compiled with, so a parallel branch adding
     /// routes cannot fail *this* build — but the moment their routes merge into
     /// this file, they must be documented or allowlisted below.
-    const ROUTER_SRC: &str = include_str!("mod.rs");
+    /// Every source file that registers routes.
+    ///
+    /// `mod.rs` alone is not enough. A module that builds its own `Router` and
+    /// gets `.merge`d — the file manager does, for its larger body limit — keeps
+    /// all eighteen of its paths inside *its* file, so a scan of `mod.rs` sees
+    /// the `.merge(files::router())` line and nothing else. That is a silent
+    /// hole exactly where drift is hardest to notice, so each sub-router's
+    /// source is scanned too. Adding a sub-router means adding it here; the
+    /// count assertion below is what stops a rename from turning this whole
+    /// test into a no-op.
+    const ROUTER_SRCS: &[&str] = &[include_str!("mod.rs"), include_str!("files.rs")];
 
     /// Routes that are registered but deliberately absent from the document.
     const UNDOCUMENTED: &[&str] = &[
@@ -175,22 +185,26 @@ mod tests {
     /// file the compiler saw is exactly as current as the binary itself.
     fn registered_paths() -> Vec<String> {
         let mut out = Vec::new();
-        let mut rest = ROUTER_SRC;
-        while let Some(pos) = rest.find(".route(") {
-            rest = &rest[pos + ".route(".len()..];
-            // `.route(` may be split from its path literal by a line break
-            // (rustfmt does this for long lines), so skip any whitespace.
-            let after = rest.trim_start();
-            if let Some(quoted) = after.strip_prefix('"') {
-                if let Some(end) = quoted.find('"') {
+        for src in ROUTER_SRCS {
+            let mut rest = *src;
+            while let Some(pos) = rest.find(".route(") {
+                rest = &rest[pos + ".route(".len()..];
+                // `.route(` may be split from its path literal by a line break
+                // (rustfmt does this for long lines), so skip any whitespace.
+                let after = rest.trim_start();
+                if let Some(quoted) = after.strip_prefix('"')
+                    && let Some(end) = quoted.find('"')
+                {
                     out.push(quoted[..end].to_string());
                 }
             }
         }
         assert!(
-            !out.is_empty(),
-            "found no .route(\"...\") calls in routes/mod.rs — the scanner is broken, \
-             which would make the completeness test pass vacuously"
+            out.len() > 20,
+            "the route scanner found only {} paths across {} source files — it is \
+             broken, which would make the completeness test pass vacuously",
+            out.len(),
+            ROUTER_SRCS.len()
         );
         out
     }

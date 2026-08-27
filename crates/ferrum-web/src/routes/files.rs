@@ -145,8 +145,29 @@ pub struct ListQuery {
     pub subscription_id: Option<i64>,
 }
 
+/// A path that must name a file, not the home directory.
+///
+/// `TenantPath` treats the empty string as the home itself, which is right for
+/// listing and wrong for everything that opens a file: "read the home" is not a
+/// request the agent should be asked to refuse, it is a request that should not
+/// have been built. Rejecting it here turns a 503 round trip into a 400 with a
+/// reason.
+fn file_path<'de, D>(deserializer: D) -> Result<TenantPath, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let path = TenantPath::deserialize(deserializer)?;
+    if path.as_str().is_empty() {
+        return Err(serde::de::Error::custom(
+            "this operation needs a file, and an empty path means the home directory",
+        ));
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PathQuery {
+    #[serde(deserialize_with = "file_path")]
     pub path: TenantPath,
     #[serde(default)]
     pub subscription_id: Option<i64>,
@@ -154,6 +175,7 @@ pub struct PathQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
+    #[serde(deserialize_with = "file_path")]
     pub path: TenantPath,
     #[serde(default)]
     pub offset: u64,

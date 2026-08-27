@@ -367,8 +367,18 @@ pub struct TenantPath(String);
 impl TenantPath {
     pub fn parse(input: &str) -> Result<Self> {
         let s = input.trim();
+        // The empty string is the home directory itself, not a missing value.
+        //
+        // [`Self::root`] produces exactly this, and `Serialize` writes it as
+        // `""` — so rejecting it here made the type non-round-trippable, and the
+        // one path that could never cross the IPC boundary was the file
+        // manager's own starting directory. Found by opening the file manager on
+        // a live server: `fs.list` with no path answered "path is empty".
+        //
+        // A caller that means "no path given" uses `Option<TenantPath>`; that is
+        // the distinction serde is for.
         if s.is_empty() {
-            return Err(err(ErrorCode::InvalidPath, "path is empty"));
+            return Ok(Self::root());
         }
         if s.len() > 4096 {
             return Err(err(ErrorCode::InvalidPath, "path exceeds 4096 characters"));
@@ -709,11 +719,38 @@ mod tests {
             "bad\0name",
             "bad\nname",
             "back\\slash",
-            "",
         ] {
             assert!(
                 TenantPath::parse(bad).is_err(),
                 "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tenant_home_itself_survives_a_round_trip() {
+        // The root is a real, addressable location — the file manager's opening
+        // screen. It serialises to `""`, so `""` has to parse back to it; when
+        // it did not, `fs.list` on a live server answered "path is empty" for
+        // the one directory every session starts in.
+        let root = TenantPath::root();
+        assert_eq!(root.as_str(), "");
+        assert_eq!(TenantPath::parse("").unwrap(), root);
+
+        let json = serde_json::to_string(&root).unwrap();
+        assert_eq!(json, r#""""#);
+        assert_eq!(serde_json::from_str::<TenantPath>(&json).unwrap(), root);
+    }
+
+    #[test]
+    fn accepting_the_root_did_not_reopen_the_traversal_hole() {
+        // Whitespace trims to empty, so this is the one shape where "empty means
+        // root" could have let something odd through.
+        assert_eq!(TenantPath::parse("   ").unwrap(), TenantPath::root());
+        for still_bad in ["/", "//", "..", "./", "/etc"] {
+            assert!(
+                TenantPath::parse(still_bad).is_err(),
+                "expected `{still_bad}` to stay rejected"
             );
         }
     }
