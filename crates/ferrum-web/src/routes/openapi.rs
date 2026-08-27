@@ -75,6 +75,9 @@ use crate::auth::CurrentUser;
         super::cron::create,
         super::cron::update,
         super::cron::delete,
+        super::dns::check,
+        super::dns::provider_set,
+        super::dns::issue_wildcard,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -90,6 +93,7 @@ use crate::auth::CurrentUser;
         (name = "alerts", description = "Alert rules, alert history and notifier channels"),
         (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
         (name = "cron", description = "Per-subscription scheduled commands and the crontab they render into"),
+        (name = "dns", description = "The pointing advisory and the stored Cloudflare credential"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -189,6 +193,7 @@ mod tests {
         "/api/files",
         "/api/databases",
         "/api/dns",
+        "/api/cron",
         "/api/backups",
         // `/api/plans`, `/api/apps` and `/api/cron` are deliberately absent:
         // all three areas are annotated and documented, so drift detection

@@ -214,13 +214,19 @@ impl TypedOperation for Issue {
     }
 }
 
-/// Register or restore the ACME account, then run the order.
-async fn obtain(
+/// Restore the panel's ACME account for a directory, registering one if this is
+/// the first order against it.
+///
+/// Shared with the DNS-01 wildcard path in [`crate::dns`] on purpose. There is
+/// exactly one account per directory URL and its key is sealed in one row; a
+/// second copy of this logic would eventually register a *second* account,
+/// which silently halves every per-account rate limit and makes the two paths'
+/// issuance histories invisible to each other.
+pub(crate) async fn acme_account(
     ctx: &OpContext,
-    names: &[String],
     contact: &str,
     directory: Directory,
-) -> Result<acme::Issued> {
+) -> Result<instant_acme::Account> {
     acme::install_crypto_provider();
 
     let db = ctx.db();
@@ -251,6 +257,18 @@ async fn obtain(
             .map_err(FerrumError::from)?;
         ctx.log("registered a new ACME account");
     }
+
+    Ok(account)
+}
+
+/// Register or restore the ACME account, then run the order.
+async fn obtain(
+    ctx: &OpContext,
+    names: &[String],
+    contact: &str,
+    directory: Directory,
+) -> Result<acme::Issued> {
+    let account = acme_account(ctx, contact, directory).await?;
 
     // The webroot the catch-all and every site vhost serve
     // `/.well-known/acme-challenge/` from.

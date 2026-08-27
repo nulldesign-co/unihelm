@@ -12,6 +12,7 @@ pub mod auth;
 pub mod certs;
 pub mod cron;
 pub mod databases;
+pub mod dns;
 pub mod events;
 pub mod files;
 pub mod health;
@@ -113,6 +114,12 @@ fn protected() -> Router<SharedState> {
         .route(
             "/api/cron/{id}",
             axum::routing::put(cron::update).delete(cron::delete),
+        )
+        .route("/api/dns/check", get(dns::check))
+        .route("/api/dns/provider", axum::routing::put(dns::provider_set))
+        .route(
+            "/api/sites/{id}/certificate-wildcard",
+            post(dns::issue_wildcard),
         )
 }
 

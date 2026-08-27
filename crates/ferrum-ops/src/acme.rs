@@ -26,7 +26,11 @@ use instant_acme::{
 
 /// The crate's 30-second default is too tight for a CA under load, and a
 /// timeout here means a task fails that would have succeeded.
-const RETRY: RetryPolicy = RetryPolicy::new()
+///
+/// `pub(crate)` because the DNS-01 order in `ops::dns` polls the same CA with
+/// the same patience — a wildcard order that gave up sooner than an HTTP-01 one
+/// would be a second, undocumented timeout policy for the same server.
+pub(crate) const RETRY: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .backoff(1.6)
     .timeout(Duration::from_secs(180));
@@ -285,6 +289,24 @@ async fn write_token(webroot: &Path, token: &str, key_authorization: &str) -> Re
     Ok(path)
 }
 
+/// Assemble an [`Issued`] from the chain and key an order produced.
+///
+/// The DNS-01 path in `ops::dns` runs its own order (the challenge lives in a
+/// zone, not in a webroot) but must end up with a certificate that is
+/// indistinguishable from an HTTP-01 one — same validity parsing, same issuer
+/// string, so `write_certificate` and `db.certificate_issued` cannot tell the
+/// two apart. Sharing this constructor is what guarantees that.
+pub fn issued_from(chain_pem: String, key_pem: String) -> Result<Issued> {
+    let (not_before, not_after, issuer) = parse_validity(&chain_pem)?;
+    Ok(Issued {
+        chain_pem,
+        key_pem,
+        not_before,
+        not_after,
+        issuer,
+    })
+}
+
 /// Read validity dates and issuer out of the leaf certificate.
 fn parse_validity(chain_pem: &str) -> Result<(time::OffsetDateTime, time::OffsetDateTime, String)> {
     use x509_parser::prelude::*;
@@ -359,7 +381,12 @@ fn strip_leaf(chain_pem: &str) -> String {
     }
 }
 
-fn acme_error(e: instant_acme::Error) -> FerrumError {
+/// Map a CA error onto the panel's error vocabulary.
+///
+/// `pub(crate)` for the same reason as [`RETRY`]: a rate-limit from Let's
+/// Encrypt must read as `FER-1003` whether the order was HTTP-01 or DNS-01, or
+/// the renewal scheduler's backoff would only recognise half of them.
+pub(crate) fn acme_error(e: instant_acme::Error) -> FerrumError {
     use instant_acme::Error;
     let code = match &e {
         Error::Api(problem) => match problem.r#type.as_deref() {

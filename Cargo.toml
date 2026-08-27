@@ -68,6 +68,17 @@ sha2 = "0.10"
 # crypt(3), which cannot read the panel's argon2 hashes (see ops::sftp).
 sha-crypt = "0.6.0"
 
+# DNS resolution the panel does itself (spec §11.13, §11.5): the `dns.check`
+# advisory, and DNS-01 propagation polling against a zone's *authoritative*
+# nameservers. A stub resolver is not enough for the second job — asking the
+# local recursor whether a TXT record exists gets its cache, which is precisely
+# the stale answer that makes an ACME order fail after the record is live.
+hickory-resolver = "0.26.1"
+# The Cloudflare API client (spec §11.13) and repository signing-key fetches.
+# rustls rather than OpenSSL, so a release build needs no system TLS library and
+# `cargo deny` can keep banning openssl-sys.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
+
 # CI-enforced budgets (spec §3) depend on a small, stripped binary.
 # NOTE: panic stays `unwind` on purpose — ferrum-web wraps handlers in
 # CatchPanicLayer so one bad request cannot take the panel down.

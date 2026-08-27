@@ -22,6 +22,7 @@ pub mod alerts;
 pub mod cert;
 pub mod cron;
 pub mod db;
+pub mod dns;
 pub mod fpm;
 pub mod harden;
 pub mod fsops;
