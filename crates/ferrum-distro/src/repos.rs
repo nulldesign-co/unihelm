@@ -369,17 +369,33 @@ pub fn docker(info: &DistroInfo) -> Result<ResolvedRepo, String> {
 
 /// MariaDB Server, from MariaDB plc's own repository (spec §7.3).
 ///
-/// The URLs deliberately use `dlm.mariadb.com` — the "download manager" host
-/// that MariaDB's own `mariadb_repo_setup` script writes — and **never** the
-/// mirror round-robins (`mirror.mariadb.org`, the `downloads.mariadb.org`
-/// redirectors). The round-robins hand consecutive requests to different
-/// volunteer mirrors, and a mirror mid-sync serves metadata that references
-/// packages it does not have yet: the install fails on a 404 or a checksum
-/// mismatch that no retry fixes, because the retry lands on yet another mirror.
-/// `dlm.mariadb.com` instead redirects every request into one signed,
-/// versioned CDN snapshot (`…/11.8/` resolves to a single point release like
-/// `…/11.8/11.8.9/…`), so the metadata and the packages of one transaction
-/// always come from the same atomic snapshot.
+/// `rpm.mariadb.org` and `deb.mariadb.org` — the canonical hostnames — and
+/// **not** `dlm.mariadb.com`, which an earlier version of this function used on
+/// the strength of a research note. Measured on a live AlmaLinux 9 box:
+///
+/// ```text
+/// 403  https://dlm.mariadb.com/repo/mariadb-server/11.8/yum/rhel/9/x86_64/repodata/repomd.xml
+/// 403  https://dlm.mariadb.com/repo/mariadb-server/11.8/repo/debian/dists/bookworm/Release
+/// 200  https://rpm.mariadb.org/11.8/rhel/9/x86_64/repodata/repomd.xml
+/// 200  https://deb.mariadb.org/11.8/debian/dists/bookworm/Release
+/// ```
+///
+/// `dlm.mariadb.com` is the browser-facing download manager: it answers a plain
+/// GET with a redirect into a Google Cloud Storage URL carrying an `Expires=`
+/// and a `Signature=`, and that signed URL returns 403 to `dnf` and `apt`. The
+/// panel got as far as verifying the signing key and writing the `.repo` file
+/// before the install died on it — the whole module was untestable without a
+/// real machine, which is why it took one to find.
+///
+/// Both canonical hosts redirect into MariaDB's mirror network, and that
+/// network really does round-robin: four consecutive requests to
+/// `deb.mariadb.org` landed on three different volunteer mirrors. The reason
+/// that is survivable, also measured, is that the redirect resolves to a
+/// **version-pinned snapshot** — `…/11.8/…` becomes `…/mariadb-11.8.9/…` — and
+/// every mirror served a byte-identical `Release` (same SHA-256 across three
+/// fetches through three mirrors). The mismatch window is therefore only the
+/// hours around a point release, while mirrors converge; the repository
+/// signature makes even that a failed transaction rather than a wrong one.
 pub fn mariadb(info: &DistroInfo, series: &str) -> Result<ResolvedRepo, String> {
     // The series lands in a URL path; refuse anything that is not `NN.N`-shaped
     // rather than trusting a future config value to be well-formed.
@@ -405,7 +421,7 @@ pub fn mariadb(info: &DistroInfo, series: &str) -> Result<ResolvedRepo, String> 
             RepoDefinition {
                 id: "mariadb".into(),
                 display_name: format!("MariaDB Server {series}"),
-                base_url: format!("https://dlm.mariadb.com/repo/mariadb-server/{series}/repo/{path}"),
+                base_url: format!("https://deb.mariadb.org/{series}/{path}"),
                 suite: Some(require_codename(info)?),
                 components: vec!["main".into()],
                 gpg_key_url,
@@ -420,7 +436,7 @@ pub fn mariadb(info: &DistroInfo, series: &str) -> Result<ResolvedRepo, String> 
                 // Major substituted, `$releasever` never written: on RHEL proper
                 // it expands to `9.6`, a directory upstream does not have.
                 base_url: format!(
-                    "https://dlm.mariadb.com/repo/mariadb-server/{series}/yum/rhel/{major}/{}",
+                    "https://rpm.mariadb.org/{series}/rhel/{major}/{}",
                     arch_dir(info)
                 ),
                 suite: None,
@@ -777,24 +793,47 @@ mod tests {
     }
 
     #[test]
-    fn mariadb_uses_the_download_manager_host_never_a_mirror_round_robin() {
-        // The mirror round-robins serve inconsistent mid-sync snapshots; the
-        // dlm host resolves a series to one atomic point-release snapshot.
+    fn mariadb_uses_the_hosts_that_actually_serve_metadata() {
+        // This test used to assert the opposite, and passed the whole time the
+        // feature was broken: it enshrined `dlm.mariadb.com`, which answers dnf
+        // and apt with a 403. A URL test can only check shape, so the shape it
+        // checks has to be the one a real machine confirmed — see the function's
+        // own docs for the measurements.
         for info in [
             debian("trixie", "debian", "13"),
             debian("noble", "ubuntu", "24.04"),
             rhel("9", Arch::X86_64),
+            rhel("10", Arch::Aarch64),
         ] {
-            let repo = mariadb(&info, MARIADB_SERIES).unwrap();
+            let url = mariadb(&info, MARIADB_SERIES).unwrap().definition.base_url;
+            let expected_host = match info.family {
+                Family::Debian => "https://deb.mariadb.org/",
+                Family::Rhel => "https://rpm.mariadb.org/",
+            };
+            assert!(url.starts_with(expected_host), "{url}");
             assert!(
-                repo.definition
-                    .base_url
-                    .starts_with("https://dlm.mariadb.com/repo/mariadb-server/"),
-                "{}",
-                repo.definition.base_url
+                !url.contains("dlm.mariadb.com"),
+                "the download-manager host serves signed redirects that package \
+                 managers cannot follow: {url}"
             );
-            assert!(!repo.definition.base_url.contains("mirror"));
+            // A mirror hostname written directly would pin one volunteer mirror
+            // and lose the vendor's own redirect.
+            assert!(!url.contains("mirror."), "{url}");
         }
+    }
+
+    #[test]
+    fn the_mariadb_series_still_reaches_the_url_intact() {
+        // The series is the one part of these URLs that comes from config, and
+        // it is what selects the version-pinned snapshot the mirrors agree on.
+        let url = mariadb(&rhel("9", Arch::X86_64), "11.8").unwrap().definition.base_url;
+        assert_eq!(url, "https://rpm.mariadb.org/11.8/rhel/9/x86_64");
+
+        let url = mariadb(&debian("bookworm", "debian", "12"), "11.8")
+            .unwrap()
+            .definition
+            .base_url;
+        assert_eq!(url, "https://deb.mariadb.org/11.8/debian");
     }
 
     #[test]
@@ -818,7 +857,7 @@ mod tests {
         assert!(
             repo.definition
                 .base_url
-                .ends_with("/yum/rhel/10/aarch64"),
+                .ends_with("/rhel/10/aarch64"),
             "{}",
             repo.definition.base_url
         );
@@ -834,12 +873,12 @@ mod tests {
     #[test]
     fn mariadb_debian_and_ubuntu_get_their_own_trees() {
         let deb = mariadb(&debian("trixie", "debian", "13"), MARIADB_SERIES).unwrap();
-        assert!(deb.definition.base_url.ends_with("/repo/debian"));
+        assert!(deb.definition.base_url.ends_with("/debian"));
         assert_eq!(deb.definition.suite.as_deref(), Some("trixie"));
         assert_eq!(deb.definition.components, vec!["main".to_string()]);
 
         let ubu = mariadb(&debian("noble", "ubuntu", "24.04"), MARIADB_SERIES).unwrap();
-        assert!(ubu.definition.base_url.ends_with("/repo/ubuntu"));
+        assert!(ubu.definition.base_url.ends_with("/ubuntu"));
         assert_eq!(ubu.definition.suite.as_deref(), Some("noble"));
     }
 
