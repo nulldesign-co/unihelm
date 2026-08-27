@@ -21,6 +21,7 @@ pub mod adminer;
 pub mod alerts;
 pub mod cert;
 pub mod db;
+pub mod dns;
 pub mod fpm;
 pub mod fsops;
 pub mod fwops;

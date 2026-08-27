@@ -41,6 +41,15 @@ pub mod keys {
     /// Addresses and CIDRs Sentinel must never ban, on top of the built-in
     /// refusals (loopback, this host's own addresses, the caller's address).
     pub const SENTINEL_ALLOWLIST: &str = "sentinel.allowlist";
+
+    /// This server's public IP addresses, as a JSON array of strings.
+    ///
+    /// The override `dns.check` consults first (spec §11.13). A server behind a
+    /// NAT, a floating IP or a load balancer answers the internet on an address
+    /// that appears on no local interface, so probing cannot find it and an
+    /// operator has to say. Unset on a plain public VPS, where the interface
+    /// addresses are already the right answer.
+    pub const DNS_SERVER_ADDRESSES: &str = "dns.server_addresses";
 }
 
 impl Db {

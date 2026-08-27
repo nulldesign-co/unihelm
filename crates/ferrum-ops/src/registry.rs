@@ -290,6 +290,9 @@ impl OpRegistry {
         registry.register(crate::nodeapp::Delete);
         registry.register(crate::nodeapp::Restart);
         registry.register(crate::nodeapp::Logs);
+        registry.register(crate::dns::Check);
+        registry.register(crate::dns::ProviderSet);
+        registry.register(crate::dns::IssueWildcard);
         registry
     }
 

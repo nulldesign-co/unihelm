@@ -235,6 +235,47 @@ so a staging certificate must never be installed on a live site, but it is the
 right way to prove the flow works without spending rate-limit budget. Not
 idempotent because each run spends real ACME rate-limit budget.
 
+### `cert.issue_wildcard`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — not cancellable, **not** idempotent |
+| Input | `site_id`; `staging` *(optional bool)*; `contact_email` *(optional string)* |
+
+Obtains a wildcard certificate for a site over **DNS-01**, through the stored
+Cloudflare credential (spec §11.5, §11.13), and installs it.
+
+The certificate covers **both** `example.com` and `*.example.com`. A
+`*.example.com` certificate does not match `example.com` — a wildcard covers
+exactly one label — so a wildcard-only certificate leaves the apex broken, which
+is the single most common wildcard mistake.
+
+The flow: find the stored token whose zone list covers the site's domain by
+**longest suffix** (so `example.co.uk` wins over a `co.uk` the token also
+administers, and `evil-example.com` never matches a zone named `example.com` —
+matching is on label boundaries); publish one `_acme-challenge.<domain>` TXT
+record per authorization; wait for those values to appear at the zone's
+**authoritative** nameservers, with a capped and jittered backoff bounded to
+roughly three minutes; tell the CA to validate; finalize; write the files;
+supersede the older row through the same `db.certificate_issued` path
+`cert.issue` uses; then **reload nginx explicitly**.
+
+That reload is not optional and is not a duplicate of the vhost render. nginx
+holds certificates in memory from the moment it loads them, and on a renewal the
+vhost text does not change — same paths, same options — so the config engine
+correctly reports "nothing to do" and skips the reload. Without the explicit
+reload a renewal appears to succeed while the expiring certificate stays live.
+
+The challenge TXT records are removed on **every** exit path: when the order
+succeeds, when it fails, and when publishing the second record fails after the
+first one was created. A cleanup failure is logged as a warning and never
+replaces the reason the order failed. Fails with `not_found` when no stored
+credential administers the site's zone, naming the zone to add a token for.
+
+`staging` uses the CA's staging directory; same caveat as `cert.issue`. Not
+idempotent because each run spends real ACME rate-limit budget.
+
 ### `panel.tls.issue`
 
 | | |
@@ -248,6 +289,100 @@ vhost live. The domain must already resolve to this server or the CA cannot
 fetch the HTTP-01 challenge. Same staging caveat as `cert.issue`, more sharply:
 a staging certificate on the panel is for proving the flow, not for a panel
 anyone logs in to.
+
+## DNS
+
+Ferrum does not run authoritative DNS in v1. It holds an API credential for
+somebody who does, and drives DNS-01 through it (spec §11.13; own authoritative
+DNS is Phase 5). Cloudflare is the only provider this build speaks, and the
+`dns_providers.kind` CHECK constraint says so rather than accepting a name the
+code cannot honour.
+
+**Cloudflare API Tokens only — never the Global API Key.** A Global Key
+authenticates *the account*: every permission the human has, on every zone, plus
+billing, and it cannot be scoped. A token carries an explicit permission list
+against an explicit resource list, and the one this panel wants is `Zone:Read` +
+`Zone:DNS:Edit` on the single zone whose wildcard is being issued. A panel
+holding a Global Key has taken custody of the customer's whole Cloudflare
+account on the strength of its own disk encryption; a panel holding a scoped
+token can at worst edit DNS in one zone, which is the authority it was given the
+credential to exercise. There is no code path that sends
+`X-Auth-Key`/`X-Auth-Email`.
+
+Because a scoped token cannot see zones it was not scoped to, an operator
+hosting several customers' domains needs several tokens. That is why the table
+is unique on `(kind, label)` rather than on `kind`, and why wildcard issuance
+walks every stored credential looking for one whose zone list covers the name.
+
+### `dns.check`
+
+| | |
+|---|---|
+| Permission | `site_read` |
+| Execution | immediate |
+| Input | `domain` |
+
+An advisory: does this domain point at this server? Resolves A and AAAA for the
+domain and its `www.` form and compares them against this server's public
+addresses, returning the records, `matches_server`, a `proxied_hint`, and one
+`advice` sentence the UI renders as-is rather than keeping its own copy of the
+decision table.
+
+`site_read`, not a DNS permission: this reads public DNS and touches no stored
+credential, so it reveals nothing a `dig` from any shell would not, and the
+customer about to point a domain at their site is exactly who needs it.
+
+This server's addresses come from three sources, in order: the
+`dns.server_addresses` setting (a JSON array of IPs — explicit beats inferred,
+and it is the documented fix when the advisory is wrong, because a server behind
+a NAT, a floating IP or a load balancer answers on an address that appears on no
+local interface); then the addresses actually bound to local interfaces, via the
+same `getifaddrs(3)` call Sentinel's self-ban guard uses, filtered to the
+globally routable ones; then a best-effort default-route probe, which asks the
+kernel which source address it *would* use to reach the internet without sending
+a packet. The probe is last because it is right behind a one-to-one NAT's inside
+address and wrong behind many-to-one NAT.
+
+`matches_server: false` with `proxied_hint: true` is a **correct** setup, not a
+fault: the domain resolves into Cloudflare's anycast space and reaches the origin
+through the proxy. Without that branch every Cloudflare-proxied customer would be
+told their DNS is broken. The lookups are bounded at six seconds; a timeout comes
+back as an advisory saying so rather than as an error.
+
+### `dns.provider.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `kind` (`cloudflare`); `label`; `token` |
+
+Verifies a Cloudflare API token and stores it sealed. Returns the label,
+Cloudflare's verdict on the token, and every zone the token administers — the
+credential's blast radius, shown back so the operator can check it is as small as
+they meant.
+
+**The token is never returned and never logged.** `ProviderSetOutput` has no
+field that could carry one, the audit row records the label and the kind, the log
+line records the label and the zone count, and the `Authorization` header is
+marked sensitive so reqwest redacts it in its own `Debug` output. The token
+newtype's `Debug` prints a placeholder, so an input struct rendered into a
+`tracing` field cannot leak it either. It is sealed with the panel master key
+(XChaCha20-Poly1305) exactly the way the ACME account key is (spec §12 rule 6).
+
+`server_manage` — admin only, deliberately not the reseller-held DNS permission.
+This credential is server-wide: every tenant's wildcard issuance runs through
+whatever token is stored here, so a reseller who could replace it could redirect
+the panel's DNS writes into a Cloudflare account they control. Storing the
+credential is an admin act; *using* it (`cert.issue_wildcard`) is not.
+
+Verification happens before storage, always, and it is two calls because they
+answer different questions: `/user/tokens/verify` asks "is this a live token",
+and the zone list asks "what can it actually reach". A token that verifies but
+sees no zones is rejected with the scopes it needs, because a stored token that
+cannot do the job turns every future issuance into a failure discovered minutes
+into a task. Re-sending the same label rotates that credential in place rather
+than accumulating a dead row whose revoked token would be tried first.
 
 ## Databases
 

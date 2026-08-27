@@ -30,10 +30,12 @@ zstd = { workspace = true }
 # `aws_lc_rs` is the backend instant-acme also uses, so the two share one
 # crypto provider rather than pulling in both ring and aws-lc-rs.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
-# Fetching repository signing keys over HTTPS. rustls rather than OpenSSL, so a
-# release build needs no system TLS library and `cargo deny` can keep banning
-# openssl-sys.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset"] }
+# Fetching repository signing keys over HTTPS, and the Cloudflare API client in
+# `dns.rs`. Pinned in [workspace.dependencies] with rustls rather than OpenSSL.
+reqwest = { workspace = true }
+# `dns.check`, and DNS-01 propagation polling against a zone's authoritative
+# nameservers (spec §11.13).
+hickory-resolver = { workspace = true }
 # ACME / Let's Encrypt. 0.8.5 is a hard floor: earlier versions treat a
 # challenge's `token` as a required field, and Let's Encrypt's dns-persist-01
 # challenge has none — so a single such challenge in an authorization fails

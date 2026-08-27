@@ -11,6 +11,7 @@ pub mod apps;
 pub mod auth;
 pub mod certs;
 pub mod databases;
+pub mod dns;
 pub mod events;
 pub mod files;
 pub mod health;
@@ -108,6 +109,12 @@ fn protected() -> Router<SharedState> {
         .route("/api/apps/{id}", axum::routing::delete(apps::delete))
         .route("/api/apps/{id}/restart", post(apps::restart))
         .route("/api/apps/{id}/logs", get(apps::logs))
+        .route("/api/dns/check", get(dns::check))
+        .route("/api/dns/provider", axum::routing::put(dns::provider_set))
+        .route(
+            "/api/sites/{id}/certificate-wildcard",
+            post(dns::issue_wildcard),
+        )
 }
 
 /// Routes reachable without a session.
