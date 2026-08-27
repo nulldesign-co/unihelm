@@ -295,6 +295,59 @@ export interface UpdateSiteRequest {
   rate_limit_enabled?: boolean;
 }
 
+// --- node apps ---------------------------------------------------------------
+
+export type NodeEnv = "production" | "development" | "test";
+
+/**
+ * One row of `GET /api/apps`.
+ *
+ * The stored row and systemd's view of the unit arrive flattened together: the
+ * row says what the panel intended, `state` says what is actually running, and
+ * an app that crash-looped overnight is exactly where the two differ.
+ */
+export interface AppView {
+  id: number;
+  subscription_id: number;
+  site_id: number | null;
+  name: string;
+  entry: string;
+  port: number;
+  node_env: NodeEnv;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  unit: string;
+  state: UnitState;
+  memory_bytes?: number;
+}
+
+export interface AppsResponse {
+  apps: AppView[];
+}
+
+export interface AppEnvVar {
+  key: string;
+  value: string;
+}
+
+export interface CreateAppRequest {
+  name: string;
+  entry: string;
+  env?: AppEnvVar[];
+  node_env?: NodeEnv;
+  memory_mb?: number;
+  proxy_domain?: string;
+}
+
+export interface AppLogsResponse {
+  unit: string;
+  lines: string[];
+}
+
+/** What the logs modal asks for. The agent clamps anything above 2000. */
+export const DEFAULT_LOG_LINES = 200;
+
 export const endpoints = {
   login: (username: string, password: string) =>
     api.post<SessionResponse>("/api/auth/login", { username, password }),
@@ -321,6 +374,13 @@ export const endpoints = {
   siteDrift: (id: number) => api.get<DriftResponse>(`/api/sites/${id}/drift`),
   issueCertificate: (id: number, staging: boolean) =>
     api.post<TaskAccepted>(`/api/sites/${id}/certificate`, { staging }),
+
+  apps: () => api.get<AppsResponse>("/api/apps"),
+  createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
+  deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),
+  restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),
+  appLogs: (id: number, lines = DEFAULT_LOG_LINES) =>
+    api.get<AppLogsResponse>(`/api/apps/${id}/logs?lines=${lines}`),
 };
 
 /** PHP versions the panel knows about, newest first. */

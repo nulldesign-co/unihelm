@@ -8,6 +8,7 @@ import {
 import { AppShell } from "@/components/app-shell";
 import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
+import { AppsPage } from "@/routes/apps";
 import { DashboardPage } from "@/routes/dashboard";
 import { FilesPage, validateFilesSearch } from "@/routes/files";
 import { LoginPage } from "@/routes/login";
@@ -61,6 +62,12 @@ const siteDetailRoute = createRoute({
   component: SiteDetailPage,
 });
 
+const appsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/apps",
+  component: AppsPage,
+});
+
 const stackRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/stack",
@@ -80,6 +87,7 @@ const routeTree = rootRoute.addChildren([
   dashboardRoute,
   sitesRoute,
   siteDetailRoute,
+  appsRoute,
   stackRoute,
   filesRoute,
 ]);

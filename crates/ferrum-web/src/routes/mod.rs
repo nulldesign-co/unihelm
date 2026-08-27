@@ -7,6 +7,7 @@
 
 pub mod adminer;
 pub mod alerts;
+pub mod apps;
 pub mod auth;
 pub mod certs;
 pub mod databases;
@@ -103,6 +104,10 @@ fn protected() -> Router<SharedState> {
             axum::routing::delete(alerts::channels_delete),
         )
         .route("/api/alerts/channels/{id}/test", post(alerts::channels_test))
+        .route("/api/apps", get(apps::list).post(apps::create))
+        .route("/api/apps/{id}", axum::routing::delete(apps::delete))
+        .route("/api/apps/{id}/restart", post(apps::restart))
+        .route("/api/apps/{id}/logs", get(apps::logs))
 }
 
 /// Routes reachable without a session.
