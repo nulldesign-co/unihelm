@@ -278,6 +278,13 @@ impl OpRegistry {
         registry.register(crate::fwops::Bans);
         registry.register(crate::fwops::SettingsGet);
         registry.register(crate::fwops::SettingsSet);
+        registry.register(crate::alerts::RulesList);
+        registry.register(crate::alerts::RulesSet);
+        registry.register(crate::alerts::EventsList);
+        registry.register(crate::alerts::ChannelsList);
+        registry.register(crate::alerts::ChannelsSet);
+        registry.register(crate::alerts::ChannelsDelete);
+        registry.register(crate::alerts::ChannelsTest::live());
         registry
     }
 

@@ -6,6 +6,7 @@
 //! product (spec §2.6).
 
 pub mod adminer;
+pub mod alerts;
 pub mod auth;
 pub mod certs;
 pub mod databases;
@@ -88,6 +89,20 @@ fn protected() -> Router<SharedState> {
         .route("/api/plans/{id}/assign", post(plans::assign))
         .route("/api/subscriptions/{id}/suspend", post(plans::suspend))
         .route("/api/subscriptions/{id}/unsuspend", post(plans::unsuspend))
+        .route("/api/alerts", get(alerts::events))
+        .route(
+            "/api/alerts/rules",
+            get(alerts::rules_list).post(alerts::rules_set),
+        )
+        .route(
+            "/api/alerts/channels",
+            get(alerts::channels_list).post(alerts::channels_set),
+        )
+        .route(
+            "/api/alerts/channels/{id}",
+            axum::routing::delete(alerts::channels_delete),
+        )
+        .route("/api/alerts/channels/{id}/test", post(alerts::channels_test))
 }
 
 /// Routes reachable without a session.

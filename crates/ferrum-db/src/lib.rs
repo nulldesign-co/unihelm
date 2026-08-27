@@ -20,6 +20,7 @@
 //! before the Phase 2 schema lands; the query strings do not change, only the
 //! call syntax.
 
+pub mod alerts;
 pub mod audit;
 pub mod certificates;
 pub mod databases;
@@ -48,6 +49,7 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
+pub use alerts::{AlertEvent, AlertKind, AlertRule, ChannelKind, NotifyChannel};
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
 pub use databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 pub use firewall::{FwRuleRecord, SentinelBan};

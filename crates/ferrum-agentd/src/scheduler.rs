@@ -60,6 +60,12 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     // means turning Sentinel on in the UI takes effect on the next tick rather
     // than needing an agent restart.
     ("sentinel.scan", Duration::seconds(60), Duration::seconds(5)),
+    // Alert evaluation (spec §11.11). A minute is the coarsest interval that
+    // still meets the acceptance criterion of "killing mariadb produces an
+    // alert in under 30 s" once the 30 s `TICK` is accounted for, and the pass
+    // is cheap: it reads the collector's existing snapshot rather than
+    // sampling, and touches the network only on a state *change*.
+    ("alerts.evaluate", Duration::minutes(1), Duration::seconds(10)),
 ];
 
 pub struct Scheduler {
@@ -151,6 +157,7 @@ impl Scheduler {
             "session.purge" => self.purge_sessions().await,
             "audit.purge" => self.purge_audit().await,
             "sentinel.scan" => self.sentinel_scan().await,
+            "alerts.evaluate" => self.evaluate_alerts().await,
             // A job left in the database by an older version. Not an error; it
             // simply has no handler any more.
             other => {
@@ -427,6 +434,46 @@ impl Scheduler {
     }
 
     // -----------------------------------------------------------------------
+    // alerting
+    // -----------------------------------------------------------------------
+
+    /// Evaluate the alert rules and notify on every state transition
+    /// (spec §11.11).
+    ///
+    /// Deliberately *not* a Task, unlike the renewals above. This runs 1,440
+    /// times a day and almost always decides nothing has changed; giving each
+    /// pass a row in the task drawer would bury the tasks an operator actually
+    /// wants to read under a wall of "alerts.evaluate — ok". The transitions
+    /// that do happen are recorded in `alert_events`, which is the record the
+    /// alerts page reads.
+    ///
+    /// The summary counts transitions rather than firing alerts, so a quiet
+    /// server logs nothing at all (`tick` treats an empty summary as "had
+    /// nothing to do").
+    async fn evaluate_alerts(&self) -> Result<String, String> {
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("alerts.evaluate"),
+        );
+
+        let raised = ferrum_ops::alerts::evaluate(&ctx)
+            .await
+            .map_err(|e| e.detail)?;
+        if raised.is_empty() {
+            return Ok(String::new());
+        }
+
+        let (opened, closed): (Vec<_>, Vec<_>) = raised
+            .iter()
+            .partition(|r| r.state == ferrum_ops::alerts::AlertState::Raised);
+        Ok(format!(
+            "{} alert(s) raised, {} resolved",
+            opened.len(),
+            closed.len()
+        ))
+    }
+
+    // -----------------------------------------------------------------------
     // retention
     // -----------------------------------------------------------------------
 
@@ -454,7 +501,20 @@ impl Scheduler {
             .get_setting_or(ferrum_db::settings::keys::AUDIT_RETENTION_DAYS, 180i64)
             .await;
         let n = db.purge_audit(days).await.map_err(|e| e.to_string())?;
-        Ok(if n == 0 { String::new() } else { format!("purged {n} audit row(s)") })
+
+        // Resolved alert events age out on the same retention setting and in
+        // the same daily sweep — an alert history is the same kind of record as
+        // an audit trail, and a panel that has been up for two years should not
+        // still be holding the disk-full events of its first week. Only
+        // *resolved* rows are eligible: an open event is current state, however
+        // old it is (spec §11.11).
+        let alerts = db.purge_alert_events(days).await.map_err(|e| e.to_string())?;
+
+        Ok(if n == 0 && alerts == 0 {
+            String::new()
+        } else {
+            format!("purged {n} audit row(s) and {alerts} resolved alert(s)")
+        })
     }
 
     // -----------------------------------------------------------------------
