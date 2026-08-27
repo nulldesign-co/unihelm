@@ -133,3 +133,12 @@ integrator must do by hand.
   numbers stay reserved.
 - The ops-docs gate is the real forcing function: merging a module without its
   docs fails CI with the exact list. Twice now that list was the checklist.
+- Wave 4: cron (0007) and dns-cloudflare (0008) merged. Union-merge ate a
+  closing paren in routes/mod.rs again — third time. Build immediately after
+  every union resolve; the merge is never trustworthy on its own.
+- Live-server findings this round, none of which any unit test could reach:
+  MariaDB's repo host answered package managers with 403 (the test asserted the
+  broken host by name and passed the whole time); the panel left MariaDB on
+  0.0.0.0:3306 with two anonymous accounts and a shared `test` database; the
+  recycle bin could never be created in a chroot-shaped home. Fixed and
+  verified on the box.
