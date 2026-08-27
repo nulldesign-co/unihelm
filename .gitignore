@@ -12,3 +12,8 @@
 .env
 /tests/.tmp
 .claude/
+# `minisign -G` writes the release signing key beside the public key it also
+# writes, so the secret half lands in the clone by default. It belongs in a
+# password manager and in the MINISIGN_SECRET_KEY repository secret, nowhere
+# else (docs/releasing.md).
+minisign.key

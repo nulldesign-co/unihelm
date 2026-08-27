@@ -1,0 +1,508 @@
+name: Release
+
+# Cutting a release is `git tag -s vX.Y.Z && git push --tags`. Everything below
+# runs from that one event so a release is never a sequence of local commands
+# somebody has to remember (spec §5.5 — the same signed artifacts feed
+# self-update, so the pipeline that produces them is part of the safety story).
+#
+# Deliberately NOT triggered by pull_request or by pushes to a branch: this
+# workflow reads the release signing key out of secrets, and `pull_request_target`
+# / fork PRs are exactly how signing keys leak. Tags only, and tags are pushed by
+# a maintainer.
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets a maintainer re-run packaging for an existing tag without re-tagging
+  # (the draft is replaced, never published — see the `release` job).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+# Read-only by default; only the job that creates the draft gets write, and only
+# that job sees the signing key.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- 0. version -----------------------------------------------------------
+  # Everything a release can be rejected for *before* compiling anything, so it
+  # is rejected in seconds rather than after a twenty-minute two-architecture
+  # build. The tag and the workspace version have to agree, because the version
+  # the binary reports is the one baked in from Cargo.toml, not the one in the
+  # tag name — a mismatch ships a binary that lies about which release it is.
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Derive the version from the tag and check it against Cargo.toml
+        id: v
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::tag '$tag' does not look like vX.Y.Z" >&2; exit 1 ;;
+          esac
+          version="${tag#v}"
+
+          # First `version = "..."` under [workspace.package].
+          declared=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/[",]/,"");print $3;exit}' Cargo.toml)
+          if [ "$declared" != "$version" ]; then
+            echo "::error::tag $tag implies version $version but Cargo.toml declares $declared — bump the workspace version in the same commit you tag" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "Releasing ferrum $version from $tag" >>"$GITHUB_STEP_SUMMARY"
+
+      # The repository ships minisign.pub as a placeholder so the file exists and
+      # the tarball layout is right from day one. Shipping the placeholder itself
+      # would hand every operator a key that verifies nothing, so it is a hard
+      # stop rather than a note somebody skims (docs/releasing.md).
+      #
+      # Checked here and not in the signing job because a placeholder key can
+      # only ever end in a failed release: the signing job verifies every
+      # signature against this exact file, so it would fail anyway — thirty
+      # minutes and two architectures later.
+      - name: Refuse to release with the placeholder public key
+        run: |
+          set -euo pipefail
+          if grep -q PLACEHOLDER minisign.pub; then
+            echo "::error file=minisign.pub::minisign.pub is still the placeholder. Generate the release key (minisign -G -W), commit the public key here, store the secret key as the MINISIGN_SECRET_KEY secret — docs/releasing.md." >&2
+            exit 1
+          fi
+          echo "Signing key: $(sed -n 1p minisign.pub)" >>"$GITHUB_STEP_SUMMARY"
+
+  # --- 1. the UI, built once ------------------------------------------------
+  # `ferrum-web` embeds the UI with rust-embed (`#[folder = "ui-dist"]` in
+  # crates/ferrum-web/src/ui.rs), which reads the directory at *compile* time.
+  # So the UI must exist on disk before cargo runs, on every architecture. It is
+  # architecture-independent, so it is built once here and downloaded by each
+  # build job — building it twice would also risk two different bundles carrying
+  # the same version number.
+  ui:
+    name: UI bundle
+    # Waits on `version` for the same reason `build` does: a tag that disagrees
+    # with Cargo.toml, or a placeholder signing key, ends this release either
+    # way, and `version` answers both in about ten seconds. Paying that to skip
+    # an `npm ci` on a release that cannot finish is the right trade.
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # `npm ci`, not `npm install`: a release must build the dependency tree the
+      # lockfile pins, not whatever resolves today.
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ui
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: ui
+
+      # vite.config.ts writes straight to crates/ferrum-web/ui-dist.
+      - name: Build
+        run: npm run build
+        working-directory: ui
+
+      - name: Bundle budget (≤ 350 KB gzipped, initial route)
+        run: bash tests/gates/budgets.sh bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/ferrum-web/ui-dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # --- 2. binaries and tarballs, per architecture ---------------------------
+  build:
+    name: ${{ matrix.arch }} (${{ matrix.target }})
+    needs: [version, ui]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both architectures build natively on GitHub-hosted runners.
+          # `ubuntu-24.04-arm` is free for public repositories and available on
+          # Team/Enterprise plans for private ones; Ferrum is AGPL and public, so
+          # native is the primary path — it avoids a cross toolchain and it runs
+          # the resulting binary's own test suite on its own architecture.
+          #
+          # CROSS-COMPILATION FALLBACK, if the arm runner is ever unavailable
+          # (private fork, plan without arm minutes): change this entry to
+          #   - { arch: aarch64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04, cross: true }
+          # and add, guarded by `if: matrix.cross`:
+          #   - run: sudo apt-get update -qq && sudo apt-get install -y gcc-aarch64-linux-gnu
+          #   - run: rustup target add aarch64-unknown-linux-gnu
+          #   with env:
+          #     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          #     CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          # Everything downstream (`--target`, the budget check, packaging) is
+          # already written against `matrix.target`, so nothing else moves.
+          # The catch worth knowing before you switch: Ubuntu's cross gcc links
+          # against the *host* runner's glibc headers for the target, so the
+          # glibc floor recorded below can shift between native and cross builds.
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Overwrites the placeholder crates/ferrum-web/ui-dist/index.html that is
+      # checked in only so rust-embed always has a folder to read.
+      - name: Fetch the UI built in the `ui` job
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/ferrum-web/ui-dist
+
+      # The placeholder index.html references /assets/index-*.js. If the download
+      # silently produced nothing, cargo would still build and ferrum-web would
+      # still start — and serve a white page to every operator. Cheap check, whole
+      # class of "the release is broken and nobody noticed until it shipped".
+      - name: The real UI is present before cargo reads it
+        run: |
+          set -euo pipefail
+          test -d crates/ferrum-web/ui-dist/assets ||
+            { echo "::error::ui-dist has no assets/ — the UI artifact did not land, the binary would embed an empty shell" >&2; exit 1; }
+          test -f crates/ferrum-web/ui-dist/index.html
+          ls -l crates/ferrum-web/ui-dist/assets | head
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p ferrum-agentd -p ferrum-web -p ferrum-cli
+
+      # Reuses tests/gates/budgets.sh rather than re-deriving the 25 MB number
+      # (spec §3) here, so there is exactly one place the budget lives. That
+      # script reads ${CARGO_TARGET_DIR:-target}/release, and a `--target` build
+      # lands in target/<triple>/release — pointing CARGO_TARGET_DIR at the
+      # triple directory makes the two agree without touching the gate.
+      - name: Binary size budget (≤ 25 MB each)
+        env:
+          CARGO_TARGET_DIR: target/${{ matrix.target }}
+        run: bash tests/gates/budgets.sh binaries
+
+      # A glibc-linked binary runs on a distribution only if that distribution's
+      # glibc is at least as new as the builder's. ubuntu-24.04 ships 2.39, while
+      # spec §7.1 also promises AlmaLinux 9 (2.34) and Debian 12 (2.36). This
+      # step does not fail the build — it records the real floor so the release
+      # notes state it instead of leaving operators to discover it as a
+      # "version `GLIBC_2.38' not found" crash on first start.
+      - name: Record the glibc floor these binaries need
+        run: |
+          set -euo pipefail
+          bindir="target/${{ matrix.target }}/release"
+          floor=$(objdump -T "$bindir"/ferrum-agentd "$bindir"/ferrum-web "$bindir"/ferrum |
+            grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V -u | tail -1)
+          echo "${{ matrix.arch }}: glibc >= ${floor}" | tee "$RUNNER_TEMP/glibc-${{ matrix.arch }}.txt"
+          echo "- \`${{ matrix.arch }}\` requires glibc >= ${floor}" >>"$GITHUB_STEP_SUMMARY"
+
+      # The layout mirrors installer/ exactly, because install.sh sources
+      # $here/preflight.sh, $here/config.toml.example and $here/systemd/*.service
+      # by relative path. Untar, run ./install.sh --from ./bin, done.
+      - name: Package ferrum-${{ needs.version.outputs.version }}-${{ matrix.arch }}.tar.gz
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/stage/ferrum-${VERSION}-${ARCH}"
+          mkdir -p "$stage/bin" "$stage/systemd" "$RUNNER_TEMP/dist"
+
+          install -m 0755 "target/${{ matrix.target }}/release/ferrum-agentd" "$stage/bin/"
+          install -m 0755 "target/${{ matrix.target }}/release/ferrum-web"    "$stage/bin/"
+          install -m 0755 "target/${{ matrix.target }}/release/ferrum"        "$stage/bin/"
+
+          install -m 0755 installer/install.sh    "$stage/install.sh"
+          install -m 0755 installer/preflight.sh  "$stage/preflight.sh"
+          install -m 0644 installer/config.toml.example "$stage/config.toml.example"
+          install -m 0644 installer/systemd/ferrum-agentd.service "$stage/systemd/"
+          install -m 0644 installer/systemd/ferrum-web.service    "$stage/systemd/"
+
+          # Shipped so an operator can verify the *next* release (and so
+          # self-update has a key on disk before it has a network) — spec §5.5.
+          install -m 0644 minisign.pub "$stage/minisign.pub"
+          install -m 0644 LICENSE "$stage/LICENSE"
+
+          cat >"$stage/README" <<EOF
+          Ferrum ${VERSION} (${ARCH}, Linux)
+
+            sudo ./install.sh --from ./bin
+
+          preflight.sh runs first and refuses an unsupported server; pass
+          --skip-preflight to override. Nothing else is installed: nginx, PHP and
+          databases arrive on demand from the panel.
+
+          Verify what you downloaded, from the directory you downloaded it into:
+
+            minisign -Vm ferrum-${VERSION}-${ARCH}.tar.gz \\
+              -p ferrum-${VERSION}-${ARCH}/minisign.pub
+            sha256sum -c SHA256SUMS
+
+          The copy of minisign.pub inside the tarball is only a convenience for
+          verifying the *next* release. The first time, take the key from the
+          repository or the release page, not from the file you are checking.
+
+          Documentation: https://github.com/farzam/ferrum/tree/v${VERSION}/docs
+          EOF
+
+          # Deterministic tarball: rebuilding the same tag on the same runner
+          # image gives the same bytes, so a checksum can be reproduced instead
+          # of merely trusted.
+          #
+          # Three separate sources of per-run noise have to be pinned, and the
+          # gzip one is the trap:
+          #   --sort=name            file order follows readdir() otherwise
+          #   --owner/--group/--numeric-owner
+          #                          the runner's uid is not part of a release
+          #   --mtime=@<commit date> the checkout's mtimes are checkout time
+          #   gzip -n                *the gzip header carries its own timestamp*
+          #
+          # `tar -czf` does not pass -n, and gzip reading a pipe still stamps
+          # the current time into that header (verified: byte 5..8 of the member
+          # is the mtime and is non-zero without -n). The archive bytes would be
+          # identical and the checksums would still differ every run, which is
+          # the sort of "reproducible" that is only discovered when someone
+          # tries to reproduce it. Hence the explicit pipe.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" \
+            -C "$RUNNER_TEMP/stage" \
+            -cf - "ferrum-${VERSION}-${ARCH}" |
+            gzip -n -9 >"$RUNNER_TEMP/dist/ferrum-${VERSION}-${ARCH}.tar.gz"
+
+          cp "$RUNNER_TEMP/glibc-${ARCH}.txt" "$RUNNER_TEMP/dist/"
+          ls -l "$RUNNER_TEMP/dist"
+
+      # Sanity: the thing we are about to sign actually unpacks, contains what
+      # install.sh reaches for, and runs on this architecture. `--version` also
+      # settles the question the Cargo.toml check could only ask indirectly — the
+      # binaries report the version on the tin, not one the tag disagrees with.
+      - name: The tarball unpacks and its binaries report the release version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          tar -xzf "$RUNNER_TEMP/dist/ferrum-${VERSION}-${ARCH}.tar.gz" -C "$check"
+          root="$check/ferrum-${VERSION}-${ARCH}"
+          # Everything install.sh reads by relative path from its own directory.
+          test -x "$root/install.sh"
+          test -x "$root/preflight.sh"
+          test -f "$root/config.toml.example"
+          test -f "$root/systemd/ferrum-agentd.service"
+          test -f "$root/systemd/ferrum-web.service"
+          for binary in ferrum ferrum-agentd ferrum-web; do
+            reported=$("$root/bin/$binary" --version)
+            echo "$reported"
+            [ "$reported" = "$binary $VERSION" ] ||
+              { echo "::error::$binary reports '$reported', expected '$binary $VERSION'" >&2; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # --- 3. checksums, signatures, draft release ------------------------------
+  # One job holds the signing key, and it runs only after every architecture has
+  # built and passed its budget — so a key is never used on a half-built release.
+  release:
+    name: Sign and draft the release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      # Debian/Ubuntu package, from the distribution's own archive — no curl'ing
+      # an unpinned release binary into the job that holds the signing key.
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -v
+
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Explicit glob: the per-arch glibc notes travel in the same artifact
+          # and are release *notes*, not release *assets*.
+          sha256sum ferrum-*.tar.gz | sort -k2 >SHA256SUMS
+          cat SHA256SUMS
+
+      # `minisign -S` over both the checksum file and each tarball:
+      #   * SHA256SUMS.minisig is what a human verifies once, then `sha256sum -c`;
+      #   * the per-tarball .minisig is what self-update verifies (spec §5.5) —
+      #     it downloads one file and must not have to fetch and parse a list to
+      #     decide whether that file is genuine.
+      # The key is written under $RUNNER_TEMP with a private umask, never into the
+      # workspace, and removed in the always-run step below.
+      - name: Sign with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::the MINISIGN_SECRET_KEY secret is not set; a release is not releasable unsigned (spec §5.5)" >&2
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key"
+
+          trusted="ferrum ${VERSION} — tag ${{ needs.version.outputs.tag }}, commit ${GITHUB_SHA}, run ${GITHUB_RUN_ID}"
+          cd dist
+          minisign -S -s "$key" -t "$trusted" -m SHA256SUMS
+          for tarball in ferrum-*.tar.gz; do
+            minisign -S -s "$key" -t "$trusted" -m "$tarball"
+          done
+          ls -l
+
+      # Proves the signatures verify against the public key that is committed in
+      # the repository — i.e. that the secret in CI still matches the key
+      # operators actually have. A rotation done halfway (new secret, old
+      # minisign.pub committed) fails here instead of in the field.
+      - name: Verify the signatures against the committed public key
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          minisign -Vm SHA256SUMS -p ../minisign.pub
+          for tarball in ferrum-*.tar.gz; do
+            minisign -Vm "$tarball" -p ../minisign.pub
+          done
+          sha256sum -c SHA256SUMS
+
+      - name: Shred the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/ferrum-${VERSION}-\$(uname -m).tar.gz"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/ferrum-${VERSION}-\$(uname -m).tar.gz.minisig"
+            echo "minisign -Vm ferrum-${VERSION}-\$(uname -m).tar.gz -P \$(sed -n 2p minisign.pub)"
+            echo "tar -xzf ferrum-${VERSION}-\$(uname -m).tar.gz"
+            echo "cd ferrum-${VERSION}-\$(uname -m) && sudo ./install.sh --from ./bin"
+            echo '```'
+            echo
+            echo "## Verifying"
+            echo
+            echo "Signed with the Ferrum release key; the public half is \`minisign.pub\` in the repository and in every tarball:"
+            echo
+            echo '```'
+            cat minisign.pub
+            echo '```'
+            echo
+            echo "\`SHA256SUMS.minisig\` covers the checksum file; each tarball is signed on its own as well, which is the signature self-update checks before it swaps a binary."
+            echo
+            echo "## Requirements"
+            echo
+            cat dist/glibc-*.txt | sed 's/^/- /'
+            echo "- systemd, cgroups v2, 1 GB RAM, 10 GB free on /var"
+          } >notes.md
+          cat notes.md
+
+      # `gh` is preinstalled on the runner and is GitHub's own client, so the
+      # release is created without granting a third-party action the write token.
+      #
+      # Draft on purpose (spec §5.5): the artifacts exist and are signed, but
+      # publishing is a human decision — self-update polls published releases, so
+      # an accidental tag must not push a binary to every server on earth.
+      - name: Draft the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Re-runs replace the draft rather than piling up a second generation
+          # of assets on it.
+          #
+          # But only a *draft*. Deleting a published release is destructive in a
+          # way a re-run must never be: its download URLs are already in
+          # people's scripts, self-update is already following it (spec §5.5),
+          # and replacing it with a fresh draft silently unpublishes the release
+          # everyone is fetching. A published tag is immutable — the fix for a
+          # bad published release is v<next>, not a rebuild of this one.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" != "true" ]; then
+              echo "::error::$TAG is already published. Re-running would delete it out from under everyone who has the URL — cut the next version instead (docs/releasing.md)." >&2
+              exit 1
+            fi
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          fi
+          gh release create "$TAG" \
+            --draft \
+            --verify-tag \
+            --title "Ferrum $VERSION" \
+            --notes-file notes.md \
+            dist/ferrum-*.tar.gz \
+            dist/ferrum-*.tar.gz.minisig \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.minisig
+          echo "Draft release created: publish it at $(gh release view "$TAG" --json url -q .url)" >>"$GITHUB_STEP_SUMMARY"

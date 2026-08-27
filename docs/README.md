@@ -6,6 +6,7 @@
 - **Developers**
   - [Architecture](architecture.md) — the two daemons, the operation registry, the config contract
   - [Contributing](../CONTRIBUTING.md) — the working agreement and the CI gates
+  - [Releasing](releasing.md) — cutting a release, the minisign signing key, rotation
   - [Security policy](../SECURITY.md) — reporting, and the threat model in brief
 - **API**
   - [Error codes](api/errors.md) — generated from the source

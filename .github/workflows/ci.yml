@@ -55,6 +55,12 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
           shellcheck installer/*.sh tests/gates/*.sh
 
+      # The release workflow cannot be exercised without a tag and a signing
+      # key, so the steps it cannot be correct without are asserted here instead
+      # — including that the signing key never reaches a log or the workspace.
+      - name: Release pipeline still signs, budgets and drafts
+        run: bash tests/gates/release.sh
+
   supply-chain:
     name: Supply chain
     runs-on: ubuntu-latest

@@ -1,0 +1,2 @@
+untrusted comment: PLACEHOLDER - NOT THE FERRUM RELEASE KEY. Generate the real one with `minisign -G -W -p minisign.pub -s minisign.key`, commit the public half over this file, and store the secret half as the MINISIGN_SECRET_KEY repository secret. See docs/releasing.md. The release workflow refuses to publish while the word PLACEHOLDER is still in this file.
+RWRPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERREPLACEMEBEFORERELEASE0000
