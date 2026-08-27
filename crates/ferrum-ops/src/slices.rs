@@ -16,14 +16,37 @@
 //! (`systemd-cgtop`, or a future `ferrum.slice` unit capping the lot) without
 //! this module writing a parent unit.
 //!
-//! # What joins the slice — and the PHP-FPM exception
+//! # What joins the slice — and the two exceptions
 //!
-//! Per-tenant units join by carrying `Slice=ferrum-<user>.slice`:
-//! Node app services (spec §11.6) via the drop-in
-//! [`apply_unit_slice_dropin`] writes, cron jobs (spec §11.8) by passing
-//! `--slice` to `systemd-run`, quota'd shell sessions later via pam_systemd
-//! wiring. The slice exists from the moment the tenant account does, so those
-//! features land into a ceiling that is already standing.
+//! Per-tenant units join by carrying `Slice=ferrum-<user>.slice`: Node app
+//! services (spec §11.6) via the drop-in [`apply_unit_slice_dropin`] writes,
+//! and quota'd shell sessions later via pam_systemd wiring. The slice exists
+//! from the moment the tenant account does, so those features land into a
+//! ceiling that is already standing.
+//!
+//! **Tenant cron jobs do not join the slice** (spec §11.8), and an earlier
+//! version of this comment claimed they would by passing `--slice` to
+//! `systemd-run`. They cannot, and the reason is worth stating plainly rather
+//! than leaving as an aspiration:
+//!
+//! - A crontab line is executed **by cron, as the tenant**. Whatever wrapper
+//!   the line names therefore also runs unprivileged, and an unprivileged
+//!   process may not place itself into a *system* slice: `systemd-run --uid=…
+//!   --slice=ferrum-<user>.slice` is a privileged operation, and
+//!   `systemd-run --user` lands in `user-<uid>.slice`, which is a different
+//!   cgroup with none of this module's limits on it.
+//! - Prefixing the line with a wrapper would also mean quoting the tenant's
+//!   command back into a single shell word so the wrapper could pass it on —
+//!   i.e. building a shell string out of tenant input, which is the one thing
+//!   this codebase does not do (spec §12 rule 2).
+//!
+//! So the jobs run in `cron.service`'s own cgroup, under `system.slice`, and a
+//! runaway tenant cron job is bounded by the server rather than by the plan.
+//! The fix is not a cleverer crontab line: it is to stop using crontab for
+//! tenant jobs and render each one as a systemd timer + service pair written by
+//! the (root) agent, where `Slice=` and `User=` are ordinary unit directives
+//! and the command is an argv array. `ferrum_ops::cron` renders from the
+//! database precisely so that swap changes the renderer and nothing else.
 //!
 //! **PHP-FPM pools cannot join the slice, and this module does not pretend
 //! otherwise.** All pools of one PHP version are children of that version's

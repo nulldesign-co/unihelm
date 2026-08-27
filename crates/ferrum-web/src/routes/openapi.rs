@@ -71,6 +71,10 @@ use crate::auth::CurrentUser;
         super::apps::delete,
         super::apps::restart,
         super::apps::logs,
+        super::cron::list,
+        super::cron::create,
+        super::cron::update,
+        super::cron::delete,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -85,6 +89,7 @@ use crate::auth::CurrentUser;
         (name = "tasks", description = "Long-running work: polling and logs"),
         (name = "alerts", description = "Alert rules, alert history and notifier channels"),
         (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
+        (name = "cron", description = "Per-subscription scheduled commands and the crontab they render into"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -183,11 +188,11 @@ mod tests {
     const PARALLEL_AREA_PREFIXES: &[&str] = &[
         "/api/files",
         "/api/databases",
-        "/api/cron",
         "/api/dns",
         "/api/backups",
-        // `/api/plans` and `/api/apps` are deliberately absent: both areas are
-        // annotated and documented, so drift detection covers them again.
+        // `/api/plans`, `/api/apps` and `/api/cron` are deliberately absent:
+        // all three areas are annotated and documented, so drift detection
+        // covers them again.
         "/api/firewall",
     ];
 

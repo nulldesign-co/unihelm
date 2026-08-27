@@ -23,6 +23,7 @@
 pub mod alerts;
 pub mod audit;
 pub mod certificates;
+pub mod cron;
 pub mod databases;
 pub mod firewall;
 pub mod models;
@@ -52,6 +53,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub use alerts::{AlertEvent, AlertKind, AlertRule, ChannelKind, NotifyChannel};
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
+pub use cron::{CronJob, CronJobUpdate, NewCronJob};
 pub use databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 pub use firewall::{FwRuleRecord, SentinelBan};
 pub use models::*;
