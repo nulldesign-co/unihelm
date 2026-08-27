@@ -296,6 +296,13 @@ impl OpRegistry {
         registry.register(crate::dns::Check);
         registry.register(crate::dns::ProviderSet);
         registry.register(crate::dns::IssueWildcard);
+        registry.register(crate::backup::RepoInit::live());
+        registry.register(crate::backup::RepoDelete);
+        registry.register(crate::backup::ScheduleSet);
+        registry.register(crate::backup::ScheduleDelete);
+        registry.register(crate::backup::Run::live());
+        registry.register(crate::backup::List::live());
+        registry.register(crate::backup::Restore::live());
         registry
     }
 

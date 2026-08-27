@@ -78,6 +78,16 @@ use crate::auth::CurrentUser;
         super::dns::check,
         super::dns::provider_set,
         super::dns::issue_wildcard,
+        super::backups::repos_list,
+        super::backups::repos_create,
+        super::backups::repos_delete,
+        super::backups::snapshots,
+        super::backups::schedules_list,
+        super::backups::schedules_create,
+        super::backups::schedules_delete,
+        super::backups::runs_list,
+        super::backups::runs_create,
+        super::backups::restores_create,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -94,6 +104,7 @@ use crate::auth::CurrentUser;
         (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
         (name = "cron", description = "Per-subscription scheduled commands and the crontab they render into"),
         (name = "dns", description = "The pointing advisory and the stored Cloudflare credential"),
+        (name = "backups", description = "restic repositories, schedules, run history and restores"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -198,6 +209,9 @@ mod tests {
         // `/api/plans`, `/api/apps` and `/api/cron` are deliberately absent:
         // all three areas are annotated and documented, so drift detection
         // covers them again.
+        // `/api/plans`, `/api/apps` and `/api/backups` are deliberately absent:
+        // those areas are annotated and documented, so drift detection covers
+        // them again.
         "/api/firewall",
     ];
 
