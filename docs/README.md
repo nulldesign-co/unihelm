@@ -9,6 +9,7 @@
   - [Releasing](releasing.md) — cutting a release, the minisign signing key, rotation
   - [Security policy](../SECURITY.md) — reporting, and the threat model in brief
 - **API**
+  - [Operations](operations.md) — every registered operation, its permission and its inputs
   - [Error codes](api/errors.md) — generated from the source
 
 The full product specification lives at [`../FERRUM_SPEC_1.md`](../FERRUM_SPEC_1.md).
