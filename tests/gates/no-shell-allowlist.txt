@@ -1,0 +1,31 @@
+# Allowlist for tests/gates/no-shell.sh
+#
+# Format — one entry per line, three whitespace-separated fields:
+#
+#     <rule-id>  <repo-relative-path>  <reason>
+#
+#   rule-id   the id printed by the gate next to the rule it failed. One of:
+#               shell-program   Command::new("sh") / Cmd::new("bash") …
+#               shell-string    a "sh -c …" / "bash -c …" string literal
+#               shell-argv      a shell binary and "-c" in the same argv
+#               shell-owned     a shell name allocated as an owned string
+#               dash-c          .arg("-c") / .args(["-c", …]) / "-c".into()
+#               command-new     Command::new outside the exec module
+#               metachars       | ; & ` built into a format!'d argument
+#   path      exact file, not a glob and not a directory. An exemption is for
+#             one file that a human has read; a directory exemption would grow
+#             to cover files nobody looked at.
+#   reason    free text to the end of the line. Say why the hit is safe, not
+#             that it is safe.
+#
+# Entries are per (rule, file): they silence that one rule in that one file and
+# nothing else. The gate reports an entry that suppresses nothing as stale, so
+# a file that stops needing its exemption stops carrying one.
+#
+# Adding a line here is a security decision. The bar is "this cannot execute a
+# shell, and here is the mechanism that makes that true" — not "this is
+# probably fine" and not "this is test code".
+
+command-new  crates/ferrum-distro/src/exec.rs  The one module allowed to construct a Command (spec §12 rule 2): Cmd resolves the program against a fixed list of trusted directories, scrubs the environment and passes an argv array. Everything else in the workspace goes through it — including crates/ferrum-ops/src/fsops/mod.rs, which re-execs the agent binary via exec::reexec_current rather than building its own Command.
+
+dash-c  crates/ferrum-ops/src/quota.rs  The `-c` belongs to xfs_quota, not to a shell: `xfs_quota -x -c '<sub-command>' <mount>`. xfs_quota tokenises that string on whitespace itself, in-process, with no shell anywhere — which is why quota.rs::reject_whitespace refuses any path that would tokenise into more than one word instead of trying to quote it. The program is `xfs_quota`, resolved by Cmd against the trusted directories; no shell binary appears in the argv, so shell-program, shell-argv and shell-owned all stay silent here and only this heuristic needs the exemption.

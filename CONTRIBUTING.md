@@ -157,6 +157,13 @@ cargo test --workspace
 bash tests/gates/no-shell.sh
 bash tests/gates/budgets.sh              # needs a release build and a built UI
 bash tests/gates/installer.sh
+bash tests/gates/migrations.sh           # needs full history, not a shallow clone
+bash tests/gates/ops-docs.sh             # every registered op appears in docs/
+
+# Each gate that relies on a heuristic can prove it still fires:
+bash tests/gates/no-shell.sh --self-test
+bash tests/gates/migrations.sh --self-test
+bash tests/gates/budgets.sh --self-test  # fixture builds; no npm needed
 
 cd ui && npm ci && npm run typecheck && npm run test && npm run build
 ```

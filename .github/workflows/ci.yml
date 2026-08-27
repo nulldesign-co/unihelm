@@ -40,28 +40,70 @@ jobs:
       - name: Migrations apply to a fresh database
         run: cargo test -p ferrum-db migrations
 
-  security-gates:
-    name: Security gates
+  gates:
+    name: Gates
     runs-on: ubuntu-latest
     steps:
+      # Full history, not a shallow clone: tests/gates/migrations.sh compares
+      # each migration against the blob at its *first* commit, and a shallow
+      # checkout cannot answer that. It fails loudly rather than passing
+      # blindly, so this is load-bearing.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # The invariant that kills shell injection as a category (spec §12 rule 2).
       - name: No shell string execution
         run: bash tests/gates/no-shell.sh
 
-      - name: Shellcheck the installer
+      # A gate nobody ever saw fail might be matching nothing at all.
+      - name: No-shell gate self-test
+        run: bash tests/gates/no-shell.sh --self-test
+
+      - name: Migrations are numbered once and never rewritten
+        run: bash tests/gates/migrations.sh
+
+      - name: Migration gate self-test
+        run: bash tests/gates/migrations.sh --self-test
+
+      # Every registered operation appears in docs/ (spec §16.5, §16.10).
+      - name: Registered operations are documented
+        run: bash tests/gates/ops-docs.sh
+
+      # The installer must not die silently on a clean server.
+      - name: Installer preflight and unit hardening
+        run: bash tests/gates/installer.sh
+
+      # Fixture builds, no npm: this checks the UI budget's own logic. The real
+      # measurement happens in the `ui` job, which has a build to measure.
+      - name: Budget gate self-test
+        run: bash tests/gates/budgets.sh --self-test
+
+      - name: Shellcheck
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y shellcheck
-          shellcheck installer/*.sh tests/gates/*.sh
+          command -v shellcheck >/dev/null ||
+            { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
+          # --source-path=SCRIPTDIR so a `# shellcheck source=` directive
+          # resolves relative to the script, not the working directory;
+          # otherwise every sourcing script reports an unfollowable SC1091 and
+          # shellcheck exits non-zero on an informational finding.
+          shellcheck -x --source-path=SCRIPTDIR installer/*.sh tests/gates/*.sh
 
   supply-chain:
-    name: Supply chain
+    name: Supply chain (advisory)
     runs-on: ubuntu-latest
+    # Non-blocking on purpose. cargo-deny's advisory database is updated
+    # continuously, so an unrelated CVE published this morning would turn every
+    # pull request red without a line of our code changing. The signal is worth
+    # having; the veto is not. Bans, licences and duplicate versions are the
+    # parts under our control — promote this to blocking once the advisory half
+    # is split out or pinned.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Advisories, licences, bans and duplicate versions (spec §12 rule 9).
+      # Advisories, licences, bans and duplicate versions (spec §12 rule 9),
+      # configured by deny.toml at the repository root.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -77,18 +119,34 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      # The build output itself, keyed on everything that can change it: the
+      # lockfile, the sources, the entry HTML and the build configuration.
+      # A hit skips npm entirely — and skipping the typecheck with it is sound
+      # precisely because the key covers every input the typecheck reads.
+      - name: Cache the UI build
+        id: ui-build-cache
+        uses: actions/cache@v4
+        with:
+          path: crates/ferrum-web/ui-dist
+          key: ui-dist-${{ runner.os }}-node22-${{ hashFiles('ui/package-lock.json', 'ui/index.html', 'ui/vite.config.ts', 'ui/tsconfig*.json', 'ui/src/**') }}
+
       - run: npm ci
+        if: steps.ui-build-cache.outputs.cache-hit != 'true'
         working-directory: ui
 
       - name: Typecheck
+        if: steps.ui-build-cache.outputs.cache-hit != 'true'
         run: npm run typecheck
         working-directory: ui
 
       - name: Build
+        if: steps.ui-build-cache.outputs.cache-hit != 'true'
         run: npm run build
         working-directory: ui
 
-      - name: Bundle budget (≤ 350 KB gzipped, initial route)
+      # Measured every run, cache hit or not: the budget is about the artefact,
+      # and a restored artefact is the same artefact.
+      - name: Bundle budget (largest initial chunk ≤ 350 KB gzipped)
         run: bash tests/gates/budgets.sh bundle
 
       - uses: actions/upload-artifact@v4
