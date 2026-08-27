@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
-# CI gate: the installer must not die silently.
+# CI gate: the installer must not die silently, and must not install anything
+# it has not verified.
 #
-# The bug this exists for: `preflight_check_conflicts` ended with
+# The bug the first half exists for: `preflight_check_conflicts` ended with
 # `[ -d "$panel" ] && _warn ...`, which returns 1 when the directory is absent.
 # As the last statement in a function that is the last thing a `set -e` script
 # calls, that killed the installer on every *clean* server — with no output at
 # all. It passed `bash -n`, passed shellcheck, and only showed up on a real box.
 #
-# So this gate asserts two things: every preflight check returns success on its
-# own, and the script always produces output before exiting.
+# The second half exists because install.sh now downloads a binary by default
+# (spec §5.5). The only thing between a user and somebody else's code is a
+# minisign signature and a SHA-256 checksum, so this gate drives those
+# decisions against local fixtures: a placeholder key must refuse, a bad
+# signature must refuse, a bad checksum must refuse, and a good release must
+# get through. `fetch_to` — the one function in install.sh that touches the
+# network — is the only thing replaced; everything the fixtures exercise below
+# it is the code that runs on a real server.
+#
+# shellcheck disable=SC1091
+# (installer/install.sh is sourced in a dozen subshells below, each with the
+# environment that one assertion needs; there is nothing for shellcheck to
+# learn by following it a dozen times.)
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -18,9 +30,10 @@ ok()   { printf '\033[32mok\033[0m   %s\n' "$1"; }
 fail() { printf '\033[31mFAIL\033[0m %s\n' "$1"; failures=$((failures + 1)); }
 
 # --- 1. every check function succeeds in isolation --------------------------
-# shellcheck source=../../installer/preflight.sh
-. installer/preflight.sh
-
+# Each check runs in its own subshell that sources preflight.sh for itself.
+# "In isolation" is the point of the test, and it keeps preflight's `set -e` and
+# its `readonly` constants out of this script, which counts failures and keeps
+# going rather than stopping at the first one.
 for check in \
   preflight_check_os \
   preflight_check_arch \
@@ -30,7 +43,8 @@ for check in \
   preflight_check_disk \
   preflight_check_conflicts
 do
-  if (set -e; "$check"); then
+  # shellcheck source=../../installer/preflight.sh
+  if ( . installer/preflight.sh; "$check" ); then
     ok "$check returns success"
   else
     fail "$check returns non-zero — under \`set -e\` this kills the installer silently"
@@ -81,6 +95,372 @@ fi
 for script in installer/preflight.sh installer/install.sh tests/gates/*.sh; do
   if bash -n "$script"; then ok "$script parses"; else fail "$script has a syntax error"; fi
 done
+
+# --- 5. install.sh functions also return success in isolation ---------------
+# Same lesson as section 1, applied to the file it was learned in. These are the
+# ones with no side effects worth guarding; the rest are covered by section 6.
+for check in cleanup parse_args; do
+  if ( . installer/install.sh; "$check" ) >/dev/null 2>&1; then
+    ok "install.sh: $check returns success"
+  else
+    fail "install.sh: $check returns non-zero — under \`set -e\` this kills the installer silently"
+  fi
+done
+
+# --- 6. release identity: architecture and version --------------------------
+# `uname -m` says amd64 on some images and arm64 on others. Getting this wrong
+# means a 404 on a download URL instead of a sentence a human can act on.
+for pair in "x86_64:x86_64" "amd64:x86_64" "aarch64:aarch64" "arm64:aarch64"; do
+  machine="${pair%%:*}"
+  expected="${pair##*:}"
+  got="$( . installer/install.sh; normalize_arch "$machine" 2>/dev/null )"
+  if [ "$got" = "$expected" ]; then
+    ok "uname -m $machine maps to the $expected release"
+  else
+    fail "uname -m $machine mapped to '${got:-<nothing>}', expected $expected"
+  fi
+done
+
+for machine in i686 armv7l riscv64 ppc64le s390x; do
+  if ( . installer/install.sh; normalize_arch "$machine" ) >/dev/null 2>&1; then
+    fail "$machine was accepted; no release is built for it"
+  else
+    ok "$machine is refused rather than 404ing on a download"
+  fi
+done
+
+# The version tag becomes part of a download URL and of a filename on disk, and
+# when it is not pinned it arrives from the GitHub API — somebody else's data.
+#
+# The loop variable is `want_tag`, not `tag`: install.sh's `resolve_version`
+# declares a `local tag`, and sourcing it inside the test subshell makes a loop
+# variable of that name look — to a reader, and to static analysis — like it
+# might be reading the installer's value rather than this loop's.
+for want_tag in v0.4.1 0.4.1 v1.2.3-rc.1 0.0.0-gate v10.20.30.40; do
+  if ( . installer/install.sh; valid_version "$want_tag" ); then
+    ok "$want_tag is accepted as a version tag"
+  else
+    fail "$want_tag is a legitimate version tag and was rejected"
+  fi
+done
+
+# `$(id)` and the rest are single-quoted on purpose: the point of the fixture is
+# the literal text reaching valid_version, not what it would expand to here.
+# shellcheck disable=SC2016
+for want_tag in '../../etc/passwd' 'v1.0; rm -rf /' '$(id)' 'v1.0 v2.0' 'latest' '' '-rf'; do
+  if ( . installer/install.sh; valid_version "$want_tag" ); then
+    fail "'$want_tag' was accepted as a version tag and would end up in a URL and a path"
+  else
+    ok "'$want_tag' is rejected as a version tag"
+  fi
+done
+
+# The same rule, applied where it matters: the tag the release API hands back.
+if ( . installer/install.sh
+     fetch_stdout() { printf '{"tag_name":"../../../etc/passwd"}\n'; }
+     resolve_version ) >/dev/null 2>&1
+then
+  fail "a tag_name of ../../../etc/passwd from the release API was accepted"
+else
+  ok "a tag_name that is not a version is refused rather than built into a URL"
+fi
+
+resolved="$( . installer/install.sh
+             fetch_stdout() { printf '{"name":"x","tag_name":"v9.9.9","draft":false}\n'; }
+             resolve_version
+             printf '%s\n' "${RELEASE_VERSION:-}" )"
+if [ "$resolved" = "v9.9.9" ]; then
+  ok "the latest release tag is read out of the API response"
+else
+  fail "resolve_version produced '${resolved:-<nothing>}', expected v9.9.9"
+fi
+
+# --- 7. the release path refuses everything it cannot verify -----------------
+fixtures="$(mktemp -d "${TMPDIR:-/tmp}/ferrum-installer-gate.XXXXXX")"
+cleanup_fixtures() {
+  rm -rf "$fixtures"
+  return 0
+}
+trap cleanup_fixtures EXIT
+
+gate_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  else
+    shasum -a 256 "$@"
+  fi
+}
+
+# Take the architecture and the artefact name from the installer itself, so the
+# fixture and the code under test cannot drift apart.
+gate_arch="$( . installer/install.sh; release_arch )"
+gate_version="0.0.0-gate"
+gate_dir="ferrum-${gate_version}-${gate_arch}-linux"
+gate_tarball="${gate_dir}.tar.gz"
+
+if [ -z "$gate_arch" ]; then
+  fail "install.sh does not recognise this machine's architecture; skipping the release fixtures"
+else
+
+mkdir -p "$fixtures/bin" "$fixtures/payload/$gate_dir"
+for binary in ferrum-agentd ferrum-web ferrum; do
+  printf '#!/bin/sh\nexit 0\n' >"$fixtures/payload/$gate_dir/$binary"
+  chmod 0755 "$fixtures/payload/$gate_dir/$binary"
+done
+
+# Two keypairs: the one the installer is told to trust, and one an attacker
+# might sign with. If the real minisign is not installed, stand in a double
+# that implements the same exit-status contract — the installer's dependency on
+# minisign is "did it exit 0 for this public key", and that is what gets tested
+# either way. CI installs the real one (.github/workflows/ci.yml).
+signer=shim
+trusted_key="RW$(printf '%054d' 0 | tr '0' 'A')"
+attacker_key="RW$(printf '%054d' 0 | tr '0' 'B')"
+
+if command -v minisign >/dev/null 2>&1 &&
+   minisign -G -f -W -p "$fixtures/trusted.pub" -s "$fixtures/trusted.key" </dev/null >/dev/null 2>&1 &&
+   minisign -G -f -W -p "$fixtures/attacker.pub" -s "$fixtures/attacker.key" </dev/null >/dev/null 2>&1
+then
+  signer=minisign
+  trusted_key="$(grep -v '^untrusted comment' "$fixtures/trusted.pub" | head -n 1)"
+  attacker_key="$(grep -v '^untrusted comment' "$fixtures/attacker.pub" | head -n 1)"
+else
+  cat >"$fixtures/bin/minisign" <<'SHIM'
+#!/usr/bin/env bash
+# Test double for minisign (tests/gates/installer.sh). This is deliberately not
+# a signature checker: it exists to prove install.sh honours minisign's exit
+# status and passes the public key it was configured with through to it, which
+# are the two things the installer depends on. A signature file naming the key
+# verifies; anything else does not.
+set -uo pipefail
+key=""; message=""; signature=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -P) key="${2:-}"; shift 2 ;;
+    -m) message="${2:-}"; shift 2 ;;
+    -x) signature="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$key" ] || exit 1
+[ -f "$message" ] || exit 1
+[ -f "$signature" ] || exit 1
+head -n 1 "$signature" | grep -qxF "signed-by $key" || exit 1
+exit 0
+SHIM
+  chmod 0755 "$fixtures/bin/minisign"
+fi
+
+sign_sums() { # directory  secret-key-file  public-key
+  if [ "$signer" = minisign ]; then
+    minisign -S -s "$2" -m "$1/SHA256SUMS" -x "$1/SHA256SUMS.minisig" \
+      </dev/null >/dev/null 2>&1
+  else
+    printf 'signed-by %s\n' "$3" >"$1/SHA256SUMS.minisig"
+  fi
+}
+
+good="$fixtures/release-good"
+bad_checksum="$fixtures/release-bad-checksum"
+bad_signature="$fixtures/release-bad-signature"
+not_listed="$fixtures/release-not-listed"
+mkdir -p "$good" "$bad_checksum" "$bad_signature" "$not_listed"
+
+tar -czf "$good/$gate_tarball" -C "$fixtures/payload" "$gate_dir"
+( cd "$good" && gate_sha256 "$gate_tarball" >SHA256SUMS )
+# A real SHA256SUMS lists every architecture, so it names tarballs this machine
+# never downloads. Feeding the whole file to `sha256sum -c` would fail on those;
+# the installer has to pick out its own line, and this fixture proves it does.
+printf '%s  ferrum-%s-otherarch-linux.tar.gz\n' \
+  "0000000000000000000000000000000000000000000000000000000000000000" \
+  "$gate_version" >>"$good/SHA256SUMS"
+sign_sums "$good" "$fixtures/trusted.key" "$trusted_key"
+
+# A tarball that is not the one the signed checksum file names.
+cp "$good/SHA256SUMS" "$good/SHA256SUMS.minisig" "$bad_checksum/"
+cp "$good/$gate_tarball" "$bad_checksum/$gate_tarball"
+printf 'tampered\n' >>"$bad_checksum/$gate_tarball"
+
+# A perfectly consistent release, signed by somebody else.
+cp "$good/SHA256SUMS" "$good/$gate_tarball" "$bad_signature/"
+sign_sums "$bad_signature" "$fixtures/attacker.key" "$attacker_key"
+
+# A correctly signed checksum file that says nothing about our tarball.
+cp "$good/$gate_tarball" "$not_listed/"
+printf '%s  ferrum-%s-otherarch-linux.tar.gz\n' \
+  "0000000000000000000000000000000000000000000000000000000000000000" \
+  "$gate_version" >"$not_listed/SHA256SUMS"
+sign_sums "$not_listed" "$fixtures/trusted.key" "$trusted_key"
+
+# The download stub. `fetch_to` is the single point in install.sh where bytes
+# come off the network, so replacing it — and nothing else — runs the real
+# verification, unpacking and staging code against a local directory.
+run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  workdir
+  local serve="$1" pubkey="$2" work="$3"
+  # Every assertion below needs its own environment and its own copy of the
+  # installer's globals, so each run happens in a subshell and nothing it sets
+  # is meant to outlive it. That is what SC2030/SC2031 warn about, and here it
+  # is the entire design: the next case must not inherit this one's key.
+  # SC2329 sees `fetch_to` defined and never called by name — it is called by
+  # `download_and_verify_release`, which is the point of overriding it.
+  # shellcheck disable=SC2030,SC2031,SC2329
+  (
+    export PATH="$fixtures/bin:$PATH"
+    export FERRUM_VERSION="$gate_version"
+    export FERRUM_SERVE="$serve"
+    if [ -n "$pubkey" ]; then
+      export FERRUM_PUBKEY="$pubkey"
+    else
+      unset FERRUM_PUBKEY
+    fi
+
+    # shellcheck source=../../installer/install.sh
+    . installer/install.sh
+
+    fetch_to() {
+      local name="${1##*/}"
+      [ -f "$FERRUM_SERVE/$name" ] || return 22
+      cp "$FERRUM_SERVE/$name" "$2"
+    }
+
+    download_and_verify_release "$work"
+  ) >"$fixtures/last-run.log" 2>&1
+}
+
+staged() { # workdir — did all three binaries get unpacked?
+  local work="$1" binary
+  for binary in ferrum-agentd ferrum-web ferrum; do
+    find "$work" -type f -name "$binary" 2>/dev/null | grep -q . || return 1
+  done
+  return 0
+}
+
+if [ "$signer" = minisign ]; then
+  ok "release fixtures signed with the real minisign"
+else
+  ok "release fixtures signed with the minisign test double (minisign is not installed here)"
+fi
+
+# 7a. The placeholder key. A fork that cloned the repo and pointed it at its own
+# releases must not download, "verify" and install a tarball against no key at
+# all.
+work="$fixtures/work-placeholder"
+if run_release_path "$good" "" "$work"; then
+  fail "the placeholder signing key installed a release anyway"
+else
+  ok "placeholder signing key refuses to install"
+fi
+if [ -d "$work" ]; then
+  fail "the placeholder check ran after downloading; it must refuse before any request"
+else
+  ok "the placeholder check refuses before anything is downloaded"
+fi
+if grep -q "signing key" "$fixtures/last-run.log"; then
+  ok "the placeholder refusal says what is wrong"
+else
+  fail "the placeholder refusal did not explain itself: $(cat "$fixtures/last-run.log")"
+fi
+
+# 7b. A release signed by the wrong key. Everything else about it is consistent,
+# which is exactly what makes it dangerous.
+work="$fixtures/work-bad-signature"
+if run_release_path "$bad_signature" "$trusted_key" "$work"; then
+  fail "a release signed by an untrusted key was accepted"
+else
+  ok "a release signed by an untrusted key is refused"
+fi
+if staged "$work"; then
+  fail "the bad-signature release was unpacked before the signature was checked"
+else
+  ok "nothing is unpacked when the signature does not verify"
+fi
+
+# 7c. A tarball that does not match its signed checksum: the signature is real,
+# the bytes are not the ones it vouches for.
+work="$fixtures/work-bad-checksum"
+if run_release_path "$bad_checksum" "$trusted_key" "$work"; then
+  fail "a tarball that does not match its signed checksum was accepted"
+else
+  ok "a tarball that does not match its signed checksum is refused"
+fi
+if staged "$work"; then
+  fail "the mismatched tarball was unpacked anyway"
+else
+  ok "nothing is unpacked when the checksum does not match"
+fi
+
+# 7d. A signed checksum file that does not mention our artefact at all. Silently
+# treating "nothing to check" as "checked" is the classic way this goes wrong.
+work="$fixtures/work-not-listed"
+if run_release_path "$not_listed" "$trusted_key" "$work"; then
+  fail "a tarball absent from the signed checksum file was accepted"
+else
+  ok "an unlisted tarball is refused rather than treated as checked"
+fi
+
+# 7e. The good release. If this stops passing, the gate above proves nothing.
+work="$fixtures/work-good"
+if run_release_path "$good" "$trusted_key" "$work"; then
+  ok "a correctly signed release with a matching checksum proceeds"
+else
+  fail "the good release was refused: $(tail -n 10 "$fixtures/last-run.log")"
+fi
+if staged "$work"; then
+  ok "the good release stages all three binaries"
+else
+  fail "the good release verified but staged no binaries"
+fi
+
+fi  # gate_arch is known
+
+# --- 8. verification cannot be configured away ------------------------------
+# `ensure_minisign` is the one function allowed to give up on installing a
+# package. It must never give up on *having* minisign, because everything after
+# it assumes a signature was really checked.
+#
+# Emptying PATH inside the subshell is how minisign is made unfindable, and
+# blanking FERRUM_FAMILY is how the package manager is taken away — both are
+# deliberate, both are scoped to the subshell, and both are what SC2123/SC2030
+# would otherwise flag as an accident.
+# shellcheck disable=SC2123,SC2030
+if ( . installer/install.sh; PATH=/nonexistent; FERRUM_FAMILY=""; ensure_minisign ) >/dev/null 2>&1; then
+  fail "ensure_minisign returned success without minisign — the release path would install an unverified binary"
+else
+  ok "ensure_minisign refuses when minisign cannot be obtained"
+fi
+
+placeholder_hits="$(grep -c 'PLACEHOLDER-REPLACE-AT-RELEASE' installer/install.sh)"
+if [ "$placeholder_hits" -eq 1 ]; then
+  ok "the signing-key placeholder appears exactly once, so release tooling can rewrite it"
+else
+  fail "the placeholder appears $placeholder_hits times; a release-time substitution would rewrite the check along with the key"
+fi
+
+if grep -qE -- '--(skip|no|without)-(verify|verification|signature|checksum|minisign)' installer/install.sh; then
+  fail "install.sh offers an option that skips verification"
+else
+  ok "install.sh offers no option that skips verification"
+fi
+
+if grep -nE '(verify_signature|verify_checksum|minisign -V|sha256sum -c|shasum -a 256 -c)[^|]*\|\|[[:space:]]*true' installer/install.sh; then
+  fail "a verification step is swallowed by \`|| true\`"
+else
+  ok "no verification step is swallowed by \`|| true\`"
+fi
+
+# The source build has to stay reachable: it is the answer for architectures we
+# do not publish, and for anyone who would rather compile than trust a binary.
+if grep -q -- '--from-source)' installer/install.sh && grep -q -- '--from)' installer/install.sh; then
+  ok "--from-source and --from are still accepted"
+else
+  fail "the source-build path lost an option"
+fi
+
+if ( . installer/install.sh; parse_args; [ -z "${SOURCE_DIR:-}" ] && [ "${FROM_SOURCE:-1}" -eq 0 ] ); then
+  ok "with no arguments the installer takes the release path"
+else
+  fail "the default is no longer the release path"
+fi
 
 echo
 if [ "$failures" -gt 0 ]; then

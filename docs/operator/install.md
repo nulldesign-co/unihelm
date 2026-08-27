@@ -22,7 +22,46 @@ panel already installed, Apache running on port 80.
 
 ## Installing
 
-There is no release download yet, so build first:
+```bash
+sudo installer/install.sh                        # the latest release
+sudo FERRUM_VERSION=v0.4.1 installer/install.sh  # a pinned one
+```
+
+That downloads the release built for this machine's architecture, verifies it,
+and installs it. No Rust toolchain, no twenty-minute build, no 2 GB of build
+artefacts on a 1 GB VPS.
+
+The installer:
+
+1. runs preflight and refuses an unsupported system,
+2. downloads the tarball, `SHA256SUMS` and `SHA256SUMS.minisig`,
+3. verifies the minisign signature on `SHA256SUMS` against the key built into
+   the installer, then checks the tarball against that signed file,
+4. creates the unprivileged `ferrum` account,
+5. installs three binaries into `/usr/local/ferrum/bin`,
+6. writes `/etc/ferrum/config.toml` and generates `/etc/ferrum/secret.key`,
+7. installs and starts both systemd units,
+8. creates the first administrator and prints its password **once**.
+
+Step 3 has no override. There is no `--skip-verify`, and installing minisign is
+not optional — if the signature cannot be checked, nothing is installed. If you
+would rather not trust a binary at all, build one; that path is below and it
+downloads nothing.
+
+It installs no stack components. Nginx, PHP and databases arrive on demand from
+the panel, which is what keeps a base install small enough for a 1 GB VPS.
+
+### Building from source instead
+
+For an architecture we do not publish, for development, or because you would
+rather compile:
+
+```bash
+sudo installer/install.sh --from-source
+```
+
+That builds the UI and the binaries here and then runs exactly the same
+installation steps. If you have already built:
 
 ```bash
 cargo build --release
@@ -32,17 +71,13 @@ cargo build --release -p ferrum-web    # embeds the built UI
 sudo installer/install.sh --from ./target/release
 ```
 
-The installer:
+### Installing from a fork
 
-1. runs preflight and refuses an unsupported system,
-2. creates the unprivileged `ferrum` account,
-3. installs three binaries into `/usr/local/ferrum/bin`,
-4. writes `/etc/ferrum/config.toml` and generates `/etc/ferrum/secret.key`,
-5. installs and starts both systemd units,
-6. creates the first administrator and prints its password **once**.
-
-It installs no stack components. Nginx, PHP and databases arrive on demand from
-the panel, which is what keeps a base install small enough for a 1 GB VPS.
+`FERRUM_REPO` chooses the repository releases come from and `FERRUM_PUBKEY` the
+minisign public key they must be signed with. Both are needed: an installer
+whose key is still the release-time placeholder refuses to download anything,
+precisely so that a fork cannot end up skipping verification by omission. See
+[packaging/README.md](../../packaging/README.md) for how a release is signed.
 
 ## First login
 

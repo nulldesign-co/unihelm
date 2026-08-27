@@ -50,10 +50,24 @@ jobs:
       - name: No shell string execution
         run: bash tests/gates/no-shell.sh
 
+      # -x follows the `source=` directives, so install.sh is checked together
+      # with the preflight it sources rather than around it. Older shellchecks
+      # need the flag to follow at all; newer ones only need it when there is no
+      # directive. Passing it always is the version-proof spelling.
       - name: Shellcheck the installer
         run: |
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
-          shellcheck installer/*.sh tests/gates/*.sh
+          shellcheck -x installer/*.sh tests/gates/*.sh
+
+      # The installer downloads a binary by default (spec §5.5), so the gate
+      # drives the real signature and checksum code against local fixtures.
+      # minisign is installed here rather than stubbed: the gate falls back to a
+      # test double when it is absent, and the point of running it in CI is that
+      # at least one place checks a genuine ed25519 signature.
+      - name: Installer gate
+        run: |
+          sudo apt-get install -y minisign
+          bash tests/gates/installer.sh
 
       # The release workflow cannot be exercised without a tag and a signing
       # key, so the steps it cannot be correct without are asserted here instead
