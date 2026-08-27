@@ -127,3 +127,9 @@ integrator must do by hand.
 - Union-merging two branches that both appended to the same Rust file lost a
   closing brace twice (paths.rs, templates.rs tuple). Always `cargo build`
   immediately after a union resolve, never trust the merge.
+- Wave 2 landed: sentinel-fw, monitoring, release-pipeline, installer-release,
+  gates-ci, node-apps (ops only — no web routes, no docs). Still missing
+  entirely: cron (0007), dns-cloudflare (0008), backups (0009). Their migration
+  numbers stay reserved.
+- The ops-docs gate is the real forcing function: merging a module without its
+  docs fails CI with the exact list. Twice now that list was the checklist.
