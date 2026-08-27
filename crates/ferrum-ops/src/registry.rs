@@ -270,6 +270,11 @@ impl OpRegistry {
         registry.register(crate::plan::Assign);
         registry.register(crate::plan::Suspend::live());
         registry.register(crate::plan::Unsuspend::live());
+        registry.register(crate::nodeapp::List);
+        registry.register(crate::nodeapp::Create::live());
+        registry.register(crate::nodeapp::Delete);
+        registry.register(crate::nodeapp::Restart);
+        registry.register(crate::nodeapp::Logs);
         registry
     }
 

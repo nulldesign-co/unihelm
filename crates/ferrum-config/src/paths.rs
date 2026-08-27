@@ -251,6 +251,17 @@ pub fn site_public(linux_user: &str, domain: &str) -> PathBuf {
     site_root(linux_user, domain).join("public")
 }
 
+/// A tenant Node application's working directory: `<home>/apps/<name>`
+/// (spec §11.6).
+///
+/// Beside `sites/` rather than inside it: an app is not a vhost — it may be
+/// published behind one, behind several, or behind none at all — and putting
+/// it under a domain's directory would make renaming the domain move the
+/// running application.
+pub fn app_dir(linux_user: &str, app: &str) -> PathBuf {
+    tenant_home(linux_user).join("apps").join(app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

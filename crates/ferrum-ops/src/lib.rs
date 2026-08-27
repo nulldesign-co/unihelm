@@ -23,6 +23,7 @@ pub mod db;
 pub mod fpm;
 pub mod fsops;
 pub mod metrics;
+pub mod nodeapp;
 pub mod panel;
 pub mod php;
 pub mod plan;
