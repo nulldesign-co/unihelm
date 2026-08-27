@@ -68,6 +68,21 @@ pub fn data_dir() -> PathBuf {
     under("/var/lib/ferrum")
 }
 
+/// `/etc/ferrum` — `config.toml` and the master key (spec §4.3).
+///
+/// Rooted like everything else here, so a development instance's "system"
+/// configuration lives in its scratch tree. The one thing that reads it as a
+/// hard-coded absolute string is the packaged installer, which by definition is
+/// not running under a development root.
+///
+/// A backup of the panel has to include this directory: without `secret.key`
+/// every sealed secret in the restored database — ACME account keys, DNS
+/// credentials, backup repository passwords — is ciphertext nobody can open
+/// (spec §11.10, §12 rule 6).
+pub fn config_dir() -> PathBuf {
+    under("/etc/ferrum")
+}
+
 /// Rendered configs, ACME account keys, certificates.
 pub fn state_dir() -> PathBuf {
     under("/var/lib/ferrum/state")

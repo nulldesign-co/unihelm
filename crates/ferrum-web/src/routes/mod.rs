@@ -9,6 +9,7 @@ pub mod adminer;
 pub mod alerts;
 pub mod apps;
 pub mod auth;
+pub mod backups;
 pub mod certs;
 pub mod databases;
 pub mod events;
@@ -108,6 +109,28 @@ fn protected() -> Router<SharedState> {
         .route("/api/apps/{id}", axum::routing::delete(apps::delete))
         .route("/api/apps/{id}/restart", post(apps::restart))
         .route("/api/apps/{id}/logs", get(apps::logs))
+        .route(
+            "/api/backups/repos",
+            get(backups::repos_list).post(backups::repos_create),
+        )
+        .route(
+            "/api/backups/repos/{id}",
+            axum::routing::delete(backups::repos_delete),
+        )
+        .route("/api/backups/repos/{id}/snapshots", get(backups::snapshots))
+        .route(
+            "/api/backups/schedules",
+            get(backups::schedules_list).post(backups::schedules_create),
+        )
+        .route(
+            "/api/backups/schedules/{id}",
+            axum::routing::delete(backups::schedules_delete),
+        )
+        .route(
+            "/api/backups/runs",
+            get(backups::runs_list).post(backups::runs_create),
+        )
+        .route("/api/backups/restores", post(backups::restores_create))
 }
 
 /// Routes reachable without a session.

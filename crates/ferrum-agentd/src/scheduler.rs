@@ -66,6 +66,16 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     // is cheap: it reads the collector's existing snapshot rather than
     // sampling, and touches the network only on a state *change*.
     ("alerts.evaluate", Duration::minutes(1), Duration::seconds(10)),
+    // Backup schedules (spec §11.10). A minute, because the schedules are
+    // five-field cron expressions whose finest granularity is one minute: a
+    // slower job would silently skip the minute a nightly backup asked for. The
+    // pass is cheap when nothing is due — it reads the enabled schedules and
+    // returns at once when there are none.
+    (
+        "backup.scheduler",
+        Duration::seconds(60),
+        Duration::seconds(10),
+    ),
 ];
 
 pub struct Scheduler {
@@ -158,6 +168,7 @@ impl Scheduler {
             "audit.purge" => self.purge_audit().await,
             "sentinel.scan" => self.sentinel_scan().await,
             "alerts.evaluate" => self.evaluate_alerts().await,
+            "backup.scheduler" => self.run_due_backups().await,
             // A job left in the database by an older version. Not an error; it
             // simply has no handler any more.
             other => {
@@ -471,6 +482,26 @@ impl Scheduler {
             opened.len(),
             closed.len()
         ))
+    }
+
+    // -----------------------------------------------------------------------
+    // backups
+    // -----------------------------------------------------------------------
+
+    /// Start whatever backup schedules are due (spec §11.10).
+    ///
+    /// Deliberately not a Task, for the same reason as the Sentinel and alert
+    /// passes above: it wakes every minute and decides nothing on almost all of
+    /// them. The backups it *does* start each get a `backup_runs` row with a
+    /// start time, an end time and — on failure — restic's own words, which is
+    /// the history the backups page reads and the record an operator needs when
+    /// the question is "when did this stop working".
+    async fn run_due_backups(&self) -> Result<String, String> {
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("backup.scheduler"),
+        );
+        ferrum_ops::backup::scheduler_tick(&ctx).await
     }
 
     // -----------------------------------------------------------------------

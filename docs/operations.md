@@ -1098,3 +1098,274 @@ derived from a row the caller's scope could already see, so no caller can read
 `sshd.service`'s journal through an app they own. The line cap bounds one IPC
 frame rather than the operator's access to their logs — the journal itself keeps
 far more, and a narrower window is one more request away.
+
+## Backups
+
+Backups are restic repositories driven over argv by `ferrum_ops::backup`
+(spec §11.10). Three properties of that module decide how these operations
+behave, and each of them is a decision rather than an accident:
+
+**Secrets travel in the environment, never in argv.** `RESTIC_REPOSITORY`,
+`RESTIC_PASSWORD` and the S3 credentials reach restic as environment variables.
+`/proc/<pid>/cmdline` is mode 0444 — every hosted tenant on the box can read
+root's command lines with `ps auxww` — while `/proc/<pid>/environ` is 0400 and
+owned by the process's uid. A password on the command line would therefore be a
+password published to every tenant. `Cmd` also clears the child's environment,
+so restic sees exactly those variables and nothing the agent was started with,
+and the task log renders argv only.
+
+**The repository password is shown once and cannot be recovered.** See
+`backup.repo.init` below; this is the disaster-recovery decision of the whole
+area, and it has an operator obligation attached to it.
+
+**Snapshots are tagged by scope.** A panel backup is tagged `ferrum-panel` and
+a tenant's is `ferrum-sub-<subscription id>` — the id, never the Linux user
+name, which can be recycled when a tenant is deleted and recreated. Retention
+runs `restic forget --prune --tag <tag> --group-by tags`, so one repository can
+hold the panel's history and every tenant's without one policy deleting
+another's snapshots.
+
+Every operation below needs `backup_manage`, and every one except `backup.run`
+and `backup.list` additionally requires **administrator scope**: repositories
+carry credentials that cover the whole server, and a restored tree can contain
+`/etc/ferrum/secret.key` and any tenant's private files. A scoped caller
+reaching one of those gets `FER-1002 permission_denied`.
+
+restic itself is installed on first use through the package backend. If it
+cannot be installed, the failure names the package and — on EL, where restic
+lives in EPEL rather than the base repositories — the repository to enable,
+because `No match for argument: restic` on a fresh AlmaLinux otherwise sends an
+operator hunting for a typo.
+
+### `backup.repo.init`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope) |
+| Execution | immediate |
+| Input | `kind` — `local` or `s3`; `label`; `path_or_url`; `s3` *(optional object: `access_key_id`, `secret_access_key`, `region` (optional))* |
+
+Creates a repository: generates a 32-character alphanumeric password, seals it
+under the master key, writes the row, then runs `restic init
+--repository-version 2`. If restic fails, the row is rolled back so the operator
+can fix the endpoint and re-use the same label. `path_or_url` is an absolute
+path for `local` (no `..`), and `endpoint/bucket[/prefix]` for `s3` — the `s3:`
+scheme prefix is added by the panel, so pasting one in does not produce
+`s3:s3:`. Control characters are refused: a NUL in the middle of
+`RESTIC_REPOSITORY` would silently truncate it and send the backup somewhere
+other than where the row says.
+
+**The response contains the repository password, once.** There is no operation
+that reveals it again, and that is deliberate: one that could would turn a
+stolen admin session into every backup this panel has ever taken.
+
+The consequence has to be stated plainly, because it is the difference between
+a backup and a false sense of one. A restic repository is encrypted and its
+password is the only key. The panel keeps a sealed copy so the scheduler can run
+an unattended backup at three in the morning — but that copy lives in
+`panel.db`, and `panel.db` is *inside* the panel-scope backup. **If the panel
+database is the only holder of the password, a panel-scope backup cannot be
+restored after losing the panel.** The key to the safe would be inside the safe.
+
+Recovering a lost panel therefore needs two things kept **off this server**:
+
+1. the password returned here, at creation; and
+2. `/etc/ferrum/secret.key`, the master key — because every other secret in the
+   restored database (ACME account keys, database passwords, notifier tokens) is
+   sealed under it and is ciphertext without it.
+
+With both, `restic restore` against the repository yields `panel.db`,
+`/etc/ferrum` and the state directory, which is the whole of the panel's state.
+
+Immediate rather than a task, for two reasons that are both about secrets: a
+task persists its *input* verbatim in `tasks.input` — which here would write the
+S3 secret access key into the database in the clear, beside the sealed copy —
+and a task discards its output, which here is the password.
+
+### `backup.repo.delete`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope) |
+| Execution | immediate |
+| Input | `repo_id` |
+
+Makes the panel forget a repository. **Nothing inside it is deleted** — not the
+snapshots, not the data; wiping a bucket is not an action that belongs behind a
+row in a list, and an operator who wants the data gone has `restic forget` and
+their storage provider's console. Refused with `FER-1403 already_exists` while
+any run is recorded against the repository: that history is the panel's only
+record of which snapshots exist, and dropping it would leave data in a bucket
+nobody can account for. The check is made before the delete so the refusal says
+why, instead of surfacing the schema's `ON DELETE RESTRICT` as an opaque
+database error.
+
+### `backup.schedule.set`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope) |
+| Execution | immediate |
+| Input | `repo_id`; `scope` — `panel` or `subscription`; `subscription_id` *(optional; required for `subscription` scope, refused for `panel`)*; `cron`; `keep_daily` *(optional, default 7)*; `keep_weekly` *(optional, default 4)*; `keep_monthly` *(optional, default 6)*; `enabled` *(optional, default true)* |
+
+Records when a scope is backed up and how much history is kept. `cron` is a
+five-field expression (`minute hour day-of-month month day-of-week`) and is
+*parsed* here, not merely stored — an expression the scheduler cannot read is a
+schedule that silently never fires, and the moment to discover that is while
+somebody is looking at the form. The retention counts are bounded to 0–3650:
+they reach restic's argv as `--keep-daily <n>`, and a five-digit one is a typo,
+not a policy.
+
+Administrator-only, and this is the operation that grants a tenant access to a
+repository at all. `backup.run` lets a scoped caller write only into a
+repository an administrator has already pointed a schedule for *their*
+subscription at, so a tenant who could write their own schedule could grant
+themselves that access — and repository ids are small integers that are trivial
+to walk.
+
+### `backup.schedule.delete`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope) |
+| Execution | immediate |
+| Input | `schedule_id` |
+
+Stops a schedule firing. The runs it already made keep their rows, with
+`schedule_id` set to NULL rather than cascaded away: turning off a schedule must
+not erase the evidence of what it did.
+
+### `backup.run`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope for `panel`) |
+| Execution | task — not cancellable, idempotent |
+| Input | `repo_id`; `scope` — `panel` or `subscription`; `subscription_id` *(optional; required for `subscription` scope, refused for `panel`)* |
+
+Takes one snapshot, streaming restic's output into the task log line by line.
+The per-second `status` progress messages are filtered out — a two-hour backup
+would otherwise be hundreds of thousands of log rows — and the final `summary`
+message is where the snapshot id and byte count come from. A restic old enough
+not to emit a summary still took a perfectly good backup, so its absence is
+recorded as a nameless snapshot rather than a failed run.
+
+**Panel scope** writes a consistent copy of the panel database with `VACUUM
+INTO`, then backs that copy up together with `/etc/ferrum` and the state
+directory (certificates and ACME accounts). It never copies `panel.db` itself:
+the panel runs SQLite in WAL mode, where the `.db` file alone is an arbitrarily
+stale prefix of the truth — committed transactions live in `panel.db-wal` until
+a checkpoint folds them in. Copying it produces a file that restores to some
+earlier state, or to no valid state at all if a checkpoint lands mid-copy. It is
+the classic backup that only fails when you finally need it. The working copy is
+0600, lives in `<state>/backup-work`, and is deleted on every path out of the
+run including the failing ones — it is a complete second copy of every sealed
+secret the panel holds.
+
+**Subscription scope** writes the tenant's home directory. Database dumps are
+not yet part of it; see *Not implemented* below.
+
+A run row is created *before* restic starts, and finished with restic's own
+words on failure, so a crash mid-backup leaves evidence rather than silence and
+the history can answer "when did this stop working" (spec §11.10 AC: a corrupted
+target produces an alert, not a silent success).
+
+Retention runs afterwards, and only after the run is recorded successful —
+pruning before the new snapshot is safely in would be deleting old backups on
+the strength of one that might yet fail. The policy comes from the first enabled
+schedule covering this repository and scope, so a manual run prunes exactly as a
+scheduled one would; a scope with no schedule prunes **nothing**, because
+inventing a policy would be the panel deleting snapshots nobody asked it to
+delete. A failed prune never fails the run: it leaves more history than asked
+for, which is a disk problem, where a run reported as failed after the snapshot
+is safely written is a correctness problem — the next thing an operator does is
+re-run it, and what they conclude is that backups are broken.
+
+Not cancellable, because killing restic mid-write leaves a lock for the next run
+to clear rather than stopping cleanly. Idempotent: a repeat costs time and
+produces a second snapshot, which retention then prunes.
+
+A scoped (non-administrator) caller may run a backup only for a subscription
+their own scope resolves, and only into a repository an administrator's schedule
+already points at for it. Anything else answers `not_found`, not
+`permission_denied`, so a customer walking repository ids cannot learn which
+repositories exist.
+
+### `backup.list`
+
+| | |
+|---|---|
+| Permission | `backup_manage` |
+| Execution | immediate |
+| Input | `repo_id`; `subscription_id` *(optional)* |
+
+`restic snapshots --json`, parsed. Unknown fields are ignored and missing
+optional ones default, so the panel does not stop listing snapshots the day
+restic adds a field; only `id` is required, since a snapshot without one is not
+something a restore could ever name.
+
+A snapshot list names paths and hostnames across the whole server, so a scoped
+caller sees only snapshots tagged for a subscription they own — and the tag is
+derived from a subscription resolved through their own scope, never taken from
+the request. An administrator may pass `subscription_id` to narrow the list, or
+omit it for everything in the repository.
+
+### `backup.restore`
+
+| | |
+|---|---|
+| Permission | `backup_manage` (administrator scope) |
+| Execution | task — not cancellable, idempotent |
+| Input | `repo_id`; `snapshot_id` — 8–64 hex characters, or `latest` |
+
+Restores a snapshot into a fresh **staging directory** under
+`<state>/restore/<timestamp>-<snapshot>` and reports where it landed. Nothing
+live is touched. The directory is 0700 before restic writes a byte, because a
+restored tree can contain `/etc/ferrum/secret.key` and every tenant's private
+files — and the response says so, along with a reminder to delete the staging
+directory once it has been picked over. One directory per restore, so two
+restores of the same snapshot cannot merge into one tree and an operator can
+still tell them apart afterwards.
+
+`snapshot_id` is validated strictly because it is the one value in this area
+that *does* reach argv: hex cannot begin with a dash, so a validated id can
+never be read by restic as a flag.
+
+### The `backup.scheduler` job
+
+Not an operation — a job in the agent's internal scheduler
+(`crates/ferrum-agentd/src/scheduler.rs`), running every 60 s with 10 s of
+jitter. Every minute, because the schedules are cron expressions whose finest
+granularity is one minute; a slower job would silently skip the minute a nightly
+backup asked for.
+
+Deliberately not a Task, for the same reason as `sentinel.scan` and
+`alerts.evaluate`: it wakes 1,440 times a day and decides nothing on almost all
+of them, and a task row per tick would bury the tasks a human started. The
+backups it does start each get a `backup_runs` row, which is what the history
+reads.
+
+The due check walks back minute by minute from now to the schedule's last run
+(capped at 24 hours) rather than asking only whether the current minute matches:
+the loop wakes on a jittered interval and can miss a wall-clock minute entirely,
+and an agent that was restarted has missed every minute it was down. Missing the
+nightly backup because the agent was updated at 03:00 is exactly the failure
+this avoids. A schedule that has never run looks back only five minutes, so
+creating one at two in the afternoon does not immediately fire last night's
+backup. One schedule failing — a dead S3 endpoint, an unreadable cron
+expression — is logged and stepped over; it must not stop every other tenant's
+backup that night.
+
+### Not implemented, on purpose
+
+- **In-place restore.** `backup.restore` stages; it never writes recovered files
+  over live ones. That is a different operation with a very different blast
+  radius, and it belongs with a UI that can show what is about to be
+  overwritten.
+- **Adopting an existing repository.** `backup.repo.init` creates. It cannot
+  take over a repository somebody else initialised, because the panel would have
+  to be told that repository's password — and a panel that can be told a
+  password is a panel that can be made to show one.
+- **Database dumps in the subscription scope.** Spec §11.10 wants
+  `--single-transaction` dumps streamed into the repository. Subscription scope
+  currently covers the tenant home only.

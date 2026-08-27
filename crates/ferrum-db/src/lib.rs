@@ -22,6 +22,7 @@
 
 pub mod alerts;
 pub mod audit;
+pub mod backups;
 pub mod certificates;
 pub mod databases;
 pub mod firewall;
@@ -51,6 +52,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 pub use alerts::{AlertEvent, AlertKind, AlertRule, ChannelKind, NotifyChannel};
+pub use backups::{
+    BackupRepo, BackupRun, BackupSchedule, BackupScope, NewBackupRepo, NewBackupSchedule, RepoKind,
+    RepoSecrets, RunOutcome, RunStatus,
+};
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
 pub use databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 pub use firewall::{FwRuleRecord, SentinelBan};

@@ -71,6 +71,16 @@ use crate::auth::CurrentUser;
         super::apps::delete,
         super::apps::restart,
         super::apps::logs,
+        super::backups::repos_list,
+        super::backups::repos_create,
+        super::backups::repos_delete,
+        super::backups::snapshots,
+        super::backups::schedules_list,
+        super::backups::schedules_create,
+        super::backups::schedules_delete,
+        super::backups::runs_list,
+        super::backups::runs_create,
+        super::backups::restores_create,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -85,6 +95,7 @@ use crate::auth::CurrentUser;
         (name = "tasks", description = "Long-running work: polling and logs"),
         (name = "alerts", description = "Alert rules, alert history and notifier channels"),
         (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
+        (name = "backups", description = "restic repositories, schedules, run history and restores"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -185,9 +196,9 @@ mod tests {
         "/api/databases",
         "/api/cron",
         "/api/dns",
-        "/api/backups",
-        // `/api/plans` and `/api/apps` are deliberately absent: both areas are
-        // annotated and documented, so drift detection covers them again.
+        // `/api/plans`, `/api/apps` and `/api/backups` are deliberately absent:
+        // those areas are annotated and documented, so drift detection covers
+        // them again.
         "/api/firewall",
     ];
 
