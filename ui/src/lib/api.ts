@@ -241,6 +241,12 @@ export type SiteState = "provisioning" | "active" | "suspended" | "failed";
 
 export interface SiteView {
   id: number;
+  /**
+   * Which subscription owns the site. The server has always sent it (the row
+   * is flattened into the view); the plans page is the first screen that needs
+   * it, because there is no endpoint that lists subscriptions on their own.
+   */
+  subscription_id: number;
   domain: string;
   site_type: SiteKind;
   php_version: string | null;

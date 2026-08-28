@@ -10,8 +10,10 @@ import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { AppsPage } from "@/routes/apps";
 import { DashboardPage } from "@/routes/dashboard";
+import { DatabasesPage } from "@/routes/databases";
 import { FilesPage, validateFilesSearch } from "@/routes/files";
 import { LoginPage } from "@/routes/login";
+import { PlansPage } from "@/routes/plans";
 import { SiteDetailPage } from "@/routes/site-detail";
 import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
@@ -68,6 +70,18 @@ const appsRoute = createRoute({
   component: AppsPage,
 });
 
+const databasesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/databases",
+  component: DatabasesPage,
+});
+
+const plansRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/plans",
+  component: PlansPage,
+});
+
 const stackRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/stack",
@@ -88,6 +102,8 @@ const routeTree = rootRoute.addChildren([
   sitesRoute,
   siteDetailRoute,
   appsRoute,
+  databasesRoute,
+  plansRoute,
   stackRoute,
   filesRoute,
 ]);
