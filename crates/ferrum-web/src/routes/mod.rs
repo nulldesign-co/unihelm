@@ -28,6 +28,7 @@ pub mod sites;
 pub mod stack;
 pub mod tasks;
 pub mod wordpress;
+pub mod waf;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -172,6 +173,11 @@ fn protected() -> Router<SharedState> {
             post(wordpress::plugins_update),
         )
         .route("/api/wordpress/{id}/cli", post(wordpress::cli))
+        .route("/api/waf", get(waf::status))
+        .route("/api/waf/enable", post(waf::enable))
+        .route("/api/waf/disable", post(waf::disable))
+        .route("/api/waf/rules", axum::routing::put(waf::rules_set))
+        .route("/api/server/security-posture", get(waf::security_posture))
 }
 
 /// Routes reachable without a session.

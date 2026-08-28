@@ -69,6 +69,20 @@ const TEMPLATES: &[(&str, &str)] = &[
         "ssh/sftp.conf",
         include_str!("../templates/ssh/sftp.conf.j2"),
     ),
+    (
+        "nginx/waf.conf",
+        include_str!("../templates/nginx/waf.conf.j2"),
+    ),
+    (
+        "nginx/load-module.conf",
+        include_str!("../templates/nginx/load-module.conf.j2"),
+    ),
+    // Not nginx syntax: this is the ModSecurity rules file nginx's
+    // `modsecurity_rules_file` points at (spec §11.9).
+    (
+        "modsecurity/main.conf",
+        include_str!("../templates/modsecurity/main.conf.j2"),
+    ),
 ];
 
 pub struct TemplateSet {

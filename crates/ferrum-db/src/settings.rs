@@ -50,6 +50,29 @@ pub mod keys {
     /// operator has to say. Unset on a plain public VPS, where the interface
     /// addresses are already the right answer.
     pub const DNS_SERVER_ADDRESSES: &str = "dns.server_addresses";
+
+    // -- ModSecurity WAF (spec §11.9) ---------------------------------------
+    //
+    // Same reasoning as Sentinel's keys: defaults live in `ferrum_ops::waf`
+    // and an absent key reads as the default, so a later release can change a
+    // default without migrating a value it once wrote into every database.
+
+    /// Whether the panel has switched ModSecurity on for this server. False
+    /// until an operator runs `waf.enable`, which is also the point at which
+    /// the panel first checks whether a loadable module exists at all.
+    pub const WAF_ENABLED: &str = "waf.enabled";
+    /// The server-wide engine mode every site inherits without a policy of its
+    /// own: `off`, `detect` or `block`. **`detect`** by default — spec §11.9
+    /// asks for a log-only mode first, because a rule set that has never seen
+    /// a site's traffic will have false positives and finding them in a log is
+    /// cheaper than finding them in a support ticket.
+    pub const WAF_DEFAULT_MODE: &str = "waf.default_mode";
+    /// The CRS paranoia level a site inherits without one of its own.
+    pub const WAF_DEFAULT_PARANOIA: &str = "waf.default_paranoia";
+    /// The Core Rule Set release currently unpacked on disk. Written after a
+    /// successful verified install, so a version mismatch against the pin in
+    /// `ferrum_ops::waf` is visible without hashing the tree again.
+    pub const WAF_CRS_VERSION: &str = "waf.crs_version";
 }
 
 impl Db {

@@ -309,6 +309,11 @@ impl OpRegistry {
         registry.register(crate::wordpress::PluginList);
         registry.register(crate::wordpress::PluginUpdate);
         registry.register(crate::wordpress::Cli);
+        registry.register(crate::waf::Status);
+        registry.register(crate::waf::Enable::live());
+        registry.register(crate::waf::Disable);
+        registry.register(crate::waf::RulesSet);
+        registry.register(crate::posture::Posture);
         registry
     }
 

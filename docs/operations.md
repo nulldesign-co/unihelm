@@ -1002,6 +1002,257 @@ anything while `enabled` is false. A panel that starts banning addresses before
 anybody asked it to is a panel that eventually bans its own operator during
 setup.
 
+## Web application firewall (ModSecurity)
+
+**On a stock Ferrum server this feature refuses to enable, and it says exactly
+why.** Ferrum installs nginx from nginx.org, and nginx.org publishes no
+ModSecurity module. Checked on 2026-08-28 against every package tree Ferrum
+installs from — `packages/debian`, `packages/ubuntu`, `packages/mainline/debian`
+and `packages/centos/10` — the published modules are acme, geoip, image-filter,
+njs, otel, perl and xslt. There is no `nginx-module-modsecurity` in any of them.
+
+A connector *is* packaged elsewhere: `libnginx-mod-http-modsecurity` on
+Debian/Ubuntu, `nginx-mod-modsecurity` in EPEL 9. Both are built against their
+own distribution's nginx, and an nginx dynamic module records the nginx build it
+was compiled against and is rejected by any other (`module ... is not binary
+compatible`). Installing one beside nginx.org's nginx produces a module that
+cannot load.
+
+There is a second, independent blocker on the same servers. `load_module` is a
+main-context directive, and nginx.org's `nginx.conf` — verified by unpacking
+`nginx-1.30.4-1.el10.ngx.x86_64.rpm` and `nginx_1.30.4-1~trixie_amd64.deb` —
+contains no main-context `include` at all; its only include is
+`/etc/nginx/conf.d/*.conf`, inside `http`. So even with a compatible module on
+disk there is nowhere to put the line that loads it except `nginx.conf` itself,
+which the panel does not edit (spec §10.4 rule 1).
+
+Spec §11.9's answer is a prebuilt dynamic module from Ferrum's own package
+repository, the same rule as brotli in §11.2. That repository does not exist in
+this build. `waf.enable` therefore refuses with `FER-1403 conflict` and a
+message naming both conditions and what would fix them. Everything below the
+preflight is implemented and tested: given a loadable module and a place to load
+it from, the configuration, validation and reload path works like any other
+nginx change.
+
+### How per-site policy works
+
+ModSecurity's nginx directives are valid at http, server and location level, so
+the obvious design is `modsecurity on;` inside each vhost. Ferrum does not do
+that. It would mean re-rendering every vhost to change one site's WAF, and a
+site whose owner had hand-edited their vhost (which the config engine detects
+and refuses to overwrite) could not be governed at all.
+
+Instead the engine is switched on once at http level in
+`/etc/nginx/ferrum.d/03-waf.conf`, starting in `DetectionOnly`, and each site's
+policy is a phase-1 `SecRule` matching that site's own hostnames which uses
+`ctl:ruleEngine` and `setvar:tx.*_paranoia_level` to set the mode and paranoia
+level for that transaction. One generated file (`/etc/ferrum/waf/main.conf`)
+holds every site's policy; turning a site on is one render and one reload.
+
+Rule ids come from the 20,000 block — inside the 1–99,999 range the Core Rule
+Set reserves for local rules — and are `20000 + site_id`, so a rule id in an
+audit log names exactly one site.
+
+A request whose `Host` matches no site matches no rule and gets the server-wide
+default. That is the safe direction: unknown traffic inherits the strictest
+configured position, never a site's relaxations.
+
+### The Core Rule Set pin
+
+OWASP CRS **4.29.0**, the `minimal` tarball, pinned by SHA-256
+`1aa1c5c8fc29e532d35293bcea36bf72de61db8f6ed4716a0f91ab14552b7fed`. The value
+was computed on 2026-08-28 by downloading the asset and hashing the 278,138
+bytes served; GitHub's release API reports the same asset. Both observations
+come from github.com, so this is a **single-source pin**: it detects a later
+tampered or truncated download, not a source that was already wrong. CRS
+publishes a detached OpenPGP signature beside every asset, and this build does
+not verify it — Ferrum's in-tree OpenPGP code parses keys and computes
+fingerprints but does not check signatures. `waf.status` reports that state in
+`crs.pin_provenance` so an operator does not have to read the source to learn
+it.
+
+The archive is unpacked with explicit guards: absolute paths, `..` components,
+symlink and hard-link entries, an entry-count cap and an unpacked-size cap are
+all refused. The checksum already proves the bytes, so the guards never fire in
+production; they exist so a future caller unpacking something less trusted
+inherits a function that cannot be talked into writing outside its destination.
+
+### `waf.status`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | none |
+
+Whether the WAF is switched on, whether it *could* be, and why not. Reports the
+module search result, where a `load_module` line could go, the packages that
+would provide a connector on this family and why installing them does not help,
+the running nginx version, the CRS pin and its provenance, every site's policy
+with its allocated rule id, and the server-wide exclusion list.
+
+`available: false` with a populated `blockers` array is the expected answer on a
+stock server. Each blocker carries a stable `code` (`module_missing`,
+`no_main_context_include`), what was observed, and the remedy.
+
+### `waf.enable`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `site_id` *(optional)*; `mode` *(optional)* — `detect` or `block`; `paranoia_level` *(optional)* — 1–4 |
+
+Without `site_id`, switches the WAF on for the server: runs the preflight,
+downloads and verifies the Core Rule Set if it is not already unpacked, stores
+the default mode and paranoia level, and renders both files through the config
+engine. With `site_id`, sets that one site's policy.
+
+The preflight runs first in both cases. Enabling a site's policy on a server
+whose WAF cannot load would write a rules file nothing reads and report success.
+A per-site enable also requires the server-wide WAF to be on already, and says
+so rather than silently enabling it.
+
+`mode: off` is refused as a contradiction — `waf.disable` is how you switch
+something off. A paranoia level outside 1–4 is refused because it would fail
+*quietly*: CRS tests no such level, so the rule set would behave as if it were
+at level 1 while the panel displayed whatever was typed.
+
+Both rendered files go through the config engine with `nginx -t` as the
+validator, so a rules file ModSecurity cannot read fails validation and the
+whole change rolls back before any reload.
+
+### `waf.disable`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `site_id` *(optional)* |
+
+Without `site_id`, switches the WAF off server-wide by **removing** the nginx
+include. Removal rather than rendering `modsecurity off;`: if the module is not
+loaded, *any* `modsecurity` directive is an unknown directive and nginx will not
+start, so removal is the only spelling of "off" that is safe in both worlds.
+`/etc/ferrum/waf/main.conf` is left in place — nothing reads it once the include
+is gone, and keeping it means re-enabling restores the policy that was there.
+
+With `site_id`, writes an explicit `off` policy for that site rather than
+deleting its row. A deleted row means "inherit the server default", and if that
+default is `block` then deleting would *enable* the WAF on a site somebody had
+just asked to switch it off for.
+
+### `waf.rules.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `exclusions` — a list of `{ rule_id, site_id (optional), reason }` |
+
+Replaces the whole exclusion list in one transaction. Wholesale replacement
+rather than add/remove verbs: the list is short, an operator edits it as a list,
+and a partial apply would leave the rendered rules file agreeing with neither
+the old list nor the new one.
+
+A server-wide exclusion (`site_id` absent) renders as `SecRuleRemoveById` after
+the CRS includes — after, because the directive can only remove a rule that has
+already been defined. A site-scoped exclusion renders as a `ctl:ruleRemoveById`
+action on that site's own phase-1 rule, which is what keeps one tenant's
+exclusion off another tenant's traffic.
+
+`reason` is required and may not contain line breaks. Required because an
+unexplained hole in a WAF is indistinguishable from an attacker's and will
+outlive whoever opened it; single-line because it is rendered as a `#` comment
+in the rules file and a newline would end the comment.
+
+When the WAF is off the list is stored but nothing is rendered, and the result
+says `applied: false` so "stored" is not read as "in effect".
+
+## Security posture
+
+### `security.posture`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | none |
+
+The one-page checklist scan (spec §11.9's security advisor). Returns findings
+ordered most severe first, each with a stable `id`, a `severity`, a one-line
+plain-language `risk`, a `remedy`, and where relevant the `subject` it is
+about — plus the `facts` every verdict was derived from, so a sceptical operator
+can see the evidence rather than take the verdict on faith.
+
+`server_read`, not `server_manage`: telling somebody their server accepts
+password logins is how they come to fix it, and gating that behind the
+permission to change the server would keep the report from the person most
+likely to act on it.
+
+**A check whose evidence could not be gathered produces an `unknown` finding
+naming what failed. It never produces silence and never produces a clean
+result.** "We could not read sshd's configuration" and "sshd is configured
+safely" are different answers, and rendering them identically converts an
+unknown into a reassurance.
+
+The checks:
+
+| id | severity | what it asserts |
+|---|---|---|
+| `ssh.password_auth` | high | `PasswordAuthentication` or `KbdInteractiveAuthentication` is on |
+| `ssh.root_login` | critical with passwords, medium without | `PermitRootLogin yes` |
+| `firewall.absent` | high | no firewall backend was detected |
+| `firewall.inactive` | high | a backend is installed but not running |
+| `mariadb.off_loopback` | critical | something is listening on 3306 on a non-loopback address |
+| `panel.tls_missing` / `panel.tls_expired` | high | the panel has no certificate, or an expired one |
+| `panel.tls_expiring` | medium | fewer than 14 days left |
+| `sites.no_certificate` | medium | sites served over plain HTTP, named |
+| `sentinel.disabled` | low | brute-force defence is switched off |
+| `updates.security_pending` | high | the package manager has pending security updates |
+
+Each check also has an `*.unknown` sibling (`ssh.unknown`, `firewall.unknown`,
+`mariadb.exposure_unknown`, `updates.unknown`) for the case where the evidence
+could not be gathered.
+
+Four details worth knowing:
+
+**SSH is read twice.** `sshd -T` is asked first — it is sshd's own settled
+answer with `Include` resolved. When it cannot run, `/etc/ssh/sshd_config` and
+`/etc/ssh/sshd_config.d/*.conf` are parsed directly and the finding's remedy
+says so, because file parsing is an approximation of sshd's resolution. sshd's
+rule is **first value wins**, the opposite of nearly every other configuration
+format, and settings inside a `Match` block are skipped — Ferrum's own
+chrooted-SFTP drop-in is such a block, and reading its contents as global
+settings would report the SFTP group's policy as the server's.
+`KbdInteractiveAuthentication` is checked alongside `PasswordAuthentication`
+because turning the latter off is widely believed to be enough and on most
+distributions is not: PAM keyboard-interactive still asks for the same password.
+An absent setting reads as OpenSSH's *default*, not as the safe value — a check
+that assumes safety when it sees nothing reports safety on a file it failed to
+parse.
+
+**Listening sockets come from `/proc/net/tcp` and `/proc/net/tcp6`, not from
+`ss`.** This is a security check, and a check that depends on a tool being
+installed and its output format holding still is a check that fails open on the
+day it matters. Only sockets in state `0A` (LISTEN) count, so an outbound
+connection to somebody else's database is not reported, and an IPv4-mapped
+loopback address is normalised so `::ffff:127.0.0.1` is not read as public.
+`mariadb.off_loopback` is the exact state a live AlmaLinux box was found in
+after a panel install; `ferrum_ops::harden` now prevents it at install time and
+this check is what catches it coming back.
+
+**The update count uses cached package metadata only** (`apt-get --no-download`,
+`dnf --cacheonly`), because this runs on a dashboard page load and a check that
+goes to the network turns that into a wait on a slow mirror. Only updates from a
+security suite are counted: "17 packages have newer versions" is always true and
+always ignored, while "3 security updates are pending" is worth interrupting
+somebody for.
+
+**A certificate inside the normal renewal window is not a finding.** Renewal
+starts at 30 days, so a panel certificate at 29 days is normal; the warning
+threshold is 14, which means renewal has been failing for two weeks.
+
 ## Alerts and notifications
 
 An alert is a *span*, not an event: it opens when a reading crosses the
