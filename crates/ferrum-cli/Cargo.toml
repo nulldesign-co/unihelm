@@ -21,3 +21,12 @@ libc = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+# Tests only, and deliberately: `parity.rs` deserialises every payload the CLI
+# would send into the operation's *own* `Input` type, which is the only way to
+# prove `ferrum site create` sends what `site.create` parses without a running
+# agent. It is a dev-dependency, so none of this reaches the binary — and CI
+# already builds ferrum-ops for the workspace, so it costs nothing there.
+ferrum-ops = { workspace = true }
+serde = { workspace = true }

@@ -23,114 +23,42 @@ const MAX_CELL: usize = 60;
 /// The column order for the listings people actually read, so the useful field
 /// is not buried three columns to the right of a timestamp.
 ///
-/// An operation with no entry here still renders — the columns are just the
-/// row's own keys, sorted. Missing from this table is not an error.
+/// Keys are `<operation>` for a bare array, or `<operation>.<field>` for the
+/// named array inside an output object — several operations answer with two
+/// (`db.list` returns databases *and* users; `fw.bans` returns bans and the
+/// addresses the firewall is dropping without a record), and one column order
+/// cannot serve both.
+///
+/// The names come from the operations' own output types. An operation with no
+/// entry here still renders — the columns are then the row's own keys, sorted
+/// — and a name that no longer exists loses its column rather than printing a
+/// stripe of dashes, so this table degrades instead of lying.
+#[rustfmt::skip]
 const COLUMNS: &[(&str, &[&str])] = &[
-    (
-        "site.list",
-        &[
-            "id",
-            "domain",
-            "site_type",
-            "php_version",
-            "status",
-            "ssl_status",
-        ],
-    ),
-    (
-        "db.list",
-        &["id", "name", "engine", "subscription_id", "size_bytes"],
-    ),
-    (
-        "cert.list",
-        &[
-            "id",
-            "domain",
-            "status",
-            "not_after",
-            "days_remaining",
-            "due_for_renewal",
-        ],
-    ),
-    (
-        "cron.list",
-        &["id", "subscription_id", "schedule", "command", "enabled"],
-    ),
-    (
-        "plan.list",
-        &[
-            "id",
-            "name",
-            "max_sites",
-            "max_dbs",
-            "storage_mb",
-            "can_ssh",
-            "can_cron",
-        ],
-    ),
-    (
-        "subscription.list",
-        &["id", "customer_id", "plan_id", "status", "suspended_reason"],
-    ),
-    (
-        "app.list",
-        &["id", "name", "entry", "port", "status", "node_env"],
-    ),
-    ("fw.bans", &["ip", "reason", "banned_at", "expires_at"]),
-    (
-        "fw.rules",
-        &["port", "proto", "source", "comment", "managed"],
-    ),
-    (
-        "backup.list",
-        &[
-            "snapshot_id",
-            "time",
-            "scope",
-            "subscription_id",
-            "size_bytes",
-        ],
-    ),
-    (
-        "stack.status",
-        &[
-            "slug",
-            "display_name",
-            "status",
-            "installed_version",
-            "unit_state",
-        ],
-    ),
-    (
-        "alert.events.list",
-        &["id", "kind", "target", "value", "opened_at", "closed_at"],
-    ),
-    (
-        "wp.plugin.list",
-        &[
-            "name",
-            "status",
-            "version",
-            "update_available",
-            "update_version",
-        ],
-    ),
-    ("security.posture", &["severity", "id", "title", "detail"]),
+    ("site.list.sites", &["id", "domain", "site_type", "php_version", "status", "has_certificate"]),
+    ("db.list.databases", &["id", "name", "engine", "subscription_id"]),
+    ("db.list.users", &["id", "username", "engine", "subscription_id"]),
+    ("cert.list.certificates", &["id", "domains", "status", "not_after", "days_remaining", "due_for_renewal"]),
+    ("cron.list.jobs", &["id", "subscription_id", "schedule", "command", "enabled", "last_error"]),
+    ("plan.list.plans", &["id", "name", "max_sites", "max_dbs", "storage_mb", "can_ssh", "can_cron", "can_node_apps", "subscriptions"]),
+    ("subscription.list.subscriptions", &["id", "customer_id", "customer_username", "plan_id", "status", "sites", "suspended_reason"]),
+    ("app.list.apps", &["id", "name", "entry", "port", "node_env", "enabled", "state"]),
+    ("fw.bans.bans", &["ip", "reason", "banned_at", "expires_at", "in_backend"]),
+    ("fw.rules.rules", &["port", "proto", "source", "comment", "in_panel", "in_backend", "drift"]),
+    ("backup.list.snapshots", &["short_id", "time", "hostname", "paths", "tags"]),
+    ("stack.status.components", &["slug", "display_name", "status", "installed_version", "unit_state"]),
+    ("alert.events.list.events", &["id", "rule_id", "subject", "message", "value", "raised_at", "resolved_at"]),
+    ("alert.rules.list.rules", &["id", "kind", "target", "threshold", "enabled"]),
+    ("alert.channels.list.channels", &["id", "kind", "label", "enabled"]),
+    // Straight from `wp plugin list --format=json`, so these are WordPress's
+    // field names, not the panel's.
+    ("wp.plugin.list.plugins", &["name", "status", "version", "update"]),
+    ("security.posture.findings", &["severity", "id", "title", "risk"]),
     // Two CLI-local views. They are not registered operations — the task table
     // is the panel's own bookkeeping and `cli.ops` is this build's parity table
     // — but they render through the same table code.
-    (
-        "task.list",
-        &[
-            "id",
-            "op",
-            "status",
-            "progress",
-            "created_at",
-            "finished_at",
-        ],
-    ),
-    ("cli.ops", &["operation", "command"]),
+    ("task.list.tasks", &["id", "op", "status", "progress", "created_at", "finished_at"]),
+    ("cli.ops.operations", &["operation", "command"]),
 ];
 
 /// Render one operation's output for a terminal.
@@ -145,31 +73,45 @@ fn render_value(op: &str, value: &Value) -> String {
     match value {
         Value::Array(rows) => table(op, rows),
         Value::Object(map) => {
-            // The common shape: one array of rows, plus a little context.
-            // `{"tasks": [...], "active": 3}` should print the table and the
-            // count, not a wall of key/value lines.
-            let arrays: Vec<&String> = map
+            // The common shape: array(s) of rows, plus a little context.
+            // `{"tasks": [...], "active": 3}` prints the count and the table;
+            // `{"databases": [...], "users": [...]}` prints both tables under
+            // their own headings, because an output with two lists in it is not
+            // a record and should not be printed as one.
+            let mut arrays: Vec<&String> = map
                 .iter()
                 .filter(|(_, v)| v.is_array())
                 .map(|(k, _)| k)
                 .collect();
+            if arrays.is_empty() {
+                return pairs(map);
+            }
+            arrays.sort();
+
             let mut out = String::new();
-            if arrays.len() == 1 {
-                let key = arrays[0].as_str();
-                let mut scalars: Vec<(&String, &Value)> =
-                    map.iter().filter(|(k, _)| k.as_str() != key).collect();
-                scalars.sort_by(|a, b| a.0.cmp(b.0));
-                for (k, v) in scalars {
-                    out.push_str(&format!("{k}: {}\n", cell(v)));
-                }
+            let mut scalars: Vec<(&String, &Value)> = map
+                .iter()
+                .filter(|(k, _)| !arrays.iter().any(|a| a.as_str() == k.as_str()))
+                .collect();
+            scalars.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in scalars {
+                out.push_str(&format!("{k}: {}\n", cell(v)));
+            }
+
+            let single = arrays.len() == 1;
+            for key in arrays {
+                let rows = map[key.as_str()].as_array().expect("filtered to arrays");
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                let rows = map[key].as_array().expect("filtered to arrays");
-                out.push_str(&table(op, rows));
-                return out;
+                // One list needs no heading; more than one does, or the reader
+                // cannot tell which table they are looking at.
+                if !single {
+                    out.push_str(&format!("{key}:\n"));
+                }
+                out.push_str(&table(&format!("{op}.{key}"), rows));
             }
-            pairs(map)
+            out
         }
         other => cell(other),
     }
@@ -383,9 +325,11 @@ mod tests {
 
     #[test]
     fn columns_come_from_the_spec_when_there_is_one() {
-        let value = json!([
-            { "zzz_last": 1, "id": 7, "domain": "a.example", "site_type": "php" }
-        ]);
+        let value = json!({
+            "sites": [
+                { "zzz_last": 1, "id": 7, "domain": "a.example", "site_type": "php" }
+            ]
+        });
         let out = render("site.list", &value);
         let header = out.lines().next().unwrap();
         assert!(header.starts_with("id"), "{header}");
@@ -393,6 +337,31 @@ mod tests {
             !header.contains("zzz_last"),
             "a spec lists the columns worth showing, not every field: {header}"
         );
+    }
+
+    #[test]
+    fn an_output_with_two_lists_prints_two_tables_under_their_own_names() {
+        // `db.list` answers with databases *and* users. Printed as one record
+        // it was two lines of compact JSON; the point of the human view is that
+        // it is readable.
+        let value = json!({
+            "databases": [{ "id": 1, "name": "shop", "engine": "mysql", "subscription_id": 2 }],
+            "users": [{ "id": 3, "username": "shop_rw", "engine": "mysql", "subscription_id": 2 }],
+        });
+        let out = render("db.list", &value);
+        assert!(out.contains("databases:\n"), "{out}");
+        assert!(out.contains("users:\n"), "{out}");
+        assert!(out.contains("shop_rw"), "{out}");
+        // Each table gets its own column order, from its own key.
+        assert!(out.contains("id  name"), "{out}");
+        assert!(out.contains("id  username"), "{out}");
+    }
+
+    #[test]
+    fn a_single_list_needs_no_heading_and_no_leading_blank_line() {
+        let out = render("site.list", &json!({ "sites": [{ "id": 1 }] }));
+        assert!(!out.starts_with('\n'), "leading blank line: {out:?}");
+        assert!(!out.contains("sites:"), "{out}");
     }
 
     #[test]
@@ -432,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_missing_field_is_a_dash_not_a_panic() {
-        let value = json!([{ "id": 1 }, { "id": 2, "domain": "b.example" }]);
+        let value = json!({ "sites": [{ "id": 1 }, { "id": 2, "domain": "b.example" }] });
         let out = render("site.list", &value);
         assert!(out.contains('-'), "{out}");
     }
