@@ -8,6 +8,7 @@ import {
 import { AppShell } from "@/components/app-shell";
 import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
+import { AlertsPage } from "@/routes/alerts";
 import { AppsPage } from "@/routes/apps";
 import { BackupsPage } from "@/routes/backups";
 import { CronPage } from "@/routes/cron";
@@ -15,6 +16,7 @@ import { DashboardPage } from "@/routes/dashboard";
 import { DatabasesPage } from "@/routes/databases";
 import { DnsPage } from "@/routes/dns";
 import { FilesPage, validateFilesSearch } from "@/routes/files";
+import { FirewallPage } from "@/routes/firewall";
 import { LoginPage } from "@/routes/login";
 import { PlansPage } from "@/routes/plans";
 import { SiteDetailPage } from "@/routes/site-detail";
@@ -118,6 +120,18 @@ const filesRoute = createRoute({
   validateSearch: validateFilesSearch,
 });
 
+const firewallRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/firewall",
+  component: FirewallPage,
+});
+
+const alertsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/alerts",
+  component: AlertsPage,
+});
+
 const routeTree = rootRoute.addChildren([
   dashboardRoute,
   sitesRoute,
@@ -130,6 +144,8 @@ const routeTree = rootRoute.addChildren([
   dnsRoute,
   stackRoute,
   filesRoute,
+  firewallRoute,
+  alertsRoute,
 ]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });

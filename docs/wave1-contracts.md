@@ -142,3 +142,10 @@ integrator must do by hand.
   0.0.0.0:3306 with two anonymous accounts and a shared `test` database; the
   recycle bin could never be created in a chroot-shaped home. Fixed and
   verified on the box.
+- Wave 5: the union-merge hazard is now the single most reliable source of
+  breakage — it has swallowed a terminator on EVERY multi-branch merge (Rust
+  braces, a JSX element, i18n groups, TS interface bodies). Two rules that
+  actually work: (a) never blind-union an import line — merge the named imports;
+  (b) after any union resolve, run the real build immediately. Note `npx tsc
+  --noEmit` at the ui/ root checks NOTHING (the root tsconfig is a solution file
+  of references); `npm run build` (tsc -b) is the only honest gate.
