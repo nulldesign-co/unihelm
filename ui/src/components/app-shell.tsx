@@ -1,5 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Boxes, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { Archive, Boxes, Clock, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Network, Sun } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -26,6 +26,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       { id: "go-dashboard", label: t("nav.dashboard"), run: () => void navigate({ to: "/" }) },
       { id: "go-sites", label: t("nav.sites"), run: () => void navigate({ to: "/sites" }) },
       { id: "go-apps", label: t("nav.apps"), run: () => void navigate({ to: "/apps" }) },
+      { id: "go-cron", label: t("nav.cron"), run: () => void navigate({ to: "/cron" }) },
+      { id: "go-backups", label: t("nav.backups"), run: () => void navigate({ to: "/backups" }) },
+      { id: "go-dns", label: t("nav.dns"), run: () => void navigate({ to: "/dns" }) },
       { id: "go-stack", label: t("nav.stack"), run: () => void navigate({ to: "/stack" }) },
       { id: "go-files", label: t("nav.files"), run: () => void navigate({ to: "/files" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
@@ -46,6 +49,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { to: "/sites", label: t("nav.sites"), icon: Globe },
     { to: "/apps", label: t("nav.apps"), icon: Boxes },
     { to: "/files", label: t("nav.files"), icon: FolderOpen },
+    { to: "/cron", label: t("nav.cron"), icon: Clock },
+    { to: "/backups", label: t("nav.backups"), icon: Archive },
+    { to: "/dns", label: t("nav.dns"), icon: Network },
     { to: "/stack", label: t("nav.stack"), icon: Layers },
   ];
 
@@ -63,13 +69,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {t("common.appName")}
           </Link>
 
-          <nav className="flex items-center gap-1" aria-label={t("nav.dashboard")}>
+          {/* Eight destinations no longer fit a narrow header: scrolling the
+              row keeps every one of them reachable, where wrapping would push
+              the toolbar off the screen. */}
+          <nav
+            className="-mx-1 flex items-center gap-1 overflow-x-auto px-1"
+            aria-label={t("nav.dashboard")}
+          >
             {nav.map((item) => (
               <Link
                 key={item.to}
                 to={item.to}
                 className={cn(
-                  "rounded-lg px-3 py-1.5 text-sm transition-colors",
+                  "shrink-0 rounded-lg px-3 py-1.5 text-sm transition-colors",
                   pathname === item.to
                     ? "bg-surface-muted font-medium text-ink"
                     : "text-ink-muted hover:bg-surface-muted hover:text-ink",
