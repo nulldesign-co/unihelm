@@ -31,6 +31,12 @@ use ferrum_ops::{OpRegistry, Services};
 use crate::handler::{Agent, ConnectionHandler};
 use crate::tasks::TaskBus;
 
+/// How often expired terminal sessions are reaped.
+///
+/// A minute is well inside the shortest limit that matters (the idle timeout is
+/// measured in minutes) and costs one lock of an almost-always-empty map.
+const TERMINAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Parser, Debug)]
 #[command(name = "ferrum-agentd", version, about = "Ferrum privileged agent")]
 struct Args {
@@ -66,6 +72,13 @@ fn main() -> Result<()> {
     // re-exec, [`drop_privileges`], and its `setuid(0)`-must-fail proof.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--wp-helper")) {
         std::process::exit(wp_helper_main());
+    }
+    // And the web terminal's (spec 11.16). Same shape again, and the same
+    // reason it is dispatched here rather than anywhere later: for a tenant
+    // session every instruction executed before [`drop_privileges`] returns is
+    // an instruction running as root on behalf of a browser.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--pty-helper")) {
+        std::process::exit(pty_helper_main());
     }
 
     let args = Args::parse();
@@ -175,6 +188,7 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
 
     let bus = TaskBus::new();
     let agent = Arc::new(Agent::new(registry.clone(), bus.clone()));
+    let terminal_agent = agent.clone();
     let factory = Arc::new(AgentFactory { agent });
 
     notify::ready();
@@ -226,6 +240,23 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
         })
     };
 
+    // Terminal sessions expire on a clock, not on a request (spec 11.16): the
+    // dangerous case is an abandoned root shell, and an abandoned shell is
+    // precisely the one nobody is sending frames about.
+    let terminal_sweep = {
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(TERMINAL_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = rx.changed() => break,
+                    _ = ticker.tick() => terminal_agent.sweep_terminals().await,
+                }
+            }
+        })
+    };
+
     wait_for_signal().await;
     tracing::info!("shutting down");
     notify::stopping();
@@ -233,6 +264,7 @@ async fn run(args: Args, config: FerrumConfig) -> Result<()> {
 
     let _ = serving.await;
     let _ = scheduling.await;
+    let _ = terminal_sweep.await;
     watchdog.abort();
     Ok(())
 }
@@ -627,6 +659,147 @@ fn parse_wp_helper_args(args: &[std::ffi::OsString]) -> std::result::Result<WpHe
     })
 }
 
+// ---------------------------------------------------------------------------
+// --pty-helper: the web terminal's shell (spec 11.16, 5.2 rule 3)
+// ---------------------------------------------------------------------------
+
+/// Entry point for
+/// `ferrum-agentd --pty-helper (--root | --uid N --gid N) --home PATH --shell PATH`.
+///
+/// The standard descriptors are already the pty slave when this runs — the
+/// parent set them up and `pre_exec` made the slave this process's controlling
+/// terminal — so all that is left is to become the right account and exec the
+/// shell.
+///
+/// `--root` is the one entry point in this binary that deliberately does *not*
+/// drop privilege, because an admin's web terminal is a root shell by
+/// definition (spec 11.16). Everything that decides whether a caller may ask
+/// for it lives in `ferrum_ops::terminal::authorize`, which has no branch a
+/// customer can reach; this flag only carries that decision across the exec.
+/// It is refused outright when the agent is not root, so a `--dev` instance
+/// cannot quietly hand out a "root" shell that is really the developer's own
+/// account.
+fn pty_helper_main() -> i32 {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let parsed = match parse_pty_helper_args(&args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("pty-helper: {msg}");
+            return 2;
+        }
+    };
+
+    match parsed.account {
+        PtyAccount::Root => {
+            if !is_root() {
+                eprintln!("pty-helper: a root terminal was requested but the agent is not root");
+                return 3;
+            }
+        }
+        PtyAccount::Tenant { uid, gid } => {
+            if let Err(msg) = drop_privileges(uid, gid) {
+                eprintln!("pty-helper: {msg}");
+                return 3;
+            }
+        }
+    }
+
+    ferrum_ops::terminal::helper::run(&parsed.home, &parsed.shell)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PtyAccount {
+    Root,
+    Tenant { uid: u32, gid: u32 },
+}
+
+#[derive(Debug)]
+struct PtyHelperArgs {
+    account: PtyAccount,
+    home: PathBuf,
+    /// Re-checked against `ferrum_ops::terminal`'s allowlist after the drop —
+    /// this side of the trust boundary is the side that counts.
+    shell: PathBuf,
+}
+
+/// Parse the helper's argv.
+///
+/// `--root` and `--uid`/`--gid` are mutually exclusive, and asking for both is a
+/// refusal rather than a precedence rule: a command line that says two
+/// different things about which account to run as is one nobody should be
+/// guessing the meaning of.
+fn parse_pty_helper_args(
+    args: &[std::ffi::OsString],
+) -> std::result::Result<PtyHelperArgs, String> {
+    let mut root = false;
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut home: Option<PathBuf> = None;
+    let mut shell: Option<PathBuf> = None;
+
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        if flag.to_str() == Some("--root") {
+            root = true;
+            continue;
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))?;
+        match flag.to_str() {
+            Some("--uid") => {
+                uid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--uid must be an integer")?,
+                );
+            }
+            Some("--gid") => {
+                gid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--gid must be an integer")?,
+                );
+            }
+            Some("--home") => home = Some(PathBuf::from(value)),
+            Some("--shell") => shell = Some(PathBuf::from(value)),
+            other => {
+                return Err(format!(
+                    "unexpected argument `{}`",
+                    other.unwrap_or("<non-utf8>")
+                ));
+            }
+        }
+    }
+
+    let account = match (root, uid, gid) {
+        (true, None, None) => PtyAccount::Root,
+        (true, _, _) => {
+            return Err("--root and --uid/--gid say different things; refusing to guess".into());
+        }
+        (false, Some(uid), Some(gid)) => {
+            if uid == 0 || gid == 0 {
+                return Err("refusing to run as uid/gid 0 without --root".into());
+            }
+            PtyAccount::Tenant { uid, gid }
+        }
+        (false, _, _) => return Err("either --root or both --uid and --gid are required".into()),
+    };
+
+    let home = home.ok_or("--home is required")?;
+    let shell = shell.ok_or("--shell is required")?;
+    if !home.is_absolute() || !shell.is_absolute() {
+        return Err("--home and --shell must be absolute paths".into());
+    }
+    Ok(PtyHelperArgs {
+        account,
+        home,
+        shell,
+    })
+}
+
 /// Become the tenant, irreversibly, or die.
 ///
 /// Order matters and is fixed: `setgroups` and `setgid` while still root
@@ -732,6 +905,63 @@ mod tests {
     // is that the argument boundary never hands it a root target or a
     // half-specified one. The drop's own proof — setuid(0) failing afterwards
     // — runs on every real invocation, in production, every time.
+
+    #[test]
+    fn a_pty_helper_command_line_that_says_two_things_about_the_account_is_refused() {
+        // `--root` plus `--uid` is a command line asking to run as two
+        // different accounts. Picking one would mean a bug on the agent side
+        // silently deciding between "the tenant" and "root".
+        let err = parse_pty_helper_args(&argv(&[
+            "--root", "--uid", "1001", "--gid", "1001", "--home", "/root", "--shell", "/bin/bash",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("refusing to guess"), "{err}");
+    }
+
+    #[test]
+    fn a_pty_helper_tenant_can_never_be_uid_zero() {
+        // "Drop to root" is not a drop. Refused at the boundary as well as
+        // inside `drop_privileges`, because this is the argv an agent bug
+        // would have produced.
+        for args in [
+            argv(&["--uid", "0", "--gid", "0", "--home", "/root", "--shell", "/bin/bash"]),
+            argv(&["--uid", "0", "--gid", "1001", "--home", "/home/x", "--shell", "/bin/bash"]),
+            argv(&["--uid", "1001", "--gid", "0", "--home", "/home/x", "--shell", "/bin/bash"]),
+        ] {
+            let err = parse_pty_helper_args(&args).unwrap_err();
+            assert!(err.contains("uid/gid 0"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_pty_helper_needs_a_complete_and_absolute_command_line() {
+        // A half-specified account, a relative home, or a relative shell all
+        // mean the caller is not the agent — refuse rather than improvise.
+        for args in [
+            argv(&["--home", "/root", "--shell", "/bin/bash"]),
+            argv(&["--uid", "1001", "--home", "/home/x", "--shell", "/bin/bash"]),
+            argv(&["--root", "--shell", "/bin/bash"]),
+            argv(&["--root", "--home", "/root"]),
+            argv(&["--root", "--home", "root", "--shell", "/bin/bash"]),
+            argv(&["--root", "--home", "/root", "--shell", "bash"]),
+            argv(&["--root", "--home", "/root", "--shell", "/bin/bash", "--sneaky", "x"]),
+        ] {
+            assert!(parse_pty_helper_args(&args).is_err(), "accepted {args:?}");
+        }
+
+        let ok = parse_pty_helper_args(&argv(&[
+            "--uid", "5001", "--gid", "5001", "--home", "/home/ft_ab12", "--shell", "/bin/bash",
+        ]))
+        .unwrap();
+        assert_eq!(ok.account, PtyAccount::Tenant { uid: 5001, gid: 5001 });
+        assert_eq!(ok.shell, PathBuf::from("/bin/bash"));
+
+        let root = parse_pty_helper_args(&argv(&[
+            "--root", "--home", "/root", "--shell", "/bin/bash",
+        ]))
+        .unwrap();
+        assert_eq!(root.account, PtyAccount::Root);
+    }
 
     #[test]
     fn helper_args_parse_when_complete() {

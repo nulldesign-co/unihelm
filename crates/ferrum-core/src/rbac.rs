@@ -94,12 +94,37 @@ impl Role {
             ],
             Role::Customer => &[
                 TaskRead,
+                // A customer may stop work they started. The tasks page offers
+                // cancel and retry (spec §11.17), and the API only ever shows a
+                // customer their own rows — the alternative was a button that
+                // works for admins and silently fails for everyone else.
+                TaskCancel,
                 SiteRead,
                 SiteManage,
                 DbManage,
                 FileManage,
                 CronManage,
                 BackupManage,
+                // Held by the role, granted by the plan. Spec §11.16 gives a
+                // customer a terminal "only if `can_ssh`", and
+                // `PlanFeatures::denied_permissions` already revokes this the
+                // moment the flag is off — which it is by default
+                // (`PlanFeatures::default`). Without the permission in the
+                // role's own set that revocation had nothing to revoke and no
+                // customer could ever be granted a terminal, so the flag was
+                // unreachable rather than restrictive.
+                //
+                // This grants nothing on its own:
+                // `ferrum_ops::terminal::authorize` re-reads the target
+                // subscription's plan and refuses a customer whose plan is
+                // absent or has `can_ssh = false`, so the permission and the
+                // plan flag must *both* say yes.
+                //
+                // Deliberately **not** `SshAccess`: that one gates
+                // `sftp.enable`, whose own plan check still fails closed for
+                // planned subscriptions, and widening it here would open real
+                // SFTP access to plan-less tenants as a side effect.
+                TerminalAccess,
             ],
         }
     }
@@ -419,6 +444,36 @@ mod tests {
             !c.has(Permission::DbManage),
             "restrict_to must drop unlisted permissions"
         );
+    }
+
+    #[test]
+    fn a_customer_holds_terminal_access_by_role_but_a_default_plan_takes_it_away() {
+        // Spec §11.16: a terminal for a customer is a *plan* feature. The role
+        // has to carry the permission for the plan to have something to revoke,
+        // and `PlanFeatures::default()` has `can_ssh = false`, so the default
+        // answer is still no.
+        let c = ctx(
+            Role::Customer,
+            TenantScope::Customer {
+                customer_id: UserId(1),
+            },
+        );
+        assert!(c.has(Permission::TerminalAccess));
+
+        let features = crate::plan::PlanFeatures::default();
+        let gated = c.clone().revoke(&features.denied_permissions());
+        assert!(
+            !gated.has(Permission::TerminalAccess),
+            "a plan without can_ssh must leave a customer with no terminal"
+        );
+        assert!(
+            !gated.has(Permission::SshAccess),
+            "the same flag gates SFTP; neither half may survive it"
+        );
+
+        // And a customer never holds SFTP/SSH by role alone, which is what
+        // keeps `sftp.enable` exactly as reachable as it was before.
+        assert!(!c.has(Permission::SshAccess));
     }
 
     #[test]

@@ -315,6 +315,9 @@ impl OpRegistry {
         registry.register(crate::waf::Disable);
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
+        registry.register(crate::terminal::keys::List);
+        registry.register(crate::terminal::keys::Add);
+        registry.register(crate::terminal::keys::Remove);
         registry
     }
 
@@ -387,7 +390,12 @@ impl OpRegistry {
     /// The returned context carries the *intersection* of what the web process
     /// claimed and what the account actually has, so a forged or stale frame can
     /// only ever lose privileges here, never gain them.
-    async fn verify_auth(&self, claimed: &AuthContext) -> Result<AuthContext> {
+    ///
+    /// Public because the web terminal needs it too: a `TerminalOpen` control
+    /// frame never reaches [`Self::dispatch`], so without this the agent would
+    /// be taking the web process's word for who is asking — and a second copy
+    /// of this logic would be a second copy that can rot (spec §11.16).
+    pub async fn verify_auth(&self, claimed: &AuthContext) -> Result<AuthContext> {
         let user = self
             .services
             .db

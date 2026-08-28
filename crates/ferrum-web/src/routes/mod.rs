@@ -27,6 +27,7 @@ pub mod server;
 pub mod sites;
 pub mod stack;
 pub mod tasks;
+pub mod terminal;
 pub mod wordpress;
 pub mod waf;
 
@@ -174,6 +175,21 @@ fn protected() -> Router<SharedState> {
             post(wordpress::plugins_update),
         )
         .route("/api/wordpress/{id}/cli", post(wordpress::cli))
+        .route("/api/tasks/{id}/cancel", post(tasks::cancel))
+        .route("/api/tasks/{id}/retry", post(tasks::retry))
+        // The web terminal (spec §11.16). The ticket is minted by a normal
+        // CSRF-protected mutation; the upgrade presents it alongside the
+        // session cookie — see routes/terminal.rs for why both are required.
+        .route("/api/terminal/sessions", post(terminal::open))
+        .route("/api/terminal/ws", get(terminal::ws))
+        .route(
+            "/api/ssh-keys",
+            get(terminal::keys_list).post(terminal::keys_add),
+        )
+        .route(
+            "/api/ssh-keys/{fingerprint}",
+            axum::routing::delete(terminal::keys_remove),
+        )
         .route("/api/waf", get(waf::status))
         .route("/api/waf/enable", post(waf::enable))
         .route("/api/waf/disable", post(waf::disable))

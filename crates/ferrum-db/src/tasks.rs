@@ -25,6 +25,19 @@ pub struct NewTask {
     pub request_id: Option<String>,
 }
 
+/// What the task history page is asking for (spec §11.17: filter by op,
+/// status and date).
+///
+/// Every field is optional and they combine with AND, which is the reading a
+/// user expects from a row of filter controls.
+#[derive(Debug, Clone, Default)]
+pub struct TaskFilter {
+    pub op: Option<String>,
+    pub status: Option<TaskStatus>,
+    pub since: Option<time::OffsetDateTime>,
+    pub until: Option<time::OffsetDateTime>,
+}
+
 pub struct TaskRepo<'a> {
     db: &'a Db,
     scope: ScopeFilter,
@@ -285,6 +298,88 @@ impl TaskRepo<'_> {
         rows.into_iter().map(Task::try_from).collect()
     }
 
+    /// Recent tasks matching a filter, newest first (spec §11.17).
+    ///
+    /// The filter is built as bound parameters rather than by pasting values
+    /// into SQL — the op name in particular arrives from a query string, and a
+    /// task history is exactly the screen where somebody would try `' OR 1=1`.
+    /// The scope predicate is prepended, never replaced, so no combination of
+    /// filters can widen what a tenant sees.
+    pub async fn list_filtered(&self, filter: &TaskFilter, limit: i64, offset: i64) -> Result<Vec<Task>> {
+        let limit = limit.clamp(1, 200);
+        let mut sql = String::from("SELECT * FROM tasks WHERE 1 = 1");
+        match self.scope {
+            ScopeFilter::All => {}
+            ScopeFilter::Reseller(_) | ScopeFilter::Customer(_) => {
+                sql.push_str(" AND actor_user_id = ?1");
+            }
+            ScopeFilter::Subscription { .. } => sql.push_str(" AND subscription_id = ?1"),
+        }
+        if filter.op.is_some() {
+            sql.push_str(" AND op = ?2");
+        }
+        if filter.status.is_some() {
+            sql.push_str(" AND status = ?3");
+        }
+        if filter.since.is_some() {
+            sql.push_str(" AND created_at >= ?4");
+        }
+        if filter.until.is_some() {
+            sql.push_str(" AND created_at <= ?5");
+        }
+        sql.push_str(" ORDER BY created_at DESC, rowid DESC LIMIT ?6 OFFSET ?7");
+
+        // Every placeholder is bound whether or not its clause is present:
+        // SQLite is happy with an unused parameter, and binding the same list
+        // every time keeps the numbering above readable.
+        let scope_id = match self.scope {
+            ScopeFilter::All => None,
+            ScopeFilter::Reseller(id) | ScopeFilter::Customer(id) => Some(id),
+            ScopeFilter::Subscription {
+                subscription_id, ..
+            } => Some(subscription_id),
+        };
+        let rows = sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(scope_id)
+            .bind(filter.op.as_deref())
+            .bind(filter.status.map(|s| s.as_str()))
+            .bind(filter.since.map(to_sql_time))
+            .bind(filter.until.map(to_sql_time))
+            .bind(limit)
+            .bind(offset.max(0))
+            .fetch_all(self.db.pool())
+            .await?;
+        rows.into_iter().map(Task::try_from).collect()
+    }
+
+    /// The operation names present in this scope's history, for the filter
+    /// dropdown. Derived from the rows rather than from the registry so the
+    /// list only ever offers filters that would match something.
+    pub async fn distinct_ops(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = match self.scope {
+            ScopeFilter::All => {
+                sqlx::query_as("SELECT DISTINCT op FROM tasks ORDER BY op")
+                    .fetch_all(self.db.pool())
+                    .await?
+            }
+            ScopeFilter::Reseller(user_id) | ScopeFilter::Customer(user_id) => sqlx::query_as(
+                "SELECT DISTINCT op FROM tasks WHERE actor_user_id = ?1 ORDER BY op",
+            )
+            .bind(user_id)
+            .fetch_all(self.db.pool())
+            .await?,
+            ScopeFilter::Subscription {
+                subscription_id, ..
+            } => sqlx::query_as(
+                "SELECT DISTINCT op FROM tasks WHERE subscription_id = ?1 ORDER BY op",
+            )
+            .bind(subscription_id)
+            .fetch_all(self.db.pool())
+            .await?,
+        };
+        Ok(rows.into_iter().map(|(op,)| op).collect())
+    }
+
     /// Log lines after `after_seq`, so a reconnecting UI can resume the stream.
     pub async fn logs(&self, id: TaskId, after_seq: i64, limit: i64) -> Result<Vec<TaskLogLine>> {
         // Reading logs requires being able to read the task itself.
@@ -411,6 +506,113 @@ mod tests {
             "a finished task must not sit at a partial percentage"
         );
         assert!(done.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_history_filters_by_op_status_and_date_without_widening_the_scope() {
+        let (db, alice, bobby) = seed().await;
+
+        let mine = db.create_task(new_task(alice, "php.install")).await.unwrap();
+        db.start_task(mine.id).await.unwrap();
+        db.finish_task_ok(mine.id).await.unwrap();
+        let mine_failed = db.create_task(new_task(alice, "site.create")).await.unwrap();
+        db.start_task(mine_failed.id).await.unwrap();
+        db.finish_task_failed(
+            mine_failed.id,
+            &FerrumError::new(ErrorCode::CommandFailed, "nginx said no"),
+        )
+        .await
+        .unwrap();
+        let theirs = db.create_task(new_task(bobby, "php.install")).await.unwrap();
+
+        let scoped = db.tasks(&TenantScope::Customer { customer_id: alice });
+
+        // By op.
+        let by_op = scoped
+            .list_filtered(
+                &TaskFilter {
+                    op: Some("php.install".into()),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_op.len(), 1, "a filter must not reach another tenant's rows");
+        assert_eq!(by_op[0].id, mine.id);
+        assert!(by_op.iter().all(|t| t.id != theirs.id));
+
+        // By status.
+        let failed = scoped
+            .list_filtered(
+                &TaskFilter {
+                    status: Some(TaskStatus::Failed),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, mine_failed.id);
+
+        // By date: a window that excludes everything, then one that includes it.
+        let future = now() + time::Duration::days(1);
+        let empty = scoped
+            .list_filtered(
+                &TaskFilter {
+                    since: Some(future),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let all = scoped
+            .list_filtered(
+                &TaskFilter {
+                    since: Some(now() - time::Duration::days(1)),
+                    until: Some(future),
+                    ..Default::default()
+                },
+                50,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        assert_eq!(
+            scoped.distinct_ops().await.unwrap(),
+            vec!["php.install".to_string(), "site.create".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_op_filter_is_data_and_never_sql() {
+        // The op name arrives from a query string. If it were pasted into the
+        // statement this would return every row instead of none.
+        let (db, alice, _) = seed().await;
+        db.create_task(new_task(alice, "php.install")).await.unwrap();
+        let hostile = scoped_filter("' OR 1=1 --");
+        let rows = db
+            .tasks(&TenantScope::Global)
+            .list_filtered(&hostile, 50, 0)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "the filter must be compared, not executed");
+    }
+
+    fn scoped_filter(op: &str) -> TaskFilter {
+        TaskFilter {
+            op: Some(op.to_string()),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
