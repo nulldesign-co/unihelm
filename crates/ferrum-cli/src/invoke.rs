@@ -148,6 +148,7 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Webhook(cmd) => webhook(cmd)?,
         Command::Plugin(cmd) => plugin(cmd)?,
         Command::Import(cmd) => import(cmd)?,
+        Command::SshKeys(cmd) => ssh_keys(cmd),
         Command::Mail(cmd) => mail(cmd, secrets),
         Command::Branding(cmd) => branding(cmd),
         Command::Quota(cmd) => quota(cmd),
@@ -965,6 +966,32 @@ fn plugin(cmd: &PluginCommand) -> Result<Action> {
         PluginCommand::Disable { slug } => call("plugin.disable", json!({ "slug": slug })),
         PluginCommand::Remove { slug } => call("plugin.remove", json!({ "slug": slug })),
     })
+}
+
+fn ssh_keys(cmd: &SshKeysCommand) -> Action {
+    match cmd {
+        SshKeysCommand::List { subscription } => call(
+            "ssh.keys.list",
+            Input::new().maybe("subscription_id", *subscription).done(),
+        ),
+        SshKeysCommand::Add { key, subscription } => call(
+            "ssh.keys.add",
+            Input::new()
+                .set("key", key.clone())
+                .maybe("subscription_id", *subscription)
+                .done(),
+        ),
+        SshKeysCommand::Remove {
+            fingerprint,
+            subscription,
+        } => call(
+            "ssh.keys.remove",
+            Input::new()
+                .set("fingerprint", fingerprint.clone())
+                .maybe("subscription_id", *subscription)
+                .done(),
+        ),
+    }
 }
 
 fn import(cmd: &ImportCommand) -> Result<Action> {

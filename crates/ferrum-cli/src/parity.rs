@@ -114,6 +114,9 @@ pub const COVERAGE: &[(&str, &[&str])] = &[
     ("site.drift", &["ferrum", "site", "drift", "1"]),
     ("site.list", &["ferrum", "site", "list"]),
     ("site.update", &["ferrum", "site", "update", "1", "--http3", "true"]),
+    ("ssh.keys.add", &["ferrum", "ssh-keys", "add", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyBytesHere name@host"]),
+    ("ssh.keys.list", &["ferrum", "ssh-keys", "list"]),
+    ("ssh.keys.remove", &["ferrum", "ssh-keys", "remove", "SHA256:0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"]),
     ("stack.install", &["ferrum", "stack", "install", "nginx"]),
     ("stack.remove", &["ferrum", "stack", "remove", "nginx"]),
     ("stack.status", &["ferrum", "stack", "status"]),
@@ -264,10 +267,17 @@ mod tests {
         let Some(fields) = input.as_object() else {
             return;
         };
-        let module = type_path
-            .split("::")
-            .next()
-            .expect("a module-qualified type");
+        // Everything but the type name is the module path, so a type nested
+        // two deep (`terminal::keys::AddInput`) is read from
+        // `terminal/keys.rs` rather than from `terminal/mod.rs`, which would
+        // not contain the fields and would fail for the wrong reason.
+        let mut segments: Vec<&str> = type_path.split("::").collect();
+        segments.pop().expect("a module-qualified type");
+        assert!(
+            !segments.is_empty(),
+            "`{op}` names `{type_path}` with no module to look it up in"
+        );
+        let module = segments.join("/");
         let base = format!("{}/../ferrum-ops/src/{module}", env!("CARGO_MANIFEST_DIR"));
         let flat = format!("{base}.rs");
         let path = if std::path::Path::new(&flat).is_file() {
@@ -400,6 +410,9 @@ mod tests {
             "site.drift" => site::DriftInput,
             "site.list" => site::ListInput,
             "site.update" => site::UpdateInput,
+            "ssh.keys.add" => terminal::keys::AddInput,
+            "ssh.keys.list" => terminal::keys::ListInput,
+            "ssh.keys.remove" => terminal::keys::RemoveInput,
             "stack.install" => stack::InstallInput,
             "stack.remove" => stack::RemoveInput,
             "stack.status" => stack::StatusInput,

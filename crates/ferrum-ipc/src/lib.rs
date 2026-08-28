@@ -23,7 +23,7 @@ pub mod transport;
 pub use client::IpcClient;
 pub use frame::{
     ClientFrame, ControlFrame, ControlKind, EventFrame, EventKind, PROTOCOL_VERSION, RequestFrame,
-    ResponseBody, ResponseFrame, ServerFrame,
+    ResponseBody, ResponseFrame, ServerFrame, TerminalTarget,
 };
 pub use server::{HandlerFactory, IpcServer, RequestHandler, SharedHandler};
 pub use transport::{FrameTransport, StreamTransport};

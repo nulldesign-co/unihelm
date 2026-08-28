@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ferrum_core::{AuthContext, FerrumError};
-use ferrum_ipc::frame::{EventFrame, ResponseBody};
+use ferrum_ipc::frame::{ControlKind, EventFrame, ResponseBody};
 use ferrum_ipc::{IpcClient, IpcError};
 use tokio::sync::{Mutex, broadcast};
 
@@ -67,6 +67,35 @@ impl AgentLink {
             ResponseBody::Err { error } => Err(error),
             ResponseBody::Task { task_id } => Ok(serde_json::json!({ "task_id": task_id })),
         }
+    }
+
+    /// Push a control frame — the web terminal's open, input, resize and close
+    /// (spec §11.16).
+    ///
+    /// Reconnects once like [`Self::call`] does, but there the resemblance
+    /// stops: a control frame has no reply envelope, so "it was sent" is all
+    /// this can promise. The agent answers, when it answers, as a `Terminal*`
+    /// event on [`Self::events`].
+    ///
+    /// A reconnect is also the one case where a retry is wrong for a terminal:
+    /// the agent that held the PTY is gone, so its sessions are gone with it,
+    /// and re-sending a keystroke would silently go nowhere. The frame is sent
+    /// on the fresh connection anyway — the agent answers `closed` for an
+    /// unknown session, which is exactly what the browser needs to be told.
+    pub async fn control(&self, kind: ControlKind) -> Result<(), FerrumError> {
+        match self.try_control(kind.clone()).await {
+            Ok(()) => Ok(()),
+            Err(IpcError::Closed | IpcError::Io(_)) => {
+                tracing::info!("agent connection lost; reconnecting for a control frame");
+                self.drop_client().await;
+                self.try_control(kind).await.map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn try_control(&self, kind: ControlKind) -> Result<(), IpcError> {
+        self.client().await?.control(kind).await
     }
 
     /// Is the agent reachable right now? Used by the health endpoint and by
@@ -148,6 +177,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::AgentUnavailable);
         assert_eq!(err.http_status(), 503, "a missing agent is not a 500");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_control_frame_fails_cleanly_when_the_agent_is_down() {
+        // The browser needs a refusal it can render, not a 500: a terminal
+        // whose agent is being restarted is a normal thing to hit.
+        let link = AgentLink::new(PathBuf::from("/nonexistent/ferrum-agent.sock"));
+        let err = link
+            .control(ferrum_ipc::frame::ControlKind::TerminalClose {
+                session: uuid::Uuid::nil(),
+                actor: UserId(1),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::AgentUnavailable);
+        assert_eq!(err.http_status(), 503);
     }
 
     #[tokio::test]

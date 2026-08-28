@@ -2933,3 +2933,200 @@ of the form untouched: nothing changed is a comprehensible partial failure.
 It is what `GET /api/branding` matches an incoming `Host` header against, which
 is how a reseller's own login page finds its branding before there is a
 session.
+
+---
+
+## Web terminal and SSH keys
+
+Spec §11.16. Two very different things share a section because they share one
+plan flag (`can_ssh`) and one module, `crates/ferrum-ops/src/terminal/`.
+
+**The web terminal is the most dangerous surface in the panel, and it is not an
+operation.** Every other entry on this page is a narrow verb with a typed
+input; a terminal is a general-purpose remote code execution endpoint the panel
+offers on purpose, and for an administrator the account it runs as is root.
+Because a PTY is a conversation rather than a request with a reply, it does not
+travel through the operation registry at all — it uses its own IPC control
+frames (`TerminalOpen`, `TerminalAttach`, `TerminalInput`, `TerminalResize`,
+`TerminalClose`) and its own event frames (`TerminalOutput`, `TerminalState`).
+That means the registry's usual guarantees are re-implemented deliberately
+rather than inherited, and it is worth knowing exactly where:
+
+| Guarantee | Where it happens for a terminal |
+|---|---|
+| The web process's `AuthContext` is re-derived from the database | `ConnectionHandler::terminal_open` calls `OpRegistry::verify_auth` — the same function `dispatch` uses |
+| A permission is required | `terminal::authorize` requires `terminal_access` before anything else runs |
+| The subject is resolved through the caller's `TenantScope` | `terminal::resolve_subscription` — another tenant's id is `not_found` |
+| The action is audited | `TerminalRegistry::open` writes the audit row **before** the PTY exists; if the row cannot be written, no shell starts |
+
+### Who gets a shell
+
+`terminal::authorize` is written as an exhaustive table over (role, target) so
+every route to a root shell is visible at once. There is one:
+
+| Role | `root` | `tenant` |
+|---|---|---|
+| admin | a root shell | a shell as that subscription's Linux account, through the privilege drop |
+| reseller | refused | refused — a reseller has no Linux account and is not an administrator of the machine |
+| customer | **refused** | only if the subscription's plan has `can_ssh`, as their own account |
+
+A customer's path has no branch that can produce a root session — not a branch
+guarded by a check, no branch — and the plan gate fails closed twice over: a
+subscription with no plan at all is refused, and so is one whose plan row
+cannot be read. `Role::Customer` holds `terminal_access` by default so that
+`PlanFeatures::denied_permissions()` has something to revoke when `can_ssh` is
+false (which is the default); the permission grants nothing on its own.
+
+Further refusals: a suspended subscription, an account whose `/etc/passwd` maps
+it to uid or gid 0, and a login shell that is `nologin`, `false`, or anything
+outside `terminal::ALLOWED_SHELLS`.
+
+### How a session runs
+
+The PTY, the child process and the scrollback all live in `ferrum-agentd`, and
+`ferrum-web` holds nothing but a WebSocket and a session id. That is what makes
+spec §11.16's acceptance criterion true: restarting the panel's web process
+drops the socket and nothing else, and the browser reconnects with
+`TerminalAttach` to get its scrollback and its live stream back. It also means
+the network-facing process never holds a descriptor to a root shell.
+
+A tenant session re-execs the agent binary as
+`ferrum-agentd --pty-helper --uid N --gid N --home PATH --shell PATH`, which
+calls the *same* `drop_privileges` as `--fs-helper` and `--wp-helper`,
+`setuid(0)`-must-fail proof included. An admin's root session passes `--root`
+instead, which is the one entry point in that binary that deliberately does not
+drop — and it is refused when the agent is not root, so a `--dev` instance
+cannot hand out a "root" shell that is really the developer's own account.
+Passing `--root` together with `--uid` is refused rather than resolved by
+precedence.
+
+Sessions are bounded (`terminal::Limits`): 8 concurrently on the server, 3 per
+account, a 15-minute idle timeout, an 8-hour lifetime ceiling and a 128 KiB
+scrollback ring. The idle timeout is the important one — an abandoned root
+shell in a browser tab is a standing foothold for whoever walks past that
+laptop — and the lifetime ceiling exists because a session that keeps printing
+never goes idle. The agent sweeps every 60 seconds, and every close writes a
+`terminal.close` audit row with the reason.
+
+### One agent connection, many browsers
+
+`ferrum-web` multiplexes every browser it serves over a *single* IPC
+connection, which means the agent's terminal events arrive in the web process
+on one broadcast that every open socket can see, and every control frame leaves
+by the same wire. Routing either direction by session id alone would put one
+account's shell one guessed UUID away from another account's tab, so both
+directions carry the account as well:
+
+- outbound frames (`TerminalInput`, `TerminalResize`, `TerminalClose`) carry
+  `actor`, and the agent refuses a frame whose actor does not own the session
+  it names — `ConnectionHandler::attached_handle`;
+- inbound events (`TerminalOutput`, `TerminalState`) carry `owner`, and a
+  socket forwards a chunk only when the session *and* the owner match —
+  `routes::terminal::socket_payload`.
+
+Either check alone would be an identifier standing in for an authorisation.
+
+### Audit trail
+
+| Action | Written by | When |
+|---|---|---|
+| `terminal.request` | `ferrum-web` | a ticket was minted; carries the caller's IP, which the agent cannot see |
+| `terminal.open` | `ferrum-agentd` | before the PTY exists; carries the account, whether it is root, and the shell |
+| `terminal.close` | `ferrum-agentd` | on close, with the reason and the duration |
+
+### `ssh.keys.list`
+
+| | |
+|---|---|
+| Permission | `terminal_access` |
+| Execution | immediate |
+| Input | `subscription_id` *(optional)* |
+
+The keys inside the Ferrum-managed block of the account's
+`~/.ssh/authorized_keys`. Returns each key's `SHA256:…` fingerprint, algorithm,
+comment and size, plus `has_unmanaged_keys` — true when the file holds entries
+outside the block, so the UI can say that the list is not the whole story
+instead of implying the panel knows about every key.
+
+`terminal_access` rather than `ssh_access`: the plan's `can_ssh` flag grants
+both faces of shell access, and `terminal_access` is the one a customer's role
+can hold. The operations re-check the plan flag directly for a customer
+(`ensure_can_manage_keys`), so this is not a way around `can_ssh`. Widening
+`ssh_access` to customers instead would also have widened `sftp.enable`, which
+is a different decision belonging to a different module.
+
+### `ssh.keys.add`
+
+| | |
+|---|---|
+| Permission | `terminal_access` |
+| Execution | immediate |
+| Input | `key` — one `authorized_keys` line; `subscription_id` *(optional)* |
+
+Validates the key and puts it in the managed block. The validation is strict on
+purpose, because `authorized_keys` is a file sshd takes decisions from:
+
+- **The first token must be an algorithm.** That is what refuses an options
+  prefix — `command="…"` replaces whatever the client asked to run and
+  `environment="…"` sets variables inside the session, so accepting either
+  would let a caller install *behaviour* rather than a credential.
+- **No control characters at all.** A newline inside a key is a second
+  `authorized_keys` entry that nobody reviewed — the same bug class as a
+  newline in a crontab command.
+- **The base64 body must name the same algorithm the line does**, so
+  `ssh-ed25519 <an-rsa-blob>` is refused rather than stored as a lie about what
+  the key is.
+- **RSA below 2048 bits is refused**, and `ssh-dss` is not on the allowlist at
+  all: DSA is 1024-bit by definition and OpenSSH dropped it years ago.
+
+Nothing a caller sent is written back verbatim — the stored line is re-rendered
+from the parsed algorithm, blob and comment. At most 32 keys per account:
+`authorized_keys` is read linearly by sshd on every login attempt.
+
+### `ssh.keys.remove`
+
+| | |
+|---|---|
+| Permission | `terminal_access` |
+| Execution | immediate |
+| Input | `fingerprint` — the `SHA256:…` value from `ssh.keys.list`; `subscription_id` *(optional)* |
+
+Removes one key from the managed block. Removing a fingerprint that is not
+there is a success with `removed: false`, not an error — the button is
+idempotent because a double click should not be a failure.
+
+### The managed block
+
+```text
+ssh-ed25519 AAAA… a key the tenant added by hand, before the panel existed
+
+# ---- BEGIN FERRUM-MANAGED KEYS ----
+ssh-ed25519 AAAA… laptop
+# ---- END FERRUM-MANAGED KEYS ----
+```
+
+Everything outside the markers is the tenant's and is copied through byte for
+byte (§10.4 rule 2). A BEGIN with no END — or an END with no BEGIN — is a
+`config_drift` refusal rather than a repair: the panel cannot tell where a
+truncated block was meant to stop, and guessing wrong deletes keys that let
+somebody into their own account. Removing the last key removes the block
+entirely rather than leaving an empty pair of markers behind.
+
+The file is written **as the tenant**, through the same privilege-dropping
+helper the file manager uses (`fsops::FsRunner`). A tenant can replace `~/.ssh`
+or `authorized_keys` with a symlink at any moment, and root writing through
+that symlink is how a key manager turns into `/etc/shadow`; running as the
+tenant means a symlink can only ever point somewhere they could already write,
+and `safepath` refuses symlinked components anyway. The modes sshd insists on
+(`~/.ssh` 0700, `authorized_keys` 0600, both owned by the account) come out
+right for free.
+
+### Not implemented, on purpose
+
+- **Session recording.** Spec §11.16 says "audited, recordable"; the audit half
+  is done, the recording half is not. A transcript of a root shell is a file
+  full of whatever was typed into it — including passwords — so it needs a
+  retention policy, an access rule and probably encryption at rest before it
+  needs an implementation.
+- **A "sessions currently open" listing.** The registry knows; nothing exposes
+  it yet. A browser reconnects with a session id it already holds.

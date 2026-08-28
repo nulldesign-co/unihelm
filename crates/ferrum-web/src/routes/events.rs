@@ -84,7 +84,14 @@ pub async fn stream(
 fn task_id_of(frame: &EventFrame) -> Option<TaskId> {
     match &frame.kind {
         EventKind::TaskLog { task_id, .. } | EventKind::TaskState { task_id, .. } => Some(*task_id),
-        EventKind::Pong { .. } => None,
+        // Terminal traffic never reaches this stream. SSE fans one agent event
+        // out to *every* subscribed browser, filtered by which tasks a caller
+        // may see — and a shell's bytes have no task id to filter on. They ride
+        // the terminal's own WebSocket instead, which belongs to exactly one
+        // session (spec §11.16).
+        EventKind::Pong { .. }
+        | EventKind::TerminalOutput { .. }
+        | EventKind::TerminalState { .. } => None,
     }
 }
 
@@ -108,7 +115,10 @@ fn to_sse(frame: &EventFrame) -> Option<Event> {
                 "detail": detail,
             }),
         ),
-        EventKind::Pong { .. } => return None,
+        // See `task_id_of`: a terminal never leaves through the shared stream.
+        EventKind::Pong { .. }
+        | EventKind::TerminalOutput { .. }
+        | EventKind::TerminalState { .. } => return None,
     };
     Event::default().event(name).json_data(payload).ok()
 }
@@ -124,6 +134,31 @@ mod tests {
         });
         assert!(task_id_of(&frame).is_none());
         assert!(to_sse(&frame).is_none());
+    }
+
+    #[test]
+    fn terminal_frames_never_leave_through_the_shared_event_stream() {
+        // Every browser with a session subscribes to /api/events. If a shell's
+        // output could be forwarded here it would go to all of them, and the
+        // tenant filter has no task id to work with.
+        let frame = EventFrame::new(EventKind::TerminalOutput {
+            session: uuid::Uuid::new_v4(),
+            owner: ferrum_core::UserId(1),
+            seq: 1,
+            data: "cm9vdCMg".into(),
+        });
+        assert!(task_id_of(&frame).is_none());
+        assert!(to_sse(&frame).is_none());
+
+        let state = EventFrame::new(EventKind::TerminalState {
+            session: uuid::Uuid::new_v4(),
+            owner: ferrum_core::UserId(1),
+            status: "open".into(),
+            detail: None,
+            user: Some("root".into()),
+        });
+        assert!(task_id_of(&state).is_none());
+        assert!(to_sse(&state).is_none());
     }
 
     #[test]

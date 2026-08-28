@@ -1,15 +1,16 @@
-import { useQuery } from "@tanstack/react-query";
-import { Loader2, X } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Loader2, RotateCcw, X, XCircle } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { endpoints, type Task, type TaskStatus } from "@/lib/api";
+import { ApiError, endpoints, type Task, type TaskStatus } from "@/lib/api";
 import { useEventStream } from "@/lib/events";
 import { cn } from "@/lib/utils";
 
-const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
+export const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
   queued: "neutral",
   running: "accent",
   ok: "success",
@@ -21,7 +22,10 @@ const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "wa
  * The task drawer (spec §11.17): a CI-run view for the panel.
  *
  * Every slow action ends up here with its live output, so nothing the panel does
- * is a spinner with no explanation.
+ * is a spinner with no explanation. The drawer is the *recent* view — the last
+ * few things, in a panel you can open from anywhere. The full history, with
+ * filters, lives on `/tasks` and shares the pieces exported from this file
+ * rather than restating them.
  */
 export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = useTranslation();
@@ -29,8 +33,8 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
   const [lagged, setLagged] = useState(false);
 
   const tasks = useQuery({
-    queryKey: ["tasks"],
-    queryFn: endpoints.tasks,
+    queryKey: ["tasks", {}],
+    queryFn: () => endpoints.tasks(),
     enabled: open,
     refetchInterval: open ? 5_000 : false,
   });
@@ -72,9 +76,14 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
               </Badge>
             ) : null}
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label={t("common.close")}>
-            <X className="h-4 w-4" />
-          </Button>
+          <div className="flex items-center gap-1">
+            <Link to="/tasks" onClick={onClose} className="text-xs font-medium text-accent hover:underline">
+              {t("tasks.viewAll")}
+            </Link>
+            <Button variant="ghost" size="icon" onClick={onClose} aria-label={t("common.close")}>
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
         </header>
 
         {lagged ? (
@@ -111,14 +120,23 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
   );
 }
 
-function TaskRow({
+/**
+ * One row of the list, used by the drawer and by the history page.
+ *
+ * `showActions` is off in the drawer on purpose: the drawer is a glance at what
+ * is happening, and a cancel button one click from a mis-tap is not what a
+ * glance should offer.
+ */
+export function TaskRow({
   task,
   expanded,
   onToggle,
+  showActions = false,
 }: {
   task: Task;
   expanded: boolean;
   onToggle: () => void;
+  showActions?: boolean;
 }) {
   const { t, i18n } = useTranslation();
 
@@ -132,7 +150,10 @@ function TaskRow({
         <Badge tone={TONE[task.status]} dot={task.status === "running"}>
           {t(`tasks.status.${task.status}`)}
         </Badge>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{task.op}</span>
+        {/* An op name is machine text: LTR even when the panel is mirrored. */}
+        <span dir="ltr" className="min-w-0 flex-1 truncate font-mono text-xs text-ink">
+          {task.op}
+        </span>
         <time className="shrink-0 text-xs text-ink-subtle" dateTime={task.created_at}>
           {new Date(task.created_at).toLocaleTimeString(i18n.language)}
         </time>
@@ -151,12 +172,73 @@ function TaskRow({
         </p>
       ) : null}
 
+      {showActions ? <TaskActions task={task} /> : null}
+
       {expanded ? <TaskLogs taskId={task.id} live={task.status === "running"} /> : null}
     </li>
   );
 }
 
-function TaskLogs({ taskId, live }: { taskId: string; live: boolean }) {
+/**
+ * Cancel and retry (spec §11.17).
+ *
+ * Retry starts a *new* task rather than reviving this one, so the failed row
+ * keeps its logs and its reason — that history is the point of the page. Cancel
+ * is offered only where the operation declared itself safe to cancel; a button
+ * that silently does nothing is worse than no button.
+ */
+export function TaskActions({ task }: { task: Task }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+
+  const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  const onError = (e: unknown) =>
+    setError(e instanceof ApiError ? e.message : t("tasks.actionFailed"));
+
+  const cancel = useMutation({
+    mutationFn: () => endpoints.cancelTask(task.id),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError,
+  });
+  const retry = useMutation({
+    mutationFn: () => endpoints.retryTask(task.id),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError,
+  });
+
+  const finished = task.status === "ok" || task.status === "failed" || task.status === "cancelled";
+  const canCancel = task.cancellable && !finished;
+
+  if (!canCancel && !finished) return null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-5 pb-3">
+      {canCancel ? (
+        <Button variant="ghost" onClick={() => cancel.mutate()} disabled={cancel.isPending}>
+          <XCircle className="h-4 w-4" />
+          {t("tasks.cancel")}
+        </Button>
+      ) : null}
+      {finished ? (
+        <Button variant="ghost" onClick={() => retry.mutate()} disabled={retry.isPending}>
+          <RotateCcw className="h-4 w-4" />
+          {t("tasks.retry")}
+        </Button>
+      ) : null}
+      {error ? <span className="text-xs text-danger">{error}</span> : null}
+    </div>
+  );
+}
+
+/** A task's log lines, polling while it runs. */
+export function TaskLogs({ taskId, live }: { taskId: string; live: boolean }) {
   const { t } = useTranslation();
   const bottom = useRef<HTMLDivElement>(null);
 

@@ -200,6 +200,17 @@ impl IpcClient {
         self.send_control(ControlKind::CancelTask { task_id }).await
     }
 
+    /// Push a control frame the caller built itself.
+    ///
+    /// The web terminal needs this: its frames are a conversation with one PTY
+    /// (open, input, resize, close) rather than a request that has a reply, so
+    /// wrapping each one in its own method here would be five identical
+    /// forwarders. The reply, when there is one, arrives on [`Self::events`]
+    /// as a `Terminal*` event.
+    pub async fn control(&self, kind: ControlKind) -> Result<()> {
+        self.send_control(kind).await
+    }
+
     /// Every event the agent pushes, for the SSE bridge.
     pub fn events(&self) -> broadcast::Receiver<EventFrame> {
         self.events.subscribe()

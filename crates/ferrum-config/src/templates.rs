@@ -73,6 +73,13 @@ const TEMPLATES: &[(&str, &str)] = &[
         "ssh/sftp.conf",
         include_str!("../templates/ssh/sftp.conf.j2"),
     ),
+    // The panel-managed block inside a tenant's authorized_keys (spec §11.16).
+    // A fragment rather than a whole file: the lines around it are the
+    // tenant's own and are spliced back untouched.
+    (
+        "ssh/authorized_keys.block",
+        include_str!("../templates/ssh/authorized_keys.block.j2"),
+    ),
     (
         "nginx/waf.conf",
         include_str!("../templates/nginx/waf.conf.j2"),

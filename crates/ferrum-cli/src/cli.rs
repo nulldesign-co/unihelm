@@ -121,6 +121,10 @@ pub enum Command {
     #[command(subcommand)]
     Import(ImportCommand),
 
+    /// The SSH keys a subscription may log in with.
+    #[command(subcommand)]
+    SshKeys(SshKeysCommand),
+
     /// The outbound mail relay: where PHP's mail() hands messages over.
     #[command(subcommand)]
     Mail(MailCommand),
@@ -1412,6 +1416,38 @@ pub enum TlsModeArg {
     None,
     Starttls,
     Implicit,
+}
+
+/// `ferrum ssh-keys …`
+///
+/// The panel owns one managed block inside the account's `authorized_keys`;
+/// keys an operator put there by hand are left alone and reported separately,
+/// which is why removing takes a fingerprint rather than an index.
+#[derive(Debug, Subcommand)]
+pub enum SshKeysCommand {
+    /// Every key in the managed block, and whether anything else is present.
+    List {
+        /// Which subscription owns it. Defaults to the caller's own.
+        #[arg(long)]
+        subscription: Option<i64>,
+    },
+    /// Authorise one public key.
+    Add {
+        /// The public key, in `authorized_keys` form, e.g.
+        /// `ssh-ed25519 AAAAC3Nz... name@host`.
+        key: String,
+        /// Which subscription owns it. Defaults to the caller's own.
+        #[arg(long)]
+        subscription: Option<i64>,
+    },
+    /// Withdraw one key, named by its fingerprint.
+    Remove {
+        /// The fingerprint as `ssh-keys list` prints it.
+        fingerprint: String,
+        /// Which subscription owns it. Defaults to the caller's own.
+        #[arg(long)]
+        subscription: Option<i64>,
+    },
 }
 
 /// `ferrum branding …`

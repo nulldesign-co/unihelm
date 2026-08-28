@@ -1,0 +1,13 @@
+{# The body of the panel-managed block in a tenant's authorized_keys.
+
+   The BEGIN/END markers are NOT here: `ferrum_ops::terminal::keys` owns them,
+   because it is the code that has to find them again to splice the block back
+   into a file whose other lines belong to the tenant. Two spellings of a marker
+   — one in a template, one in a matcher — is a bug waiting for the day they
+   drift apart.
+
+   Every line below has been through `parse_authorized_key` and is re-rendered
+   from the parsed form, so nothing here is text a caller supplied verbatim. #}
+{% for key in keys %}
+{{ key.line }}
+{% endfor %}

@@ -13,8 +13,15 @@
 //!
 //! Only after all four does any code run. Because inputs are enums and newtypes
 //! rather than strings, and because execution goes through
-//! [`ferrum_distro::Cmd`]'s argv arrays, there is no path from an API request to
-//! a shell.
+//! [`ferrum_distro::Cmd`]'s argv arrays, no operation input can become a shell
+//! command.
+//!
+//! There is exactly one deliberate exception, and it is not an accident of this
+//! design but a product decision: [`terminal`] hands an authorised operator a
+//! real shell (spec §11.16). It is the most dangerous surface in the panel, it
+//! says so in its own module docs, and it does not travel through this registry
+//! at all — a PTY is a conversation, not a request with a reply, so it has its
+//! own control frames, its own authorisation, and its own audit ordering.
 
 pub mod acme;
 pub mod adminer;
@@ -48,6 +55,7 @@ pub mod slices;
 pub mod stack;
 pub mod svc;
 pub mod sys;
+pub mod terminal;
 pub mod tls;
 pub mod webhook;
 pub mod wordpress;

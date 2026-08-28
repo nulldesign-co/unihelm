@@ -100,7 +100,7 @@ async fn tenant_fs(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Tena
 /// Unprivileged agent (dev mode, tests) → in-process: `setuid` is a root-only
 /// call, so there is no privilege to drop — and nothing to protect either,
 /// since a dev home is a scratch directory owned by the current user.
-fn runner_for(linux_user: &str) -> Result<FsRunner> {
+pub(crate) fn runner_for(linux_user: &str) -> Result<FsRunner> {
     // SAFETY: `geteuid` reads process state and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return Ok(FsRunner::Local);
