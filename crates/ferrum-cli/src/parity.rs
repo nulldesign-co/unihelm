@@ -14,6 +14,13 @@
 //!   asserts it emits exactly the operation it is filed under. Without that
 //!   half the gate would only be checking that somebody typed a name into a
 //!   table.
+//! - [`tests::every_planned_payload_parses_as_its_operation_s_input`] takes the
+//!   JSON each of those commands would send and deserialises it into the
+//!   operation's own `Input` type, then checks every key it sends is really a
+//!   field on that struct. "Reachable" has to mean the operation *accepts* what
+//!   the CLI sends, not that a name matches; the second half is there because
+//!   none of the `Input` types can use `deny_unknown_fields`, so a misspelt
+//!   optional field would otherwise be dropped in silence.
 //!
 //! It is also what `ferrum ops list` prints, so an operator can see the mapping
 //! without reading the source.
@@ -207,5 +214,232 @@ mod tests {
         let first = &json["operations"][0];
         assert_eq!(first["operation"], "alert.channels.delete");
         assert_eq!(first["command"], "alert channels-delete 1");
+    }
+
+    /// Deserialise a planned payload into the operation's own `Input` type.
+    ///
+    /// This is the check that a table of names cannot make: it is the
+    /// operation's own parser saying yes. A required field the CLI spells
+    /// wrongly, a number sent where a string belongs, a value a newtype
+    /// refuses — all of them fail here rather than on the wire.
+    fn parses_as<T: serde::de::DeserializeOwned>(op: &str, input: &Value) {
+        if let Err(e) = serde_json::from_value::<T>(input.clone()) {
+            panic!("`{op}` would send input its own operation refuses: {e}\n  {input}");
+        }
+    }
+
+    /// Every top-level key the CLI sends must be a field the operation has.
+    ///
+    /// The parse check above cannot see this. None of the `Input` structs use
+    /// `deny_unknown_fields` — they cannot, several of them flatten an enum —
+    /// so a *misspelt optional* key deserialises perfectly and is silently
+    /// dropped: `site update --maintenance true` would report success and
+    /// change nothing. The only place that spelling is written down is the
+    /// struct, so this reads the struct.
+    ///
+    /// `type_path` is `stringify!`d from the table below, and its first segment
+    /// is the module, which is the file.
+    fn keys_are_real_fields(op: &str, type_path: &str, input: &Value) {
+        let Some(fields) = input.as_object() else {
+            return;
+        };
+        let module = type_path
+            .split("::")
+            .next()
+            .expect("a module-qualified type");
+        let path = format!(
+            "{}/../ferrum-ops/src/{module}.rs",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("could not read {path} for `{op}` ({e}); did the module become a directory?")
+        });
+        for key in fields.keys() {
+            assert!(
+                source.contains(&format!("pub {key}:")),
+                "`{op}` sends `{key}`, which is not a field in {path} — serde would \
+                 discard it without a word"
+            );
+        }
+    }
+
+    /// The payload the CLI would send for one COVERAGE row.
+    fn payload(op: &str) -> Value {
+        let (_, argv) = COVERAGE
+            .iter()
+            .find(|(name, _)| *name == op)
+            .unwrap_or_else(|| panic!("`{op}` is not in COVERAGE"));
+        let cli = Cli::try_parse_from(*argv).expect("parses");
+        match action_for(&cli.command, &secrets()).expect("plans") {
+            Action::Call(invocation) => invocation.input,
+            // The merge's write is built from what the agent returned, so the
+            // payload under test is the merged struct, not the patch.
+            Action::MergeSentinelSettings(patch) => patch.apply(
+                serde_json::to_value(ferrum_ops::fwops::SentinelSettings::default())
+                    .expect("settings serialise"),
+            ),
+            Action::Local => panic!("`{op}` never reaches the agent"),
+        }
+    }
+
+    #[test]
+    fn every_planned_payload_parses_as_its_operation_s_input() {
+        use ferrum_ops::*;
+
+        macro_rules! check {
+            ($($op:literal => $ty:ty),* $(,)?) => {{
+                let mut checked: Vec<&str> = Vec::new();
+                $(
+                    let input = payload($op);
+                    parses_as::<$ty>($op, &input);
+                    keys_are_real_fields($op, stringify!($ty), &input);
+                    checked.push($op);
+                )*
+                checked
+            }};
+        }
+
+        let mut checked = check! {
+            "alert.channels.delete" => alerts::ChannelsDeleteInput,
+            "alert.channels.list" => alerts::ChannelsListInput,
+            "alert.channels.set" => alerts::ChannelsSetInput,
+            "alert.channels.test" => alerts::ChannelsTestInput,
+            "alert.events.list" => alerts::EventsListInput,
+            "alert.rules.list" => alerts::RulesListInput,
+            "alert.rules.set" => alerts::RulesSetInput,
+            "app.create" => nodeapp::CreateInput,
+            "app.delete" => nodeapp::DeleteInput,
+            "app.list" => nodeapp::ListInput,
+            "app.logs" => nodeapp::LogsInput,
+            "app.restart" => nodeapp::RestartInput,
+            "backup.list" => backup::ListInput,
+            "backup.repo.delete" => backup::RepoDeleteInput,
+            "backup.repo.init" => backup::RepoInitInput,
+            "backup.restore" => backup::RestoreInput,
+            "backup.run" => backup::RunInput,
+            "backup.schedule.delete" => backup::ScheduleDeleteInput,
+            "backup.schedule.set" => backup::ScheduleSetInput,
+            "cert.issue" => cert::IssueInput,
+            "cert.issue_wildcard" => dns::IssueWildcardInput,
+            "cert.list" => cert::ListInput,
+            "cron.delete" => cron::DeleteInput,
+            "cron.list" => cron::ListInput,
+            "cron.set" => cron::SetInput,
+            "db.adminer.disable" => adminer::DisableInput,
+            "db.adminer.enable" => adminer::EnableInput,
+            "db.adminer.status" => adminer::StatusInput,
+            "db.create" => db::CreateInput,
+            "db.drop" => db::DropInput,
+            "db.grant" => db::GrantInput,
+            "db.list" => db::ListInput,
+            "db.user.create" => db::UserCreateInput,
+            "db.user.drop" => db::UserDropInput,
+            "db.user.password" => db::UserPasswordInput,
+            "dns.check" => dns::CheckInput,
+            "dns.provider.set" => dns::ProviderSetInput,
+            "fw.ban" => fwops::BanInput,
+            "fw.bans" => fwops::BansInput,
+            "fw.port.close" => fwops::PortInput,
+            "fw.port.open" => fwops::PortInput,
+            "fw.rules" => fwops::RulesInput,
+            "fw.unban" => fwops::UnbanInput,
+            "metrics.snapshot" => metrics::SnapshotInput,
+            "panel.tls.issue" => panel::IssueInput,
+            "plan.assign" => plan::AssignInput,
+            "plan.create" => plan::CreateInput,
+            "plan.delete" => plan::DeleteInput,
+            "plan.list" => plan::ListInput,
+            "plan.update" => plan::UpdateInput,
+            "quota.backend" => quota::BackendInput,
+            "quota.set" => quota::SetInput,
+            "quota.usage" => quota::UsageInput,
+            "security.posture" => posture::PostureInput,
+            "sentinel.settings" => fwops::SettingsGetInput,
+            "sentinel.settings.set" => fwops::SentinelSettings,
+            "sftp.disable" => sftp::DisableInput,
+            "sftp.enable" => sftp::EnableInput,
+            "site.create" => site::CreateInput,
+            "site.delete" => site::DeleteInput,
+            "site.drift" => site::DriftInput,
+            "site.list" => site::ListInput,
+            "site.update" => site::UpdateInput,
+            "stack.install" => stack::InstallInput,
+            "stack.remove" => stack::RemoveInput,
+            "stack.status" => stack::StatusInput,
+            "subscription.list" => plan::ListSubscriptionsInput,
+            "subscription.suspend" => plan::SuspendInput,
+            "subscription.unsuspend" => plan::UnsuspendInput,
+            "svc.action" => svc::ActionInput,
+            "svc.status" => svc::StatusInput,
+            "sys.ping" => sys::PingInput,
+            "waf.disable" => waf::DisableInput,
+            "waf.enable" => waf::EnableInput,
+            "waf.rules.set" => waf::RulesSetInput,
+            "waf.status" => waf::StatusInput,
+            "wp.cli" => wordpress::CliInput,
+            "wp.detect" => wordpress::DetectInput,
+            "wp.install" => wordpress::InstallInput,
+            "wp.plugin.list" => wordpress::PluginListInput,
+            "wp.plugin.update" => wordpress::PluginUpdateInput,
+            "wp.update" => wordpress::UpdateInput,
+        };
+
+        // And the table above must cover the table below, or an operation could
+        // be added to COVERAGE and quietly never have its payload checked.
+        checked.sort_unstable();
+        let mut listed: Vec<&str> = COVERAGE.iter().map(|(op, _)| *op).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            checked, listed,
+            "every COVERAGE row needs an Input type here, and vice versa"
+        );
+    }
+
+    #[test]
+    fn a_payload_with_a_misspelt_required_field_is_caught() {
+        // The guard on the guard: `parses_as` has to actually reject something,
+        // or the test above is 82 assertions that never fire. `site.create`
+        // without its domain is exactly the shape of a rename gone wrong.
+        let broken = json!({ "domian": "example.com" });
+        let outcome = std::panic::catch_unwind(|| {
+            parses_as::<ferrum_ops::site::CreateInput>("site.create", &broken)
+        });
+        assert!(
+            outcome.is_err(),
+            "a missing required field must fail the payload check"
+        );
+    }
+
+    #[test]
+    fn a_misspelt_optional_field_is_caught_even_though_serde_accepts_it() {
+        // The gap this closes, demonstrated: `site.update` takes
+        // `maintenance_mode`, and `maintenance` deserialises without complaint
+        // because there is no `deny_unknown_fields` to complain. Only the
+        // source check notices.
+        let plausible = json!({ "site_id": 1, "maintenance": true });
+        assert!(
+            serde_json::from_value::<ferrum_ops::site::UpdateInput>(plausible.clone()).is_ok(),
+            "serde really does accept it, which is the whole problem"
+        );
+        let outcome = std::panic::catch_unwind(|| {
+            keys_are_real_fields("site.update", "site::UpdateInput", &plausible)
+        });
+        assert!(
+            outcome.is_err(),
+            "the source check must catch what serde does not"
+        );
+    }
+
+    #[test]
+    fn a_newtype_that_refuses_its_value_is_caught() {
+        // The other half: a field that is present, of the right JSON type, and
+        // still not a legal value. `Domain` is the one the CLI leans on most.
+        let outcome = std::panic::catch_unwind(|| {
+            parses_as::<ferrum_ops::site::CreateInput>(
+                "site.create",
+                &json!({ "domain": "not a domain at all" }),
+            )
+        });
+        assert!(outcome.is_err(), "an invalid Domain must fail the check");
     }
 }
