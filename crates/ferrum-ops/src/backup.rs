@@ -1456,6 +1456,24 @@ pub async fn run_backup(
             // pruning before the new snapshot is safely in would be deleting
             // old backups on the strength of one that might yet fail.
             out.pruned = prune(ctx, program, target, scope, subscription).await;
+
+            // Spec §14 Phase 6: a backup that finished is one of the events an
+            // integrator watches for. Emitted from `run_backup` rather than
+            // from the operation body so a *scheduled* run notifies too — the
+            // unattended ones are precisely the ones nobody is watching.
+            crate::webhook::emit(
+                ctx,
+                "backup.completed",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "repo_id": target.id,
+                    "scope": scope,
+                    "subscription_id": subscription.map(|s| s.get()),
+                    "snapshot_id": out.snapshot_id,
+                    "bytes": out.bytes,
+                }),
+            )
+            .await;
             Ok(out)
         }
         Err(e) => {
@@ -1468,6 +1486,20 @@ pub async fn run_backup(
                     },
                 )
                 .await;
+
+            // The event every integrator asks for first.
+            crate::webhook::emit(
+                ctx,
+                "backup.failed",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "repo_id": target.id,
+                    "scope": scope,
+                    "subscription_id": subscription.map(|s| s.get()),
+                    "error": e.detail,
+                }),
+            )
+            .await;
             Err(e)
         }
     }

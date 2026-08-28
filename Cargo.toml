@@ -36,6 +36,11 @@ ferrum-metrics = { path = "crates/ferrum-metrics" }
 
 anyhow = "1"
 base64 = "0.22.1"
+# minisign verification for plugin payloads (spec §6 plugin note): the same
+# ed25519/minisign format the installer and self-update already trust, verified
+# in-process rather than by shelling out to a binary that may not be installed.
+blake2 = "0.10.6"
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 # File-manager content crosses the op JSON as base64 chunks (spec §11.7).
 # Archive formats for fs.compress / fs.extract (spec §11.7). Extraction is
 # zip-bomb and path-traversal guarded in ferrum-ops::fsops::archive.
@@ -66,6 +71,9 @@ libc = "0.2"
 toml = "0.8"
 rand = "0.8"
 hex = "0.4"
+# HMAC-SHA256 over webhook bodies (spec §14 Phase 6): the signature a receiver
+# verifies. `hmac` 0.12 shares the digest 0.10 traits with sha2 above.
+hmac = "0.12"
 sha2 = "0.10"
 # sha512-crypt for /etc/shadow: sshd/PAM verify tenant SFTP passwords through
 # crypt(3), which cannot read the panel's argon2 hashes (see ops::sftp).

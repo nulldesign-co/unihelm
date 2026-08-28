@@ -33,6 +33,7 @@ pub mod nodeapp;
 pub mod panel;
 pub mod php;
 pub mod plan;
+pub mod plugin;
 pub mod posture;
 pub mod provision;
 pub mod quota;
@@ -45,6 +46,7 @@ pub mod stack;
 pub mod svc;
 pub mod sys;
 pub mod tls;
+pub mod webhook;
 pub mod wordpress;
 pub mod waf;
 

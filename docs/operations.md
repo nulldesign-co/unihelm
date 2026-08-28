@@ -2159,3 +2159,304 @@ endpoint, and an audit row is browsable by anyone holding `audit_read`
   `Db::wp_installs_with_auto_update()` exposes it, but no scheduler job walks
   it yet; the safe-hour window and pre-update snapshot the spec asks for belong
   with that job.
+
+---
+
+## Webhooks
+
+Outbound event delivery (spec §2.4, §9 `webhooks`, §14 Phase 6). Ferrum will
+never grow a billing module, so it has to be a panel somebody else's billing
+module can watch. Four operations register endpoints; a scheduler job
+(`webhook.deliver`, every 30 s) does the sending.
+
+Three properties shape every operation below, and each is explained in full in
+**`docs/webhooks.md`**, which is the contract an integrator implements against:
+
+- **Deliveries are signed.** `X-Ferrum-Signature: v1=<hex>` is an HMAC-SHA256
+  over `v1:<X-Ferrum-Timestamp>:<raw body>`, so a receiver can prove the panel
+  sent it *and* refuse a replay — the timestamp is inside the MAC precisely so
+  it cannot be edited by anyone who did not have the secret.
+- **Delivery is at-least-once and bounded at both ends.** Each delivery gets
+  six attempts on a 30/60/120/240/480-second curve; a hook whose *consecutive*
+  failures reach 20 is switched off with a reason and its queue abandoned. A
+  dead endpoint must not become an unbounded retry queue.
+- **The event catalogue is closed.** A name that is not one the panel emits is
+  refused, because a typo is otherwise a hook that looks configured and never
+  fires. The catalogue: `account.created`, `quota.near_limit`,
+  `certificate.renewed`, `backup.completed`, `backup.failed`,
+  `subscription.suspended`, `site.created`, `site.deleted`, plus `*` for all of
+  them.
+
+The permissions are `server_read` to look and `server_manage` to change.
+Registering a hook means this panel will POST its internal events to an address
+of the caller's choosing, which is a server-configuration change rather than a
+tenant one. (Spec §6.1's permission set is fixed for this wave; a dedicated
+`webhook_manage` permission is the natural follow-up, and the rows are already
+owner-scoped for it.)
+
+### `webhook.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `id` *(optional)* — also return this hook's recent delivery history |
+
+Every hook the caller's tenant scope can see: URL, subscribed events, `active`,
+the consecutive-failure count, `last_status` (the HTTP status of the most recent
+attempt) and `disabled_reason` — why the panel switched it off, or `null` if a
+human did. Also returns the whole event catalogue and `max_per_owner`, so a UI
+never hard-codes either.
+
+The scope resolves through `users.reseller_id` exactly as the user repository
+does: an admin sees everything, a reseller its own hooks and its customers',
+a customer only its own.
+
+**The signing secret is never in the answer.** It is not merely omitted from
+this output — `ferrum_db::Webhook` marks the field `#[serde(skip)]`, so no
+future caller can serialise it by accident.
+
+With `id`, the hook is resolved through the caller's scope *first*, so an id
+outside it answers `not_found` rather than an empty history — "there are no
+deliveries" and "that is not yours" are different answers and only one of them
+is true. The history is the last 50 attempts with their status, attempt count,
+response code and last error.
+
+### `webhook.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `url`; `events`; `id` *(optional)* — update this hook instead of creating one; `active` *(optional bool, default `true`)*; `owner_user_id` *(optional)* — defaults to the caller's own account; `rotate_secret` *(optional bool, default false)* |
+
+Creates a hook, or updates the one named by `id`.
+
+**On create the signing secret is minted and returned once**: 32 bytes of
+CSPRNG, hex-encoded, sealed with the panel master key (spec §12 rule 6) on the
+way into the database and never readable again. On update it is absent unless
+`rotate_secret` is set, which is how a leaked secret is replaced — and which
+invalidates every signature made with the old one immediately.
+
+`owner_user_id` is resolved **through the caller's scope**, so an id outside it
+is `not_found` and cannot be used to plant a hook on somebody else's account. A
+hook cannot be moved between accounts afterwards; the REST layer drops the field
+on the update path rather than letting a client that round-trips a hook object
+trip over the refusal.
+
+The URL must be `http://` or `https://`, under 2048 characters, with no
+whitespace or control characters — an embedded newline is header injection into
+the request the panel is about to build. Private and loopback addresses are
+**not** blocked: only an account holding `server_manage` can register a hook,
+that account already has root on the machine, and relaying through
+`http://127.0.0.1:9000/hook` is a legitimate and common setup.
+
+Re-enabling a hook clears its failure bookkeeping. That is the point of the
+verb: an operator who fixed their endpoint has said the previous failures are
+history, and leaving the counter at its threshold would disable the hook again
+on the first hiccup.
+
+An account may hold at most 20 hooks. The cap is enforced inside the `INSERT`
+rather than as a read-then-write, so two concurrent creates cannot both see
+"19 hooks" and both insert; past it the answer is `FER-1403 conflict`.
+
+### `webhook.delete`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `id` |
+
+Removes a hook and, by cascade, everything still queued for it. Resolved
+through the caller's scope, so guessing an id is not a way in.
+
+### `webhook.test`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `id` |
+
+Sends one synthetic delivery and reports what the endpoint answered:
+`delivered`, the HTTP `status` if one was seen, the `error` if not, and the
+`timestamp` and `signature` that were sent — the last two so somebody writing
+the receiving side can diff their own computation against the panel's.
+
+Synchronous rather than queued, and that is the whole value: an operator
+pressing "test" wants the answer, not a task id and a promise.
+
+The payload carries the reserved event name `webhook.test`, which is
+deliberately **not** in the catalogue and cannot be subscribed to, so a receiver
+switching on `event` can tell a drill from the real thing. Its `id` is `0`: a
+probe has no delivery row, and saying so beats colliding with a real delivery a
+receiver has stored.
+
+**A test counts toward the failure streak.** It is a real POST to a real
+endpoint, and an operator who tests a hook twenty times against a dead host has
+taught the panel exactly what twenty failed deliveries would.
+
+---
+
+## Plugins
+
+The extension system (spec §6 plugin note, §14 Phase 6), **sidecar model only**.
+Spec §6 is explicit — *"Do NOT let plugins run in-process as root"* — so a
+plugin is a separate process, started under a dedicated unprivileged system
+account, inside a systemd unit carrying the same hardening as the panel's own
+`ferrum-web` unit, speaking the panel's existing length-prefixed JSON framing
+(`ferrum-ipc`) over its own Unix socket.
+
+The full contract — the manifest format, the trust model, the socket protocol
+and a working sidecar in twenty lines — is **`docs/plugins.md`**. Two properties
+matter enough to restate here:
+
+- **The manifest is the routing authority.** A plugin declares its extension
+  points at install time; the stored list is what the agent routes against, and
+  a running sidecar is never asked what it thinks it provides. A plugin that
+  declared `notifier` and is asked for `dns.present` is refused before a socket
+  is opened.
+- **A plugin can never register an operation.** The registry is built from a
+  fixed list in Rust and nothing here inserts into it. That is load-bearing:
+  the registry is where the permission check lives, so an extension point that
+  could add an operation would be one that could add an unchecked one. Plugins
+  are reached *through* operations, never as them.
+
+### `plugin.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Every installed plugin: slug, name, version, the validated manifest, the
+declared extension points, the install directory, the account its sidecar runs
+as, how it was signed (`minisign` or `unsigned`), whether it is enabled, and the
+last error its sidecar reported. Also returns this build's extension-point
+catalogue, the plugin `api_version`, whether `plugins.allow_unsigned` is on, and
+how many trusted signing keys are configured — which is what an operator needs
+to see next to "unsigned plugins: refused".
+
+### `plugin.install`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, **not** idempotent) |
+| Input | `source` — an absolute path to a staged plugin tree containing `plugin.toml` |
+
+Verifies a payload and installs it **disabled**.
+
+**The panel does not fetch anything.** Staging is the operator's step; a
+marketplace client (spec §14 Phase 6) belongs above this layer and would stage a
+tree exactly like this one. `source` must be absolute and canonical, and may not
+be under `/home` — a tree a tenant can rewrite between the moment it is verified
+and the moment it is copied would make the signature check theatre.
+
+The order of the checks is the design, and each refusal leaves nothing behind:
+
+1. **The manifest** is parsed and validated: the slug's alphabet (the
+   intersection of a systemd unit-name component, a Unix account name and a path
+   component), the entry point (relative, traversal-free, and free of anything
+   systemd would read as syntax in `ExecStart=`), the protocol version, a
+   non-empty duplicate-free extension list, and a `[files]` digest table that
+   includes the entry point — an unlisted file is an unverified file.
+2. **Authenticity**: `plugin.toml.minisig` is verified in-process against the
+   keys in `plugins.trusted_keys`, the same ed25519/minisign format the
+   installer verifies releases with (spec §5.5). Both the payload signature and
+   the global signature over the trusted comment are checked. A signature from a
+   key nobody has said they trust is `FER-1300`, and so is a signed plugin
+   installed while no trusted keys are configured — a signature nobody trusts is
+   not better than no signature, it is just longer.
+3. **Unsigned payloads are refused** unless `plugins.allow_unsigned` is
+   explicitly on (it defaults to **false**). The refusal names the setting. The
+   reasoning is in `docs/plugins.md`: a plugin is code the agent starts as a
+   service on a machine full of other people's websites, and "I downloaded it
+   from somewhere" is not a trust decision a panel makes on an operator's
+   behalf. When it *is* on, the decision is recorded on the row
+   (`signature = "unsigned"`) rather than forgotten.
+4. **Integrity**: every listed file must match its SHA-256, **and every file in
+   the tree must be listed**. The second direction is the one that matters — a
+   checker that only verifies what the manifest mentions is defeated by shipping
+   a second binary the manifest does not mention. Symlinks are refused anywhere
+   in the tree.
+5. **The row is written before anything on disk changes**, so two concurrent
+   installs of one slug cannot both create an account and a unit; the second is
+   `FER-1403 conflict`.
+6. **The account, the tree, the unit**, in that order. The tree is copied
+   file by file with modes set explicitly (0755 for the entry point, 0644 for
+   everything else, nothing group- or world-writable) rather than by `cp -a`,
+   which would preserve whatever the staging directory happened to have. The
+   unit goes through the config engine like every other file the panel owns:
+   render, `systemd-analyze verify`, `daemon-reload`, rollback on failure.
+
+A failure after step 5 unwinds the row, the tree and the unit. The **account is
+deliberately not unwound**: a system account with no files is inert, and
+deleting one is how a uid gets recycled onto files somebody still owns.
+
+**Installing is not starting.** A freshly installed plugin is disabled, so an
+operator can read the manifest the panel accepted before any of that code runs.
+There is no in-place upgrade: installing over an existing slug is a conflict.
+
+### `plugin.enable`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `slug` |
+
+Starts the sidecar (`systemctl enable --now`) and marks the row enabled, which
+is what makes the agent willing to route its declared extension points. Clears
+any previously recorded sidecar error. Returns the row and the unit's state.
+
+### `plugin.disable`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `slug` |
+
+The reverse, and the order is the safety property: **the row is flipped first**.
+If systemd refuses to stop the unit, the panel must still stop routing to it — a
+plugin the registry thinks is enabled is a plugin the agent will happily dial.
+A stop failure is reported, with the row already disabled and the reason
+recorded.
+
+### `plugin.remove`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `slug` |
+
+Stops the sidecar, removes the unit and reloads systemd, removes the installed
+tree, and deletes the row. Every step is "make sure this is gone", which is why
+it is safe to re-run: a unit that is already absent reports an error that means
+"already done", and the tree is only ever removed from inside
+`/var/lib/ferrum/plugins`, so a hand-edited `install_dir` cannot turn this into
+a recursive delete of somewhere else.
+
+The dedicated account is left behind and the result names it, for the same
+reason `plugin.install` does not unwind it.
+
+### Not implemented, on purpose
+
+- **A marketplace client.** `plugin.install` takes a staged path; fetching,
+  browsing and updating from a remote index (spec §14 Phase 6) is a layer above
+  this one.
+- **In-place upgrade.** Remove and install. Reconciling a running sidecar, a
+  changed manifest and a changed extension set is its own operation with its own
+  failure modes, and getting it half-right is worse than not offering it.
+- **Calling plugins from the core modules.** `ferrum_ops::plugin::call` is the
+  routed, permission-respecting entry point and is tested end to end against a
+  real socket, but no core module consults a plugin yet: `dns.rs` still knows
+  only Cloudflare, `backup.rs` only its built-in targets, `alerts.rs` only its
+  own channels. Wiring each one is a change to that module, not to this one.
+- **A UI page and the micro-frontend mount.** A manifest may declare a
+  `ui_panel` with its `[ui]` mount point and the panel validates and stores it,
+  but nothing in `ui/` renders it yet.

@@ -204,6 +204,24 @@ impl TypedOperation for Issue {
         let days_valid = (issued.not_after - ferrum_db::now()).whole_days();
         ctx.log(format!("{} is now served over HTTPS", site.domain));
 
+        // Spec §14 Phase 6. Emitted for a first issuance as well as a renewal:
+        // to an integrator the interesting fact is "this domain now has a
+        // certificate valid until X", and the unattended renewals the
+        // scheduler drives come through this same path (see
+        // `ferrum_agentd::scheduler::renew_certificates`).
+        crate::webhook::emit(
+            ctx,
+            "certificate.renewed",
+            serde_json::json!({
+                "certificate_id": record.id,
+                "site_id": site.id.get(),
+                "domains": names,
+                "not_after": ferrum_db::to_sql_time(issued.not_after),
+                "days_valid": days_valid,
+            }),
+        )
+        .await;
+
         Ok(IssueOutput {
             certificate_id: record.id,
             domains: names,

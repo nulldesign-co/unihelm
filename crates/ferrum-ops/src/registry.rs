@@ -315,6 +315,15 @@ impl OpRegistry {
         registry.register(crate::waf::Disable);
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
+        registry.register(crate::webhook::List);
+        registry.register(crate::webhook::Set);
+        registry.register(crate::webhook::Delete);
+        registry.register(crate::webhook::Test::live());
+        registry.register(crate::plugin::List);
+        registry.register(crate::plugin::Install);
+        registry.register(crate::plugin::Enable);
+        registry.register(crate::plugin::Disable);
+        registry.register(crate::plugin::Remove);
         registry
     }
 
