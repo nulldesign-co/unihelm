@@ -962,6 +962,171 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
+    /// The file half, against a real home directory.
+    ///
+    /// Everything above tests the parsing and the splicing as pure functions.
+    /// This drives the same code through [`FsRunner`] — the file manager's own
+    /// helper — so what is proven is the whole path a key actually takes:
+    /// create `~/.ssh`, write the file, set the modes sshd insists on, and read
+    /// it back. `FsRunner::Local` is the dev/test variant of the same runner
+    /// production uses (there is no privilege to drop when the test process
+    /// owns the directory), so the request shapes are the production ones.
+    async fn write_keys(home: &std::path::Path, existing: &str, keys: &[SshPublicKey]) {
+        let target = Target {
+            linux_user: LinuxUser::parse("ft_test").unwrap(),
+            home: home.to_path_buf(),
+            runner: FsRunner::Local,
+        };
+        // The block is rendered by the config engine's template set, the same
+        // one the agent loads at startup.
+        let templates = ferrum_config::TemplateSet::load().unwrap();
+        let block = templates
+            .render(
+                "ssh/authorized_keys.block",
+                &serde_json::json!({
+                    "keys": keys.iter().map(|k| serde_json::json!({ "line": k.line() }))
+                        .collect::<Vec<_>>(),
+                }),
+            )
+            .unwrap();
+        let updated = splice_block(existing, &block).unwrap();
+
+        target
+            .runner
+            .call(
+                &target.home,
+                FsRequest::Mkdir {
+                    path: PathBuf::from(SSH_DIR),
+                },
+                Vec::new(),
+                FS_TIMEOUT,
+            )
+            .await
+            .or_else(|e| {
+                if e.code == ErrorCode::AlreadyExists {
+                    Ok((FsData::Done, Vec::new()))
+                } else {
+                    Err(e)
+                }
+            })
+            .unwrap();
+        target.chmod(SSH_DIR, SSH_DIR_MODE).await.unwrap();
+
+        let bytes = updated.into_bytes();
+        target
+            .runner
+            .call(
+                &target.home,
+                FsRequest::Write {
+                    path: PathBuf::from(AUTHORIZED_KEYS),
+                    len: bytes.len() as u64,
+                    create_parents: true,
+                    append: false,
+                },
+                bytes,
+                FS_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        target
+            .chmod(AUTHORIZED_KEYS, AUTHORIZED_KEYS_MODE)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_survives_a_round_trip_through_a_real_authorized_keys_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let target = Target {
+            linux_user: LinuxUser::parse("ft_test").unwrap(),
+            home: home.clone(),
+            runner: FsRunner::Local,
+        };
+
+        // Nothing there yet is the normal state for an account that has never
+        // added a key — not an error.
+        assert_eq!(target.read().await.unwrap(), "");
+
+        let first = parse_authorized_key(&ed25519_line(1, "laptop")).unwrap();
+        write_keys(&home, "", std::slice::from_ref(&first)).await;
+
+        let back = target.read().await.unwrap();
+        assert_eq!(read_block(&back).unwrap(), vec![first.clone()]);
+
+        // sshd's StrictModes refuses anything more permissive than these, and a
+        // key manager that installs a key nobody can log in with is worse than
+        // one that refuses.
+        let mode = |path: &str| {
+            std::fs::metadata(home.join(path)).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(SSH_DIR), SSH_DIR_MODE);
+        assert_eq!(mode(AUTHORIZED_KEYS), AUTHORIZED_KEYS_MODE);
+
+        // A second key joins the block rather than replacing it.
+        let second = parse_authorized_key(&ed25519_line(2, "phone")).unwrap();
+        write_keys(&home, &back, &[first.clone(), second.clone()]).await;
+        assert_eq!(read_block(&target.read().await.unwrap()).unwrap().len(), 2);
+
+        // And removing one leaves the other alone.
+        let after = target.read().await.unwrap();
+        write_keys(&home, &after, std::slice::from_ref(&second)).await;
+        assert_eq!(read_block(&target.read().await.unwrap()).unwrap(), vec![second]);
+    }
+
+    #[tokio::test]
+    async fn a_key_the_tenant_added_by_hand_survives_the_panel_writing_the_file() {
+        // Spec §10.4 rule 2, on a real file: the tenant put a key there over
+        // SFTP before the panel existed, and it is not the panel's to delete.
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let target = Target {
+            linux_user: LinuxUser::parse("ft_test").unwrap(),
+            home: home.clone(),
+            runner: FsRunner::Local,
+        };
+
+        let theirs = ed25519_line(9, "added-by-hand-over-sftp");
+        std::fs::create_dir(home.join(SSH_DIR)).unwrap();
+        std::fs::write(home.join(AUTHORIZED_KEYS), format!("{theirs}
+")).unwrap();
+
+        let existing = target.read().await.unwrap();
+        let mine = parse_authorized_key(&ed25519_line(1, "panel")).unwrap();
+        write_keys(&home, &existing, std::slice::from_ref(&mine)).await;
+
+        let after = target.read().await.unwrap();
+        assert!(after.contains(&theirs), "the tenant's own key was lost: {after}");
+        assert_eq!(read_block(&after).unwrap(), vec![mine]);
+        assert!(has_keys_outside_block(&after).unwrap());
+
+        // Removing the panel's last key removes the block and leaves theirs.
+        write_keys(&home, &after, &[]).await;
+        let emptied = target.read().await.unwrap();
+        assert_eq!(emptied, format!("{theirs}
+"));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_valid_utf8_is_refused_rather_than_rewritten() {
+        // Rewriting it would replace whatever is there with a lossy version of
+        // itself, which for an authorized_keys file means locking somebody out.
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(home.join(SSH_DIR)).unwrap();
+        std::fs::write(home.join(AUTHORIZED_KEYS), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let target = Target {
+            linux_user: LinuxUser::parse("ft_test").unwrap(),
+            home,
+            runner: FsRunner::Local,
+        };
+        let err = target.read().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
     #[test]
     fn an_empty_file_gains_a_block_with_no_stray_blank_lines() {
         let out = splice_block("", &format!("{}\n", ed25519_line(1, "only"))).unwrap();
