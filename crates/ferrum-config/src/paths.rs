@@ -289,6 +289,25 @@ pub fn app_dir(linux_user: &str, app: &str) -> PathBuf {
     tenant_home(linux_user).join("apps").join(app)
 }
 
+/// Where the panel-managed WP-CLI phar lives (spec §11.12).
+///
+/// Under the panel's data directory, root-owned and mode 0755, for the same
+/// reason Adminer lives there: a tenant runs it (as themselves, through the
+/// privilege-dropping helper) but must never be able to *replace* it. A phar
+/// inside a tenant home would be a file the tenant could swap for their own
+/// code moments before the panel invoked it — and the panel invokes it while
+/// holding a database password.
+pub fn wp_cli_dir() -> PathBuf {
+    under("/var/lib/ferrum/wp-cli")
+}
+
+/// The WP-CLI phar itself. Not `wp` on `$PATH`: the panel runs the version it
+/// pinned and verified, never whatever a distribution package happens to have
+/// put in `/usr/local/bin`.
+pub fn wp_cli_phar() -> PathBuf {
+    wp_cli_dir().join("wp-cli.phar")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,5 +44,6 @@ pub mod stack;
 pub mod svc;
 pub mod sys;
 pub mod tls;
+pub mod wordpress;
 
 pub use registry::{Execution, OpContext, OpRegistry, Operation, Services, TypedOperation};
