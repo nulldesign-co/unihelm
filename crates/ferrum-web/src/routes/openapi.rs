@@ -75,6 +75,14 @@ use crate::auth::CurrentUser;
         super::cron::create,
         super::cron::update,
         super::cron::delete,
+        super::firewall::rules,
+        super::firewall::port_open,
+        super::firewall::port_close,
+        super::firewall::bans,
+        super::firewall::ban,
+        super::firewall::unban,
+        super::firewall::sentinel_get,
+        super::firewall::sentinel_set,
         super::dns::check,
         super::dns::provider_set,
         super::dns::issue_wildcard,
@@ -109,6 +117,7 @@ use crate::auth::CurrentUser;
         (name = "alerts", description = "Alert rules, alert history and notifier channels"),
         (name = "apps", description = "Tenant Node.js applications: units, ports and journals"),
         (name = "cron", description = "Per-subscription scheduled commands and the crontab they render into"),
+        (name = "firewall", description = "Managed ports, bans, and the Sentinel brute-force defence"),
         (name = "dns", description = "The pointing advisory and the stored Cloudflare credential"),
         (name = "backups", description = "restic repositories, schedules, run history and restores"),
         (name = "wordpress", description = "The WordPress toolkit: install, detect, core and plugin updates, and the restricted WP-CLI passthrough"),
@@ -219,7 +228,6 @@ mod tests {
         // `/api/plans`, `/api/apps` and `/api/backups` are deliberately absent:
         // those areas are annotated and documented, so drift detection covers
         // them again.
-        "/api/firewall",
     ];
 
     /// Every string literal handed to `.route(...)` in the router source.

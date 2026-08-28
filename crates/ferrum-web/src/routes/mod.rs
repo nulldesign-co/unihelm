@@ -16,6 +16,7 @@ pub mod databases;
 pub mod dns;
 pub mod events;
 pub mod files;
+pub mod firewall;
 pub mod health;
 pub mod openapi;
 pub mod ops;
@@ -116,6 +117,21 @@ fn protected() -> Router<SharedState> {
         .route(
             "/api/cron/{id}",
             axum::routing::put(cron::update).delete(cron::delete),
+        )
+        .route("/api/firewall", get(firewall::rules))
+        .route("/api/firewall/ports", post(firewall::port_open))
+        .route("/api/firewall/ports/close", post(firewall::port_close))
+        .route(
+            "/api/firewall/bans",
+            get(firewall::bans).post(firewall::ban),
+        )
+        .route(
+            "/api/firewall/bans/{ip}",
+            axum::routing::delete(firewall::unban),
+        )
+        .route(
+            "/api/firewall/sentinel",
+            get(firewall::sentinel_get).put(firewall::sentinel_set),
         )
         .route("/api/dns/check", get(dns::check))
         .route("/api/dns/provider", axum::routing::put(dns::provider_set))
