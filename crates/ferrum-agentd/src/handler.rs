@@ -77,7 +77,13 @@ pub struct ConnectionHandler {
     /// streaming. Dropping the connection aborts the forwarders but leaves the
     /// sessions running — that separation is what lets a browser reconnect to a
     /// shell after `ferrum-web` restarts (spec 11.16).
-    attached: Mutex<std::collections::HashMap<Uuid, Attachment>>,
+    ///
+    /// Shared with the pumps so each can drop its own entry when its session
+    /// ends. `ferrum-web` holds one IPC connection for its whole process life,
+    /// so this map is effectively permanent: an entry that outlives its session
+    /// pins the pty master, the scrollback and the writer thread until the web
+    /// process restarts.
+    attached: Arc<Mutex<std::collections::HashMap<Uuid, Attachment>>>,
 }
 
 /// One terminal this connection is streaming.
@@ -116,7 +122,7 @@ impl ConnectionHandler {
         Self {
             agent,
             interests: Mutex::new(HashSet::new()),
-            attached: Mutex::new(std::collections::HashMap::new()),
+            attached: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -265,8 +271,12 @@ impl ConnectionHandler {
         events: EventSink,
     ) {
         let session = handle.info.id;
-        let pump = spawn_terminal_pump(handle.clone(), events);
-        let previous = self.attached.lock().await.insert(
+        let pump = spawn_terminal_pump(handle.clone(), events, Arc::clone(&self.attached));
+        let mut map = self.attached.lock().await;
+        // Belt and braces for a pump that was aborted before it could tidy up:
+        // an entry whose session is finished can never be useful again.
+        map.retain(|id, a| *id == session || !a.handle.is_closed());
+        let previous = map.insert(
             session,
             Attachment {
                 handle,
@@ -274,6 +284,7 @@ impl ConnectionHandler {
                 pump,
             },
         );
+        drop(map);
         // Re-attaching on the same connection replaces the old stream rather
         // than doubling every byte.
         if let Some(previous) = previous {
@@ -360,6 +371,7 @@ impl ConnectionHandler {
 fn spawn_terminal_pump(
     handle: Arc<SessionHandle>,
     events: EventSink,
+    attached: Arc<Mutex<std::collections::HashMap<Uuid, Attachment>>>,
 ) -> tokio::task::JoinHandle<()> {
     let session = handle.info.id;
     let owner = handle.info.owner;
@@ -415,6 +427,15 @@ fn spawn_terminal_pump(
                 None,
             ))
             .await;
+
+        // Let the attachment go. Only when the session is actually finished:
+        // this task is also aborted and replaced when the same connection
+        // re-attaches, and that successor's entry must not be removed by its
+        // predecessor. A live session's entry is removed by `terminal_close`
+        // or by dropping the connection, as before.
+        if handle.is_closed() {
+            attached.lock().await.remove(&session);
+        }
     })
 }
 

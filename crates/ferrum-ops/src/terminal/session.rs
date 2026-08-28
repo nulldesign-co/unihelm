@@ -132,6 +132,14 @@ pub struct SessionHandle {
     /// Unix seconds of the last keystroke, for the idle clock.
     last_input: AtomicI64,
     closed: AtomicBool,
+    /// Whether `finish` has already killed and audited this session.
+    ///
+    /// Distinct from `closed`, which only means "the shell is gone" and is set
+    /// by the output pump the moment the master side ends. Sharing one flag
+    /// made the ordinary ending — the operator types `exit` — take `finish`'s
+    /// early return, so the shell was never killed and no `terminal.close` row
+    /// was written: the audit trail showed a root shell that was still open.
+    reaped: AtomicBool,
     /// Woken once when the session ends, so a streaming connection learns that
     /// the shell exited without polling for it.
     ended: Arc<tokio::sync::Notify>,
@@ -384,6 +392,7 @@ impl TerminalRegistry {
             scrollback: Mutex::new(Scrollback::new(self.limits.scrollback_bytes)),
             last_input: AtomicI64::new(now.unix_timestamp()),
             closed: AtomicBool::new(false),
+            reaped: AtomicBool::new(false),
             ended: Arc::new(tokio::sync::Notify::new()),
         });
 
@@ -456,13 +465,17 @@ impl TerminalRegistry {
 
     /// Kill the shell, drop the entry, and record the end of the session.
     async fn finish(&self, handle: &Arc<SessionHandle>, reason: &str) {
-        // Mark first: a concurrent sweep then sees a closed session rather than
-        // killing and auditing the same shell twice.
-        if handle.closed.swap(true, Ordering::SeqCst) {
+        // Mark first: a concurrent sweep then sees a reaped session rather than
+        // killing and auditing the same shell twice. Guarded on `reaped`, not
+        // on `closed` — the output pump sets `closed` as soon as the shell
+        // exits, so guarding on that skipped the kill and the audit row for
+        // every session that ended the ordinary way.
+        if handle.reaped.swap(true, Ordering::SeqCst) {
             handle.ended.notify_waiters();
             self.sessions.lock().await.remove(&handle.info.id);
             return;
         }
+        handle.closed.store(true, Ordering::SeqCst);
         handle.ended.notify_waiters();
         handle.io.kill();
         self.sessions.lock().await.remove(&handle.info.id);
@@ -657,7 +670,7 @@ impl PtySpawner for RealPtySpawner {
 
         let io = Arc::new(RealPtyIo {
             input: std::sync::Mutex::new(Some(in_tx)),
-            master: pair.master,
+            master: std::sync::Mutex::new(Some(pair.master)),
             pid: pid as i32,
         });
 
@@ -676,7 +689,9 @@ struct RealPtyIo {
     /// `None` once the session has been killed, which is what makes `kill`
     /// idempotent and stops the writer thread.
     input: std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
-    master: std::os::fd::OwnedFd,
+    /// Taken by `kill`. Closing the master is what hangs up a shell that
+    /// ignores SIGHUP, so it cannot wait for the handle to be dropped.
+    master: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
     pid: i32,
 }
 
@@ -691,7 +706,11 @@ impl PtyIo for RealPtyIo {
 
     fn resize(&self, cols: u16, rows: u16) {
         use std::os::fd::AsRawFd;
-        let _ = super::pty::set_window_size(self.master.as_raw_fd(), cols, rows);
+        if let Ok(guard) = self.master.lock()
+            && let Some(master) = guard.as_ref()
+        {
+            let _ = super::pty::set_window_size(master.as_raw_fd(), cols, rows);
+        }
     }
 
     fn kill(&self) {
@@ -709,6 +728,15 @@ impl PtyIo for RealPtyIo {
                 libc::kill(-self.pid, libc::SIGHUP);
                 libc::kill(self.pid, libc::SIGHUP);
             }
+        }
+        // Then take the terminal away. A shell can `trap '' HUP`, but it cannot
+        // refuse the end of its own input: closing the last master descriptor
+        // is what makes the idle sweep and the lifetime ceiling binding rather
+        // than advisory. Dropping the handle would eventually do this, so this
+        // is only the difference between "when the last reference goes" and
+        // "now" — but the last reference is held by whoever is still attached.
+        if let Ok(mut guard) = self.master.lock() {
+            guard.take();
         }
     }
 }
@@ -751,6 +779,12 @@ mod tests {
                 written: Arc::new(std::sync::Mutex::new(Vec::new())),
                 killed: Arc::new(AtomicBool::new(false)),
             })
+        }
+
+        /// Pretend the shell exited: the master side ends, which is what the
+        /// output pump watches for.
+        fn shell_exits(&self) {
+            *self.last.lock().unwrap() = None;
         }
 
         /// Pretend the shell printed something.
@@ -1191,6 +1225,50 @@ mod tests {
             .filter(|a| *a == "terminal.close")
             .count();
         assert_eq!(closes, 1, "an idempotent close must not double the trail");
+    }
+
+    #[tokio::test]
+    async fn a_shell_that_exits_on_its_own_is_still_killed_and_still_audited() {
+        // The ordinary ending: the operator types `exit`. The output pump marks
+        // the session closed the moment the master side ends, and `finish` used
+        // to read that flag as "somebody already reaped this" and return early —
+        // so the shell was never killed and no `terminal.close` row was written.
+        // An incident review then saw a `terminal.open` for a root shell with no
+        // close, which is the worst possible thing for the audit trail to say.
+        let f = fixture().await;
+        let spawner = FakeSpawner::new();
+        let reg = registry(&f, spawner.clone(), Limits::default());
+        let id = Uuid::new_v4();
+        reg.open(id, &f.admin, &TerminalTarget::Root, 80, 24)
+            .await
+            .unwrap();
+
+        spawner.shell_exits();
+        // Let the output pump observe the closed channel.
+        for _ in 0..50 {
+            if reg
+                .for_owner(id, &f.admin)
+                .await
+                .map(|h| h.is_closed())
+                .unwrap_or(true)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        reg.close(id, &f.admin, "reaped").await.ok();
+
+        assert!(
+            spawner.killed.load(Ordering::SeqCst),
+            "the pty must be torn down even though the shell went first"
+        );
+        let closes = audit_actions(&f.db)
+            .await
+            .iter()
+            .filter(|a| *a == "terminal.close")
+            .count();
+        assert_eq!(closes, 1, "exactly one closing row, and never zero");
     }
 
     #[test]
