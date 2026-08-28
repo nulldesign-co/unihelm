@@ -187,6 +187,7 @@ mod tests {
         let err = link
             .control(ferrum_ipc::frame::ControlKind::TerminalClose {
                 session: uuid::Uuid::nil(),
+                actor: UserId(1),
             })
             .await
             .unwrap_err();

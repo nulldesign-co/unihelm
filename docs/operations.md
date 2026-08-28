@@ -2234,6 +2234,24 @@ laptop — and the lifetime ceiling exists because a session that keeps printing
 never goes idle. The agent sweeps every 60 seconds, and every close writes a
 `terminal.close` audit row with the reason.
 
+### One agent connection, many browsers
+
+`ferrum-web` multiplexes every browser it serves over a *single* IPC
+connection, which means the agent's terminal events arrive in the web process
+on one broadcast that every open socket can see, and every control frame leaves
+by the same wire. Routing either direction by session id alone would put one
+account's shell one guessed UUID away from another account's tab, so both
+directions carry the account as well:
+
+- outbound frames (`TerminalInput`, `TerminalResize`, `TerminalClose`) carry
+  `actor`, and the agent refuses a frame whose actor does not own the session
+  it names — `ConnectionHandler::attached_handle`;
+- inbound events (`TerminalOutput`, `TerminalState`) carry `owner`, and a
+  socket forwards a chunk only when the session *and* the owner match —
+  `routes::terminal::socket_payload`.
+
+Either check alone would be an identifier standing in for an authorisation.
+
 ### Audit trail
 
 | Action | Written by | When |

@@ -143,6 +143,7 @@ mod tests {
         // tenant filter has no task id to work with.
         let frame = EventFrame::new(EventKind::TerminalOutput {
             session: uuid::Uuid::new_v4(),
+            owner: ferrum_core::UserId(1),
             seq: 1,
             data: "cm9vdCMg".into(),
         });
@@ -151,6 +152,7 @@ mod tests {
 
         let state = EventFrame::new(EventKind::TerminalState {
             session: uuid::Uuid::new_v4(),
+            owner: ferrum_core::UserId(1),
             status: "open".into(),
             detail: None,
             user: Some("root".into()),

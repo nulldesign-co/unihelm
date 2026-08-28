@@ -30,6 +30,21 @@
 //! because that is the only channel the browser gives us; it is a capability
 //! with a one-minute life, not an identity, and it is never logged.
 //!
+//! # One agent connection, many browsers
+//!
+//! `ferrum-web` multiplexes every browser it serves over a *single* IPC
+//! connection, so the agent's terminal events arrive here on one broadcast that
+//! every open socket can see, and every control frame this file sends leaves by
+//! the same wire. Neither direction may be routed by session id alone: an id is
+//! an identifier, not an authorisation.
+//!
+//! So both directions carry the account. Frames going out carry `actor` (the
+//! account this request authenticated as) and the agent refuses one whose actor
+//! does not own the session it names; frames coming back carry `owner` and
+//! [`socket_payload`] forwards a chunk only when both the session *and* the
+//! owner match this socket. Either check alone would leave a shell's output one
+//! guessed UUID away from the wrong browser.
+//!
 //! # Closing the socket must not close the shell
 //!
 //! Spec §11.16's acceptance criterion is that a session survives a `ferrum-web`
@@ -423,6 +438,7 @@ async fn bridge(
     }
 
     // Agent → browser.
+    let viewer = ticket.user_id;
     let downstream = tokio::spawn(async move {
         loop {
             let frame = match events.recv().await {
@@ -430,30 +446,8 @@ async fn bridge(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            // Every connected client sees every agent event; the session id is
-            // what makes this socket only ever forward its own.
-            let payload = match &frame.kind {
-                EventKind::TerminalOutput {
-                    session: id,
-                    seq,
-                    data,
-                } if *id == session => {
-                    json!({ "type": "output", "seq": seq, "data": data })
-                }
-                EventKind::TerminalState {
-                    session: id,
-                    status,
-                    detail,
-                    user,
-                } if *id == session => {
-                    json!({
-                        "type": "state",
-                        "status": status,
-                        "detail": detail,
-                        "user": user,
-                    })
-                }
-                _ => continue,
+            let Some(payload) = socket_payload(&frame.kind, session, viewer) else {
+                continue;
             };
             let terminal = matches!(&frame.kind, EventKind::TerminalState { status, .. }
                 if status == "closed" || status == "denied");
@@ -488,17 +482,27 @@ async fn bridge(
             continue;
         };
 
+        // `actor` on every frame, not just the first: the agent's attachment
+        // table is shared between every browser this process serves.
         let control = match parsed {
-            ClientMessage::Input { data } => ControlKind::TerminalInput { session, data },
+            ClientMessage::Input { data } => ControlKind::TerminalInput {
+                session,
+                actor: viewer,
+                data,
+            },
             ClientMessage::Resize { cols, rows } => ControlKind::TerminalResize {
                 session,
+                actor: viewer,
                 cols: cols.clamp(1, 500),
                 rows: rows.clamp(1, 300),
             },
             ClientMessage::Close => {
                 let _ = state
                     .agent
-                    .control(ControlKind::TerminalClose { session })
+                    .control(ControlKind::TerminalClose {
+                        session,
+                        actor: viewer,
+                    })
                     .await;
                 break;
             }
@@ -511,6 +515,43 @@ async fn bridge(
     // The socket is done; the shell is not. Only the explicit `close` above
     // ends a session, so a reload reconnects to the same shell.
     downstream.abort();
+}
+
+/// Should this agent event go down this socket, and as what?
+///
+/// Both halves of the guard are load-bearing, and the second one is the
+/// unobvious one: every socket in this process sees every terminal event, so a
+/// session-id-only match would put one account's shell output into another
+/// account's browser the moment somebody guessed — or was told — a session id.
+/// The owner check makes the id irrelevant to the decision.
+fn socket_payload(
+    kind: &EventKind,
+    session: Uuid,
+    viewer: UserId,
+) -> Option<serde_json::Value> {
+    match kind {
+        EventKind::TerminalOutput {
+            session: id,
+            owner,
+            seq,
+            data,
+        } if *id == session && *owner == viewer => {
+            Some(json!({ "type": "output", "seq": seq, "data": data }))
+        }
+        EventKind::TerminalState {
+            session: id,
+            owner,
+            status,
+            detail,
+            user,
+        } if *id == session && *owner == viewer => Some(json!({
+            "type": "state",
+            "status": status,
+            "detail": detail,
+            "user": user,
+        })),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +818,66 @@ mod tests {
             store.issue(ticket(1, 60)).await.is_some(),
             "dead tickets must not hold the budget"
         );
+    }
+
+    fn output(session: Uuid, owner: u32) -> EventKind {
+        EventKind::TerminalOutput {
+            session,
+            owner: UserId(owner as i64),
+            seq: 1,
+            data: "cm9vdCMg".into(),
+        }
+    }
+
+    #[test]
+    fn a_socket_never_forwards_another_accounts_shell() {
+        // One agent connection serves every browser, so every socket sees every
+        // terminal event. A session id is an identifier; the owner is the
+        // authorisation, and without it a guessed id would put a root shell's
+        // output into somebody else's tab.
+        let mine = Uuid::new_v4();
+        let me = UserId(7);
+        let you = UserId(8);
+
+        assert!(socket_payload(&output(mine, 7), mine, me).is_some());
+
+        // Same session id, different owner: refused. This is the case that
+        // matters — it is what a guessed or leaked id looks like.
+        assert!(socket_payload(&output(mine, 8), mine, me).is_none());
+        // Same owner, different session: also refused, so a second tab of mine
+        // does not double-render.
+        assert!(socket_payload(&output(Uuid::new_v4(), 7), mine, me).is_none());
+        // And from the other side of the same pair.
+        assert!(socket_payload(&output(mine, 7), mine, you).is_none());
+    }
+
+    #[test]
+    fn state_events_are_filtered_by_owner_as_well() {
+        let session = Uuid::new_v4();
+        let state = |owner: i64| EventKind::TerminalState {
+            session,
+            owner: UserId(owner),
+            status: "open".into(),
+            detail: None,
+            user: Some("root".into()),
+        };
+        assert!(socket_payload(&state(7), session, UserId(7)).is_some());
+        assert!(
+            socket_payload(&state(8), session, UserId(7)).is_none(),
+            "another account's session must not even announce itself here"
+        );
+    }
+
+    #[test]
+    fn task_events_never_leak_into_a_terminal_socket() {
+        // The same broadcast carries task logs. A terminal socket forwards
+        // exactly two event kinds and ignores the rest.
+        let kind = EventKind::TaskLog {
+            task_id: ferrum_core::TaskId::new(),
+            seq: 1,
+            line: "installing".into(),
+        };
+        assert!(socket_payload(&kind, Uuid::new_v4(), UserId(7)).is_none());
     }
 
     #[test]

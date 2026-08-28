@@ -1,6 +1,6 @@
 //! The envelopes that travel over the socket (spec §5.3).
 
-use ferrum_core::{AuthContext, FerrumError, TaskId};
+use ferrum_core::{AuthContext, FerrumError, TaskId, UserId};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -149,18 +149,28 @@ pub enum ControlKind {
         auth: ferrum_core::AuthContext,
     },
     /// Keystrokes, base64 so arbitrary bytes survive a JSON frame.
+    ///
+    /// `actor` is the account the web process authenticated for *this* frame.
+    /// It is not decoration: one `ferrum-web` process multiplexes every
+    /// browser over a single agent connection, so without it the agent's only
+    /// way to tell one viewer's keystrokes from another's would be the session
+    /// id — and an id is not an authorisation. The agent refuses a frame whose
+    /// actor does not own the session it names.
     TerminalInput {
         session: Uuid,
+        actor: UserId,
         data: String,
     },
     TerminalResize {
         session: Uuid,
+        actor: UserId,
         cols: u16,
         rows: u16,
     },
     /// End the session and reap the shell. Idempotent.
     TerminalClose {
         session: Uuid,
+        actor: UserId,
     },
 }
 
@@ -213,6 +223,11 @@ pub enum EventKind {
     /// lets a re-attaching client drop what it already rendered.
     TerminalOutput {
         session: Uuid,
+        /// Who this session belongs to. The mirror of `actor` on the way in,
+        /// and for the same reason: the web process fans agent events out to
+        /// every browser it is serving, so a socket must be able to tell that
+        /// a chunk is *its* shell's rather than merely one whose id matches.
+        owner: UserId,
         seq: u64,
         data: String,
     },
@@ -222,6 +237,8 @@ pub enum EventKind {
     /// has no response envelope — the same reason `Pong` is an event.
     TerminalState {
         session: Uuid,
+        /// See [`EventKind::TerminalOutput::owner`].
+        owner: UserId,
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
@@ -414,6 +431,7 @@ mod tests {
         // is base64 and the frame stays parseable.
         let ev = ServerFrame::Event(EventFrame::new(EventKind::TerminalOutput {
             session: Uuid::nil(),
+            owner: UserId(1),
             seq: 1,
             data: "3q2+7w==".into(),
         }));
