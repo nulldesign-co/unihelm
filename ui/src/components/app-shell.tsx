@@ -1,5 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Boxes, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun } from "lucide-react";
+import { BellRing, Boxes, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, ShieldCheck, Sun } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -28,6 +28,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       { id: "go-apps", label: t("nav.apps"), run: () => void navigate({ to: "/apps" }) },
       { id: "go-stack", label: t("nav.stack"), run: () => void navigate({ to: "/stack" }) },
       { id: "go-files", label: t("nav.files"), run: () => void navigate({ to: "/files" }) },
+      { id: "go-firewall", label: t("nav.firewall"), run: () => void navigate({ to: "/firewall" }) },
+      { id: "go-alerts", label: t("nav.alerts"), run: () => void navigate({ to: "/alerts" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
       { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, run: () => setTheme("dark") },
       { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, run: () => setTheme("system") },
@@ -46,6 +48,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { to: "/sites", label: t("nav.sites"), icon: Globe },
     { to: "/apps", label: t("nav.apps"), icon: Boxes },
     { to: "/files", label: t("nav.files"), icon: FolderOpen },
+    { to: "/firewall", label: t("nav.firewall"), icon: ShieldCheck },
+    { to: "/alerts", label: t("nav.alerts"), icon: BellRing },
     { to: "/stack", label: t("nav.stack"), icon: Layers },
   ];
 

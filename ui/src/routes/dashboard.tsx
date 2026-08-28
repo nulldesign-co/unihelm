@@ -1,5 +1,16 @@
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Cpu, HardDrive, MemoryStick, Timer } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import {
+  AlertTriangle,
+  BellRing,
+  ChevronRight,
+  Cpu,
+  HardDrive,
+  MemoryStick,
+  ShieldCheck,
+  Slash,
+  Timer,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -7,7 +18,8 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Meter } from "@/components/ui/meter";
 import { Spinner } from "@/components/ui/spinner";
-import { endpoints, type ServiceStatus, type UnitState } from "@/lib/api";
+import { endpoints, type ServiceStatus, type SystemInfo, type UnitState } from "@/lib/api";
+import { useSession } from "@/lib/session";
 import { formatBytes, formatPercent, formatUptime } from "@/lib/utils";
 
 /** The CI-enforced panel memory budget (spec §3). */
@@ -129,6 +141,8 @@ export function DashboardPage() {
         </>
       ) : null}
 
+      <SecurityCard system={data?.system} />
+
       <div className="grid gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-2">
           <CardHeader title={t("dashboard.services")} />
@@ -167,6 +181,155 @@ export function DashboardPage() {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/**
+ * The security summary (spec §11.9, §11.11).
+ *
+ * Three numbers that an operator should never have to go looking for, each a
+ * link to the page that can act on it. It is deliberately honest about what it
+ * cannot see: a firewall read needs `firewall_manage`, so a customer session
+ * gets the tiles it is allowed to have and no misleading zeroes for the rest —
+ * "0 bans" from a session that cannot read the ban list would be a lie.
+ */
+function SecurityCard({ system }: { system?: SystemInfo }) {
+  const { t } = useTranslation();
+  const { user } = useSession();
+
+  const canFirewall = user?.permissions.includes("firewall_manage") ?? false;
+  const canRead = user?.permissions.includes("server_read") ?? false;
+
+  // `retry: false`: on a build without `/api/firewall` these 404 immediately,
+  // and three silent retries per tile would be a wasted round of requests on
+  // every dashboard load.
+  const firewall = useQuery({
+    queryKey: ["firewall"],
+    queryFn: endpoints.firewall,
+    enabled: canFirewall,
+    retry: false,
+  });
+  const bans = useQuery({
+    queryKey: ["firewall-bans"],
+    queryFn: endpoints.bans,
+    enabled: canFirewall,
+    retry: false,
+  });
+  const open = useQuery({
+    queryKey: ["alerts-open"],
+    queryFn: endpoints.openAlerts,
+    enabled: canRead,
+    retry: false,
+  });
+
+  if (!canFirewall && !canRead) return null;
+
+  // The overview already carries the detected backend under `server_read`, so a
+  // session that cannot read the firewall still learns whether one is installed.
+  const backend = firewall.data?.backend ?? system?.firewall_backend ?? null;
+  const backendName = backend
+    ? t(`firewall.backendName.${backend}`, { defaultValue: backend })
+    : t("common.unknown");
+  const unmanaged = backend === "none";
+  const activeBans = bans.data?.bans.filter((ban) => ban.lifted_at === null).length ?? null;
+  const openAlerts = open.data?.events.length ?? null;
+
+  return (
+    <Card>
+      <CardHeader title={t("dashboard.security")} description={t("dashboard.securityHint")} />
+      <CardBody>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <SecurityTile
+            to="/firewall"
+            icon={
+              unmanaged ? (
+                <Slash className="h-4 w-4" aria-hidden />
+              ) : (
+                <ShieldCheck className="h-4 w-4" aria-hidden />
+              )
+            }
+            label={t("dashboard.firewall")}
+            value={unmanaged ? t("firewall.backendName.none") : backendName}
+            badge={
+              firewall.data ? (
+                <Badge
+                  tone={unmanaged ? "danger" : firewall.data.active ? "success" : "warning"}
+                  dot
+                >
+                  {unmanaged
+                    ? t("dashboard.firewallUnprotected")
+                    : firewall.data.active
+                      ? t("dashboard.firewallActive")
+                      : t("dashboard.firewallInactive")}
+                </Badge>
+              ) : null
+            }
+          />
+
+          <SecurityTile
+            to="/alerts"
+            icon={<BellRing className="h-4 w-4" aria-hidden />}
+            label={t("dashboard.openAlerts")}
+            value={openAlerts === null ? "—" : String(openAlerts)}
+            badge={
+              openAlerts === null ? null : (
+                <Badge tone={openAlerts > 0 ? "danger" : "success"} dot={openAlerts > 0}>
+                  {openAlerts > 0 ? t("dashboard.alertsFiring") : t("dashboard.alertsClear")}
+                </Badge>
+              )
+            }
+          />
+
+          <SecurityTile
+            to="/firewall"
+            icon={<AlertTriangle className="h-4 w-4" aria-hidden />}
+            label={t("dashboard.activeBans")}
+            value={activeBans === null ? "—" : String(activeBans)}
+            badge={
+              activeBans === null ? null : (
+                <Badge tone="neutral">{t("dashboard.bansHint")}</Badge>
+              )
+            }
+          />
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function SecurityTile({
+  to,
+  icon,
+  label,
+  value,
+  badge,
+}: {
+  to: "/firewall" | "/alerts";
+  icon: ReactNode;
+  label: string;
+  value: string;
+  badge: ReactNode;
+}) {
+  return (
+    <Link
+      to={to}
+      className="group flex flex-col gap-2 rounded-lg border border-border p-4 transition-colors hover:bg-surface-muted"
+    >
+      <span className="flex items-center gap-2 text-ink-muted">
+        {icon}
+        <span className="text-xs font-medium tracking-wide uppercase">{label}</span>
+        {/* A chevron rather than a mirrored arrow: the icon is rotated by the
+            RTL rule below so it always points the way the reader travels. */}
+        <ChevronRight
+          className="ms-auto h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100 rtl:rotate-180"
+          aria-hidden
+        />
+      </span>
+      <span dir="auto" className="text-xl font-semibold tracking-tight text-ink tabular-nums">
+        {value}
+      </span>
+      {badge}
+    </Link>
   );
 }
 

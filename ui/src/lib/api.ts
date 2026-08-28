@@ -88,6 +88,8 @@ export const api = {
     request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) }),
   patch: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "PATCH", body: body === undefined ? undefined : JSON.stringify(body) }),
+  put: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: "PUT", body: body === undefined ? undefined : JSON.stringify(body) }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
@@ -348,6 +350,212 @@ export interface AppLogsResponse {
 /** What the logs modal asks for. The agent clamps anything above 2000. */
 export const DEFAULT_LOG_LINES = 200;
 
+// --- firewall + Sentinel (spec §11.9) ---------------------------------------
+
+/**
+ * Which backend owns the ruleset. `none` is not a failure — it is a host with
+ * no firewall installed, and the page has to say so out loud rather than draw
+ * an empty rule table that reads as "nothing is open".
+ */
+export type FirewallBackend = "firewalld" | "ufw" | "nftables" | "none";
+
+/**
+ * Where the panel's record and the live ruleset disagree.
+ *
+ * `missing_from_backend` — the panel promised this hole and the firewall has
+ * never heard of it (somebody flushed the ruleset).
+ * `unrecorded` — the firewall enforces a Ferrum-marked rule the panel has no
+ * row for (a restored database, or an older build).
+ */
+export type RuleDrift = "missing_from_backend" | "unrecorded";
+
+export interface FirewallRule {
+  port: number;
+  proto: "tcp" | "udp";
+  /** `null` means "from anywhere". */
+  source: string | null;
+  comment: string;
+  in_panel: boolean;
+  in_backend: boolean;
+  drift: RuleDrift | null;
+}
+
+export interface FirewallResponse {
+  backend: FirewallBackend;
+  /** A backend that is installed but stopped enforces nothing. */
+  active: boolean;
+  rules: FirewallRule[];
+  /**
+   * The address this request arrived from, as the web layer saw it.
+   *
+   * A browser cannot see past its own NAT, so this is the only way the ban form
+   * can refuse "my own address" before the round trip. Optional on purpose: if
+   * the server does not report it, the agent still refuses the ban and the form
+   * simply cannot explain it in advance.
+   */
+  your_ip?: string | null;
+}
+
+export interface PortRuleRequest {
+  port: number;
+  proto: "tcp" | "udp";
+  /** A literal address or CIDR, never a hostname. */
+  source?: string;
+  comment?: string;
+}
+
+/**
+ * What an open/close answers with: the rule as the backend accepted it, plus
+ * which backend did the work — not a `FirewallRule`, because drift is a
+ * property of the merged view and not of a write that just succeeded.
+ */
+export interface PortRuleResult {
+  port: number;
+  proto: string;
+  source: string | null;
+  comment: string;
+  backend: FirewallBackend;
+}
+
+export interface BanRecord {
+  id: number;
+  ip: string;
+  reason: string;
+  banned_at: string;
+  /** `null` is a permanent ban — only ever an operator's deliberate choice. */
+  expires_at: string | null;
+  lifted_at: string | null;
+  /** The backend is holding this address right now. */
+  in_backend: boolean;
+}
+
+export interface BansResponse {
+  backend: FirewallBackend;
+  bans: BanRecord[];
+  /** Addresses the firewall drops that the panel has no open record for. */
+  unrecorded: string[];
+}
+
+export interface BanRequest {
+  ip: string;
+  /** Absent = the configured default; `0` = permanent. */
+  minutes?: number;
+  reason?: string;
+}
+
+export interface BanResult {
+  ip: string;
+  expires_at: string | null;
+  backend: FirewallBackend;
+}
+
+export interface UnbanResult {
+  ip: string;
+  /**
+   * How many open records this closed. Zero means the panel never banned the
+   * address — reported rather than papered over, because "unbanned!" for an
+   * address still blocked by an operator's own rule is a lie.
+   */
+  lifted: number;
+  backend: FirewallBackend;
+}
+
+export interface SentinelSettings {
+  enabled: boolean;
+  ssh_threshold: number;
+  window_minutes: number;
+  ban_minutes: number;
+  allowlist: string[];
+}
+
+// --- alerting (spec §11.11) --------------------------------------------------
+
+export type AlertKind = "disk_pct" | "mem_pct" | "load" | "service_down" | "cert_expiry_days";
+
+export interface AlertRule {
+  id: number;
+  kind: AlertKind;
+  /** `null` = every subject of this kind. */
+  target: string | null;
+  threshold: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One span during which a rule's condition held.
+ *
+ * An event is a span, not a notification: `raised_at` with a null `resolved_at`
+ * is happening now, and the pair together is what makes "the disk was full for
+ * forty minutes last night" readable.
+ */
+export interface AlertEvent {
+  id: number;
+  rule_id: number;
+  subject: string;
+  message: string;
+  value: number | null;
+  raised_at: string;
+  resolved_at: string | null;
+  notified: number;
+}
+
+export interface AlertRulesResponse {
+  rules: AlertRule[];
+  open: AlertEvent[];
+  kinds: AlertKind[];
+}
+
+export interface AlertEventsResponse {
+  events: AlertEvent[];
+}
+
+export interface AlertRuleRequest {
+  kind: AlertKind;
+  target?: string | null;
+  threshold?: number;
+  enabled: boolean;
+}
+
+export type ChannelKind = "webhook" | "telegram";
+
+/**
+ * A notifier channel, without its configuration — ever.
+ *
+ * The server skips the sealed blob when it serializes, so there is no field
+ * here to render. That is why the form shows "configured" instead of an empty
+ * secret box: an empty box would read as data the panel had lost.
+ */
+export interface NotifyChannel {
+  id: number;
+  kind: ChannelKind;
+  label: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelsResponse {
+  channels: NotifyChannel[];
+}
+
+export interface ChannelRequest {
+  /** Absent = create. */
+  id?: number;
+  kind?: ChannelKind;
+  label?: string;
+  /** Omitted on an edit = keep the stored credential. */
+  config?: Record<string, string>;
+  enabled?: boolean;
+}
+
+/** A failed test answers 200 with `delivered: false` — it is an answer, not an error. */
+export interface ChannelTestResult {
+  delivered: boolean;
+  detail: string | null;
+}
+
 export const endpoints = {
   login: (username: string, password: string) =>
     api.post<SessionResponse>("/api/auth/login", { username, password }),
@@ -381,6 +589,36 @@ export const endpoints = {
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),
   appLogs: (id: number, lines = DEFAULT_LOG_LINES) =>
     api.get<AppLogsResponse>(`/api/apps/${id}/logs?lines=${lines}`),
+
+  // Firewall + Sentinel. Every one of these is an immediate operation, so they
+  // answer 200 with data rather than a task receipt.
+  firewall: () => api.get<FirewallResponse>("/api/firewall"),
+  openPort: (body: PortRuleRequest) => api.post<PortRuleResult>("/api/firewall/ports", body),
+  // A close carries the rule's whole identity rather than an id: `(port, proto,
+  // source)` *is* the identity of a hole, and the panel may be asked to close
+  // one it never recorded.
+  closePort: (body: PortRuleRequest) => api.post<PortRuleResult>("/api/firewall/ports/close", body),
+  bans: () => api.get<BansResponse>("/api/firewall/bans"),
+  // No `client_ip` in the body: the web layer fills that in from the live
+  // connection, precisely so a client cannot spoof its way past the self-ban
+  // guard by claiming to be somewhere else.
+  ban: (body: BanRequest) => api.post<BanResult>("/api/firewall/bans", body),
+  unban: (ip: string) => api.del<UnbanResult>(`/api/firewall/bans/${encodeURIComponent(ip)}`),
+  sentinel: () => api.get<SentinelSettings>("/api/firewall/sentinel"),
+  // The whole settings object every time: the agent deserializes
+  // `SentinelSettings` with no per-field defaults, so a partial body is a
+  // rejected request rather than a merge.
+  setSentinel: (body: SentinelSettings) => api.put<SentinelSettings>("/api/firewall/sentinel", body),
+
+  alertEvents: (limit = 200) => api.get<AlertEventsResponse>(`/api/alerts?limit=${limit}`),
+  openAlerts: () => api.get<AlertEventsResponse>("/api/alerts?open_only=true"),
+  alertRules: () => api.get<AlertRulesResponse>("/api/alerts/rules"),
+  setAlertRule: (body: AlertRuleRequest) => api.post<{ rule: AlertRule }>("/api/alerts/rules", body),
+  channels: () => api.get<ChannelsResponse>("/api/alerts/channels"),
+  setChannel: (body: ChannelRequest) =>
+    api.post<{ channel: NotifyChannel }>("/api/alerts/channels", body),
+  deleteChannel: (id: number) => api.del<{ deleted: boolean }>(`/api/alerts/channels/${id}`),
+  testChannel: (id: number) => api.post<ChannelTestResult>(`/api/alerts/channels/${id}/test`),
 };
 
 /** PHP versions the panel knows about, newest first. */
