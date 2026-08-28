@@ -303,6 +303,12 @@ impl OpRegistry {
         registry.register(crate::backup::Run::live());
         registry.register(crate::backup::List::live());
         registry.register(crate::backup::Restore::live());
+        registry.register(crate::wordpress::Install::live());
+        registry.register(crate::wordpress::Detect);
+        registry.register(crate::wordpress::Update);
+        registry.register(crate::wordpress::PluginList);
+        registry.register(crate::wordpress::PluginUpdate);
+        registry.register(crate::wordpress::Cli);
         registry
     }
 

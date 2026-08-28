@@ -56,6 +56,17 @@ fn main() -> Result<()> {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--fs-helper")) {
         std::process::exit(fs_helper_main());
     }
+    // The WordPress toolkit's helper (spec §11.12) is the same idea for a
+    // different payload: WP-CLI loads the site's own plugins and themes, which
+    // is tenant-authored PHP, so it must never run as root either. It gets its
+    // own entry point rather than an `Exec` arm on the file manager's protocol
+    // — that protocol is a closed set of filesystem verbs, and widening it to
+    // carry commands would turn the panel's most tightly bounded interface into
+    // a general exec channel. What is shared is the part that matters: the
+    // re-exec, [`drop_privileges`], and its `setuid(0)`-must-fail proof.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--wp-helper")) {
+        std::process::exit(wp_helper_main());
+    }
 
     let args = Args::parse();
     let config = load_config(&args)?;
@@ -494,6 +505,128 @@ fn parse_fs_helper_args(args: &[std::ffi::OsString]) -> std::result::Result<FsHe
     Ok(FsHelperArgs { uid, gid, home })
 }
 
+// ---------------------------------------------------------------------------
+// --wp-helper: WP-CLI as the tenant (spec §11.12, §5.2 rule 3)
+// ---------------------------------------------------------------------------
+
+/// Entry point for
+/// `ferrum-agentd --wp-helper --uid N --gid N --home PATH --dir PATH -- <wp argv…>`.
+///
+/// Identical in shape to [`fs_helper_main`], and identical in the part that
+/// matters: parse, drop, *then* work. `ferrum_ops::wordpress::helper::run` does
+/// its own re-check of the argument vector — after the drop, because that is
+/// where the privilege boundary is — and never executes anything but the
+/// pinned WP-CLI phar through the PHP binary resolved from
+/// `ferrum_distro`'s trusted directories. There is deliberately no way to name
+/// a program on this command line.
+fn wp_helper_main() -> i32 {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let parsed = match parse_wp_helper_args(&args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("wp-helper: {msg}");
+            return 2;
+        }
+    };
+    if let Err(msg) = drop_privileges(parsed.uid, parsed.gid) {
+        eprintln!("wp-helper: {msg}");
+        return 3;
+    }
+    ferrum_ops::wordpress::helper::run(&parsed.home, &parsed.dir, &parsed.wp_args)
+}
+
+#[derive(Debug)]
+struct WpHelperArgs {
+    uid: u32,
+    gid: u32,
+    /// The tenant home, which becomes `$HOME` for WP-CLI's cache and config.
+    home: PathBuf,
+    /// The installation directory. Also carried inside `wp_args` as
+    /// `--path=<dir>`; the helper refuses to run if the two disagree.
+    dir: PathBuf,
+    /// Everything after `--`: the WP-CLI argument vector.
+    wp_args: Vec<std::ffi::OsString>,
+}
+
+/// Parse `--uid N --gid N --home PATH --dir PATH -- <wp argv…>`.
+///
+/// Everything after the first bare `--` is passed through untouched: it is
+/// WP-CLI's, not ours, and re-parsing it here would only create a second
+/// opinion about what an argument means. What is *not* passed through is a
+/// program name — there is no flag for one, so this helper can only ever start
+/// the pinned phar.
+fn parse_wp_helper_args(args: &[std::ffi::OsString]) -> std::result::Result<WpHelperArgs, String> {
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut home: Option<PathBuf> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut wp_args: Vec<std::ffi::OsString> = Vec::new();
+
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        if flag.to_str() == Some("--") {
+            wp_args.extend(iter.cloned());
+            break;
+        }
+        let value = iter
+            .next()
+            .ok_or_else(|| format!("{} needs a value", flag.to_string_lossy()))?;
+        match flag.to_str() {
+            Some("--uid") => {
+                uid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--uid must be an integer")?,
+                );
+            }
+            Some("--gid") => {
+                gid = Some(
+                    value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("--gid must be an integer")?,
+                );
+            }
+            Some("--home") => home = Some(PathBuf::from(value)),
+            Some("--dir") => dir = Some(PathBuf::from(value)),
+            other => {
+                return Err(format!(
+                    "unexpected argument `{}`",
+                    other.unwrap_or("<non-utf8>")
+                ));
+            }
+        }
+    }
+
+    let uid = uid.ok_or("--uid is required")?;
+    let gid = gid.ok_or("--gid is required")?;
+    let home = home.ok_or("--home is required")?;
+    let dir = dir.ok_or("--dir is required")?;
+    if uid == 0 || gid == 0 {
+        return Err("refusing to run as uid/gid 0: that is not a privilege drop".into());
+    }
+    if !home.is_absolute() || !dir.is_absolute() {
+        return Err("--home and --dir must be absolute paths".into());
+    }
+    // The directory the tenant's WordPress lives in is inside their home by
+    // construction (`wordpress::target_for_site` refuses anything else). Saying
+    // so again here means a malformed pair cannot even reach the phar.
+    if !dir.starts_with(&home) {
+        return Err("--dir must be inside --home".into());
+    }
+    if wp_args.is_empty() {
+        return Err("no WP-CLI arguments were given after `--`".into());
+    }
+    Ok(WpHelperArgs {
+        uid,
+        gid,
+        home,
+        dir,
+        wp_args,
+    })
+}
+
 /// Become the tenant, irreversibly, or die.
 ///
 /// Order matters and is fixed: `setgroups` and `setgid` while still root
@@ -642,5 +775,121 @@ mod tests {
     fn drop_privileges_refuses_root_targets_outright() {
         assert!(drop_privileges(0, 1001).is_err());
         assert!(drop_privileges(1001, 0).is_err());
+    }
+
+    // --- the WP-CLI helper's argument boundary -----------------------------
+
+    #[test]
+    fn wp_helper_args_parse_and_pass_the_wp_argv_through_untouched() {
+        let parsed = parse_wp_helper_args(&argv(&[
+            "--uid",
+            "1001",
+            "--gid",
+            "1001",
+            "--home",
+            "/home/ft_ab12",
+            "--dir",
+            "/home/ft_ab12/sites/example.com/public",
+            "--",
+            "--path=/home/ft_ab12/sites/example.com/public",
+            "core",
+            "version",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.uid, 1001);
+        assert_eq!(
+            parsed.dir,
+            PathBuf::from("/home/ft_ab12/sites/example.com/public")
+        );
+        assert_eq!(
+            parsed.wp_args,
+            argv(&[
+                "--path=/home/ft_ab12/sites/example.com/public",
+                "core",
+                "version",
+            ])
+        );
+    }
+
+    /// Everything after `--` belongs to WP-CLI, including things that look
+    /// like our own flags. Re-parsing them here would be a second opinion
+    /// about what an argument means, which is how flag-injection bugs happen.
+    #[test]
+    fn arguments_after_the_separator_are_never_reinterpreted_as_helper_flags() {
+        let parsed = parse_wp_helper_args(&argv(&[
+            "--uid",
+            "1001",
+            "--gid",
+            "1001",
+            "--home",
+            "/home/ft_x",
+            "--dir",
+            "/home/ft_x/sites/d/public",
+            "--",
+            "--path=/home/ft_x/sites/d/public",
+            "option",
+            "update",
+            "--uid",
+            "--home",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.uid, 1001, "the trailing --uid is WP-CLI's, not ours");
+        assert_eq!(parsed.home, PathBuf::from("/home/ft_x"));
+        assert!(parsed.wp_args.contains(&std::ffi::OsString::from("--uid")));
+    }
+
+    /// The same root refusal as the file helper, for the same reason: WP-CLI
+    /// loads tenant-authored PHP, so "drop to root" is the one outcome that
+    /// must never be reachable.
+    #[test]
+    fn the_wp_helper_refuses_a_root_target_or_an_escaping_directory() {
+        let base = |uid: &str, gid: &str, home: &str, dir: &str| {
+            argv(&[
+                "--uid", uid, "--gid", gid, "--home", home, "--dir", dir, "--", "x",
+            ])
+        };
+        for (uid, gid) in [("0", "1001"), ("1001", "0")] {
+            let err = parse_wp_helper_args(&base(uid, gid, "/home/x", "/home/x/s")).unwrap_err();
+            assert!(err.contains("not a privilege drop"), "{err}");
+        }
+
+        // A directory outside the home would mean the privilege drop bought
+        // nothing: the tenant's uid has no particular rights there.
+        let err = parse_wp_helper_args(&base("1001", "1001", "/home/x", "/etc")).unwrap_err();
+        assert!(err.contains("inside --home"), "{err}");
+
+        // Relative paths, and a missing argument vector.
+        assert!(parse_wp_helper_args(&base("1001", "1001", "home/x", "home/x/s")).is_err());
+        assert!(
+            parse_wp_helper_args(&argv(&[
+                "--uid",
+                "1001",
+                "--gid",
+                "1001",
+                "--home",
+                "/home/x",
+                "--dir",
+                "/home/x/s",
+            ]))
+            .is_err(),
+            "an empty WP-CLI argument vector must be refused"
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_wp_helper_args_are_refused() {
+        for args in [
+            &["--uid", "1001", "--gid", "1001", "--home", "/h", "--", "x"][..], // no dir
+            &["--uid", "1001", "--gid", "1001", "--dir", "/h/s", "--", "x"][..], // no home
+            &["--gid", "1001", "--home", "/h", "--dir", "/h/s", "--", "x"][..], // no uid
+            &[
+                "--uid", "x", "--gid", "1", "--home", "/h", "--dir", "/h/s", "--", "x",
+            ][..],
+            &[
+                "--uid", "1", "--gid", "1", "--home", "/h", "--dir", "/h/s", "--bad", "1",
+            ][..],
+        ] {
+            assert!(parse_wp_helper_args(&argv(args)).is_err(), "{args:?}");
+        }
     }
 }

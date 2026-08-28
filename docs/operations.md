@@ -1661,3 +1661,235 @@ backup that night.
 - **Database dumps in the subscription scope.** Spec §11.10 wants
   `--single-transaction` dumps streamed into the repository. Subscription scope
   currently covers the tenant home only.
+
+## WordPress toolkit
+
+The `wp.*` operations are `ferrum_ops::wordpress` (spec §11.12). Four
+properties of that module decide how all six behave, and each is a decision
+rather than an accident.
+
+**WP-CLI runs as the tenant, never as root.** WP-CLI is a PHP program that
+loads the site's own `wp-config.php`, plugins and themes — that is, code the
+tenant controls, and on a shared box a plugin is not trusted input. Every run
+therefore goes through `ferrum-agentd --wp-helper`, which re-execs the agent
+binary (`ferrum_distro::exec::reexec_current`), calls
+`setgroups`/`setgid`/`setuid`, and **proves** the drop by checking that
+`setuid(0)` now fails, before a single byte of PHP is loaded. It is the same
+`drop_privileges` the file manager's helper uses (spec §5.2 rule 3).
+
+It is a second *entry point*, not a second mechanism. The file manager's
+protocol (`FsRequest`) is a closed set of filesystem verbs with no arm that
+carries a command, and widening it so that helper could also execute programs
+would turn the panel's most tightly bounded interface into a general exec
+channel. What the two share is the part that matters: the re-exec, the drop and
+its proof. On an agent that is *already* unprivileged (`--dev`, tests) there is
+no privilege to shed and PHP runs in-process — the same `Local`/`Tenant` split
+`fsops::FsRunner` makes, for the same reason.
+
+**`wp.cli` is not a shell.** The command group is a closed enum (`core`,
+`plugin`, `theme`, `option`, `user`, `db`, `cache`, `rewrite`), so `eval`,
+`eval-file`, `shell`, `server`, `package` and `cli` are not spellable at all.
+Each argument must be ASCII, free of control characters and free of shell
+metacharacters, and must not name a reserved flag: `--path` (the panel decides
+which installation), `--require` (loads an arbitrary PHP file), `--exec` (runs
+arbitrary PHP), `--ssh`, `--http`, `--prompt` (would block until the timeout)
+and `--context`. The `--no-` negation spelling is refused too. `--path=<dir>`
+is prepended by the panel and is always the first argument, and the
+privilege-dropping helper **re-checks the reserved list and that `--path`
+matches the directory it was told about** — after the drop, because that is
+where the privilege boundary is, and a bug on the agent side must not become
+arbitrary code execution inside a tenant account.
+
+The metacharacter refusal is worth a sentence of its own. Through
+`ferrum_distro::Cmd` an argv reaches `execve` untouched, so `;` and backticks
+are already inert *for us* — but WP-CLI builds its own `mysql` and `mysqldump`
+command lines for parts of `wp db`, and our argv discipline does not extend
+into another program's process spawning.
+
+**The WP-CLI phar is pinned, and its pin has one source.** The panel installs
+WP-CLI 2.12.0 from the upstream GitHub release, refuses to install it unless
+the SHA-256 matches `WP_CLI_SHA256`, and stores it root-owned 0755 under
+`/var/lib/ferrum/wp-cli/` — a tenant runs it but must never be able to replace
+it. The checksum was computed from the asset and agrees with the publisher's
+own `.sha512` file in the same release; the release also carries a detached
+OpenPGP signature (issuer `63AF7AA1 5067C056 16FDDD88 A3A2E8F2 26F0BC06`,
+`releases@wp-cli.org`) which **this build does not verify**. Every observation
+therefore comes from one host, so the pin protects against a later tampered or
+truncated download, not against the source having been wrong on the day it was
+pinned. `wp.detect` reports that provenance the way `db.adminer.status` reports
+Adminer's.
+
+**No password is ever returned or logged.** The database password reaches
+exactly two places — the string the panel renders and the `wp-config.php` it
+writes — and never an argv, a task log or an operation output. The WordPress
+administrator password is generated for `wp core install` and discarded. Both
+have to work this way: a task's `input_json` is stored verbatim with no
+redaction (unlike audit details, which redact by key), and a task's *output* is
+never delivered to the caller at all — only its log survives, and a log is
+exactly where a credential must not be. Rotate the database password with
+`db.user.password`; reset the WordPress administrator with
+`wp.cli user update <user> --user_pass=…` or WordPress's own password-reset
+mail.
+
+Every operation below needs `site_manage`, and every one resolves its subject —
+a site id, or an install id — through the caller's `TenantScope`. Another
+tenant's install id answers `not_found`, which is exactly what a nonexistent id
+answers.
+
+### `wp.install`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task (not cancellable, not idempotent) |
+| Input | `site_id`; `subdirectory` *(optional tenant-relative path under the document root)*; `locale` *(optional, `en_US` by default; `fa_IR` is first-class)*; `title`; `admin_user`; `admin_email`; `auto_update` *(optional bool)* |
+
+One-click WordPress. In order: refuse if the site already has an install row or
+the directory already holds a `wp-config.php`; download and verify the pinned
+WP-CLI phar if it is not already on disk; create a MySQL user and database
+**through `db.user.create` and `db.create`** rather than any SQL written here;
+`wp core download --locale=…`; render `wp-config.php` and write it as the
+tenant; `wp core install`; record the row.
+
+`wp-config.php` is rendered by the panel rather than by `wp config create`,
+because that command takes the database password as `--dbpass=…` — a
+long-lived credential in a process's argv, and `/proc/<pid>/cmdline` is
+world-readable on a box whose whole point is that other people's code runs on
+it. The eight WordPress salts come from a CSPRNG on this server (the same
+`rand::thread_rng` the panel's database passwords use); they are the site's
+cookie-signing keys, so a predictable one lets anyone forge an admin session.
+The file is written **through the file-manager helper, as the tenant**, at mode
+0640: the install directory is tenant-controlled, so a root process writing
+there could be aimed at `/etc/shadow` with a pre-placed symlink, and the helper
+resolves paths as the tenant and refuses symlinks. `DISALLOW_FILE_EDIT` and
+`FS_METHOD = direct` are set (spec §11.12's "basic hardening toggles"); the
+theme/plugin editor is a code-execution surface reachable from a stolen admin
+session.
+
+Not idempotent, because it creates a database and a database user and a retry
+would try to create a second pair. Not cancellable, because the dangerous
+moment is between "database created" and "install row written" — on any failure
+after that point the operation drops the database and the user itself, in
+reverse creation order. The **files are deliberately left in place**: they are
+the tenant's, the failure text names the directory, and deleting a tree the
+panel only partly wrote is how a panel eats somebody's data.
+
+The response carries the install id, path, URL, version, locale, the database
+and user names, and a note explaining where the credentials went. It carries no
+password.
+
+### `wp.detect`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | immediate |
+| Input | `site_id`; `subdirectory` *(optional)* |
+
+Is there a WordPress on this site? Presence is decided from the filesystem —
+`wp-config.php` and `wp-load.php` both present — and not from the install row,
+because a panel that reports "installed" on the strength of a row is wrong
+exactly when it matters. Also returns the install row if the panel has one
+(absent for a WordPress somebody imported or uploaded), the core version
+WP-CLI reports, and the pinned WP-CLI version with its pin provenance.
+
+A WP-CLI failure here is *information*, not an error: `version` comes back
+`null` rather than failing the call, because a broken installation is precisely
+what an operator opens this screen to find out about. The version, when
+observed, is cached on the row so a list page need not spawn one PHP process
+per site — and caching it never touches the `auto_update` policy the operator
+set.
+
+### `wp.update`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `install_id`; `version` *(optional, e.g. `6.8.2`)*; `update_db` *(optional bool, default true)* |
+
+`wp core update`, then `wp core update-db` unless asked not to — the second is
+what WordPress itself prompts for after a core update. Idempotent because
+updating an already-current install is a no-op that exits 0, so a retry after
+an agent restart is safe. `version` goes through the same argument validator
+the passthrough uses and must additionally look like a version (digits, dots
+and dashes). The observed version afterwards is cached on the row.
+
+### `wp.plugin.list`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | immediate |
+| Input | `install_id` |
+
+`wp plugin list --format=json --skip-plugins --skip-themes`, passed through as
+parsed JSON rather than re-modelled: the fields are WordPress's to define, and
+a struct here would silently drop whatever it did not know about. The two
+`--skip-*` flags matter — a plugin that fatals on load must not take the
+listing down with it, because this is the screen an operator opens *to find*
+the broken plugin.
+
+### `wp.plugin.update`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `install_id`; `plugins` *(optional list of slugs; empty means every plugin with an update available)* |
+
+Each slug is validated as a slug — WordPress's own alphabet for a plugin
+directory, so `--all` cannot be smuggled in as one. WP-CLI's own report comes
+back verbatim: plugin updates partially succeed all the time (one download
+fails, four update fine), and a boolean would throw away the only description
+of which was which.
+
+### `wp.cli`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | immediate |
+| Input | `install_id`; `subcommand` — one of `core`, `plugin`, `theme`, `option`, `user`, `db`, `cache`, `rewrite`; `args` *(optional list, at most 32, each at most 512 bytes)* |
+
+The restricted passthrough described above. Returns the exact argv WP-CLI
+received (`--path` included, so there is no hidden rewriting), its exit status,
+stdout and stderr.
+
+**A non-zero exit is data, not a failure.** `wp option get missing_key` exits
+1, and an operation that turned that into `FER-1601` would make half of WP-CLI
+unusable.
+
+Immediate rather than a task, because a passthrough whose output is discarded
+would not be a passthrough — a task delivers only its log. The cost is a
+25-second ceiling, chosen to sit inside the 30-second IPC call timeout so a
+slow command produces a clear error instead of `agent_unavailable` from a dead
+round trip. Work that legitimately takes longer has its own operations.
+
+`wp db cli` is refused: it opens an interactive `mysql` session and, with no
+terminal, would block until the timeout — a denial of service dressed as a
+feature request.
+
+The REST layer records the command *group* and the argument count in the audit
+log, never the argument values: `wp user update admin --user_pass=…` and
+`wp option update stripe_key sk_live_…` are both ordinary uses of this
+endpoint, and an audit row is browsable by anyone holding `audit_read`
+(spec §12 rule 6).
+
+### Not implemented, on purpose
+
+- **Clone-to-staging and push-to-production** (spec §11.12). They need a
+  second site, a database copy and a URL search-replace across a serialised
+  blob; each is its own operation with its own failure modes.
+- **The magic one-time admin login link** (spec §11.12). It is the intended way
+  back into a fresh install, and it is why `wp.install` can decline to hand
+  back a password at all.
+- **A UI page.** The backend and the REST surface are complete; no
+  `ui/src/routes/wordpress.tsx` exists yet.
+- **Verifying the WP-CLI release signature.** The fingerprint is recorded in
+  `WP_CLI_SIGNING_KEY_FPR`; verifying it through `ferrum_distro::pgp` (the way
+  repository keys already are) is what would make the pin multi-source.
+- **The auto-update runner.** `wp_installs.auto_update` is stored and
+  `Db::wp_installs_with_auto_update()` exposes it, but no scheduler job walks
+  it yet; the safe-hour window and pre-update snapshot the spec asks for belong
+  with that job.

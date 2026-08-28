@@ -26,6 +26,7 @@ pub mod server;
 pub mod sites;
 pub mod stack;
 pub mod tasks;
+pub mod wordpress;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -144,6 +145,17 @@ fn protected() -> Router<SharedState> {
             get(backups::runs_list).post(backups::runs_create),
         )
         .route("/api/backups/restores", post(backups::restores_create))
+        .route(
+            "/api/wordpress",
+            get(wordpress::detect).post(wordpress::install),
+        )
+        .route("/api/wordpress/{id}/update", post(wordpress::update))
+        .route("/api/wordpress/{id}/plugins", get(wordpress::plugins))
+        .route(
+            "/api/wordpress/{id}/plugins/update",
+            post(wordpress::plugins_update),
+        )
+        .route("/api/wordpress/{id}/cli", post(wordpress::cli))
 }
 
 /// Routes reachable without a session.
