@@ -55,14 +55,19 @@ impl Default for Limits {
 }
 
 /// Running totals for one extraction, checked against [`Limits`].
-struct Budget {
+///
+/// `pub(crate)` for the same reason [`split_entry_name`] is: the importers'
+/// tarball scan enforces the same three caps (entries, total bytes, ratio) on
+/// the same counters, and a second implementation of "how big is too big"
+/// would be a second place to get it wrong.
+pub(crate) struct Budget {
     limits: Limits,
     entries: u64,
-    written: u64,
+    pub(crate) written: u64,
 }
 
 impl Budget {
-    fn new(limits: Limits) -> Self {
+    pub(crate) fn new(limits: Limits) -> Self {
         Self {
             limits,
             entries: 0,
@@ -70,7 +75,7 @@ impl Budget {
         }
     }
 
-    fn count_entry(&mut self) -> SafeResult<()> {
+    pub(crate) fn count_entry(&mut self) -> SafeResult<()> {
         self.entries += 1;
         if self.entries > self.limits.max_entries {
             return Err(SafeError::new(
@@ -84,7 +89,7 @@ impl Budget {
         Ok(())
     }
 
-    fn count_bytes(&mut self, n: u64) -> SafeResult<()> {
+    pub(crate) fn count_bytes(&mut self, n: u64) -> SafeResult<()> {
         self.written += n;
         if self.written > self.limits.max_total_bytes {
             return Err(SafeError::new(
@@ -117,7 +122,12 @@ fn unsafe_entry(name: &str, why: &str) -> SafeError {
 /// applied again when the path is walked; this pass exists to reject the whole
 /// name up front with an error that quotes it, and to strip the trailing `/`
 /// a directory entry carries.
-fn split_entry_name(name: &str) -> SafeResult<Vec<&str>> {
+///
+/// `pub(crate)` for the migration importers (spec §11.15): scanning a cpmove
+/// tarball is a *read-only* pass and cannot reuse [`extract`], but it must
+/// refuse exactly the same entry names — so it calls this rather than growing
+/// a second, quietly divergent opinion about what a safe entry name is.
+pub(crate) fn split_entry_name(name: &str) -> SafeResult<Vec<&str>> {
     if name.contains('\0') {
         return Err(unsafe_entry("<nul>", "name contains a NUL byte"));
     }

@@ -103,6 +103,10 @@ use crate::auth::CurrentUser;
         super::wordpress::plugins,
         super::wordpress::plugins_update,
         super::wordpress::cli,
+        super::imports::create,
+        super::imports::list,
+        super::imports::detail,
+        super::imports::apply,
         super::waf::status,
         super::waf::enable,
         super::waf::disable,
@@ -128,6 +132,7 @@ use crate::auth::CurrentUser;
         (name = "backups", description = "restic repositories, schedules, run history and restores"),
         (name = "wordpress", description = "The WordPress toolkit: install, detect, core and plugin updates, and the restricted WP-CLI passthrough"),
         (name = "waf", description = "ModSecurity: module availability, per-site policy and rule exclusions"),
+        (name = "imports", description = "Migrating an account in from cPanel or aaPanel: the dry-run plan, and applying one"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]

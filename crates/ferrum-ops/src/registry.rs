@@ -315,6 +315,9 @@ impl OpRegistry {
         registry.register(crate::waf::Disable);
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
+        registry.register(crate::importer::Plan);
+        registry.register(crate::importer::List);
+        registry.register(crate::importer::Apply::live());
         registry
     }
 

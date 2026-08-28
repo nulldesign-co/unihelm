@@ -28,6 +28,7 @@ pub mod fpm;
 pub mod harden;
 pub mod fsops;
 pub mod fwops;
+pub mod importer;
 pub mod metrics;
 pub mod nodeapp;
 pub mod panel;

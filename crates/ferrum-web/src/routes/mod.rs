@@ -18,6 +18,7 @@ pub mod events;
 pub mod files;
 pub mod firewall;
 pub mod health;
+pub mod imports;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
@@ -174,6 +175,9 @@ fn protected() -> Router<SharedState> {
             post(wordpress::plugins_update),
         )
         .route("/api/wordpress/{id}/cli", post(wordpress::cli))
+        .route("/api/imports", get(imports::list).post(imports::create))
+        .route("/api/imports/{id}", get(imports::detail))
+        .route("/api/imports/{id}/apply", post(imports::apply))
         .route("/api/waf", get(waf::status))
         .route("/api/waf/enable", post(waf::enable))
         .route("/api/waf/disable", post(waf::disable))
