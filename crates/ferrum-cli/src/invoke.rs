@@ -144,6 +144,8 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Svc(cmd) => svc(cmd)?,
         Command::Waf(cmd) => waf(cmd)?,
         Command::Alert(cmd) => alert(cmd)?,
+        Command::Webhook(cmd) => webhook(cmd)?,
+        Command::Plugin(cmd) => plugin(cmd)?,
         Command::Quota(cmd) => quota(cmd),
         Command::Sftp(cmd) => sftp(cmd, secrets),
         Command::Security(SecurityCommand::Posture) => call("security.posture", json!({})),
@@ -921,6 +923,44 @@ pub fn parse_exclusions(items: &[String], site: Option<i64>) -> Result<Vec<Value
                 .done())
         })
         .collect()
+}
+
+fn webhook(cmd: &WebhookCommand) -> Result<Action> {
+    Ok(match cmd {
+        WebhookCommand::List => call("webhook.list", json!({})),
+        WebhookCommand::Set {
+            url,
+            event,
+            id,
+            disabled,
+            rotate_secret,
+        } => call(
+            "webhook.set",
+            json!({
+                "id": id,
+                "url": url,
+                "events": event,
+                // The operation defaults `active` to true, so the flag is
+                // inverted here rather than defaulted twice in two places.
+                "active": !disabled,
+                "rotate_secret": rotate_secret,
+            }),
+        ),
+        WebhookCommand::Delete { id } => call("webhook.delete", json!({ "id": id })),
+        WebhookCommand::Test { id } => call("webhook.test", json!({ "id": id })),
+    })
+}
+
+fn plugin(cmd: &PluginCommand) -> Result<Action> {
+    Ok(match cmd {
+        PluginCommand::List => call("plugin.list", json!({})),
+        PluginCommand::Install { source } => {
+            call("plugin.install", json!({ "source": source }))
+        }
+        PluginCommand::Enable { slug } => call("plugin.enable", json!({ "slug": slug })),
+        PluginCommand::Disable { slug } => call("plugin.disable", json!({ "slug": slug })),
+        PluginCommand::Remove { slug } => call("plugin.remove", json!({ "slug": slug })),
+    })
 }
 
 fn alert(cmd: &AlertCommand) -> Result<Action> {

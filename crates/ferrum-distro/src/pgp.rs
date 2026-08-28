@@ -220,7 +220,7 @@ fn collect_issuer_fingerprints(area: &[u8], out: &mut Vec<String>) {
                 6 => 32,
                 _ => 0,
             };
-            if expected > 0 && body.len() >= 1 + expected {
+            if expected > 0 && body.len() > expected {
                 out.push(hex_upper(&body[1..1 + expected]));
             }
         }

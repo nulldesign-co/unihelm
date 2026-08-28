@@ -108,6 +108,14 @@ pub enum Command {
     /// Alert rules, open events and notification channels.
     #[command(subcommand, alias = "alerts")]
     Alert(AlertCommand),
+
+    /// Outgoing webhooks: where the panel reports events, and their secrets.
+    #[command(subcommand)]
+    Webhook(WebhookCommand),
+
+    /// Plugin sidecars: install, enable, remove.
+    #[command(subcommand)]
+    Plugin(PluginCommand),
     /// Per-subscription disk quotas.
     #[command(subcommand)]
     Quota(QuotaCommand),
@@ -1193,6 +1201,70 @@ pub enum AlertCommand {
     ChannelsTest {
         /// Channel id.
         id: i64,
+    },
+}
+
+/// `ferrum webhook …`
+///
+/// A webhook secret is shown once, when it is minted, and never again — the
+/// panel stores it to sign with, not to hand back. `--rotate-secret` is how a
+/// leaked one is replaced.
+#[derive(Debug, Subcommand)]
+pub enum WebhookCommand {
+    /// Every hook, with its event list and failure count.
+    List,
+    /// Create a hook, or update one by id.
+    Set {
+        /// Where deliveries are POSTed. HTTPS unless the host is loopback.
+        url: String,
+        /// Which events to send. Repeat the flag, or comma-separate.
+        #[arg(long, value_delimiter = ',', required = true)]
+        event: Vec<String>,
+        /// Update this hook instead of creating one.
+        #[arg(long)]
+        id: Option<i64>,
+        /// Keep the hook but stop delivering to it.
+        #[arg(long)]
+        disabled: bool,
+        /// Mint a new signing secret, invalidating the old one.
+        #[arg(long)]
+        rotate_secret: bool,
+    },
+    /// Remove a hook.
+    Delete {
+        id: i64,
+    },
+    /// Send a test delivery and report what the endpoint answered.
+    Test {
+        id: i64,
+    },
+}
+
+/// `ferrum plugin …`
+///
+/// A plugin runs as a sidecar under its own account, never in the agent (spec
+/// §6). Install takes a staged directory containing `plugin.toml`; the panel
+/// verifies its signature before anything is copied into place.
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Installed plugins and what each one registers.
+    List,
+    /// Install from a staged directory.
+    Install {
+        /// Absolute path to a tree containing `plugin.toml`.
+        source: String,
+    },
+    /// Start a plugin's sidecar and route its extension points.
+    Enable {
+        slug: String,
+    },
+    /// Stop the sidecar, leaving the plugin installed.
+    Disable {
+        slug: String,
+    },
+    /// Stop it and remove it entirely.
+    Remove {
+        slug: String,
     },
 }
 
