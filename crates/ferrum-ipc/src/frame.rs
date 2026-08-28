@@ -214,9 +214,7 @@ pub enum EventKind {
         detail: Option<String>,
     },
     /// Reply to [`ControlKind::Ping`].
-    Pong {
-        agent_version: String,
-    },
+    Pong { agent_version: String },
 
     // --- web terminal (spec §11.16) ----------------------------------------
     /// Bytes the shell wrote, base64-encoded. `seq` starts at 1 per session and

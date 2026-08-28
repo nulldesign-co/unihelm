@@ -411,7 +411,8 @@ fn write_file(path: &SafePath, len: u64, payload: &mut impl BufRead) -> SafeResu
                 .map_err(|e| SafeError::io(path.as_path(), &e))?;
             remaining -= want as u64;
         }
-        file.flush().map_err(|e| SafeError::io(path.as_path(), &e))?;
+        file.flush()
+            .map_err(|e| SafeError::io(path.as_path(), &e))?;
     }
     std::fs::rename(&temp, path.as_path()).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
@@ -474,8 +475,7 @@ fn make_parents(home: &Path, path: &Path) -> SafeResult<(SafePath, String)> {
     for component in components {
         let next = current.join_entry(component)?;
         if !next.as_path().exists() {
-            std::fs::create_dir(next.as_path())
-                .map_err(|e| SafeError::io(next.as_path(), &e))?;
+            std::fs::create_dir(next.as_path()).map_err(|e| SafeError::io(next.as_path(), &e))?;
         }
         // Re-walk rather than trusting the join: if `component` turned out to be
         // a symlink placed between the create and here, this refuses it.
@@ -711,8 +711,8 @@ fn write_reply(
     payload_len: u64,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let line = serde_json::to_string(reply)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let line =
+        serde_json::to_string(reply).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     out.write_all(line.as_bytes())?;
     out.write_all(b"\n")?;
     if payload_len > 0 {

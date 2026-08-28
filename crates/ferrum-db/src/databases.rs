@@ -551,7 +551,9 @@ mod tests {
     #[tokio::test]
     async fn a_db_username_is_unique_across_the_whole_server() {
         let (db, mine, theirs, ..) = seed().await;
-        db.create_db_user(mysql_user(mine, "shop_rw")).await.unwrap();
+        db.create_db_user(mysql_user(mine, "shop_rw"))
+            .await
+            .unwrap();
         let err = db.create_db_user(mysql_user(theirs, "shop_rw")).await;
         assert!(matches!(err, Err(DbError::Conflict { .. })));
     }
@@ -573,7 +575,10 @@ mod tests {
     #[tokio::test]
     async fn one_customer_cannot_see_or_touch_anothers_databases() {
         let (db, mine, theirs, alice, _bobby) = seed().await;
-        let victim = db.create_database(mysql_db(theirs, "victim")).await.unwrap();
+        let victim = db
+            .create_database(mysql_db(theirs, "victim"))
+            .await
+            .unwrap();
         db.create_database(mysql_db(mine, "minedb")).await.unwrap();
 
         let intruder = TenantScope::Customer { customer_id: alice };
@@ -600,8 +605,13 @@ mod tests {
     #[tokio::test]
     async fn one_customer_cannot_see_or_touch_anothers_db_users() {
         let (db, mine, theirs, alice, _bobby) = seed().await;
-        let victim = db.create_db_user(mysql_user(theirs, "victim_rw")).await.unwrap();
-        db.create_db_user(mysql_user(mine, "mine_rw")).await.unwrap();
+        let victim = db
+            .create_db_user(mysql_user(theirs, "victim_rw"))
+            .await
+            .unwrap();
+        db.create_db_user(mysql_user(mine, "mine_rw"))
+            .await
+            .unwrap();
 
         let intruder = TenantScope::Customer { customer_id: alice };
         let repo = db.databases(&intruder);
@@ -620,14 +630,21 @@ mod tests {
         // This is what makes "is this name free?" answer honestly before the
         // engine-level CREATE runs.
         let (db, _mine, theirs, ..) = seed().await;
-        db.create_database(mysql_db(theirs, "takenname")).await.unwrap();
+        db.create_database(mysql_db(theirs, "takenname"))
+            .await
+            .unwrap();
         assert!(
             db.database_by_name_global("takenname")
                 .await
                 .unwrap()
                 .is_some()
         );
-        assert!(db.database_by_name_global("freename").await.unwrap().is_none());
+        assert!(
+            db.database_by_name_global("freename")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -655,7 +672,10 @@ mod tests {
     #[tokio::test]
     async fn touching_a_user_moves_only_updated_at() {
         let (db, sub, ..) = seed().await;
-        let user = db.create_db_user(mysql_user(sub, "rotate_me")).await.unwrap();
+        let user = db
+            .create_db_user(mysql_user(sub, "rotate_me"))
+            .await
+            .unwrap();
         // Ensure the clock can visibly advance (second resolution).
         sqlx::query("UPDATE db_users SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?1")
             .bind(user.id)

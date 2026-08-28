@@ -391,7 +391,10 @@ async fn render_sshd_dropin(ctx: &OpContext) -> Result<bool> {
         .map_err(FerrumError::from)?;
 
     if outcome.changed {
-        ctx.log(format!("{} written and sshd reloaded", outcome.path.display()));
+        ctx.log(format!(
+            "{} written and sshd reloaded",
+            outcome.path.display()
+        ));
     }
     Ok(outcome.changed)
 }
@@ -454,9 +457,7 @@ async fn is_group_member(user: &LinuxUser) -> bool {
         .arg(user.as_str())
         .run()
         .await
-        .map(|out| {
-            out.success() && out.stdout.split_whitespace().any(|g| g == SFTP_GROUP)
-        })
+        .map(|out| out.success() && out.stdout.split_whitespace().any(|g| g == SFTP_GROUP))
         .unwrap_or(false)
 }
 
@@ -996,7 +997,13 @@ mod tests {
             PathBuf::from("/home/ft_abc12345")
         );
 
-        for evil in ["/", "/home", "/etc", "/home/ft_abc12345/../..", "/home/other"] {
+        for evil in [
+            "/",
+            "/home",
+            "/etc",
+            "/home/ft_abc12345/../..",
+            "/home/other",
+        ] {
             let bad = Subscription {
                 home_dir: evil.into(),
                 ..good.clone()

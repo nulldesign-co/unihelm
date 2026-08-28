@@ -255,7 +255,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 1);
-        assert_eq!(db.mail_relay().await.unwrap().unwrap().host, "smtp2.example.net");
+        assert_eq!(
+            db.mail_relay().await.unwrap().unwrap().host,
+            "smtp2.example.net"
+        );
     }
 
     #[tokio::test]

@@ -310,7 +310,10 @@ fn truncate_for_message(text: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockSpan {
     /// Line indices of the BEGIN and END markers, inclusive.
-    Present { begin: usize, end: usize },
+    Present {
+        begin: usize,
+        end: usize,
+    },
     Absent,
 }
 
@@ -390,7 +393,8 @@ pub fn splice_block(contents: &str, block: &str) -> Result<String> {
             out.extend(lines.iter().map(|l| (*l).to_string()));
             // One blank line before the block when there is something above it,
             // so the file stays readable to whoever opens it in vi.
-            if !out.is_empty() && !rendered.is_empty() && out.last().is_some_and(|l| !l.is_empty()) {
+            if !out.is_empty() && !rendered.is_empty() && out.last().is_some_and(|l| !l.is_empty())
+            {
                 out.push(String::new());
             }
             out.extend(rendered);
@@ -638,7 +642,10 @@ impl Target {
             Err(e) => return Err(e),
         };
 
-        if let FsData::Content { truncated: true, .. } = data {
+        if let FsData::Content {
+            truncated: true, ..
+        } = data
+        {
             return Err(FerrumError::new(
                 ErrorCode::InvalidInput,
                 "authorized_keys is larger than the panel will read; trim it by hand",
@@ -730,8 +737,7 @@ async fn resolve(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Target
     // Resolved through the caller's scope and never created: see
     // `terminal::resolve_subscription` for why the "default subscription"
     // helper is the wrong one here.
-    let subscription =
-        super::resolve_subscription(ctx.db(), ctx.auth(), subscription_id).await?;
+    let subscription = super::resolve_subscription(ctx.db(), ctx.auth(), subscription_id).await?;
 
     ensure_can_manage_keys(ctx.db(), ctx.auth().acting_role, &subscription).await?;
 
@@ -787,7 +793,11 @@ mod tests {
     }
 
     fn ed25519_line(seed: u8, comment: &str) -> String {
-        format!("ssh-ed25519 {} {}", BASE64.encode(ed25519_blob(seed)), comment)
+        format!(
+            "ssh-ed25519 {} {}",
+            BASE64.encode(ed25519_blob(seed)),
+            comment
+        )
     }
 
     /// `string "ssh-rsa"`, `mpint e`, `mpint n` with `bits` of modulus.
@@ -916,7 +926,11 @@ mod tests {
         assert!(updated.contains(END_MARKER));
 
         // And a second write replaces only the block.
-        let block2 = format!("{}\n{}\n", ed25519_line(3, "panel"), ed25519_line(4, "phone"));
+        let block2 = format!(
+            "{}\n{}\n",
+            ed25519_line(3, "panel"),
+            ed25519_line(4, "phone")
+        );
         let twice = splice_block(&updated, &block2).unwrap();
         assert!(twice.contains(&mine));
         assert!(twice.contains(&other));
@@ -929,7 +943,8 @@ mod tests {
     fn removing_the_last_key_removes_the_block_and_nothing_else() {
         let mine = ed25519_line(1, "mine");
         let existing = format!("{mine}\n");
-        let with_block = splice_block(&existing, &format!("{}\n", ed25519_line(2, "panel"))).unwrap();
+        let with_block =
+            splice_block(&existing, &format!("{}\n", ed25519_line(2, "panel"))).unwrap();
         let emptied = splice_block(&with_block, "").unwrap();
 
         assert_eq!(emptied, existing, "only the block may disappear");
@@ -1060,7 +1075,11 @@ mod tests {
         // key manager that installs a key nobody can log in with is worse than
         // one that refuses.
         let mode = |path: &str| {
-            std::fs::metadata(home.join(path)).unwrap().permissions().mode() & 0o777
+            std::fs::metadata(home.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
         };
         assert_eq!(mode(SSH_DIR), SSH_DIR_MODE);
         assert_eq!(mode(AUTHORIZED_KEYS), AUTHORIZED_KEYS_MODE);
@@ -1073,7 +1092,10 @@ mod tests {
         // And removing one leaves the other alone.
         let after = target.read().await.unwrap();
         write_keys(&home, &after, std::slice::from_ref(&second)).await;
-        assert_eq!(read_block(&target.read().await.unwrap()).unwrap(), vec![second]);
+        assert_eq!(
+            read_block(&target.read().await.unwrap()).unwrap(),
+            vec![second]
+        );
     }
 
     #[tokio::test]
@@ -1090,23 +1112,37 @@ mod tests {
 
         let theirs = ed25519_line(9, "added-by-hand-over-sftp");
         std::fs::create_dir(home.join(SSH_DIR)).unwrap();
-        std::fs::write(home.join(AUTHORIZED_KEYS), format!("{theirs}
-")).unwrap();
+        std::fs::write(
+            home.join(AUTHORIZED_KEYS),
+            format!(
+                "{theirs}
+"
+            ),
+        )
+        .unwrap();
 
         let existing = target.read().await.unwrap();
         let mine = parse_authorized_key(&ed25519_line(1, "panel")).unwrap();
         write_keys(&home, &existing, std::slice::from_ref(&mine)).await;
 
         let after = target.read().await.unwrap();
-        assert!(after.contains(&theirs), "the tenant's own key was lost: {after}");
+        assert!(
+            after.contains(&theirs),
+            "the tenant's own key was lost: {after}"
+        );
         assert_eq!(read_block(&after).unwrap(), vec![mine]);
         assert!(has_keys_outside_block(&after).unwrap());
 
         // Removing the panel's last key removes the block and leaves theirs.
         write_keys(&home, &after, &[]).await;
         let emptied = target.read().await.unwrap();
-        assert_eq!(emptied, format!("{theirs}
-"));
+        assert_eq!(
+            emptied,
+            format!(
+                "{theirs}
+"
+            )
+        );
     }
 
     #[tokio::test]

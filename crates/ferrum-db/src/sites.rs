@@ -781,12 +781,21 @@ mod tests {
         // the whole defence: without it, "list the sites on subscription 1"
         // would be a working cross-tenant read for anyone who can count.
         let (db, mine, theirs, my_user, _) = seed().await;
-        db.create_site(php_site(theirs, "theirs.example")).await.unwrap();
-        db.create_site(php_site(mine, "mine.example")).await.unwrap();
+        db.create_site(php_site(theirs, "theirs.example"))
+            .await
+            .unwrap();
+        db.create_site(php_site(mine, "mine.example"))
+            .await
+            .unwrap();
 
-        let scope = TenantScope::Customer { customer_id: my_user };
+        let scope = TenantScope::Customer {
+            customer_id: my_user,
+        };
         let stolen = db.sites(&scope).for_subscription(theirs).await.unwrap();
-        assert!(stolen.is_empty(), "another tenant's sites must not be readable");
+        assert!(
+            stolen.is_empty(),
+            "another tenant's sites must not be readable"
+        );
 
         let own = db.sites(&scope).for_subscription(mine).await.unwrap();
         assert_eq!(own.len(), 1);
@@ -794,7 +803,11 @@ mod tests {
 
         // And an admin sees each of them for what they are.
         assert_eq!(
-            db.sites(&TenantScope::Global).for_subscription(theirs).await.unwrap().len(),
+            db.sites(&TenantScope::Global)
+                .for_subscription(theirs)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -805,13 +818,18 @@ mod tests {
         // the problem, try again, and the panel answers "already a site".
         let (db, sub, _other, _, _) = seed().await;
         let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
-        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed)
+            .await
+            .unwrap();
 
         let mut retry = php_site(sub, "example.com");
         retry.php_version = Some(PhpVersion::V84);
         let again = db.reclaim_failed_site(site.id, &retry).await.unwrap();
 
-        assert_eq!(again.id, site.id, "the retry reuses the row, keeping its history");
+        assert_eq!(
+            again.id, site.id,
+            "the retry reuses the row, keeping its history"
+        );
         assert_eq!(again.status, SiteStatus::Provisioning);
         assert_eq!(
             again.php_version,
@@ -826,7 +844,9 @@ mod tests {
         // route to their domain.
         let (db, sub, other, _, _) = seed().await;
         let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
-        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed)
+            .await
+            .unwrap();
 
         // The op layer refuses this by comparing owners; the row keeps its owner
         // either way, so a reclaim can never move a site between subscriptions.
@@ -852,7 +872,9 @@ mod tests {
                 .is_err()
         );
 
-        db.set_site_status(site.id, SiteStatus::Active).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Active)
+            .await
+            .unwrap();
         assert!(
             db.reclaim_failed_site(site.id, &php_site(sub, "example.com"))
                 .await
@@ -860,7 +882,9 @@ mod tests {
             "a live site must never be silently rebuilt under a retry"
         );
 
-        db.set_site_status(site.id, SiteStatus::Suspended).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Suspended)
+            .await
+            .unwrap();
         assert!(
             db.reclaim_failed_site(site.id, &php_site(sub, "example.com"))
                 .await
@@ -875,10 +899,16 @@ mod tests {
         // so a double-click cannot start two provisioning runs on one row.
         let (db, sub, _other, _, _) = seed().await;
         let site = db.create_site(php_site(sub, "example.com")).await.unwrap();
-        db.set_site_status(site.id, SiteStatus::Failed).await.unwrap();
+        db.set_site_status(site.id, SiteStatus::Failed)
+            .await
+            .unwrap();
 
-        let first = db.reclaim_failed_site(site.id, &php_site(sub, "example.com")).await;
-        let second = db.reclaim_failed_site(site.id, &php_site(sub, "example.com")).await;
+        let first = db
+            .reclaim_failed_site(site.id, &php_site(sub, "example.com"))
+            .await;
+        let second = db
+            .reclaim_failed_site(site.id, &php_site(sub, "example.com"))
+            .await;
         assert!(first.is_ok());
         assert!(second.is_err(), "the second claim must lose");
     }

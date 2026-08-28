@@ -305,7 +305,12 @@ impl TaskRepo<'_> {
     /// task history is exactly the screen where somebody would try `' OR 1=1`.
     /// The scope predicate is prepended, never replaced, so no combination of
     /// filters can widen what a tenant sees.
-    pub async fn list_filtered(&self, filter: &TaskFilter, limit: i64, offset: i64) -> Result<Vec<Task>> {
+    pub async fn list_filtered(
+        &self,
+        filter: &TaskFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Task>> {
         let limit = limit.clamp(1, 200);
         let mut sql = String::from("SELECT * FROM tasks WHERE 1 = 1");
         match self.scope {
@@ -362,20 +367,22 @@ impl TaskRepo<'_> {
                     .fetch_all(self.db.pool())
                     .await?
             }
-            ScopeFilter::Reseller(user_id) | ScopeFilter::Customer(user_id) => sqlx::query_as(
-                "SELECT DISTINCT op FROM tasks WHERE actor_user_id = ?1 ORDER BY op",
-            )
-            .bind(user_id)
-            .fetch_all(self.db.pool())
-            .await?,
+            ScopeFilter::Reseller(user_id) | ScopeFilter::Customer(user_id) => {
+                sqlx::query_as("SELECT DISTINCT op FROM tasks WHERE actor_user_id = ?1 ORDER BY op")
+                    .bind(user_id)
+                    .fetch_all(self.db.pool())
+                    .await?
+            }
             ScopeFilter::Subscription {
                 subscription_id, ..
-            } => sqlx::query_as(
-                "SELECT DISTINCT op FROM tasks WHERE subscription_id = ?1 ORDER BY op",
-            )
-            .bind(subscription_id)
-            .fetch_all(self.db.pool())
-            .await?,
+            } => {
+                sqlx::query_as(
+                    "SELECT DISTINCT op FROM tasks WHERE subscription_id = ?1 ORDER BY op",
+                )
+                .bind(subscription_id)
+                .fetch_all(self.db.pool())
+                .await?
+            }
         };
         Ok(rows.into_iter().map(|(op,)| op).collect())
     }
@@ -512,10 +519,16 @@ mod tests {
     async fn the_history_filters_by_op_status_and_date_without_widening_the_scope() {
         let (db, alice, bobby) = seed().await;
 
-        let mine = db.create_task(new_task(alice, "php.install")).await.unwrap();
+        let mine = db
+            .create_task(new_task(alice, "php.install"))
+            .await
+            .unwrap();
         db.start_task(mine.id).await.unwrap();
         db.finish_task_ok(mine.id).await.unwrap();
-        let mine_failed = db.create_task(new_task(alice, "site.create")).await.unwrap();
+        let mine_failed = db
+            .create_task(new_task(alice, "site.create"))
+            .await
+            .unwrap();
         db.start_task(mine_failed.id).await.unwrap();
         db.finish_task_failed(
             mine_failed.id,
@@ -523,7 +536,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let theirs = db.create_task(new_task(bobby, "php.install")).await.unwrap();
+        let theirs = db
+            .create_task(new_task(bobby, "php.install"))
+            .await
+            .unwrap();
 
         let scoped = db.tasks(&TenantScope::Customer { customer_id: alice });
 
@@ -539,7 +555,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(by_op.len(), 1, "a filter must not reach another tenant's rows");
+        assert_eq!(
+            by_op.len(),
+            1,
+            "a filter must not reach another tenant's rows"
+        );
         assert_eq!(by_op[0].id, mine.id);
         assert!(by_op.iter().all(|t| t.id != theirs.id));
 
@@ -598,7 +618,9 @@ mod tests {
         // The op name arrives from a query string. If it were pasted into the
         // statement this would return every row instead of none.
         let (db, alice, _) = seed().await;
-        db.create_task(new_task(alice, "php.install")).await.unwrap();
+        db.create_task(new_task(alice, "php.install"))
+            .await
+            .unwrap();
         let hostile = scoped_filter("' OR 1=1 --");
         let rows = db
             .tasks(&TenantScope::Global)

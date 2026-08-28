@@ -71,7 +71,12 @@ impl Db {
     /// doing so must not reset a schedule or lose a job's history. Only the
     /// interval and jitter are refreshed, so changing them in code takes effect
     /// on upgrade.
-    pub async fn register_job(&self, name: &str, interval: Duration, jitter: Duration) -> Result<()> {
+    pub async fn register_job(
+        &self,
+        name: &str,
+        interval: Duration,
+        jitter: Duration,
+    ) -> Result<()> {
         let ts = to_sql_time(now());
         // A newly registered job is due almost immediately, but jittered —
         // otherwise every job registered at boot fires in the same instant.
@@ -118,7 +123,9 @@ impl Db {
         outcome: std::result::Result<(), String>,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let Some(job) = self.job(name).await? else { return Ok(()) };
+        let Some(job) = self.job(name).await? else {
+            return Ok(());
+        };
 
         let interval = Duration::seconds(job.interval_seconds);
         let jitter = Duration::seconds(job.jitter_seconds);
@@ -153,10 +160,11 @@ impl Db {
     }
 
     pub async fn job(&self, name: &str) -> Result<Option<ScheduledJob>> {
-        let row = sqlx::query_as::<_, ScheduledJobRow>("SELECT * FROM scheduler_jobs WHERE name = ?1")
-            .bind(name)
-            .fetch_optional(self.pool())
-            .await?;
+        let row =
+            sqlx::query_as::<_, ScheduledJobRow>("SELECT * FROM scheduler_jobs WHERE name = ?1")
+                .bind(name)
+                .fetch_optional(self.pool())
+                .await?;
         row.map(ScheduledJob::try_from).transpose()
     }
 
@@ -214,7 +222,9 @@ mod tests {
     #[tokio::test]
     async fn a_registered_job_becomes_due() {
         let db = db().await;
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
+            .await
+            .unwrap();
 
         let due = db.due_jobs().await.unwrap();
         assert_eq!(due.len(), 1);
@@ -227,30 +237,54 @@ mod tests {
         // The agent registers its jobs on every start; doing so must not lose a
         // job's history or make everything due again.
         let db = db().await;
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
-        db.finish_job("cert.renew", Ok(()), std::time::Duration::from_millis(5)).await.unwrap();
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
+            .await
+            .unwrap();
+        db.finish_job("cert.renew", Ok(()), std::time::Duration::from_millis(5))
+            .await
+            .unwrap();
 
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
+            .await
+            .unwrap();
 
         let job = db.job("cert.renew").await.unwrap().unwrap();
         assert_eq!(job.run_count, 1, "history must survive re-registration");
-        assert!(job.next_run_at > now(), "the schedule must not be reset to now");
+        assert!(
+            job.next_run_at > now(),
+            "the schedule must not be reset to now"
+        );
         assert!(db.due_jobs().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn changing_the_interval_in_code_takes_effect_on_upgrade() {
         let db = db().await;
-        db.register_job("metrics.rollup", Duration::hours(1), Duration::ZERO).await.unwrap();
-        db.register_job("metrics.rollup", Duration::minutes(5), Duration::ZERO).await.unwrap();
-        assert_eq!(db.job("metrics.rollup").await.unwrap().unwrap().interval_seconds, 300);
+        db.register_job("metrics.rollup", Duration::hours(1), Duration::ZERO)
+            .await
+            .unwrap();
+        db.register_job("metrics.rollup", Duration::minutes(5), Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.job("metrics.rollup")
+                .await
+                .unwrap()
+                .unwrap()
+                .interval_seconds,
+            300
+        );
     }
 
     #[tokio::test]
     async fn finishing_a_job_schedules_the_next_run_and_records_the_outcome() {
         let db = db().await;
-        db.register_job("audit.purge", Duration::hours(24), Duration::ZERO).await.unwrap();
-        db.finish_job("audit.purge", Ok(()), std::time::Duration::from_millis(120)).await.unwrap();
+        db.register_job("audit.purge", Duration::hours(24), Duration::ZERO)
+            .await
+            .unwrap();
+        db.finish_job("audit.purge", Ok(()), std::time::Duration::from_millis(120))
+            .await
+            .unwrap();
 
         let job = db.job("audit.purge").await.unwrap().unwrap();
         assert_eq!(job.last_status.as_deref(), Some("ok"));
@@ -258,7 +292,10 @@ mod tests {
         assert_eq!(job.run_count, 1);
         assert!(job.last_run_at.is_some());
         let ahead = (job.next_run_at - now()).whole_seconds();
-        assert!((86_000..=86_400).contains(&ahead), "next run is {ahead}s away");
+        assert!(
+            (86_000..=86_400).contains(&ahead),
+            "next run is {ahead}s away"
+        );
     }
 
     #[tokio::test]
@@ -266,39 +303,68 @@ mod tests {
         // A job that stops rescheduling after one bad day is a job that stops
         // forever.
         let db = db().await;
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
-        db.finish_job("cert.renew", Err("the CA was unreachable".into()), std::time::Duration::ZERO)
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
             .await
             .unwrap();
+        db.finish_job(
+            "cert.renew",
+            Err("the CA was unreachable".into()),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
 
         let job = db.job("cert.renew").await.unwrap().unwrap();
         assert_eq!(job.last_status.as_deref(), Some("failed"));
         assert!(job.last_error.unwrap().contains("unreachable"));
         assert_eq!(job.failure_count, 1);
-        assert!(job.next_run_at > now(), "a failed job must still be scheduled again");
+        assert!(
+            job.next_run_at > now(),
+            "a failed job must still be scheduled again"
+        );
     }
 
     #[tokio::test]
     async fn a_success_clears_the_failure_streak() {
         let db = db().await;
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
-        db.finish_job("cert.renew", Err("x".into()), std::time::Duration::ZERO).await.unwrap();
-        db.finish_job("cert.renew", Err("x".into()), std::time::Duration::ZERO).await.unwrap();
-        assert_eq!(db.job("cert.renew").await.unwrap().unwrap().failure_count, 2);
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
+            .await
+            .unwrap();
+        db.finish_job("cert.renew", Err("x".into()), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        db.finish_job("cert.renew", Err("x".into()), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.job("cert.renew").await.unwrap().unwrap().failure_count,
+            2
+        );
 
-        db.finish_job("cert.renew", Ok(()), std::time::Duration::ZERO).await.unwrap();
-        assert_eq!(db.job("cert.renew").await.unwrap().unwrap().failure_count, 0);
+        db.finish_job("cert.renew", Ok(()), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.job("cert.renew").await.unwrap().unwrap().failure_count,
+            0
+        );
     }
 
     #[tokio::test]
     async fn a_job_that_fell_due_while_the_agent_was_down_comes_back_due() {
         // The whole reason the schedule is persisted.
         let db = db().await;
-        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO).await.unwrap();
-        db.finish_job("cert.renew", Ok(()), std::time::Duration::ZERO).await.unwrap();
+        db.register_job("cert.renew", Duration::hours(12), Duration::ZERO)
+            .await
+            .unwrap();
+        db.finish_job("cert.renew", Ok(()), std::time::Duration::ZERO)
+            .await
+            .unwrap();
         assert!(db.due_jobs().await.unwrap().is_empty());
 
-        db.defer_job("cert.renew", -Duration::hours(1)).await.unwrap();
+        db.defer_job("cert.renew", -Duration::hours(1))
+            .await
+            .unwrap();
         assert_eq!(db.due_jobs().await.unwrap().len(), 1);
     }
 
@@ -308,16 +374,29 @@ mod tests {
         // second — but nor may a job be scheduled in the past and fire twice.
         let db = db().await;
         for i in 0..20 {
-            db.register_job(&format!("job{i}"), Duration::hours(12), Duration::minutes(30))
-                .await
-                .unwrap();
+            db.register_job(
+                &format!("job{i}"),
+                Duration::hours(12),
+                Duration::minutes(30),
+            )
+            .await
+            .unwrap();
         }
         let jobs = db.jobs().await.unwrap();
-        let offsets: Vec<i64> =
-            jobs.iter().map(|j| (j.next_run_at - now()).whole_seconds()).collect();
-        assert!(offsets.iter().all(|o| (0..=1800).contains(o)), "offsets: {offsets:?}");
+        let offsets: Vec<i64> = jobs
+            .iter()
+            .map(|j| (j.next_run_at - now()).whole_seconds())
+            .collect();
         assert!(
-            offsets.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            offsets.iter().all(|o| (0..=1800).contains(o)),
+            "offsets: {offsets:?}"
+        );
+        assert!(
+            offsets
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
             "no jitter was applied"
         );
     }
@@ -330,19 +409,45 @@ mod tests {
             .create_certificate(None, CertKind::Le, &["a.example".into()], "/certs/a")
             .await
             .unwrap();
-        db.certificate_issued(cert.id, "LE", now() - Duration::days(80), now() + Duration::days(10))
-            .await
-            .unwrap();
+        db.certificate_issued(
+            cert.id,
+            "LE",
+            now() - Duration::days(80),
+            now() + Duration::days(10),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // A failure pushes the next attempt out; the scheduler must respect it,
         // or a broken vhost burns the five-failures-per-hour budget.
-        db.set_certificate_next_attempt(cert.id, now() + Duration::hours(1)).await.unwrap();
-        assert!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().is_empty());
+        db.set_certificate_next_attempt(cert.id, now() + Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
-        db.set_certificate_next_attempt(cert.id, now() - Duration::minutes(1)).await.unwrap();
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        db.set_certificate_next_attempt(cert.id, now() - Duration::minutes(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -354,9 +459,20 @@ mod tests {
             .create_certificate(None, CertKind::Le, &["a.example".into()], "/certs/a")
             .await
             .unwrap();
-        db.certificate_issued(cert.id, "LE", now() - Duration::days(95), now() - Duration::days(5))
-            .await
-            .unwrap();
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        db.certificate_issued(
+            cert.id,
+            "LE",
+            now() - Duration::days(95),
+            now() - Duration::days(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

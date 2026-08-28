@@ -132,13 +132,19 @@ pub(crate) fn split_entry_name(name: &str) -> SafeResult<Vec<&str>> {
         return Err(unsafe_entry("<nul>", "name contains a NUL byte"));
     }
     if name.starts_with('/') {
-        return Err(unsafe_entry(name, "absolute paths cannot come from a tenant archive"));
+        return Err(unsafe_entry(
+            name,
+            "absolute paths cannot come from a tenant archive",
+        ));
     }
     // Windows-made archives sometimes separate with `\`. Treating it as a
     // literal character would let `..\..\x` pass the `/`-split checks below,
     // so it is refused rather than interpreted.
     if name.contains('\\') {
-        return Err(unsafe_entry(name, "backslashes are not accepted in entry names"));
+        return Err(unsafe_entry(
+            name,
+            "backslashes are not accepted in entry names",
+        ));
     }
 
     let mut parts = Vec::new();
@@ -188,7 +194,9 @@ fn descend_create(dir: &SafePath, comp: &str) -> SafeResult<SafePath> {
 /// Resolve where an entry's bytes will land: create the directory chain, and
 /// return the final component's [`SafePath`].
 fn entry_target(dest: &SafePath, components: &[&str]) -> SafeResult<SafePath> {
-    let (name, dirs) = components.split_last().expect("split_entry_name is non-empty");
+    let (name, dirs) = components
+        .split_last()
+        .expect("split_entry_name is non-empty");
     let mut dir = dest.clone();
     for comp in dirs {
         dir = descend_create(&dir, comp)?;
@@ -343,10 +351,7 @@ fn extract_zip(archive: &SafePath, dest: &SafePath, limits: Limits) -> SafeResul
         // A zip symlink is a file entry whose mode says S_IFLNK and whose body
         // is the target. Skipped, not created (spec §11.7 AC): materialising it
         // would plant a tenant-chosen redirection for every later operation.
-        if entry
-            .unix_mode()
-            .is_some_and(|m| m & 0o170000 == 0o120000)
-        {
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             continue;
         }
 
@@ -358,17 +363,21 @@ fn extract_zip(archive: &SafePath, dest: &SafePath, limits: Limits) -> SafeResul
             .saturating_mul(limits.ratio)
             .saturating_add(limits.grace);
         if entry.size() > allowed {
-            return Err(unsafe_entry(&raw_name, "declared size exceeds the ratio cap"));
+            return Err(unsafe_entry(
+                &raw_name,
+                "declared size exceeds the ratio cap",
+            ));
         }
 
         let target = entry_target(dest, &components)?;
         let mut out = open_target(&target)?;
-        guarded_copy(&mut entry, &mut out, allowed, &mut |n| budget.count_bytes(n)).inspect_err(
-            |_| {
-                // Never leave a half-written bomb fragment behind.
-                let _ = std::fs::remove_file(target.as_path());
-            },
-        )?;
+        guarded_copy(&mut entry, &mut out, allowed, &mut |n| {
+            budget.count_bytes(n)
+        })
+        .inspect_err(|_| {
+            // Never leave a half-written bomb fragment behind.
+            let _ = std::fs::remove_file(target.as_path());
+        })?;
 
         restore_mode(&target, entry.unix_mode());
         files += 1;
@@ -493,10 +502,7 @@ fn zip_error(path: &Path, e: zip::result::ZipError) -> SafeError {
     match e {
         ZipError::Io(io) => SafeError::io(path, &io),
         ZipError::FileNotFound => SafeError::new(FsErrorKind::NotFound, "no such archive member"),
-        other => SafeError::new(
-            FsErrorKind::Invalid,
-            format!("{}: {other}", path.display()),
-        ),
+        other => SafeError::new(FsErrorKind::Invalid, format!("{}: {other}", path.display())),
     }
 }
 
@@ -601,8 +607,7 @@ fn walk_tree(
     }
 
     visit(path, rel, TreeItem::Dir)?;
-    let read =
-        std::fs::read_dir(path.as_path()).map_err(|e| SafeError::io(path.as_path(), &e))?;
+    let read = std::fs::read_dir(path.as_path()).map_err(|e| SafeError::io(path.as_path(), &e))?;
     for item in read {
         let Ok(item) = item else { continue };
         let Some(name) = item.file_name().to_str().map(str::to_string) else {
@@ -649,8 +654,7 @@ fn compress_zip(root: &SafePath, entries: &[String], file: std::fs::File) -> Saf
                 zip.start_file(rel, options)
                     .map_err(|e| zip_error(path.as_path(), e))?;
                 let mut src = open_source(path)?;
-                std::io::copy(&mut src, &mut zip)
-                    .map_err(|e| SafeError::io(path.as_path(), &e))?;
+                std::io::copy(&mut src, &mut zip).map_err(|e| SafeError::io(path.as_path(), &e))?;
                 Ok(())
             }
         })?;
@@ -759,10 +763,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{archive_name}: {e:?}", e = e.message));
 
             let dest = home.make_dest("out");
-            let (files, bytes) =
-                extract(&home.safe(archive_name), &dest).unwrap_or_else(|e| {
-                    panic!("{archive_name}: {}", e.message)
-                });
+            let (files, bytes) = extract(&home.safe(archive_name), &dest)
+                .unwrap_or_else(|e| panic!("{archive_name}: {}", e.message));
             assert_eq!(files, 2, "{archive_name}");
             assert!(bytes > 0, "{archive_name}");
             assert_eq!(
@@ -786,7 +788,13 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", home.path.join("src/leak")).unwrap();
 
         let root = home.root();
-        compress(&root, &["src".into()], &home.safe_new("a.tar.gz"), ArchiveFormat::TarGz).unwrap();
+        compress(
+            &root,
+            &["src".into()],
+            &home.safe_new("a.tar.gz"),
+            ArchiveFormat::TarGz,
+        )
+        .unwrap();
 
         let dest = home.make_dest("out");
         let (files, _) = extract(&home.safe("a.tar.gz"), &dest).unwrap();
@@ -946,7 +954,13 @@ mod tests {
         let home = Home::new();
         home.write("big.bin", &vec![0u8; 8 * 1024 * 1024]);
         let root = home.root();
-        compress(&root, &["big.bin".into()], &home.safe_new("bomb.zip"), ArchiveFormat::Zip).unwrap();
+        compress(
+            &root,
+            &["big.bin".into()],
+            &home.safe_new("bomb.zip"),
+            ArchiveFormat::Zip,
+        )
+        .unwrap();
 
         let dest = home.make_dest("out");
         let err = extract(&home.safe("bomb.zip"), &dest).unwrap_err();
@@ -961,12 +975,16 @@ mod tests {
             home.write(&format!("many/f{i}"), b"x");
         }
         let root = home.root();
-        compress(&root, &["many".into()], &home.safe_new("many.tar.gz"), ArchiveFormat::TarGz)
-            .unwrap();
+        compress(
+            &root,
+            &["many".into()],
+            &home.safe_new("many.tar.gz"),
+            ArchiveFormat::TarGz,
+        )
+        .unwrap();
 
         let dest = home.make_dest("out");
-        let err =
-            extract_with_limits(&home.safe("many.tar.gz"), &dest, tiny_limits()).unwrap_err();
+        let err = extract_with_limits(&home.safe("many.tar.gz"), &dest, tiny_limits()).unwrap_err();
         assert_eq!(err.kind, FsErrorKind::UnsafeArchive, "{}", err.message);
     }
 
@@ -975,12 +993,16 @@ mod tests {
         let home = Home::new();
         home.write("data/blob", &[7u8; 4096]);
         let root = home.root();
-        compress(&root, &["data".into()], &home.safe_new("data.tar.gz"), ArchiveFormat::TarGz)
-            .unwrap();
+        compress(
+            &root,
+            &["data".into()],
+            &home.safe_new("data.tar.gz"),
+            ArchiveFormat::TarGz,
+        )
+        .unwrap();
 
         let dest = home.make_dest("out");
-        let err =
-            extract_with_limits(&home.safe("data.tar.gz"), &dest, tiny_limits()).unwrap_err();
+        let err = extract_with_limits(&home.safe("data.tar.gz"), &dest, tiny_limits()).unwrap_err();
         assert_eq!(err.kind, FsErrorKind::TooLarge, "{}", err.message);
     }
 
@@ -1010,7 +1032,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o7000, 0, "setuid/setgid must be stripped, got {mode:o}");
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "setuid/setgid must be stripped, got {mode:o}"
+        );
     }
 
     #[test]
@@ -1035,7 +1061,9 @@ mod tests {
 
     #[test]
     fn entry_names_that_are_not_relative_paths_are_refused() {
-        for bad in ["/etc/x", "../x", "a/../b", "", ".", "..", "a\\b", "a/./../b"] {
+        for bad in [
+            "/etc/x", "../x", "a/../b", "", ".", "..", "a\\b", "a/./../b",
+        ] {
             assert!(split_entry_name(bad).is_err(), "{bad:?} should be refused");
         }
         for ok in ["a", "a/b/c", "./a", "a//b", "dir/"] {

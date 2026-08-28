@@ -207,14 +207,19 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut temp = dir.join(path.file_name().unwrap_or_default());
     temp.as_mut_os_string().push(".ferrum-tmp");
     {
-        let mut file = std::fs::File::create(&temp)
-            .map_err(|e| FerrumError::internal(format!("could not create {}: {e}", temp.display())))?;
-        file.write_all(bytes)
-            .map_err(|e| FerrumError::internal(format!("could not write {}: {e}", temp.display())))?;
+        let mut file = std::fs::File::create(&temp).map_err(|e| {
+            FerrumError::internal(format!("could not create {}: {e}", temp.display()))
+        })?;
+        file.write_all(bytes).map_err(|e| {
+            FerrumError::internal(format!("could not write {}: {e}", temp.display()))
+        })?;
         file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .map_err(|e| FerrumError::internal(format!("could not chmod {}: {e}", temp.display())))?;
-        file.sync_all()
-            .map_err(|e| FerrumError::internal(format!("could not sync {}: {e}", temp.display())))?;
+            .map_err(|e| {
+                FerrumError::internal(format!("could not chmod {}: {e}", temp.display()))
+            })?;
+        file.sync_all().map_err(|e| {
+            FerrumError::internal(format!("could not sync {}: {e}", temp.display()))
+        })?;
     }
     std::fs::rename(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
@@ -627,8 +632,9 @@ impl TypedOperation for Enable {
         //    runtime user may write.
         write_bytes_atomic(&script_path, &bytes, 0o644)?;
         let sessions = paths::adminer_tmp_dir().join("sessions");
-        std::fs::create_dir_all(&sessions)
-            .map_err(|e| FerrumError::internal(format!("could not create {}: {e}", sessions.display())))?;
+        std::fs::create_dir_all(&sessions).map_err(|e| {
+            FerrumError::internal(format!("could not create {}: {e}", sessions.display()))
+        })?;
         std::fs::create_dir_all(paths::adminer_log_dir()).map_err(|e| {
             FerrumError::internal(format!("could not create the adminer log dir: {e}"))
         })?;
@@ -639,8 +645,9 @@ impl TypedOperation for Enable {
 
         // 3. The pool. Same serialisation key and validators as tenant pools
         //    on this PHP version, so concurrent site work cannot interleave.
-        std::fs::create_dir_all(paths::fpm_socket_dir())
-            .map_err(|e| FerrumError::internal(format!("could not create the FPM socket dir: {e}")))?;
+        std::fs::create_dir_all(paths::fpm_socket_dir()).map_err(|e| {
+            FerrumError::internal(format!("could not create the FPM socket dir: {e}"))
+        })?;
         let pool = adminer_pool_context(php, crate::provision::nginx_user(distro));
         ctx.config()
             .apply(ApplyRequest {
@@ -876,7 +883,11 @@ mod tests {
         let tampered = b"pretend this is adminer!".to_vec();
         let err = verify_sha256(&tampered, &pin).unwrap_err();
         assert_eq!(err.code, ErrorCode::PackageBackendFailed);
-        assert!(err.detail.contains("Nothing was installed"), "{}", err.detail);
+        assert!(
+            err.detail.contains("Nothing was installed"),
+            "{}",
+            err.detail
+        );
         assert!(err.detail.contains(&pin), "must name the expected hash");
     }
 
@@ -970,7 +981,9 @@ mod tests {
         assert!(ferrum_core::Domain::parse(POOL_KEY).is_err());
         let pool = adminer_pool_context(PhpVersion::V83, "nginx");
         assert!(
-            pool.socket.to_string_lossy().ends_with("adminer-php83.sock"),
+            pool.socket
+                .to_string_lossy()
+                .ends_with("adminer-php83.sock"),
             "{:?}",
             pool.socket
         );
@@ -1064,7 +1077,12 @@ mod tests {
 
     /// Apply a template through the engine into an explicit path, the way
     /// enable does, so removal is exercised against genuinely managed files.
-    async fn apply_into(engine: &ConfigEngine, file: ManagedFile, template: &str, ctx: serde_json::Value) {
+    async fn apply_into(
+        engine: &ConfigEngine,
+        file: ManagedFile,
+        template: &str,
+        ctx: serde_json::Value,
+    ) {
         engine
             .apply(ApplyRequest {
                 file,
@@ -1124,7 +1142,11 @@ mod tests {
 
         assert!(report.vhost_removed);
         assert_eq!(report.pools_removed, vec![pool_path.clone()]);
-        assert!(report.pool_failures.is_empty(), "{:?}", report.pool_failures);
+        assert!(
+            report.pool_failures.is_empty(),
+            "{:?}",
+            report.pool_failures
+        );
         assert!(!vhost_path.exists());
         assert!(!pool_path.exists());
         assert!(!script_dir.exists(), "the script directory must go too");

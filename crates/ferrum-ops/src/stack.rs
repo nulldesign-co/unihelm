@@ -31,7 +31,9 @@ use crate::services::{NginxValidator, NoReload, SkipValidation, UnitReloader};
 #[serde(tag = "component", rename_all = "snake_case")]
 pub enum StackComponent {
     Nginx,
-    Php { version: PhpVersion },
+    Php {
+        version: PhpVersion,
+    },
     /// MariaDB, the default database engine (spec §11.4).
     Mariadb,
     /// PostgreSQL from PGDG (spec §11.4).
@@ -524,7 +526,9 @@ async fn open_web_ports(ctx: &OpContext) {
             return;
         }
         Err(e) => {
-            ctx.log(format!("could not query the firewall ({e}); leaving it alone"));
+            ctx.log(format!(
+                "could not query the firewall ({e}); leaving it alone"
+            ));
             return;
         }
     }
@@ -1127,10 +1131,7 @@ mod tests {
             .display();
         // `--no-defaults` must be the first argument or the client ignores it —
         // and then an operator's stray ~/.my.cnf can steer the probe.
-        assert!(
-            mariadb.starts_with("mariadb --no-defaults"),
-            "{mariadb}"
-        );
+        assert!(mariadb.starts_with("mariadb --no-defaults"), "{mariadb}");
         assert!(mariadb.contains("SELECT 1"));
         assert!(mariadb.contains("--protocol=socket"));
 

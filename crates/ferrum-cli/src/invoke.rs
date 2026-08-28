@@ -959,9 +959,7 @@ fn webhook(cmd: &WebhookCommand) -> Result<Action> {
 fn plugin(cmd: &PluginCommand) -> Result<Action> {
     Ok(match cmd {
         PluginCommand::List => call("plugin.list", json!({})),
-        PluginCommand::Install { source } => {
-            call("plugin.install", json!({ "source": source }))
-        }
+        PluginCommand::Install { source } => call("plugin.install", json!({ "source": source })),
         PluginCommand::Enable { slug } => call("plugin.enable", json!({ "slug": slug })),
         PluginCommand::Disable { slug } => call("plugin.disable", json!({ "slug": slug })),
         PluginCommand::Remove { slug } => call("plugin.remove", json!({ "slug": slug })),

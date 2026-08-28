@@ -462,7 +462,11 @@ fn raise_message(rule: &AlertRule, o: &Observation) -> String {
 fn resolve_message(rule: &AlertRule, o: &Observation) -> String {
     match rule.kind {
         AlertKind::ServiceDown => format!("{} again", o.describe),
-        _ => format!("{}, back within the {} limit", o.describe, threshold_text(rule)),
+        _ => format!(
+            "{}, back within the {} limit",
+            o.describe,
+            threshold_text(rule)
+        ),
     }
 }
 
@@ -615,10 +619,11 @@ fn validate_webhook(config: &WebhookConfig) -> Result<()> {
         .with_field("config.url"));
     }
     if url.len() > 2048 {
-        return Err(
-            FerrumError::new(ErrorCode::InvalidInput, "that webhook URL is implausibly long")
-                .with_field("config.url"),
-        );
+        return Err(FerrumError::new(
+            ErrorCode::InvalidInput,
+            "that webhook URL is implausibly long",
+        )
+        .with_field("config.url"));
     }
     if url.chars().any(|c| c.is_control() || c == ' ') {
         return Err(FerrumError::new(
@@ -647,7 +652,9 @@ fn validate_telegram(config: &TelegramConfig) -> Result<()> {
         .split_once(':')
         .ok_or_else(|| bad_token("a Telegram bot token looks like `123456:AA...`"))?;
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad_token("the part of the token before `:` must be the bot's numeric id"));
+        return Err(bad_token(
+            "the part of the token before `:` must be the bot's numeric id",
+        ));
     }
     if secret.len() < 20
         || !secret
@@ -879,10 +886,7 @@ pub async fn evaluate_with(ctx: &OpContext, transport: &dyn Transport) -> Result
 
     let by_id: BTreeMap<i64, &AlertRule> = rules.iter().map(|r| (r.id, r)).collect();
     let panel = db
-        .get_setting_or(
-            ferrum_db::settings::keys::PANEL_NAME,
-            "Ferrum".to_string(),
-        )
+        .get_setting_or(ferrum_db::settings::keys::PANEL_NAME, "Ferrum".to_string())
         .await;
 
     let mut out = Vec::new();
@@ -1104,7 +1108,9 @@ fn validate_rule(kind: AlertKind, target: Option<&str>, threshold: Option<f64>) 
                 && !t.starts_with('/')
             {
                 return Err(field(
-                    format!("`{t}` is not a mount point; leave the target empty to watch every filesystem"),
+                    format!(
+                        "`{t}` is not a mount point; leave the target empty to watch every filesystem"
+                    ),
                     "target",
                 ));
             }
@@ -1112,7 +1118,10 @@ fn validate_rule(kind: AlertKind, target: Option<&str>, threshold: Option<f64>) 
         AlertKind::MemPct | AlertKind::Load => {
             if target.is_some() {
                 return Err(field(
-                    format!("a {} rule watches the whole server and takes no target", kind.as_str()),
+                    format!(
+                        "a {} rule watches the whole server and takes no target",
+                        kind.as_str()
+                    ),
                     "target",
                 ));
             }
@@ -1217,7 +1226,11 @@ impl TypedOperation for ChannelsList {
         Ok(ChannelsListOutput {
             // `NotifyChannel` skips `config_sealed` in its Serialize impl, so
             // this cannot leak the sealed blob even by accident.
-            channels: ctx.db().notify_channels().await.map_err(FerrumError::from)?,
+            channels: ctx
+                .db()
+                .notify_channels()
+                .await
+                .map_err(FerrumError::from)?,
         })
     }
 }
@@ -1275,11 +1288,8 @@ impl TypedOperation for ChannelsSet {
                         .with_field("label")
                 })?;
                 let config = input.config.ok_or_else(|| {
-                    FerrumError::new(
-                        ErrorCode::InvalidInput,
-                        "a new channel needs its `config`",
-                    )
-                    .with_field("config")
+                    FerrumError::new(ErrorCode::InvalidInput, "a new channel needs its `config`")
+                        .with_field("config")
                 })?;
                 let sealed = seal_config(ctx, kind, &config)?;
                 ctx.db()
@@ -1411,10 +1421,7 @@ impl TypedOperation for ChannelsTest {
 
         let panel = ctx
             .db()
-            .get_setting_or(
-                ferrum_db::settings::keys::PANEL_NAME,
-                "Ferrum".to_string(),
-            )
+            .get_setting_or(ferrum_db::settings::keys::PANEL_NAME, "Ferrum".to_string())
             .await;
         let payload = NotificationPayload {
             panel,
@@ -1578,7 +1585,10 @@ mod tests {
         let k = AlertKind::CertExpiryDays;
         assert!(breaches(k, 14.0, 14.0));
         assert!(breaches(k, 14.0, 0.0));
-        assert!(breaches(k, 14.0, -3.0), "already expired is very much a breach");
+        assert!(
+            breaches(k, 14.0, -3.0),
+            "already expired is very much a breach"
+        );
         assert!(!breaches(k, 14.0, 15.0));
 
         assert!(!clears(k, 14.0, 15.0), "inside the one-day band");
@@ -1675,7 +1685,9 @@ mod tests {
             for t in plan(&rules, &readings_with_disk(used), &open) {
                 messages.push(t.state());
                 match t {
-                    Transition::Raise { subject, .. } => open.push(open_event(200 + i as i64, 1, &subject)),
+                    Transition::Raise { subject, .. } => {
+                        open.push(open_event(200 + i as i64, 1, &subject))
+                    }
                     Transition::Resolve { event_id, .. } => open.retain(|e| e.id != event_id),
                 }
             }
@@ -1745,7 +1757,11 @@ mod tests {
         let mut r = rule(1, AlertKind::DiskPct, None, 90.0);
         r.enabled = false;
         let transitions = plan(&[r], &readings_with_disk(99), &[open_event(3, 1, "/")]);
-        assert_eq!(transitions.len(), 1, "and it does not re-raise while disabled");
+        assert_eq!(
+            transitions.len(),
+            1,
+            "and it does not re-raise while disabled"
+        );
         assert_eq!(transitions[0].state(), AlertState::Resolved);
     }
 
@@ -1788,7 +1804,9 @@ mod tests {
         };
         let raise = plan(&rules, &expiring, &[]);
         assert_eq!(raise.len(), 1);
-        assert!(matches!(&raise[0], Transition::Raise { message, .. } if message.contains("expires in 3 days")));
+        assert!(
+            matches!(&raise[0], Transition::Raise { message, .. } if message.contains("expires in 3 days"))
+        );
 
         // Still inside the band the day after: no second message.
         let renewed = Readings {
@@ -1833,7 +1851,10 @@ mod tests {
             assert_eq!(err.code, ErrorCode::InvalidInput);
         }
 
-        assert_eq!(validate_rule(AlertKind::DiskPct, None, Some(90.0)).unwrap(), 90.0);
+        assert_eq!(
+            validate_rule(AlertKind::DiskPct, None, Some(90.0)).unwrap(),
+            90.0
+        );
         // A boolean rule's threshold is settled for it.
         assert_eq!(
             validate_rule(AlertKind::ServiceDown, Some("nginx"), Some(0.3)).unwrap(),
@@ -1854,17 +1875,25 @@ mod tests {
             "https://exa mple.com/",
         ] {
             let err = validate_webhook(&WebhookConfig { url: bad.into() }).unwrap_err();
-            assert_eq!(err.code, ErrorCode::InvalidInput, "`{bad}` should be refused");
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "`{bad}` should be refused"
+            );
         }
-        assert!(validate_webhook(&WebhookConfig {
-            url: "https://hooks.example.test/services/T0/B0/xyz".into()
-        })
-        .is_ok());
+        assert!(
+            validate_webhook(&WebhookConfig {
+                url: "https://hooks.example.test/services/T0/B0/xyz".into()
+            })
+            .is_ok()
+        );
         // Loopback is allowed on purpose — see validate_webhook's comment.
-        assert!(validate_webhook(&WebhookConfig {
-            url: "http://127.0.0.1:9000/hook".into()
-        })
-        .is_ok());
+        assert!(
+            validate_webhook(&WebhookConfig {
+                url: "http://127.0.0.1:9000/hook".into()
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1887,14 +1916,20 @@ mod tests {
                 chat_id: "-1001234567890".into(),
             })
             .unwrap_err();
-            assert_eq!(err.code, ErrorCode::InvalidInput, "`{bad}` should be refused");
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "`{bad}` should be refused"
+            );
         }
 
-        assert!(validate_telegram(&TelegramConfig {
-            bot_token: "123456789:AAHkq-Zx_pQ1234567890abcdefghij".into(),
-            chat_id: "-1001234567890".into(),
-        })
-        .is_ok());
+        assert!(
+            validate_telegram(&TelegramConfig {
+                bot_token: "123456789:AAHkq-Zx_pQ1234567890abcdefghij".into(),
+                chat_id: "-1001234567890".into(),
+            })
+            .is_ok()
+        );
 
         // And the chat id gets the same treatment.
         let err = validate_telegram(&TelegramConfig {
@@ -1926,7 +1961,12 @@ mod tests {
         (reg, ctx)
     }
 
-    async fn add_channel(ctx: &OpContext, kind: ChannelKind, label: &str, config: serde_json::Value) -> i64 {
+    async fn add_channel(
+        ctx: &OpContext,
+        kind: ChannelKind,
+        label: &str,
+        config: serde_json::Value,
+    ) -> i64 {
         let sealed = seal_config(ctx, kind, &config).expect("the fixture config is valid");
         ctx.db()
             .create_notify_channel(kind, label, &sealed, true)
@@ -2002,7 +2042,12 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["chat_id"], "-1001234567890");
-        assert!(body["text"].as_str().unwrap().contains("nginx is not running"));
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap()
+                .contains("nginx is not running")
+        );
         assert!(body["text"].as_str().unwrap().starts_with("[ALERT]"));
         assert_eq!(body["disable_web_page_preview"], true);
     }
@@ -2011,13 +2056,25 @@ mod tests {
     async fn a_broken_channel_does_not_stop_the_working_one() {
         // Spec §11.11: per-channel failures are logged, never fatal.
         let (_reg, ctx) = admin_ctx().await;
-        add_channel(&ctx, ChannelKind::Webhook, "good", json!({ "url": "https://a.test/h" })).await;
+        add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "good",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
         // A row whose sealed blob was written under a different master key.
         ctx.db()
             .create_notify_channel(ChannelKind::Webhook, "unreadable", "00ff00ff", true)
             .await
             .unwrap();
-        add_channel(&ctx, ChannelKind::Webhook, "also good", json!({ "url": "https://b.test/h" })).await;
+        add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "also good",
+            json!({ "url": "https://b.test/h" }),
+        )
+        .await;
 
         let transport = RecordingTransport::default();
         let payload = NotificationPayload {
@@ -2037,7 +2094,13 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_channel_is_not_sent_to() {
         let (_reg, ctx) = admin_ctx().await;
-        let id = add_channel(&ctx, ChannelKind::Webhook, "ops", json!({ "url": "https://a.test/h" })).await;
+        let id = add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
         ctx.db()
             .update_notify_channel(id, None, None, Some(false))
             .await
@@ -2058,7 +2121,13 @@ mod tests {
     #[tokio::test]
     async fn a_non_2xx_answer_counts_as_a_failure() {
         let (_reg, ctx) = admin_ctx().await;
-        add_channel(&ctx, ChannelKind::Webhook, "ops", json!({ "url": "https://a.test/h" })).await;
+        add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
 
         let transport = RecordingTransport {
             status: Some(403),
@@ -2094,7 +2163,8 @@ mod tests {
         assert!(stored.config_sealed.chars().all(|c| c.is_ascii_hexdigit()));
 
         let opened: TelegramConfig =
-            serde_json::from_str(&ctx.master_key().open_str(&stored.config_sealed).unwrap()).unwrap();
+            serde_json::from_str(&ctx.master_key().open_str(&stored.config_sealed).unwrap())
+                .unwrap();
         assert_eq!(opened.bot_token, token);
         assert_eq!(opened.chat_id, "-1001234567890");
     }
@@ -2120,19 +2190,33 @@ mod tests {
 
         let (_reg, ctx) = admin_ctx().await;
         only_rule(&ctx, AlertKind::ServiceDown).await;
-        add_channel(&ctx, ChannelKind::Webhook, "ops", json!({ "url": "https://a.test/h" })).await;
+        add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
 
         let nginx = ManagedUnit::Nginx.unit_name(ctx.distro().info.family);
         let transport = RecordingTransport::default();
 
         // Running: nothing to say, however often we look.
-        ctx.distro().svc.action(&nginx, SvcAction::Start).await.unwrap();
+        ctx.distro()
+            .svc
+            .action(&nginx, SvcAction::Start)
+            .await
+            .unwrap();
         for _ in 0..5 {
             assert!(evaluate_with(&ctx, &transport).await.unwrap().is_empty());
         }
 
         // Down: one message, then silence for as long as it stays down.
-        ctx.distro().svc.action(&nginx, SvcAction::Stop).await.unwrap();
+        ctx.distro()
+            .svc
+            .action(&nginx, SvcAction::Stop)
+            .await
+            .unwrap();
         let raised = evaluate_with(&ctx, &transport).await.unwrap();
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].state, AlertState::Raised);
@@ -2146,7 +2230,11 @@ mod tests {
         }
 
         // Back up: one more, and then silence again.
-        ctx.distro().svc.action(&nginx, SvcAction::Start).await.unwrap();
+        ctx.distro()
+            .svc
+            .action(&nginx, SvcAction::Start)
+            .await
+            .unwrap();
         let resolved = evaluate_with(&ctx, &transport).await.unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].state, AlertState::Resolved);
@@ -2220,7 +2308,13 @@ mod tests {
     async fn evaluation_records_the_event_even_when_every_channel_fails() {
         let (_reg, ctx) = admin_ctx().await;
         only_rule(&ctx, AlertKind::ServiceDown).await;
-        add_channel(&ctx, ChannelKind::Webhook, "ops", json!({ "url": "https://a.test/h" })).await;
+        add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
 
         let nginx = ManagedUnit::Nginx.unit_name(ctx.distro().info.family);
         ctx.distro()
@@ -2244,7 +2338,10 @@ mod tests {
 
         let events = ctx.db().open_alert_events().await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].notified, 0, "nothing was delivered, and we say so");
+        assert_eq!(
+            events[0].notified, 0,
+            "nothing was delivered, and we say so"
+        );
 
         // Crucially: the failure must not make it re-raise every minute.
         assert!(evaluate_with(&ctx, &transport).await.unwrap().is_empty());
@@ -2258,9 +2355,15 @@ mod tests {
         let auth = auth_for(customer, Role::Customer);
         for (op, input) in [
             ("alert.rules.list", json!({})),
-            ("alert.rules.set", json!({ "kind": "disk_pct", "threshold": 80 })),
+            (
+                "alert.rules.set",
+                json!({ "kind": "disk_pct", "threshold": 80 }),
+            ),
             ("alert.channels.list", json!({})),
-            ("alert.channels.set", json!({ "kind": "webhook", "label": "x", "config": { "url": "https://a.test" } })),
+            (
+                "alert.channels.set",
+                json!({ "kind": "webhook", "label": "x", "config": { "url": "https://a.test" } }),
+            ),
             ("alert.channels.delete", json!({ "id": 1 })),
             ("alert.channels.test", json!({ "id": 1 })),
             ("alert.events.list", json!({})),
@@ -2358,7 +2461,10 @@ mod tests {
         let db = reg.services().db.clone();
         let stored = db.notify_channel(id).await.unwrap().unwrap();
         let opened: TelegramConfig = serde_json::from_str(
-            &reg.services().master_key.open_str(&stored.config_sealed).unwrap(),
+            &reg.services()
+                .master_key
+                .open_str(&stored.config_sealed)
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(opened.chat_id, "-1001234567890");
@@ -2424,10 +2530,19 @@ mod tests {
                 .dispatch("alert.channels.set", &auth, config.clone(), None)
                 .await
                 .unwrap_err();
-            assert_eq!(err.code, ErrorCode::InvalidInput, "{config} should be refused");
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "{config} should be refused"
+            );
         }
         assert!(
-            reg.services().db.notify_channels().await.unwrap().is_empty(),
+            reg.services()
+                .db
+                .notify_channels()
+                .await
+                .unwrap()
+                .is_empty(),
             "nothing invalid should have been stored"
         );
     }
@@ -2435,7 +2550,13 @@ mod tests {
     #[tokio::test]
     async fn testing_a_channel_reports_the_endpoints_answer_rather_than_failing() {
         let (_reg, ctx) = admin_ctx().await;
-        let id = add_channel(&ctx, ChannelKind::Webhook, "ops", json!({ "url": "https://a.test/h" })).await;
+        let id = add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": "https://a.test/h" }),
+        )
+        .await;
 
         let ok = ChannelsTest::with_transport(Arc::new(RecordingTransport::default()))
             .run(&ctx, ChannelsTestInput { id })
@@ -2472,9 +2593,15 @@ mod tests {
         let db = reg.services().db.clone();
         let rule = db.alert_rules().await.unwrap()[0].clone();
 
-        let a = db.raise_alert(rule.id, "/", "full", Some(99.0)).await.unwrap().unwrap();
+        let a = db
+            .raise_alert(rule.id, "/", "full", Some(99.0))
+            .await
+            .unwrap()
+            .unwrap();
         db.resolve_alert(a.id).await.unwrap();
-        db.raise_alert(rule.id, "/var", "full", Some(99.0)).await.unwrap();
+        db.raise_alert(rule.id, "/var", "full", Some(99.0))
+            .await
+            .unwrap();
 
         let all = reg
             .dispatch("alert.events.list", &auth, json!({}), None)
@@ -2483,7 +2610,12 @@ mod tests {
         assert_eq!(all["events"].as_array().unwrap().len(), 2);
 
         let open = reg
-            .dispatch("alert.events.list", &auth, json!({ "open_only": true }), None)
+            .dispatch(
+                "alert.events.list",
+                &auth,
+                json!({ "open_only": true }),
+                None,
+            )
             .await
             .unwrap();
         let open = open["events"].as_array().unwrap();

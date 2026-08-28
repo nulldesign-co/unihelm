@@ -228,9 +228,9 @@ static RENDERED: OnceLock<String> = OnceLock::new();
 
 fn rendered() -> &'static str {
     RENDERED.get_or_init(|| {
-        ApiDoc::openapi()
-            .to_json()
-            .expect("the OpenAPI document is built from static annotations; serializing cannot fail")
+        ApiDoc::openapi().to_json().expect(
+            "the OpenAPI document is built from static annotations; serializing cannot fail",
+        )
     })
 }
 
@@ -395,7 +395,10 @@ mod tests {
         let schemes = &doc["components"]["securitySchemes"];
         assert_eq!(schemes["session_cookie"]["type"], "apiKey");
         assert_eq!(schemes["session_cookie"]["in"], "cookie");
-        assert_eq!(schemes["session_cookie"]["name"], crate::auth::SESSION_COOKIE);
+        assert_eq!(
+            schemes["session_cookie"]["name"],
+            crate::auth::SESSION_COOKIE
+        );
         assert_eq!(schemes["csrf_header"]["type"], "apiKey");
         assert_eq!(schemes["csrf_header"]["in"], "header");
         assert_eq!(schemes["csrf_header"]["name"], crate::auth::CSRF_HEADER);

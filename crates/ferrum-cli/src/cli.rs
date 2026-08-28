@@ -1247,13 +1247,9 @@ pub enum WebhookCommand {
         rotate_secret: bool,
     },
     /// Remove a hook.
-    Delete {
-        id: i64,
-    },
+    Delete { id: i64 },
     /// Send a test delivery and report what the endpoint answered.
-    Test {
-        id: i64,
-    },
+    Test { id: i64 },
 }
 
 /// `ferrum plugin …`
@@ -1271,17 +1267,11 @@ pub enum PluginCommand {
         source: String,
     },
     /// Start a plugin's sidecar and route its extension points.
-    Enable {
-        slug: String,
-    },
+    Enable { slug: String },
     /// Stop the sidecar, leaving the plugin installed.
-    Disable {
-        slug: String,
-    },
+    Disable { slug: String },
     /// Stop it and remove it entirely.
-    Remove {
-        slug: String,
-    },
+    Remove { slug: String },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

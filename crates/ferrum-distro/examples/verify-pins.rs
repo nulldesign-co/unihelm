@@ -153,7 +153,9 @@ async fn main() {
                                 Err(e) => println!("             signature unreadable: {e}"),
                             }
                         }
-                        Ok(sr) => println!("             no detached signature: HTTP {}", sr.status()),
+                        Ok(sr) => {
+                            println!("             no detached signature: HTTP {}", sr.status())
+                        }
                         Err(e) => println!("             signature fetch failed: {e}"),
                     }
                 }

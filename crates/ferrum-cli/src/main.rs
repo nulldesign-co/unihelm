@@ -218,7 +218,11 @@ fn secret(from_stdin: bool, env_var: &str) -> Result<Option<String>> {
 /// clear, an empty line is a real instruction — so it has to survive as
 /// `Some("")` rather than being rejected here or silently read as absent,
 /// which the operation would take as "keep what is stored".
-fn secret_allowing_empty(from_stdin: bool, env_var: &str, clearable: bool) -> Result<Option<String>> {
+fn secret_allowing_empty(
+    from_stdin: bool,
+    env_var: &str,
+    clearable: bool,
+) -> Result<Option<String>> {
     if from_stdin {
         return Ok(Some(read_secret_line(clearable)?));
     }

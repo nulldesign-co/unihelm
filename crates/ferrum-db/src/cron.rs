@@ -173,17 +173,15 @@ impl Db {
     /// is: the crontab is installed as one file, so when the install fails no
     /// job in it took effect, and marking only the job the caller happened to
     /// be editing would leave the others claiming a schedule they do not have.
-    pub async fn set_cron_last_error(
-        &self,
-        id: SubscriptionId,
-        error: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query("UPDATE cron_jobs SET last_error = ?2, updated_at = ?3 WHERE subscription_id = ?1")
-            .bind(id.get())
-            .bind(error)
-            .bind(to_sql_time(now()))
-            .execute(self.pool())
-            .await?;
+    pub async fn set_cron_last_error(&self, id: SubscriptionId, error: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE cron_jobs SET last_error = ?2, updated_at = ?3 WHERE subscription_id = ?1",
+        )
+        .bind(id.get())
+        .bind(error)
+        .bind(to_sql_time(now()))
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 }
@@ -414,7 +412,11 @@ mod tests {
         };
         assert!(db.cron_jobs(&scope).by_id(ours.id).await.unwrap().is_some());
         assert!(
-            db.cron_jobs(&scope).by_id(alien.id).await.unwrap().is_none(),
+            db.cron_jobs(&scope)
+                .by_id(alien.id)
+                .await
+                .unwrap()
+                .is_none(),
             "another tenant's job must not be visible"
         );
 

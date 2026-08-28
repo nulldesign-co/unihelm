@@ -158,15 +158,14 @@ impl Db {
     /// the foreign key here (the column predates the `plans` table), so this
     /// method is the seam every assignment must pass through.
     pub async fn assign_plan(&self, subscription: SubscriptionId, plan: PlanId) -> Result<()> {
-        let affected = sqlx::query(
-            "UPDATE subscriptions SET plan_id = ?2, updated_at = ?3 WHERE id = ?1",
-        )
-        .bind(subscription.get())
-        .bind(plan.get())
-        .bind(to_sql_time(now()))
-        .execute(self.pool())
-        .await?
-        .rows_affected();
+        let affected =
+            sqlx::query("UPDATE subscriptions SET plan_id = ?2, updated_at = ?3 WHERE id = ?1")
+                .bind(subscription.get())
+                .bind(plan.get())
+                .bind(to_sql_time(now()))
+                .execute(self.pool())
+                .await?
+                .rows_affected();
         if affected == 0 {
             return Err(DbError::NotFound {
                 what: "subscription",
@@ -363,7 +362,9 @@ impl PlanRepo<'_> {
         }
         result?;
 
-        self.by_id(id).await?.ok_or(DbError::NotFound { what: "plan" })
+        self.by_id(id)
+            .await?
+            .ok_or(DbError::NotFound { what: "plan" })
     }
 
     /// Delete a plan — refused while any subscription is still on it.

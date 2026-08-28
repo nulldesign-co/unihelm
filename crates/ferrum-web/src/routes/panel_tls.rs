@@ -15,8 +15,8 @@ use ferrum_db::CertStatus;
 use ferrum_db::audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use utoipa::ToSchema;
 use std::net::SocketAddr;
+use utoipa::ToSchema;
 
 use crate::auth::{CurrentUser, client_ip};
 use crate::error::{ApiError, ApiResult};

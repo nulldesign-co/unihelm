@@ -198,7 +198,13 @@ pub async fn bans(
         .require(Permission::FirewallManage)
         .map_err(ApiError::from)?;
     Ok(Json(
-        ops::invoke_now(&state, &current.auth, "fw.bans", json!({ "limit": q.limit })).await?,
+        ops::invoke_now(
+            &state,
+            &current.auth,
+            "fw.bans",
+            json!({ "limit": q.limit }),
+        )
+        .await?,
     ))
 }
 
@@ -295,7 +301,16 @@ pub async fn unban(
         .auth
         .require(Permission::FirewallManage)
         .map_err(ApiError::from)?;
-    audit(&state, &current, &headers, &peer, "fw.unban", &ip, json!({})).await?;
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "fw.unban",
+        &ip,
+        json!({}),
+    )
+    .await?;
     Ok(Json(
         ops::invoke_now(&state, &current.auth, "fw.unban", json!({ "ip": ip })).await?,
     ))

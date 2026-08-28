@@ -160,7 +160,11 @@ mod tests {
     #[test]
     fn the_environment_is_built_from_scratch_and_carries_no_inherited_variables() {
         // Whatever the agent's own environment holds must not appear here.
-        let env = environment("ft_demo", Path::new("/home/ft_demo"), Path::new("/bin/bash"));
+        let env = environment(
+            "ft_demo",
+            Path::new("/home/ft_demo"),
+            Path::new("/bin/bash"),
+        );
         let text: Vec<String> = env
             .iter()
             .map(|c| c.to_string_lossy().into_owned())

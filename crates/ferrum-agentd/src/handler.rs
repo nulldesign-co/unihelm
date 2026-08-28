@@ -276,14 +276,7 @@ impl ConnectionHandler {
         // Belt and braces for a pump that was aborted before it could tidy up:
         // an entry whose session is finished can never be useful again.
         map.retain(|id, a| *id == session || !a.handle.is_closed());
-        let previous = map.insert(
-            session,
-            Attachment {
-                handle,
-                auth,
-                pump,
-            },
-        );
+        let previous = map.insert(session, Attachment { handle, auth, pump });
         drop(map);
         // Re-attaching on the same connection replaces the old stream rather
         // than doubling every byte.

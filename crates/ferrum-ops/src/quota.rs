@@ -269,9 +269,9 @@ fn fs_kind_of(_path: &Path) -> FsKind {
 /// on a corrupted database row — but "cannot happen" plus a check is cheaper
 /// than "cannot happen" alone (spec §12 rule 3).
 fn reject_whitespace(path: &Path) -> Result<&str> {
-    let s = path.to_str().ok_or_else(|| {
-        FerrumError::new(ErrorCode::InvalidPath, "quota path is not valid UTF-8")
-    })?;
+    let s = path
+        .to_str()
+        .ok_or_else(|| FerrumError::new(ErrorCode::InvalidPath, "quota path is not valid UTF-8"))?;
     if s.chars().any(|c| c.is_whitespace()) || s.is_empty() {
         return Err(FerrumError::new(
             ErrorCode::InvalidPath,
@@ -521,9 +521,9 @@ impl XfsProjectBackend {
     }
 
     fn project_id(target: &QuotaTarget) -> Result<i64> {
-        target.project_id.ok_or_else(|| {
-            FerrumError::internal("the XFS backend needs an allocated project id")
-        })
+        target
+            .project_id
+            .ok_or_else(|| FerrumError::internal("the XFS backend needs an allocated project id"))
     }
 }
 
@@ -561,7 +561,8 @@ impl QuotaBackend for XfsProjectBackend {
             .await?
             .checked("xfs_quota quota")?;
         // No line for the project means no blocks were ever charged to it.
-        let (used_kib, _soft, hard_kib) = parse_quota_report(&out.stdout, None).unwrap_or((0, 0, 0));
+        let (used_kib, _soft, hard_kib) =
+            parse_quota_report(&out.stdout, None).unwrap_or((0, 0, 0));
         Ok(QuotaUsage {
             used_mb: kib_to_mb_ceil(used_kib),
             // 0 is xfs_quota's spelling of "no limit".
@@ -762,11 +763,10 @@ impl TypedOperation for Set {
             .with_field("hard_mb"));
         }
         if input.soft_mb > input.hard_mb {
-            return Err(FerrumError::new(
-                ErrorCode::InvalidInput,
-                "soft_mb cannot exceed hard_mb",
-            )
-            .with_field("soft_mb"));
+            return Err(
+                FerrumError::new(ErrorCode::InvalidInput, "soft_mb cannot exceed hard_mb")
+                    .with_field("soft_mb"),
+            );
         }
         if input.hard_mb > MAX_QUOTA_MB {
             return Err(FerrumError::new(
@@ -983,10 +983,7 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0";
         let entries = parse_mounts(XFS_PRJQUOTA);
         let entry = mount_for(&entries, &home());
         assert_eq!(entry.unwrap().fs_type, "xfs");
-        assert_eq!(
-            choose_backend(FsKind::Xfs, entry),
-            BackendKind::XfsProject
-        );
+        assert_eq!(choose_backend(FsKind::Xfs, entry), BackendKind::XfsProject);
     }
 
     #[test]
@@ -1027,8 +1024,7 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0";
 
     #[test]
     fn journaled_quota_options_count_as_user_quota() {
-        let entries =
-            parse_mounts("/dev/sda1 /home ext4 rw,usrjquota=aquota.user,jqfmt=vfsv1 0 0");
+        let entries = parse_mounts("/dev/sda1 /home ext4 rw,usrjquota=aquota.user,jqfmt=vfsv1 0 0");
         assert_eq!(
             choose_backend(FsKind::Ext4, mount_for(&entries, &home())),
             BackendKind::Ext4User
@@ -1093,7 +1089,10 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0";
 
         let (prog, args) = xfs_limit_argv(101, 500, 550, mount).unwrap();
         assert_eq!(prog, "xfs_quota");
-        assert_eq!(args, vec!["-x", "-c", "limit -p bsoft=500m bhard=550m 101", "/home"]);
+        assert_eq!(
+            args,
+            vec!["-x", "-c", "limit -p bsoft=500m bhard=550m 101", "/home"]
+        );
 
         let (prog, args) = xfs_usage_argv(101, mount).unwrap();
         assert_eq!(prog, "xfs_quota");
@@ -1124,8 +1123,8 @@ proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0";
         // xfs_quota splits its -c string on whitespace itself; a path with a
         // space would become two arguments. LinuxUser validation makes this
         // unreachable, but a corrupted home_dir row must fail closed.
-        let err = xfs_project_setup_argv(101, Path::new("/home/ft x"), Path::new("/home"))
-            .unwrap_err();
+        let err =
+            xfs_project_setup_argv(101, Path::new("/home/ft x"), Path::new("/home")).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidPath);
         let err = setquota_argv(&user(), 1, 2, Path::new("/ho me")).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidPath);

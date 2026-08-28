@@ -456,11 +456,12 @@ impl Db {
     }
 
     pub async fn delete_branding_asset(&self, reseller_id: i64, kind: AssetKind) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM branding_assets WHERE reseller_id = ?1 AND kind = ?2")
-            .bind(reseller_id)
-            .bind(kind.as_str())
-            .execute(self.pool())
-            .await?;
+        let result =
+            sqlx::query("DELETE FROM branding_assets WHERE reseller_id = ?1 AND kind = ?2")
+                .bind(reseller_id)
+                .bind(kind.as_str())
+                .execute(self.pool())
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -521,9 +522,7 @@ pub fn normalize_login_host(host: &str) -> String {
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    without_port
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    without_port.trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -577,7 +576,9 @@ mod tests {
     #[tokio::test]
     async fn clearing_a_field_goes_back_to_inheriting_rather_than_to_empty() {
         let db = Db::open_memory().await.unwrap();
-        db.save_branding(PANEL_DEFAULT, update("Ferrum")).await.unwrap();
+        db.save_branding(PANEL_DEFAULT, update("Ferrum"))
+            .await
+            .unwrap();
         db.save_branding(7, update("Acme Hosting")).await.unwrap();
         db.save_branding(
             7,
@@ -600,7 +601,9 @@ mod tests {
         // The shape a UI sends when only the logo was touched.
         let db = Db::open_memory().await.unwrap();
         db.save_branding(7, update("Acme Hosting")).await.unwrap();
-        db.save_branding(7, BrandingUpdate::default()).await.unwrap();
+        db.save_branding(7, BrandingUpdate::default())
+            .await
+            .unwrap();
         assert_eq!(
             db.branding(7).await.unwrap().unwrap().panel_name.as_deref(),
             Some("Acme Hosting"),
@@ -617,12 +620,20 @@ mod tests {
             .await
             .unwrap();
 
-        let asset = db.branding_asset(7, AssetKind::Logo).await.unwrap().unwrap();
+        let asset = db
+            .branding_asset(7, AssetKind::Logo)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(asset.reseller_id, 7);
         assert_eq!(asset.image_type, ImageType::Gif);
 
         let resolved = db.resolved_branding(7).await.unwrap();
-        let logo = resolved.assets.iter().find(|a| a.kind == AssetKind::Logo).unwrap();
+        let logo = resolved
+            .assets
+            .iter()
+            .find(|a| a.kind == AssetKind::Logo)
+            .unwrap();
         assert_eq!(logo.owner_id, 7);
     }
 
@@ -633,7 +644,11 @@ mod tests {
             .await
             .unwrap();
 
-        let asset = db.branding_asset(7, AssetKind::Logo).await.unwrap().unwrap();
+        let asset = db
+            .branding_asset(7, AssetKind::Logo)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(asset.reseller_id, PANEL_DEFAULT);
         let resolved = db.resolved_branding(7).await.unwrap();
         assert_eq!(resolved.assets.len(), 1);
@@ -651,7 +666,11 @@ mod tests {
             .unwrap();
         assert!(db.delete_branding_asset(7, AssetKind::Logo).await.unwrap());
 
-        let asset = db.branding_asset(7, AssetKind::Logo).await.unwrap().unwrap();
+        let asset = db
+            .branding_asset(7, AssetKind::Logo)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(asset.reseller_id, PANEL_DEFAULT);
     }
 
@@ -711,7 +730,13 @@ mod tests {
         .await
         .unwrap();
 
-        for header in ["", "  ", "evil.example", "panel.acme.example.evil.test", "'"] {
+        for header in [
+            "",
+            "  ",
+            "evil.example",
+            "panel.acme.example.evil.test",
+            "'",
+        ] {
             assert!(
                 db.branding_for_login_host(header).await.unwrap().is_none(),
                 "{header:?} must not match",
@@ -742,7 +767,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(err.is_err(), "the unique index must reject the second claim");
+        assert!(
+            err.is_err(),
+            "the unique index must reject the second claim"
+        );
     }
 
     #[tokio::test]
@@ -818,7 +846,10 @@ mod tests {
         ] {
             let ct = t.content_type();
             assert!(ct.starts_with("image/"), "{ct}");
-            assert!(!ct.contains("svg"), "{ct} would be scriptable in our origin");
+            assert!(
+                !ct.contains("svg"),
+                "{ct} would be scriptable in our origin"
+            );
             assert!(!ct.contains("xml"), "{ct}");
             assert_eq!(ImageType::parse(ct).unwrap(), t);
         }

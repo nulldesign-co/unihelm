@@ -39,10 +39,7 @@ impl SafeError {
     }
 
     pub fn io(path: &Path, e: &io::Error) -> Self {
-        Self::new(
-            FsErrorKind::from_io(e),
-            format!("{}: {e}", path.display()),
-        )
+        Self::new(FsErrorKind::from_io(e), format!("{}: {e}", path.display()))
     }
 }
 
@@ -271,7 +268,10 @@ mod tests {
     fn an_absolute_path_inside_the_home_resolves_too() {
         let home = Home::new();
         let absolute = home.path.join("sites/example.com");
-        assert_eq!(resolve(&home.path, &absolute).unwrap().relative(), "sites/example.com");
+        assert_eq!(
+            resolve(&home.path, &absolute).unwrap().relative(),
+            "sites/example.com"
+        );
     }
 
     #[test]
@@ -280,7 +280,12 @@ mod tests {
         // accepting it means the normaliser is the thing standing between a
         // tenant and `/etc` — and normalisers are where these bugs live.
         let home = Home::new();
-        for bad in ["sites/../sites", "../", "sites/../../etc/passwd", "/etc/passwd"] {
+        for bad in [
+            "sites/../sites",
+            "../",
+            "sites/../../etc/passwd",
+            "/etc/passwd",
+        ] {
             let err = resolve(&home.path, Path::new(bad)).unwrap_err();
             assert_eq!(err.kind, FsErrorKind::Escape, "{bad} -> {err:?}");
         }
@@ -351,7 +356,10 @@ mod tests {
     fn a_resolved_directory_extends_only_by_a_plain_name() {
         let home = Home::new();
         let dir = resolve(&home.path, Path::new("sites")).unwrap();
-        assert_eq!(dir.join_entry("example.com").unwrap().relative(), "sites/example.com");
+        assert_eq!(
+            dir.join_entry("example.com").unwrap().relative(),
+            "sites/example.com"
+        );
         for bad in ["..", ".", "", "a/b", "a\0b"] {
             assert!(dir.join_entry(bad).is_err(), "{bad:?} should be refused");
         }

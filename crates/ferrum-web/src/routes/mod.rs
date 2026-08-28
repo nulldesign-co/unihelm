@@ -24,17 +24,17 @@ pub mod mail;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
+pub mod plans;
 pub mod plugins;
 pub mod quota;
-pub mod plans;
 pub mod server;
 pub mod sites;
 pub mod stack;
 pub mod tasks;
-pub mod webhooks;
 pub mod terminal;
-pub mod wordpress;
 pub mod waf;
+pub mod webhooks;
+pub mod wordpress;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -116,7 +116,10 @@ fn protected() -> Router<SharedState> {
             "/api/alerts/channels/{id}",
             axum::routing::delete(alerts::channels_delete),
         )
-        .route("/api/alerts/channels/{id}/test", post(alerts::channels_test))
+        .route(
+            "/api/alerts/channels/{id}/test",
+            post(alerts::channels_test),
+        )
         .route("/api/apps", get(apps::list).post(apps::create))
         .route("/api/apps/{id}", axum::routing::delete(apps::delete))
         .route("/api/apps/{id}/restart", post(apps::restart))
@@ -203,10 +206,7 @@ fn protected() -> Router<SharedState> {
         .route("/api/waf/disable", post(waf::disable))
         .route("/api/waf/rules", axum::routing::put(waf::rules_set))
         .route("/api/server/security-posture", get(waf::security_posture))
-        .route(
-            "/api/webhooks",
-            get(webhooks::list).post(webhooks::create),
-        )
+        .route("/api/webhooks", get(webhooks::list).post(webhooks::create))
         .route(
             "/api/webhooks/{id}",
             get(webhooks::detail)
@@ -221,10 +221,7 @@ fn protected() -> Router<SharedState> {
         )
         .route("/api/plugins/{slug}/enable", post(plugins::enable))
         .route("/api/plugins/{slug}/disable", post(plugins::disable))
-        .route(
-            "/api/mail/relay",
-            get(mail::relay_get).put(mail::relay_set),
-        )
+        .route("/api/mail/relay", get(mail::relay_get).put(mail::relay_set))
         .route("/api/mail/relay/test", post(mail::relay_test))
         // The *authenticated* half of branding. `GET /api/branding` and the
         // asset route are in `public()`: the login page renders before there

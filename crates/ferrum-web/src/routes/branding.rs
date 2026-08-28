@@ -161,7 +161,10 @@ fn public_view(resolved: ResolvedBranding) -> PublicBranding {
         (status = 200, description = "Panel name, support URL, primary colour and the resolved image URLs", body = PublicBranding),
     ),
 )]
-pub async fn public_get(State(state): State<SharedState>, headers: HeaderMap) -> Json<PublicBranding> {
+pub async fn public_get(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Json<PublicBranding> {
     let owner = owner_for_host(&state, &headers).await;
     match state.db.resolved_branding(owner).await {
         Ok(resolved) => Json(public_view(resolved)),
@@ -229,7 +232,10 @@ pub async fn asset(
     Ok((
         [
             // From the closed `ImageType` enum, never from the upload.
-            (header::CONTENT_TYPE, asset.image_type.content_type().to_string()),
+            (
+                header::CONTENT_TYPE,
+                asset.image_type.content_type().to_string(),
+            ),
             // See the module docs: this is what stops an image/HTML polyglot
             // ever being *rendered* as a document in the panel's origin.
             (
@@ -533,7 +539,12 @@ mod tests {
             .unwrap();
 
         let body = body_json(anonymous(&state, "/api/branding", "panel.acme.example").await).await;
-        let mut keys: Vec<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -563,7 +574,8 @@ mod tests {
             .await
             .unwrap();
 
-        let matched = body_json(anonymous(&state, "/api/branding", "panel.acme.example").await).await;
+        let matched =
+            body_json(anonymous(&state, "/api/branding", "panel.acme.example").await).await;
         let forged = body_json(anonymous(&state, "/api/branding", "evil.example").await).await;
         assert_eq!(matched["panel_name"], "Acme");
         assert_eq!(forged["panel_name"], serde_json::Value::Null);
@@ -650,8 +662,12 @@ mod tests {
     async fn an_asset_kind_that_is_not_one_of_the_three_is_refused() {
         let state = state().await;
         for kind in ["script", "..%2f..%2fetc%2fpasswd", "LOGO"] {
-            let response =
-                anonymous(&state, &format!("/api/branding/assets/{kind}"), "panel.example").await;
+            let response = anonymous(
+                &state,
+                &format!("/api/branding/assets/{kind}"),
+                "panel.example",
+            )
+            .await;
             assert_ne!(response.status(), StatusCode::OK, "{kind}");
         }
     }

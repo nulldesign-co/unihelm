@@ -299,7 +299,13 @@ pub async fn delete(
     )
     .await?;
 
-    ops::invoke(&state, &current.auth, "plan.delete", json!({ "plan_id": id })).await
+    ops::invoke(
+        &state,
+        &current.auth,
+        "plan.delete",
+        json!({ "plan_id": id }),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

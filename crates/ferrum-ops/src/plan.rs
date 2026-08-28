@@ -707,7 +707,8 @@ impl TypedOperation for Suspend {
             subscription.id
         ));
 
-        let sites_switched = switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, true).await?;
+        let sites_switched =
+            switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, true).await?;
 
         // Billing systems integrate through webhooks rather than through a
         // billing module the panel will never grow (spec §2.4), and
@@ -783,7 +784,8 @@ impl TypedOperation for Unsuspend {
         // force_maintenance = false: each vhost renders from the site's own
         // stored flags, so a site the tenant had put in maintenance themselves
         // comes back in maintenance — suspension never rewrote their settings.
-        let sites_restored = switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, false).await?;
+        let sites_restored =
+            switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, false).await?;
 
         Ok(UnsuspendOutput {
             subscription_id: subscription.id.get(),
@@ -878,7 +880,10 @@ mod tests {
     async fn a_customer_cannot_touch_the_plan_catalogue() {
         let (reg, _, customer) = registry().await;
         for (op, input) in [
-            ("plan.create", json!({ "name": "x", "max_sites": 1, "max_dbs": 1, "storage_mb": 1 })),
+            (
+                "plan.create",
+                json!({ "name": "x", "max_sites": 1, "max_dbs": 1, "storage_mb": 1 }),
+            ),
             ("plan.update", json!({ "plan_id": 1 })),
             ("plan.delete", json!({ "plan_id": 1 })),
             ("plan.assign", json!({ "subscription_id": 1, "plan_id": 1 })),
@@ -1120,10 +1125,7 @@ mod tests {
         seed_site(&db, &sub, "broken.example.com", SiteStatus::Failed).await;
 
         let recorder = Arc::new(RecordingVhosts::default());
-        let ctx = OpContext::new(
-            reg.services().clone(),
-            auth_for(admin, Role::Admin),
-        );
+        let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
 
         let suspend = Suspend {
             vhosts: recorder.clone(),
@@ -1156,7 +1158,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(suspended.status, SubscriptionStatus::Suspended);
-        assert_eq!(suspended.suspended_reason.as_deref(), Some("unpaid invoice #42"));
+        assert_eq!(
+            suspended.suspended_reason.as_deref(),
+            Some("unpaid invoice #42")
+        );
         assert!(suspended.suspended_at.is_some());
         // The site's own maintenance flag was never rewritten: the forced page
         // lives only in the rendered vhost, so reinstating cannot clobber a

@@ -457,10 +457,11 @@ impl Db {
     }
 
     pub async fn notify_channel(&self, id: i64) -> Result<Option<NotifyChannel>> {
-        let row = sqlx::query_as::<_, NotifyChannelRow>("SELECT * FROM notify_channels WHERE id = ?1")
-            .bind(id)
-            .fetch_optional(self.pool())
-            .await?;
+        let row =
+            sqlx::query_as::<_, NotifyChannelRow>("SELECT * FROM notify_channels WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
         row.map(NotifyChannel::try_from).transpose()
     }
 
@@ -653,7 +654,10 @@ mod tests {
         )
         .execute(db.pool())
         .await;
-        assert!(err.is_err(), "the CHECK constraint must hold in storage too");
+        assert!(
+            err.is_err(),
+            "the CHECK constraint must hold in storage too"
+        );
     }
 
     #[tokio::test]
@@ -694,7 +698,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(db.raise_alert(rule.id, "/", "a", None).await.unwrap().is_some());
+        assert!(
+            db.raise_alert(rule.id, "/", "a", None)
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(
             db.raise_alert(rule.id, "/var", "b", None)
                 .await

@@ -284,10 +284,7 @@ mod tests {
 
         let seen = read_some(&pty.master, 21);
         let text = String::from_utf8_lossy(&seen);
-        assert!(
-            text.contains("hello from the shell"),
-            "master saw {text:?}"
-        );
+        assert!(text.contains("hello from the shell"), "master saw {text:?}");
     }
 
     #[test]

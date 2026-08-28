@@ -79,7 +79,7 @@ impl Default for SentinelSettings {
             ssh_threshold: 6,
             window_minutes: 10,
             ban_minutes: 60,
-        allowlist: Vec::new(),
+            allowlist: Vec::new(),
         }
     }
 }
@@ -633,7 +633,11 @@ fn rule_key(port: u16, proto: &str, source: Option<&str>) -> (u16, String, Strin
         proto.to_ascii_lowercase(),
         // An empty source string and a NULL both mean "from anywhere"; keeping
         // them distinct would report every unrestricted rule as drift.
-        source.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("").to_string(),
+        source
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string(),
     )
 }
 
@@ -700,7 +704,8 @@ pub fn merge_rules(backend: &[PortRule], intent: &[FwRuleRecord]) -> Vec<MergedR
 /// firewall would have rejected.
 fn port_rule(port: u16, proto: &str, source: Option<&str>, comment: &str) -> Result<PortRule> {
     let proto = Proto::parse(proto).ok_or_else(|| {
-        FerrumError::new(ErrorCode::InvalidInput, "proto must be `tcp` or `udp`").with_field("proto")
+        FerrumError::new(ErrorCode::InvalidInput, "proto must be `tcp` or `udp`")
+            .with_field("proto")
     })?;
     let rule = PortRule {
         port,
@@ -717,16 +722,13 @@ fn port_rule(port: u16, proto: &str, source: Option<&str>, comment: &str) -> Res
 
 /// Parse an address from the wire, refusing anything that is not literally one.
 fn parse_ip(text: &str, field: &'static str) -> Result<IpAddr> {
-    text.trim()
-        .parse::<IpAddr>()
-        .map(canonical)
-        .map_err(|_| {
-            FerrumError::new(
-                ErrorCode::InvalidInput,
-                format!("`{text}` is not an IP address"),
-            )
-            .with_field(field)
-        })
+    text.trim().parse::<IpAddr>().map(canonical).map_err(|_| {
+        FerrumError::new(
+            ErrorCode::InvalidInput,
+            format!("`{text}` is not an IP address"),
+        )
+        .with_field(field)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -942,11 +944,14 @@ impl TypedOperation for Ban {
         }
 
         let minutes = input.minutes.unwrap_or(settings.ban_minutes);
-        let expires_at = (minutes > 0).then(|| ferrum_db::now() + Duration::minutes(i64::from(minutes)));
+        let expires_at =
+            (minutes > 0).then(|| ferrum_db::now() + Duration::minutes(i64::from(minutes)));
         let ttl_seconds = (minutes > 0).then(|| minutes.saturating_mul(60));
 
         let fw = &ctx.distro().fw;
-        fw.ban_ip(ip, ttl_seconds).await.map_err(FerrumError::from)?;
+        fw.ban_ip(ip, ttl_seconds)
+            .await
+            .map_err(FerrumError::from)?;
 
         let reason = input
             .reason
@@ -1214,7 +1219,10 @@ pub async fn sentinel_tick_with(ctx: &OpContext, journal: &dyn JournalReader) ->
         // Counted at `now` on purpose: the query already restricted them to
         // the window, and re-deriving each row's timestamp would buy nothing.
         for _ in 0..count.clamp(0, i64::from(u32::MAX)) {
-            events.push(AuthFailure { ip: parsed, at: now });
+            events.push(AuthFailure {
+                ip: parsed,
+                at: now,
+            });
         }
     }
 
@@ -1730,7 +1738,12 @@ not json at all
 
         // The record exists, and the merged view agrees with the backend.
         let rules = reg
-            .dispatch("fw.rules", &auth_for(admin, Role::Admin), serde_json::json!({}), None)
+            .dispatch(
+                "fw.rules",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({}),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rules["rules"].as_array().unwrap().len(), 1);
@@ -1748,7 +1761,12 @@ not json at all
         .await
         .unwrap();
         let rules = reg
-            .dispatch("fw.rules", &auth_for(admin, Role::Admin), serde_json::json!({}), None)
+            .dispatch(
+                "fw.rules",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({}),
+                None,
+            )
             .await
             .unwrap();
         assert!(rules["rules"].as_array().unwrap().is_empty());
@@ -1912,8 +1930,7 @@ not json at all
     #[async_trait]
     impl JournalReader for FakeJournal {
         async fn read(&self, _since: OffsetDateTime) -> Result<String> {
-            self.reads
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.text.clone())
         }
     }
@@ -2014,7 +2031,9 @@ not json at all
             journal_with("198.51.100.9", 10)
         );
         let ctx = context(&reg).await;
-        let summary = sentinel_tick_with(&ctx, &FakeJournal::new(text)).await.unwrap();
+        let summary = sentinel_tick_with(&ctx, &FakeJournal::new(text))
+            .await
+            .unwrap();
 
         assert!(summary.contains("spared 2"), "{summary}");
         assert!(
@@ -2051,7 +2070,9 @@ not json at all
             .unwrap();
 
         let ctx = context(&reg).await;
-        let summary = sentinel_tick_with(&ctx, &FakeJournal::new("")).await.unwrap();
+        let summary = sentinel_tick_with(&ctx, &FakeJournal::new(""))
+            .await
+            .unwrap();
         assert!(summary.contains("banned 1"), "{summary}");
         assert_eq!(db.active_bans().await.unwrap()[0].ip, "198.51.100.44");
     }
@@ -2078,7 +2099,9 @@ not json at all
         .unwrap();
 
         let ctx = context(&reg).await;
-        let summary = sentinel_tick_with(&ctx, &FakeJournal::new("")).await.unwrap();
+        let summary = sentinel_tick_with(&ctx, &FakeJournal::new(""))
+            .await
+            .unwrap();
         assert!(summary.contains("lifted 1"), "{summary}");
         assert!(db.active_bans().await.unwrap().is_empty());
     }

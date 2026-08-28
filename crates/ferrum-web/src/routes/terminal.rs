@@ -149,11 +149,7 @@ impl TicketStore {
         // bearer token for a root shell should be made of. Using `uuid` rather
         // than adding a random-number dependency keeps the crate's surface as
         // it was; the entropy source is the same `getrandom` either way.
-        let token = format!(
-            "{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         tickets.insert(token.clone(), ticket);
         Some(token)
     }
@@ -407,8 +403,13 @@ pub async fn ws(
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     /// Keystrokes, base64.
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
+    Input {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     /// End the session for real. Nothing else does — see the module docs.
     Close,
 }
@@ -448,7 +449,9 @@ async fn bridge(
     if let Err(e) = state.agent.control(control).await {
         let _ = sink
             .send(Message::Text(
-                json!({ "type": "state", "status": "denied", "detail": e.detail }).to_string().into(),
+                json!({ "type": "state", "status": "denied", "detail": e.detail })
+                    .to_string()
+                    .into(),
             ))
             .await;
         return;
@@ -541,11 +544,7 @@ async fn bridge(
 /// session-id-only match would put one account's shell output into another
 /// account's browser the moment somebody guessed — or was told — a session id.
 /// The owner check makes the id irrelevant to the decision.
-fn socket_payload(
-    kind: &EventKind,
-    session: Uuid,
-    viewer: UserId,
-) -> Option<serde_json::Value> {
+fn socket_payload(kind: &EventKind, session: Uuid, viewer: UserId) -> Option<serde_json::Value> {
     match kind {
         EventKind::TerminalOutput {
             session: id,

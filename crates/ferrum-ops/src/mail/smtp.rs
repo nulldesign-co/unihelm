@@ -119,7 +119,9 @@ impl Stage {
             Stage::Greeting => {
                 "Something is listening on that port but it did not answer as an SMTP server."
             }
-            Stage::Ehlo => "The relay refused the greeting. Some relays reject unknown clients here.",
+            Stage::Ehlo => {
+                "The relay refused the greeting. Some relays reject unknown clients here."
+            }
             Stage::Starttls => {
                 "The relay did not offer or did not complete STARTTLS. Try implicit TLS on \
                  port 465, or plain submission on 587 only if the relay is on a private network."
@@ -296,7 +298,12 @@ pub fn parse_reply(raw: &[String]) -> Result<Reply, String> {
             }
             Some(_) => {}
         }
-        lines.push(line[3..].trim_start_matches(['-', ' ']).trim_end().to_string());
+        lines.push(
+            line[3..]
+                .trim_start_matches(['-', ' '])
+                .trim_end()
+                .to_string(),
+        );
     }
     match code {
         Some(code) => Ok(Reply { code, lines }),
@@ -576,7 +583,12 @@ async fn connect(endpoint: &Endpoint) -> Result<Session, (Stage, String)> {
                 ),
             )
         })?
-        .map_err(|e| (Stage::Connect, format!("connecting to {address} failed: {e}")))?;
+        .map_err(|e| {
+            (
+                Stage::Connect,
+                format!("connecting to {address} failed: {e}"),
+            )
+        })?;
 
     // Nagle off: this protocol is a sequence of tiny writes each waiting for a
     // reply, which is the exact shape Nagle's algorithm delays.
@@ -605,8 +617,12 @@ async fn upgrade(conn: Conn, host: &str) -> Result<Conn, (Stage, String)> {
             "internal: only a plaintext connection can be upgraded".into(),
         ));
     };
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| (Stage::Tls, format!("`{host}` is not a valid TLS server name")))?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
+        (
+            Stage::Tls,
+            format!("`{host}` is not a valid TLS server name"),
+        )
+    })?;
     let stream = buffered.into_inner();
     let connector = TlsConnector::from(tls_config());
     let tls = connector
@@ -963,7 +979,10 @@ mod tests {
         let (address, _server) = scripted(vec![
             ("", "220 relay.example ESMTP\r\n"),
             ("EHLO", "250 relay.example\r\n"),
-            ("MAIL FROM", "550 5.7.1 Sender address rejected: not owned by user\r\n"),
+            (
+                "MAIL FROM",
+                "550 5.7.1 Sender address rejected: not owned by user\r\n",
+            ),
         ])
         .await;
 
@@ -971,8 +990,16 @@ mod tests {
         assert!(!report.delivered);
         assert_eq!(report.stage, Stage::MailFrom);
         assert_eq!(report.code, Some(550));
-        assert!(report.detail.contains("Sender address rejected"), "{report:?}");
-        assert!(report.transcript.iter().any(|l| l.starts_with("C: MAIL FROM")));
+        assert!(
+            report.detail.contains("Sender address rejected"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .transcript
+                .iter()
+                .any(|l| l.starts_with("C: MAIL FROM"))
+        );
     }
 
     #[tokio::test]
@@ -981,7 +1008,10 @@ mod tests {
             ("", "220 relay.example ESMTP\r\n"),
             ("EHLO", "250 relay.example\r\n"),
             ("MAIL FROM", "250 Ok\r\n"),
-            ("RCPT TO", "553 5.7.1 Recipient not verified in sandbox mode\r\n"),
+            (
+                "RCPT TO",
+                "553 5.7.1 Recipient not verified in sandbox mode\r\n",
+            ),
         ])
         .await;
 
@@ -1057,7 +1087,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_relay_that_accepts_nothing_at_the_greeting_is_reported_at_the_greeting() {
-        let (address, _server) = scripted(vec![("", "554 relay.example No service here\r\n")]).await;
+        let (address, _server) =
+            scripted(vec![("", "554 relay.example No service here\r\n")]).await;
         let report = send(&endpoint(&address), None, &message(), "panel.example").await;
         assert_eq!(report.stage, Stage::Greeting);
         assert!(report.detail.contains("No service"));
@@ -1104,9 +1135,7 @@ mod tests {
 
     #[test]
     fn a_subject_carrying_a_newline_cannot_inject_a_header() {
-        assert!(
-            reject_control_characters("subject", "Test\r\nBcc: everyone@example.net").is_err()
-        );
+        assert!(reject_control_characters("subject", "Test\r\nBcc: everyone@example.net").is_err());
         assert!(reject_control_characters("subject", "Ferrum relay test").is_ok());
     }
 

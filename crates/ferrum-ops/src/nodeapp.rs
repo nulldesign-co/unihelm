@@ -488,10 +488,7 @@ async fn resolve_subscription(ctx: &OpContext, id: Option<i64>) -> Result<Subscr
 /// `enforce_site_limit` also keeps — because a plan-less subscription predates
 /// the feature flags entirely and refusing it would break every existing
 /// install on upgrade.
-async fn ensure_plan_allows_node_apps(
-    ctx: &OpContext,
-    subscription: &Subscription,
-) -> Result<()> {
+async fn ensure_plan_allows_node_apps(ctx: &OpContext, subscription: &Subscription) -> Result<()> {
     let Some(plan) = ctx
         .db()
         .plan_of_subscription(subscription.id)
@@ -607,7 +604,10 @@ impl TypedOperation for List {
             };
 
             views.push(AppView {
-                state: status.as_ref().map(|s| s.state).unwrap_or(UnitState::Unknown),
+                state: status
+                    .as_ref()
+                    .map(|s| s.state)
+                    .unwrap_or(UnitState::Unknown),
                 memory_bytes: status.and_then(|s| s.memory_bytes),
                 unit,
                 app,
@@ -765,9 +765,9 @@ fn next_steps(input: &CreateInput, port: i64) -> Vec<String> {
             steps.push(format!("Point {domain} at this server's IP address"));
             steps.push("Issue a certificate once DNS has propagated".into());
         }
-        None => steps.push(
-            "Create a proxy site for this port to publish the app on a domain".into(),
-        ),
+        None => {
+            steps.push("Create a proxy site for this port to publish the app on a domain".into())
+        }
     }
     steps
 }
@@ -1231,10 +1231,7 @@ mod tests {
         );
         TemplateSet::load()
             .unwrap()
-            .render(
-                "systemd/node-app.service",
-                &json!({ "app": context }),
-            )
+            .render("systemd/node-app.service", &json!({ "app": context }))
             .unwrap()
     }
 
@@ -1310,7 +1307,12 @@ mod tests {
             argv,
             vec![
                 vec!["mkdir", "-p", "--", "/home/ft_abc12345/apps"],
-                vec!["chown", "ft_abc12345:ft_abc12345", "--", "/home/ft_abc12345/apps"],
+                vec![
+                    "chown",
+                    "ft_abc12345:ft_abc12345",
+                    "--",
+                    "/home/ft_abc12345/apps"
+                ],
                 vec!["chmod", "0750", "--", "/home/ft_abc12345/apps"],
                 vec!["mkdir", "-p", "--", "/home/ft_abc12345/apps/blog"],
                 vec![
@@ -1690,7 +1692,10 @@ mod tests {
         let (reg, _admin, customer) = registry().await;
         for (op, input) in [
             ("app.list", json!({})),
-            ("app.create", json!({ "name": "blog", "entry": "apps/blog/server.js" })),
+            (
+                "app.create",
+                json!({ "name": "blog", "entry": "apps/blog/server.js" }),
+            ),
             ("app.delete", json!({ "app_id": 1 })),
             ("app.restart", json!({ "app_id": 1 })),
             ("app.logs", json!({ "app_id": 1 })),
@@ -1738,7 +1743,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             seen["unit"],
-            format!("ferrum-app-{}-blog.service", linux_user_of(&db, victim).await)
+            format!(
+                "ferrum-app-{}-blog.service",
+                linux_user_of(&db, victim).await
+            )
         );
 
         // ...and a different customer cannot, even holding the permission.
@@ -1947,7 +1955,11 @@ mod tests {
         }
 
         assert_eq!(
-            db.node_apps(&TenantScope::Global).list(10, 0).await.unwrap().len(),
+            db.node_apps(&TenantScope::Global)
+                .list(10, 0)
+                .await
+                .unwrap()
+                .len(),
             0,
             "a refused create must not have allocated anything"
         );
@@ -1998,7 +2010,11 @@ mod tests {
             err.detail
         );
         assert_eq!(
-            db.node_apps(&TenantScope::Global).list(10, 0).await.unwrap().len(),
+            db.node_apps(&TenantScope::Global)
+                .list(10, 0)
+                .await
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -2242,7 +2258,10 @@ mod tests {
             .unwrap();
         assert_eq!(before["apps"][0]["state"], "not_found");
         assert_eq!(before["apps"][0]["unit"], unit.as_str());
-        assert_eq!(before["apps"][0]["port"], ferrum_db::node_apps::APP_PORT_MIN);
+        assert_eq!(
+            before["apps"][0]["port"],
+            ferrum_db::node_apps::APP_PORT_MIN
+        );
 
         reg.services()
             .distro

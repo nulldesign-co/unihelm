@@ -133,9 +133,8 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
         {
             let s = statement.trim();
-            let idempotent = s.contains("IF EXISTS")
-                || s.starts_with("DELETE FROM")
-                || s.starts_with("FLUSH");
+            let idempotent =
+                s.contains("IF EXISTS") || s.starts_with("DELETE FROM") || s.starts_with("FLUSH");
             assert!(idempotent, "not safe to re-run: {s}");
         }
     }
@@ -158,10 +157,7 @@ mod tests {
             let argv = mysql_argv(family, false);
             assert!(argv.iter().any(|a| a == "--protocol=socket"), "{argv:?}");
             assert!(argv.iter().any(|a| a.starts_with("--socket=")), "{argv:?}");
-            assert!(
-                !argv.iter().any(|a| a.starts_with("--host")),
-                "{argv:?}"
-            );
+            assert!(!argv.iter().any(|a| a.starts_with("--host")), "{argv:?}");
         }
     }
 }

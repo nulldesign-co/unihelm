@@ -46,7 +46,11 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     // due.
     ("cert.renew", Duration::hours(12), Duration::hours(1)),
     // So the dashboard stops calling an expired certificate active.
-    ("cert.expire-stale", Duration::hours(1), Duration::minutes(5)),
+    (
+        "cert.expire-stale",
+        Duration::hours(1),
+        Duration::minutes(5),
+    ),
     ("session.purge", Duration::hours(24), Duration::hours(1)),
     ("audit.purge", Duration::hours(24), Duration::hours(1)),
     // Sentinel, the brute-force defence (spec §11.9). A minute is the slowest
@@ -65,7 +69,11 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     // alert in under 30 s" once the 30 s `TICK` is accounted for, and the pass
     // is cheap: it reads the collector's existing snapshot rather than
     // sampling, and touches the network only on a state *change*.
-    ("alerts.evaluate", Duration::minutes(1), Duration::seconds(10)),
+    (
+        "alerts.evaluate",
+        Duration::minutes(1),
+        Duration::seconds(10),
+    ),
     // Backup schedules (spec §11.10). A minute, because the schedules are
     // five-field cron expressions whose finest granularity is one minute: a
     // slower job would silently skip the minute a nightly backup asked for. The
@@ -258,7 +266,9 @@ impl Scheduler {
         match (renewed, failed) {
             (0, 0) => Ok(String::new()),
             (r, 0) => Ok(format!("renewed {r} certificate(s)")),
-            (r, f) => Err(format!("renewed {r}, failed {f} — see the task log for each")),
+            (r, f) => Err(format!(
+                "renewed {r}, failed {f} — see the task log for each"
+            )),
         }
     }
 
@@ -452,8 +462,16 @@ impl Scheduler {
     }
 
     async fn expire_stale_certificates(&self) -> Result<String, String> {
-        let n = self.db().expire_stale_certificates().await.map_err(|e| e.to_string())?;
-        Ok(if n == 0 { String::new() } else { format!("marked {n} certificate(s) expired") })
+        let n = self
+            .db()
+            .expire_stale_certificates()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(if n == 0 {
+            String::new()
+        } else {
+            format!("marked {n} certificate(s) expired")
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -542,7 +560,10 @@ impl Scheduler {
 
     async fn purge_sessions(&self) -> Result<String, String> {
         let db = self.db();
-        let sessions = db.purge_expired_sessions().await.map_err(|e| e.to_string())?;
+        let sessions = db
+            .purge_expired_sessions()
+            .await
+            .map_err(|e| e.to_string())?;
         // Keep a fortnight of login history: enough for the rate limiter and for
         // somebody investigating an incident, not enough to grow forever.
         let attempts = db
@@ -571,7 +592,10 @@ impl Scheduler {
         // still be holding the disk-full events of its first week. Only
         // *resolved* rows are eligible: an open event is current state, however
         // old it is (spec §11.11).
-        let alerts = db.purge_alert_events(days).await.map_err(|e| e.to_string())?;
+        let alerts = db
+            .purge_alert_events(days)
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Terminal webhook deliveries age out on the same sweep and the same
         // setting. The queue is a queue, not a history: a panel that has been

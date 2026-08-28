@@ -73,8 +73,8 @@ pub async fn create(
 
     // The agent validates this too, but rejecting it here gives the user
     // `FER-1202` with the field highlighted instead of a round trip.
-    let name = ferrum_core::DbName::parse(&body.name)
-        .map_err(|e| ApiError::new(e.with_field("name")))?;
+    let name =
+        ferrum_core::DbName::parse(&body.name).map_err(|e| ApiError::new(e.with_field("name")))?;
 
     audit(
         &state,

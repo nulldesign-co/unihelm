@@ -132,7 +132,12 @@ impl Db {
     /// Forget a rule the panel closed. Returns how many records went away, so
     /// a caller can tell "closed a rule we knew about" from "closed a rule that
     /// only ever existed in the backend".
-    pub async fn forget_fw_rule(&self, port: u16, proto: &str, source: Option<&str>) -> Result<u64> {
+    pub async fn forget_fw_rule(
+        &self,
+        port: u16,
+        proto: &str,
+        source: Option<&str>,
+    ) -> Result<u64> {
         let result = sqlx::query(
             "DELETE FROM fw_rules
              WHERE port = ?1 AND proto = ?2 AND COALESCE(source, '') = COALESCE(?3, '')",
@@ -183,11 +188,13 @@ impl Db {
     /// were closed — zero means the address was not banned by us, which the
     /// unban operation reports honestly rather than claiming success.
     pub async fn lift_bans_for(&self, ip: &str) -> Result<u64> {
-        let result = sqlx::query("UPDATE sentinel_bans SET lifted_at = ?1 WHERE ip = ?2 AND lifted_at IS NULL")
-            .bind(to_sql_time(now()))
-            .bind(ip)
-            .execute(self.pool())
-            .await?;
+        let result = sqlx::query(
+            "UPDATE sentinel_bans SET lifted_at = ?1 WHERE ip = ?2 AND lifted_at IS NULL",
+        )
+        .bind(to_sql_time(now()))
+        .bind(ip)
+        .execute(self.pool())
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -294,7 +301,9 @@ mod tests {
         db.record_fw_rule(3306, "tcp", Some("10.0.0.0/8"), "office")
             .await
             .unwrap();
-        db.record_fw_rule(3306, "udp", None, "why not").await.unwrap();
+        db.record_fw_rule(3306, "udp", None, "why not")
+            .await
+            .unwrap();
         assert_eq!(db.fw_rules().await.unwrap().len(), 3);
     }
 
@@ -320,9 +329,13 @@ mod tests {
     #[tokio::test]
     async fn a_lifted_ban_stays_in_the_history() {
         let db = Db::open_memory().await.unwrap();
-        db.record_ban("203.0.113.9", "6 ssh failures", Some(now() + Duration::hours(1)))
-            .await
-            .unwrap();
+        db.record_ban(
+            "203.0.113.9",
+            "6 ssh failures",
+            Some(now() + Duration::hours(1)),
+        )
+        .await
+        .unwrap();
         assert!(db.is_banned("203.0.113.9").await.unwrap());
 
         assert_eq!(db.lift_bans_for("203.0.113.9").await.unwrap(), 1);

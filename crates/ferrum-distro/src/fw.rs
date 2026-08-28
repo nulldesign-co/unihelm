@@ -134,7 +134,9 @@ fn validate_cidr(src: &str) -> Result<()> {
 /// Is a CIDR in the v6 family?
 fn cidr_is_v6(src: &str) -> bool {
     let addr = src.split_once('/').map(|(a, _)| a).unwrap_or(src);
-    addr.parse::<IpAddr>().map(|ip| ip.is_ipv6()).unwrap_or(false)
+    addr.parse::<IpAddr>()
+        .map(|ip| ip.is_ipv6())
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -639,7 +641,9 @@ fn parse_ufw_status(text: &str) -> Vec<PortRule> {
             continue;
         }
         let mut fields = body.split_whitespace();
-        let Some(target) = fields.next() else { continue };
+        let Some(target) = fields.next() else {
+            continue;
+        };
         let Some((port, proto)) = target.split_once('/') else {
             continue;
         };
@@ -744,8 +748,15 @@ impl NftablesBackend {
         if !listing.stdout.contains(BAN_SET_V4) {
             self.cmd()
                 .args([
-                    "add", "rule", "inet", NFT_TABLE, "input", "ip", "saddr",
-                    &format!("@{BAN_SET_V4}"), "drop",
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "input",
+                    "ip",
+                    "saddr",
+                    &format!("@{BAN_SET_V4}"),
+                    "drop",
                 ])
                 .run_checked()
                 .await?;
@@ -753,8 +764,15 @@ impl NftablesBackend {
         if !listing.stdout.contains(BAN_SET_V6) {
             self.cmd()
                 .args([
-                    "add", "rule", "inet", NFT_TABLE, "input", "ip6", "saddr",
-                    &format!("@{BAN_SET_V6}"), "drop",
+                    "add",
+                    "rule",
+                    "inet",
+                    NFT_TABLE,
+                    "input",
+                    "ip6",
+                    "saddr",
+                    &format!("@{BAN_SET_V6}"),
+                    "drop",
                 ])
                 .run_checked()
                 .await?;
@@ -823,7 +841,11 @@ impl FwBackend for NftablesBackend {
             "input".into(),
         ];
         if let Some(src) = &rule.source {
-            args.push(if cidr_is_v6(src) { "ip6".into() } else { "ip".into() });
+            args.push(if cidr_is_v6(src) {
+                "ip6".into()
+            } else {
+                "ip".into()
+            });
             args.push("saddr".into());
             args.push(src.clone());
         }

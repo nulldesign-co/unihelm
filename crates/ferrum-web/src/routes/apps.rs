@@ -187,8 +187,8 @@ pub async fn create(
 fn create_input(body: &CreateRequest) -> ApiResult<serde_json::Value> {
     // Parsed here for the field-highlighted error; the agent parses these same
     // newtypes again on the way in, and its copy is the one that is trusted.
-    let name = ferrum_core::AppName::parse(&body.name)
-        .map_err(|e| ApiError::new(e.with_field("name")))?;
+    let name =
+        ferrum_core::AppName::parse(&body.name).map_err(|e| ApiError::new(e.with_field("name")))?;
     let entry = ferrum_core::TenantPath::parse(&body.entry)
         .map_err(|e| ApiError::new(e.with_field("entry")))?;
 

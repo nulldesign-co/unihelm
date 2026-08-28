@@ -527,7 +527,10 @@ mod tests {
     fn the_system_context_can_act_but_is_not_a_real_account() {
         let system = AuthContext::system("cert.renew");
         assert!(system.is_system());
-        assert!(system.has(Permission::SiteManage), "renewals need to re-render a vhost");
+        assert!(
+            system.has(Permission::SiteManage),
+            "renewals need to re-render a vhost"
+        );
         assert!(system.tenant_scope.is_global());
         // Id 0 is below SQLite's first AUTOINCREMENT value, so no user row can
         // ever occupy it — which is what makes a forged system context fail the

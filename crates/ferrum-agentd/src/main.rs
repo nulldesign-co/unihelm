@@ -822,10 +822,16 @@ fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
             ));
         }
         if libc::setgid(gid) != 0 {
-            return Err(format!("setgid({gid}) failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "setgid({gid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         if libc::setuid(uid) != 0 {
-            return Err(format!("setuid({uid}) failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "setuid({uid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         // The proof. On a correct drop the kernel refuses to give root back.
@@ -912,7 +918,15 @@ mod tests {
         // different accounts. Picking one would mean a bug on the agent side
         // silently deciding between "the tenant" and "root".
         let err = parse_pty_helper_args(&argv(&[
-            "--root", "--uid", "1001", "--gid", "1001", "--home", "/root", "--shell", "/bin/bash",
+            "--root",
+            "--uid",
+            "1001",
+            "--gid",
+            "1001",
+            "--home",
+            "/root",
+            "--shell",
+            "/bin/bash",
         ]))
         .unwrap_err();
         assert!(err.contains("refusing to guess"), "{err}");
@@ -924,9 +938,36 @@ mod tests {
         // inside `drop_privileges`, because this is the argv an agent bug
         // would have produced.
         for args in [
-            argv(&["--uid", "0", "--gid", "0", "--home", "/root", "--shell", "/bin/bash"]),
-            argv(&["--uid", "0", "--gid", "1001", "--home", "/home/x", "--shell", "/bin/bash"]),
-            argv(&["--uid", "1001", "--gid", "0", "--home", "/home/x", "--shell", "/bin/bash"]),
+            argv(&[
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--home",
+                "/root",
+                "--shell",
+                "/bin/bash",
+            ]),
+            argv(&[
+                "--uid",
+                "0",
+                "--gid",
+                "1001",
+                "--home",
+                "/home/x",
+                "--shell",
+                "/bin/bash",
+            ]),
+            argv(&[
+                "--uid",
+                "1001",
+                "--gid",
+                "0",
+                "--home",
+                "/home/x",
+                "--shell",
+                "/bin/bash",
+            ]),
         ] {
             let err = parse_pty_helper_args(&args).unwrap_err();
             assert!(err.contains("uid/gid 0"), "{err}");
@@ -944,20 +985,45 @@ mod tests {
             argv(&["--root", "--home", "/root"]),
             argv(&["--root", "--home", "root", "--shell", "/bin/bash"]),
             argv(&["--root", "--home", "/root", "--shell", "bash"]),
-            argv(&["--root", "--home", "/root", "--shell", "/bin/bash", "--sneaky", "x"]),
+            argv(&[
+                "--root",
+                "--home",
+                "/root",
+                "--shell",
+                "/bin/bash",
+                "--sneaky",
+                "x",
+            ]),
         ] {
             assert!(parse_pty_helper_args(&args).is_err(), "accepted {args:?}");
         }
 
         let ok = parse_pty_helper_args(&argv(&[
-            "--uid", "5001", "--gid", "5001", "--home", "/home/ft_ab12", "--shell", "/bin/bash",
+            "--uid",
+            "5001",
+            "--gid",
+            "5001",
+            "--home",
+            "/home/ft_ab12",
+            "--shell",
+            "/bin/bash",
         ]))
         .unwrap();
-        assert_eq!(ok.account, PtyAccount::Tenant { uid: 5001, gid: 5001 });
+        assert_eq!(
+            ok.account,
+            PtyAccount::Tenant {
+                uid: 5001,
+                gid: 5001
+            }
+        );
         assert_eq!(ok.shell, PathBuf::from("/bin/bash"));
 
         let root = parse_pty_helper_args(&argv(&[
-            "--root", "--home", "/root", "--shell", "/bin/bash",
+            "--root",
+            "--home",
+            "/root",
+            "--shell",
+            "/bin/bash",
         ]))
         .unwrap();
         assert_eq!(root.account, PtyAccount::Root);
@@ -966,7 +1032,12 @@ mod tests {
     #[test]
     fn helper_args_parse_when_complete() {
         let parsed = parse_fs_helper_args(&argv(&[
-            "--uid", "1001", "--gid", "1001", "--home", "/home/ft_ab12",
+            "--uid",
+            "1001",
+            "--gid",
+            "1001",
+            "--home",
+            "/home/ft_ab12",
         ]))
         .unwrap();
         assert_eq!(parsed.uid, 1001);
@@ -977,10 +1048,9 @@ mod tests {
     #[test]
     fn a_root_uid_or_gid_is_refused_before_any_drop_is_attempted() {
         for (uid, gid) in [("0", "1001"), ("1001", "0"), ("0", "0")] {
-            let err = parse_fs_helper_args(&argv(&[
-                "--uid", uid, "--gid", gid, "--home", "/home/x",
-            ]))
-            .unwrap_err();
+            let err =
+                parse_fs_helper_args(&argv(&["--uid", uid, "--gid", gid, "--home", "/home/x"]))
+                    .unwrap_err();
             assert!(err.contains("not a privilege drop"), "{uid}/{gid}: {err}");
         }
     }
@@ -994,7 +1064,9 @@ mod tests {
             &["--uid", "abc", "--gid", "1", "--home", "/h"][..],
             &["--uid", "-4", "--gid", "1", "--home", "/h"][..],
             &["--uid", "1001", "--gid", "1001", "--home", "relative/home"][..],
-            &["--uid", "1001", "--gid", "1001", "--home", "/h", "--extra", "x"][..],
+            &[
+                "--uid", "1001", "--gid", "1001", "--home", "/h", "--extra", "x",
+            ][..],
             &["--uid"][..],
         ] {
             assert!(parse_fs_helper_args(&argv(args)).is_err(), "{args:?}");

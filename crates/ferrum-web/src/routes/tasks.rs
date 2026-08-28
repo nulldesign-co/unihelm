@@ -265,7 +265,9 @@ pub async fn cancel(
         .control(ControlKind::CancelTask { task_id: id })
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(serde_json::json!({ "task_id": id, "requested": true })))
+    Ok(Json(
+        serde_json::json!({ "task_id": id, "requested": true }),
+    ))
 }
 
 /// Run a finished task's operation again.
@@ -381,7 +383,11 @@ mod tests {
         // they asked for, which on a history page reads as data loss.
         assert!(parse_time(None, "since").unwrap().is_none());
         assert!(parse_time(Some(""), "since").unwrap().is_none());
-        assert!(parse_time(Some("2026-08-28T00:00:00Z"), "since").unwrap().is_some());
+        assert!(
+            parse_time(Some("2026-08-28T00:00:00Z"), "since")
+                .unwrap()
+                .is_some()
+        );
 
         let err = parse_time(Some("yesterday"), "since").unwrap_err();
         assert_eq!(err.inner.code, ErrorCode::InvalidInput);

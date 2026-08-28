@@ -673,7 +673,10 @@ mod tests {
             .unwrap();
         assert!(out.contains("tls             on"));
         assert!(out.contains("tls_starttls    on"));
-        assert!(out.contains("tls_certcheck   on"), "verification must stay on");
+        assert!(
+            out.contains("tls_certcheck   on"),
+            "verification must stay on"
+        );
         assert!(out.contains("auth            on"));
         assert!(out.contains("from            noreply@example.com"));
         // The tenant runs this; a log file they could write is a log file they

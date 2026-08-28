@@ -215,10 +215,7 @@ fn argv_for(family: Family, engine: DbEngine, query: bool) -> Vec<String> {
 /// passwords from [`generate_password`], whose alphabet contains none of the
 /// rejected bytes — this function is the belt to that braces.
 pub fn quote_str(value: &str) -> Result<String> {
-    if value
-        .bytes()
-        .any(|b| b == b'\\' || b.is_ascii_control())
-    {
+    if value.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
         return Err(FerrumError::new(
             ErrorCode::InvalidInput,
             "string values in SQL may not contain backslashes or control characters",
@@ -588,7 +585,11 @@ impl TypedOperation for Create {
             sql: sql_db_exists(input.engine, &input.name),
             secret: false,
         };
-        if !execute(sh.as_ref(), &probe).await?.trimmed_stdout().is_empty() {
+        if !execute(sh.as_ref(), &probe)
+            .await?
+            .trimmed_stdout()
+            .is_empty()
+        {
             return Err(FerrumError::new(
                 ErrorCode::AlreadyExists,
                 format!(
@@ -773,7 +774,11 @@ impl TypedOperation for UserCreate {
             sql: sql_user_exists(input.engine, &input.username),
             secret: false,
         };
-        if !execute(sh.as_ref(), &probe).await?.trimmed_stdout().is_empty() {
+        if !execute(sh.as_ref(), &probe)
+            .await?
+            .trimmed_stdout()
+            .is_empty()
+        {
             return Err(FerrumError::new(
                 ErrorCode::AlreadyExists,
                 format!(
@@ -868,7 +873,9 @@ impl TypedOperation for UserDrop {
         };
         execute(shell().as_ref(), &job).await?;
 
-        repo.delete_user(found.id).await.map_err(FerrumError::from)?;
+        repo.delete_user(found.id)
+            .await
+            .map_err(FerrumError::from)?;
         ctx.log(format!("dropped database user {}", found.username));
         Ok(UserDropOutput {
             username: found.username,
@@ -923,7 +930,9 @@ impl TypedOperation for UserPassword {
         };
         execute(shell().as_ref(), &job).await?;
 
-        db.touch_db_user(found.id).await.map_err(FerrumError::from)?;
+        db.touch_db_user(found.id)
+            .await
+            .map_err(FerrumError::from)?;
         ctx.log(format!("reset the password of {}", found.username));
         Ok(UserPasswordOutput {
             username: found.username,
@@ -1107,7 +1116,9 @@ mod tests {
             db.claim_component(slug, ferrum_db::ComponentStatus::Installing, "test-task")
                 .await
                 .unwrap();
-            db.component_installed(slug, Some("1.0-mock")).await.unwrap();
+            db.component_installed(slug, Some("1.0-mock"))
+                .await
+                .unwrap();
         }
         let sh = Arc::new(RecordingShell::default());
         install_shell(sh.clone());
@@ -1308,7 +1319,12 @@ mod tests {
     async fn a_failed_engine_create_releases_the_name_claim() {
         let (reg, _, customer, sh) = setup().await;
         sh.script(RecordingShell::output("mariadb", 0, "", "")); // probe: free
-        sh.script(RecordingShell::output("mariadb", 1, "", "ERROR 1006 (HY000)"));
+        sh.script(RecordingShell::output(
+            "mariadb",
+            1,
+            "",
+            "ERROR 1006 (HY000)",
+        ));
 
         let err = dispatch(
             &reg,
@@ -1367,7 +1383,10 @@ mod tests {
 
         let jobs = sh.recorded();
         let create = &jobs[1];
-        assert!(create.secret, "a password-bearing job must be marked secret");
+        assert!(
+            create.secret,
+            "a password-bearing job must be marked secret"
+        );
         assert_eq!(
             create.sql,
             format!("CREATE USER 'shop_rw'@'localhost' IDENTIFIED BY '{password}';\n")
@@ -1380,15 +1399,17 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row.len(), 1);
-        let everything: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT username, engine, created_at, updated_at FROM db_users",
-        )
-        .fetch_all(reg.services().db.pool())
-        .await
-        .unwrap();
+        let everything: Vec<(String, String, String, String)> =
+            sqlx::query_as("SELECT username, engine, created_at, updated_at FROM db_users")
+                .fetch_all(reg.services().db.pool())
+                .await
+                .unwrap();
         for (a, b, c, d) in everything {
             for field in [a, b, c, d] {
-                assert!(!field.contains(password), "the password leaked into storage");
+                assert!(
+                    !field.contains(password),
+                    "the password leaked into storage"
+                );
             }
         }
     }

@@ -839,7 +839,10 @@ mod tests {
     fn the_mariadb_series_still_reaches_the_url_intact() {
         // The series is the one part of these URLs that comes from config, and
         // it is what selects the version-pinned snapshot the mirrors agree on.
-        let url = mariadb(&rhel("9", Arch::X86_64), "11.8").unwrap().definition.base_url;
+        let url = mariadb(&rhel("9", Arch::X86_64), "11.8")
+            .unwrap()
+            .definition
+            .base_url;
         assert_eq!(url, "https://rpm.mariadb.org/11.8/rhel/9/x86_64");
 
         let url = mariadb(&debian("bookworm", "debian", "12"), "11.8")
@@ -868,9 +871,7 @@ mod tests {
     fn mariadb_on_rhel_substitutes_the_major_and_sets_module_hotfixes() {
         let repo = mariadb(&rhel("10", Arch::Aarch64), MARIADB_SERIES).unwrap();
         assert!(
-            repo.definition
-                .base_url
-                .ends_with("/rhel/10/aarch64"),
+            repo.definition.base_url.ends_with("/rhel/10/aarch64"),
             "{}",
             repo.definition.base_url
         );
@@ -939,7 +940,11 @@ mod tests {
             a64.definition.accepted_fingerprints,
             vec![PGDG_RPM_AARCH64_KEY.to_string()]
         );
-        assert!(x86.definition.gpg_key_url.ends_with("PGDG-RPM-GPG-KEY-RHEL"));
+        assert!(
+            x86.definition
+                .gpg_key_url
+                .ends_with("PGDG-RPM-GPG-KEY-RHEL")
+        );
         assert!(
             a64.definition
                 .gpg_key_url
@@ -1043,7 +1048,9 @@ mod tests {
         // The two halves of that Docker asymmetry, pinned so a future edit that
         // flattens them has to say why.
         assert_eq!(
-            docker(&debian("trixie", "debian", "13")).unwrap().provenance,
+            docker(&debian("trixie", "debian", "13"))
+                .unwrap()
+                .provenance,
             Provenance::SingleSource
         );
         assert_eq!(
@@ -1054,8 +1061,14 @@ mod tests {
         // The per-architecture rpm keys are genuinely different keys, and each
         // is corroborated separately — a single check would have missed one.
         assert_ne!(
-            pgdg(&rhel("9", Arch::X86_64)).unwrap().definition.accepted_fingerprints,
-            pgdg(&rhel("9", Arch::Aarch64)).unwrap().definition.accepted_fingerprints
+            pgdg(&rhel("9", Arch::X86_64))
+                .unwrap()
+                .definition
+                .accepted_fingerprints,
+            pgdg(&rhel("9", Arch::Aarch64))
+                .unwrap()
+                .definition
+                .accepted_fingerprints
         );
     }
 

@@ -653,7 +653,9 @@ macro_rules! string_newtype_impls {
     )*};
 }
 
-string_newtype_impls!(AppName, Domain, LinuxUser, Username, Email, DbName, TenantPath);
+string_newtype_impls!(
+    AppName, Domain, LinuxUser, Username, Email, DbName, TenantPath
+);
 
 impl fmt::Display for PhpVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

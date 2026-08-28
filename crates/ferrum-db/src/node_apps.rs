@@ -430,7 +430,10 @@ mod tests {
         let created = db.create_node_app(app(sub, "blog")).await.unwrap();
         assert_eq!(created.port, APP_PORT_MIN);
         assert_eq!(created.node_env, NodeEnv::Production);
-        assert!(created.enabled, "a new app is enabled; it is about to start");
+        assert!(
+            created.enabled,
+            "a new app is enabled; it is about to start"
+        );
         assert!(created.site_id.is_none());
     }
 
@@ -568,7 +571,13 @@ mod tests {
         db.create_node_app(app(mine, "mine")).await.unwrap();
 
         let intruder = TenantScope::Customer { customer_id: alice };
-        assert!(db.node_apps(&intruder).by_id(victim.id).await.unwrap().is_none());
+        assert!(
+            db.node_apps(&intruder)
+                .by_id(victim.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(db.node_apps(&intruder).list(100, 0).await.unwrap().len(), 1);
         assert!(matches!(
             db.node_apps(&intruder).delete(victim.id).await,
@@ -608,7 +617,10 @@ mod tests {
             .await
             .unwrap();
 
-        db.sites(&TenantScope::Global).delete(site.id).await.unwrap();
+        db.sites(&TenantScope::Global)
+            .delete(site.id)
+            .await
+            .unwrap();
 
         let after = db
             .node_apps(&TenantScope::Global)

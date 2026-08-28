@@ -135,7 +135,9 @@ pub fn parse_email(field: &'static str, input: &str) -> Result<String> {
         FerrumError::new(ErrorCode::InvalidInput, detail.to_string()).with_field(field)
     };
     if value.is_empty() || value.len() > MAX_FIELD {
-        return Err(invalid("an email address is required, at most 255 characters"));
+        return Err(invalid(
+            "an email address is required, at most 255 characters",
+        ));
     }
     let Some((local, domain)) = value.split_once('@') else {
         return Err(invalid("an email address needs exactly one `@`"));
@@ -144,10 +146,14 @@ pub fn parse_email(field: &'static str, input: &str) -> Result<String> {
         return Err(invalid("an email address needs exactly one `@`"));
     }
     if local.is_empty() || domain.is_empty() {
-        return Err(invalid("an email address needs something either side of the `@`"));
+        return Err(invalid(
+            "an email address needs something either side of the `@`",
+        ));
     }
     if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
-        return Err(invalid("the domain part of an email address needs a dot in it"));
+        return Err(invalid(
+            "the domain part of an email address needs a dot in it",
+        ));
     }
     if value
         .chars()
@@ -168,11 +174,9 @@ pub fn parse_email(field: &'static str, input: &str) -> Result<String> {
 pub fn parse_display_name(field: &'static str, input: &str) -> Result<String> {
     let value = input.trim();
     if value.len() > MAX_FIELD {
-        return Err(FerrumError::new(
-            ErrorCode::InvalidInput,
-            "at most 255 characters",
-        )
-        .with_field(field));
+        return Err(
+            FerrumError::new(ErrorCode::InvalidInput, "at most 255 characters").with_field(field),
+        );
     }
     if let Err(detail) = smtp::reject_control_characters(field, value) {
         return Err(FerrumError::new(ErrorCode::InvalidInput, detail).with_field(field));
@@ -267,7 +271,9 @@ pub async fn write_site_relay(
     // the length of the render.
     let password = match &relay.password_sealed {
         Some(sealed) => Some(ctx.master_key().open_str(sealed).map_err(|e| {
-            FerrumError::internal(format!("the stored relay password could not be opened: {e}"))
+            FerrumError::internal(format!(
+                "the stored relay password could not be opened: {e}"
+            ))
         })?),
         None => None,
     };
@@ -584,7 +590,10 @@ pub fn dns_advisory(relay: Option<&MailRelay>) -> DnsAdvisory {
         AdvisoryRecord {
             name: format!("_dmarc.{domain}"),
             record_type: "TXT",
-            value: Some(format!("v=DMARC1; p=none; rua=mailto:{}", relay.from_address)),
+            value: Some(format!(
+                "v=DMARC1; p=none; rua=mailto:{}",
+                relay.from_address
+            )),
             managed: false,
             purpose: "DMARC: tells recipients what to do when SPF and DKIM disagree, and where \
                       to send reports. `p=none` is the safe starting policy — it changes no \
@@ -642,8 +651,7 @@ pub struct RelayView {
     pub dns: DnsAdvisory,
 }
 
-const CREDENTIAL_NOTE: &str =
-    "PHP's mail() runs as each site's own Linux user, so that user can read the relay \
+const CREDENTIAL_NOTE: &str = "PHP's mail() runs as each site's own Linux user, so that user can read the relay \
      credential for their own site (and no other site's). Use a send-only credential scoped \
      to this server, and rotate it here rather than reusing an account password.";
 
@@ -737,7 +745,6 @@ pub struct RelaySetInput {
     pub enabled: Option<bool>,
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct RelaySetOutput {
     pub relay: RelayView,
@@ -763,8 +770,10 @@ impl TypedOperation for RelaySet {
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let host = parse_relay_host(&input.host)?;
         if input.port == 0 {
-            return Err(FerrumError::new(ErrorCode::InvalidPort, "the port must be 1–65535")
-                .with_field("port"));
+            return Err(
+                FerrumError::new(ErrorCode::InvalidPort, "the port must be 1–65535")
+                    .with_field("port"),
+            );
         }
         let from_address = parse_email("from_address", &input.from_address)?;
         let from_name = match input.from_name.as_deref() {
@@ -926,10 +935,7 @@ impl TypedOperation for RelayTest {
 
         let panel_name: String = ctx
             .db()
-            .get_setting_or(
-                ferrum_db::settings::keys::PANEL_NAME,
-                "Ferrum".to_string(),
-            )
+            .get_setting_or(ferrum_db::settings::keys::PANEL_NAME, "Ferrum".to_string())
             .await;
 
         let report = smtp::send(

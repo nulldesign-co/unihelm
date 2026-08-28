@@ -425,7 +425,13 @@ mod tests {
         .await
         .unwrap();
         assert!(payload.is_empty());
-        assert!(matches!(data, FsData::Content { truncated: false, .. }));
+        assert!(matches!(
+            data,
+            FsData::Content {
+                truncated: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -450,9 +456,15 @@ mod tests {
         let (_g, home) = temp_home();
 
         // mkdir, write into it, list, rename, delete.
-        local(&home, FsRequest::Mkdir { path: "site".into() }, b"")
-            .await
-            .unwrap();
+        local(
+            &home,
+            FsRequest::Mkdir {
+                path: "site".into(),
+            },
+            b"",
+        )
+        .await
+        .unwrap();
         local(
             &home,
             FsRequest::Write {
@@ -492,9 +504,15 @@ mod tests {
         )
         .await
         .unwrap();
-        local(&home, FsRequest::Remove { path: "site".into() }, b"")
-            .await
-            .unwrap();
+        local(
+            &home,
+            FsRequest::Remove {
+                path: "site".into(),
+            },
+            b"",
+        )
+        .await
+        .unwrap();
         assert!(!home.join("site").exists());
     }
 

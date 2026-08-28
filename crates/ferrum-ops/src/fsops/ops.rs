@@ -64,7 +64,9 @@ impl TenantFs {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> Result<(FsData, Vec<u8>)> {
-        self.runner.call(&self.home, request, payload, timeout).await
+        self.runner
+            .call(&self.home, request, payload, timeout)
+            .await
     }
 }
 
@@ -190,10 +192,11 @@ fn check_name(name: &str, field: &'static str) -> Result<()> {
         || name.contains('\0')
         || name.chars().any(|c| c.is_control())
     {
-        return Err(
-            FerrumError::new(ErrorCode::InvalidPath, format!("`{name}` is not a usable name"))
-                .with_field(field),
-        );
+        return Err(FerrumError::new(
+            ErrorCode::InvalidPath,
+            format!("`{name}` is not a usable name"),
+        )
+        .with_field(field));
     }
     Ok(())
 }
@@ -702,9 +705,7 @@ async fn ensure_trash(ctx: &OpContext, fs: &TenantFs) -> Result<()> {
         // So `.trash` is panel infrastructure, like `sites/`, and the panel
         // creates it the same way. The tenant still only ever operates
         // *inside* it, through the helper, under their own uid.
-        Err(e) if e.code == ErrorCode::NotFound => {
-            create_trash_as_root(ctx, fs).await
-        }
+        Err(e) if e.code == ErrorCode::NotFound => create_trash_as_root(ctx, fs).await,
         Err(e) => Err(e),
     }
 }
@@ -739,7 +740,9 @@ async fn create_trash_as_root(ctx: &OpContext, fs: &TenantFs) -> Result<()> {
             .arg(&path)
             .run_checked()
             .await
-            .map_err(|e| FerrumError::internal(format!("could not hand over the recycle bin: {e}")))?;
+            .map_err(|e| {
+                FerrumError::internal(format!("could not hand over the recycle bin: {e}"))
+            })?;
     }
 
     std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -1245,14 +1248,13 @@ impl TypedOperation for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::testing::{auth_for, registry};
     use crate::registry::OpRegistry;
+    use crate::registry::testing::{auth_for, registry};
     use ferrum_core::{Role, UserId};
 
     /// A registry whose seeded customer's subscription points at a real,
     /// throwaway home directory.
-    async fn registry_with_home() -> (OpRegistry, UserId, tempfile::TempDir, std::path::PathBuf)
-    {
+    async fn registry_with_home() -> (OpRegistry, UserId, tempfile::TempDir, std::path::PathBuf) {
         let (reg, _admin, customer) = registry().await;
         let db = reg.services().db.clone();
         let subscription = db.default_subscription_for(customer).await.unwrap();
@@ -1336,7 +1338,10 @@ mod tests {
             .await
             .unwrap();
         }
-        assert_eq!(std::fs::read(home.join("upload.bin")).unwrap(), b"AAAABBBBCC");
+        assert_eq!(
+            std::fs::read(home.join("upload.bin")).unwrap(),
+            b"AAAABBBBCC"
+        );
     }
 
     #[tokio::test]
@@ -1398,7 +1403,9 @@ mod tests {
         assert!(home.join(TRASH_DIR).join(trashed).exists());
 
         let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(home.join(TRASH_DIR)).unwrap().permissions(),
+            &std::fs::metadata(home.join(TRASH_DIR))
+                .unwrap()
+                .permissions(),
         );
         assert_eq!(
             mode & 0o777,
@@ -1462,9 +1469,14 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
-        let listed = run(&reg, user, "fs.list", serde_json::json!({ "show_hidden": true }))
-            .await
-            .unwrap();
+        let listed = run(
+            &reg,
+            user,
+            "fs.list",
+            serde_json::json!({ "show_hidden": true }),
+        )
+        .await
+        .unwrap();
         assert!(
             listed["entries"]
                 .as_array()
@@ -1490,7 +1502,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(std::fs::read(home.join("precious.txt")).unwrap(), b"keep me");
+        assert_eq!(
+            std::fs::read(home.join("precious.txt")).unwrap(),
+            b"keep me"
+        );
     }
 
     #[tokio::test]
@@ -1505,9 +1520,14 @@ mod tests {
             )
             .await
             .unwrap();
-            run(&reg, user, "fs.delete", serde_json::json!({ "path": "a.txt" }))
-                .await
-                .unwrap();
+            run(
+                &reg,
+                user,
+                "fs.delete",
+                serde_json::json!({ "path": "a.txt" }),
+            )
+            .await
+            .unwrap();
         }
         let listed = run(&reg, user, "fs.trash.list", serde_json::json!({}))
             .await
@@ -1526,9 +1546,14 @@ mod tests {
         )
         .await
         .unwrap();
-        run(&reg, user, "fs.delete", serde_json::json!({ "path": "young.txt" }))
-            .await
-            .unwrap();
+        run(
+            &reg,
+            user,
+            "fs.delete",
+            serde_json::json!({ "path": "young.txt" }),
+        )
+        .await
+        .unwrap();
 
         // Deleted seconds ago: a 7-day purge must not touch it.
         let out = run(
@@ -1592,9 +1617,14 @@ mod tests {
         .unwrap();
         assert!(out["bytes"].as_u64().unwrap() > 0);
 
-        run(&reg, user, "fs.mkdir", serde_json::json!({ "path": "restored" }))
-            .await
-            .unwrap();
+        run(
+            &reg,
+            user,
+            "fs.mkdir",
+            serde_json::json!({ "path": "restored" }),
+        )
+        .await
+        .unwrap();
         let out = run(
             &reg,
             user,
@@ -1674,9 +1704,14 @@ mod tests {
         )
         .await
         .unwrap();
-        run(&reg, user, "fs.delete", serde_json::json!({ "path": "junk.bin" }))
-            .await
-            .unwrap();
+        run(
+            &reg,
+            user,
+            "fs.delete",
+            serde_json::json!({ "path": "junk.bin" }),
+        )
+        .await
+        .unwrap();
 
         let out = run(&reg, user, "fs.usage", serde_json::json!({}))
             .await
@@ -1689,7 +1724,10 @@ mod tests {
 
     #[test]
     fn trash_names_parse_back_into_time_and_name() {
-        assert_eq!(parse_trash_name("1724567890-a.txt"), (Some(1724567890), "a.txt"));
+        assert_eq!(
+            parse_trash_name("1724567890-a.txt"),
+            (Some(1724567890), "a.txt")
+        );
         assert_eq!(
             parse_trash_name("1724567890-with-dashes.txt"),
             (Some(1724567890), "with-dashes.txt")

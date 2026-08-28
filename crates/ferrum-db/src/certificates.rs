@@ -737,14 +737,23 @@ mod tests {
             ids.push(c.id);
         }
 
-        let due = db.certificates_to_renew(Duration::days(30), 10).await.unwrap();
+        let due = db
+            .certificates_to_renew(Duration::days(30), 10)
+            .await
+            .unwrap();
         assert_eq!(due.len(), 1, "one site must produce one renewal, not three");
-        assert_eq!(due[0].id, *ids.last().unwrap(), "the newest is the one served");
+        assert_eq!(
+            due[0].id,
+            *ids.last().unwrap(),
+            "the newest is the one served"
+        );
 
         let all = db.certificates_for(&TenantScope::Global).await.unwrap();
         assert_eq!(all.len(), 3, "the older rows are retired, not deleted");
         assert_eq!(
-            all.iter().filter(|c| c.status == CertStatus::Superseded).count(),
+            all.iter()
+                .filter(|c| c.status == CertStatus::Superseded)
+                .count(),
             2
         );
     }
@@ -754,13 +763,23 @@ mod tests {
         let (db, site) = seed().await;
         let other = seed_site(&db, "other.example").await;
         let keep = db
-            .create_certificate(Some(other), CertKind::Le, &["other.example".into()], "/certs/o")
+            .create_certificate(
+                Some(other),
+                CertKind::Le,
+                &["other.example".into()],
+                "/certs/o",
+            )
             .await
             .unwrap();
         issue(&db, keep.id, 20).await;
 
         let mine = db
-            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .create_certificate(
+                Some(site),
+                CertKind::Le,
+                &["example.com".into()],
+                "/certs/e",
+            )
             .await
             .unwrap();
         issue(&db, mine.id, 20).await;
@@ -772,28 +791,60 @@ mod tests {
             .into_iter()
             .map(|c| (c.id, c.status))
             .collect();
-        assert!(statuses.contains(&(keep.id, CertStatus::Active)), "{statuses:?}");
-        assert!(statuses.contains(&(mine.id, CertStatus::Active)), "{statuses:?}");
+        assert!(
+            statuses.contains(&(keep.id, CertStatus::Active)),
+            "{statuses:?}"
+        );
+        assert!(
+            statuses.contains(&(mine.id, CertStatus::Active)),
+            "{statuses:?}"
+        );
     }
 
     #[tokio::test]
     async fn a_certificate_in_its_backoff_window_is_not_retried() {
         let (db, site) = seed().await;
         let cert = db
-            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .create_certificate(
+                Some(site),
+                CertKind::Le,
+                &["example.com".into()],
+                "/certs/e",
+            )
             .await
             .unwrap();
         issue(&db, cert.id, 10).await;
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
-        db.set_certificate_next_attempt(cert.id, now() + Duration::hours(1)).await.unwrap();
-        assert!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().is_empty());
+        db.set_certificate_next_attempt(cert.id, now() + Duration::hours(1))
+            .await
+            .unwrap();
+        assert!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // And a successful issuance clears the hold, so the next cycle is normal.
         issue(&db, cert.id, 90).await;
-        db.set_certificate_next_attempt(cert.id, now() - Duration::minutes(1)).await.unwrap();
+        db.set_certificate_next_attempt(cert.id, now() - Duration::minutes(1))
+            .await
+            .unwrap();
         issue(&db, cert.id, 10).await;
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -802,12 +853,23 @@ mod tests {
         // stop trying.
         let (db, site) = seed().await;
         let cert = db
-            .create_certificate(Some(site), CertKind::Le, &["example.com".into()], "/certs/e")
+            .create_certificate(
+                Some(site),
+                CertKind::Le,
+                &["example.com".into()],
+                "/certs/e",
+            )
             .await
             .unwrap();
         issue(&db, cert.id, -5).await;
         db.expire_stale_certificates().await.unwrap();
-        assert_eq!(db.certificates_to_renew(Duration::days(30), 10).await.unwrap().len(), 1);
+        assert_eq!(
+            db.certificates_to_renew(Duration::days(30), 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

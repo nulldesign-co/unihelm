@@ -222,7 +222,9 @@ pub fn parse_support_url(input: &str) -> Result<String> {
         FerrumError::new(ErrorCode::InvalidInput, detail.to_string()).with_field("support_url")
     };
     if value.is_empty() || value.len() > 512 {
-        return Err(invalid("a support URL must be between 1 and 512 characters"));
+        return Err(invalid(
+            "a support URL must be between 1 and 512 characters",
+        ));
     }
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(invalid(
@@ -240,7 +242,11 @@ pub fn parse_support_url(input: &str) -> Result<String> {
     if lowered.len() <= "https://".len() && lowered.starts_with("https://") {
         return Err(invalid("that URL has no host"));
     }
-    if lowered.trim_start_matches("https://").trim_start_matches("http://").is_empty() {
+    if lowered
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .is_empty()
+    {
         return Err(invalid("that URL has no host"));
     }
     Ok(value.to_string())
@@ -373,8 +379,7 @@ pub struct AssetLimit {
     pub max_bytes: usize,
 }
 
-const SVG_NOTE: &str =
-    "SVG is refused. An SVG is an XML document that can carry scripts and event handlers, and a \
+const SVG_NOTE: &str = "SVG is refused. An SVG is an XML document that can carry scripts and event handlers, and a \
      branding image is served from the panel's own origin — so an SVG logo would be script \
      execution against whoever opened it. Uploads are identified by their bytes, not by their \
      filename.";
@@ -412,7 +417,13 @@ impl TypedOperation for Get {
                 .await
                 .map_err(FerrumError::from)?,
             limits: limits(),
-            accepted_formats: vec!["image/png", "image/jpeg", "image/gif", "image/webp", "image/x-icon"],
+            accepted_formats: vec![
+                "image/png",
+                "image/jpeg",
+                "image/gif",
+                "image/webp",
+                "image/x-icon",
+            ],
             svg_note: SVG_NOTE,
         })
     }
@@ -646,8 +657,10 @@ fn decode_upload(kind: AssetKind, content_b64: &str) -> Result<Vec<u8>> {
         .with_field("content_b64"));
     }
     if bytes.is_empty() {
-        return Err(FerrumError::new(ErrorCode::InvalidInput, "the image is empty")
-            .with_field("content_b64"));
+        return Err(
+            FerrumError::new(ErrorCode::InvalidInput, "the image is empty")
+                .with_field("content_b64"),
+        );
     }
     Ok(bytes)
 }

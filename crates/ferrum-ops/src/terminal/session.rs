@@ -171,8 +171,10 @@ impl SessionHandle {
         if self.is_closed() {
             return;
         }
-        self.last_input
-            .store(time::OffsetDateTime::now_utc().unix_timestamp(), Ordering::SeqCst);
+        self.last_input.store(
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            Ordering::SeqCst,
+        );
         self.io.write(data);
     }
 
@@ -980,7 +982,9 @@ mod tests {
         assert!(handle.info.is_root);
         assert_eq!(handle.info.account, "root");
 
-        reg.close(id, &f.admin, "closed by the operator").await.unwrap();
+        reg.close(id, &f.admin, "closed by the operator")
+            .await
+            .unwrap();
 
         let actions = audit_actions(&f.db).await;
         assert!(actions.contains(&"terminal.open".to_string()));
@@ -1085,7 +1089,11 @@ mod tests {
 
         assert_eq!(reg.sweep().await, 1);
         assert!(reg.is_empty().await);
-        assert!(audit_actions(&f.db).await.contains(&"terminal.close".into()));
+        assert!(
+            audit_actions(&f.db)
+                .await
+                .contains(&"terminal.close".into())
+        );
     }
 
     #[tokio::test]
@@ -1145,7 +1153,10 @@ mod tests {
             .expect("live output should arrive")
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&next.data), "third\n");
-        assert_eq!(next.seq, 3, "sequence numbers must continue across an attach");
+        assert_eq!(
+            next.seq, 3,
+            "sequence numbers must continue across an attach"
+        );
     }
 
     #[tokio::test]
@@ -1181,7 +1192,10 @@ mod tests {
         let (replay, _) = handle.attach().await;
         let total: usize = replay.iter().map(|c| c.data.len()).sum();
         assert!(total <= 16, "the ring kept {total} bytes");
-        assert!(!replay.is_empty(), "the ring must keep the most recent output");
+        assert!(
+            !replay.is_empty(),
+            "the ring must keep the most recent output"
+        );
     }
 
     #[tokio::test]
@@ -1298,6 +1312,9 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(!argv.contains(&"--root".to_string()));
-        assert_eq!(argv[argv.iter().position(|a| a == "--uid").unwrap() + 1], "5001");
+        assert_eq!(
+            argv[argv.iter().position(|a| a == "--uid").unwrap() + 1],
+            "5001"
+        );
     }
 }

@@ -503,10 +503,9 @@ mod tests {
         assert!(armed.enabled);
         assert_eq!(armed.target, None, "no target means every filesystem");
 
-        let disarmed: RuleRequest = serde_json::from_value(
-            json!({ "kind": "load", "threshold": 8.0, "enabled": false }),
-        )
-        .expect("parses");
+        let disarmed: RuleRequest =
+            serde_json::from_value(json!({ "kind": "load", "threshold": 8.0, "enabled": false }))
+                .expect("parses");
         assert!(!disarmed.enabled);
     }
 }

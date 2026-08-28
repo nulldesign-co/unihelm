@@ -7,8 +7,8 @@
 
 use std::sync::Mutex;
 
-use ferrum_core::{Domain, Role, TenantScope};
 use ferrum_core::PhpVersion;
+use ferrum_core::{Domain, Role, TenantScope};
 use ferrum_db::{Db, NewSite, SiteType};
 use serde_json::json;
 
@@ -112,7 +112,12 @@ async fn run_set(
 async fn a_panel_with_no_relay_says_so_rather_than_failing() {
     let (reg, admin, _) = registry().await;
     let out = reg
-        .dispatch("mail.relay.get", &auth_for(admin, Role::Admin), json!({}), None)
+        .dispatch(
+            "mail.relay.get",
+            &auth_for(admin, Role::Admin),
+            json!({}),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(out["configured"], false);
@@ -274,7 +279,12 @@ async fn the_relay_password_never_appears_in_any_output() {
     assert!(!rendered.contains("token-secret"));
 
     let read = reg
-        .dispatch("mail.relay.get", &auth_for(admin, Role::Admin), json!({}), None)
+        .dispatch(
+            "mail.relay.get",
+            &auth_for(admin, Role::Admin),
+            json!({}),
+            None,
+        )
         .await
         .unwrap()
         .to_string();
@@ -367,7 +377,9 @@ async fn a_hostile_relay_host_is_refused_rather_than_rendered() {
     ] {
         let mut input = relay_input();
         input["host"] = json!(bad);
-        let err = run_set(&reg, admin, pools.clone(), input).await.unwrap_err();
+        let err = run_set(&reg, admin, pools.clone(), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.field.as_deref(), Some("host"), "for {bad:?}");
     }
 }
@@ -388,7 +400,9 @@ async fn a_hostile_from_address_is_refused() {
     ] {
         let mut input = relay_input();
         input["from_address"] = json!(bad);
-        let err = run_set(&reg, admin, pools.clone(), input).await.unwrap_err();
+        let err = run_set(&reg, admin, pools.clone(), input)
+            .await
+            .unwrap_err();
         assert_eq!(err.field.as_deref(), Some("from_address"), "for {bad:?}");
     }
 }
@@ -521,7 +535,10 @@ fn the_dkim_record_has_no_value_because_only_the_relay_can_supply_one() {
         .iter()
         .find(|r| r.name.contains("_domainkey"))
         .expect("a DKIM row must be surfaced");
-    assert!(dkim.value.is_none(), "a made-up DKIM record would be published");
+    assert!(
+        dkim.value.is_none(),
+        "a made-up DKIM record would be published"
+    );
     assert!(dkim.purpose.contains("does not sign"));
 }
 
@@ -616,8 +633,14 @@ fn a_relay_host_is_lowercased_so_it_matches_however_it_was_typed() {
         parse_relay_host(" SMTP.Example.NET ").unwrap(),
         "smtp.example.net"
     );
-    assert!(parse_relay_host("[2001:db8::1]").is_err(), "brackets are not a host here");
-    assert!(parse_relay_host("2001:db8::1").is_ok(), "a bare IPv6 literal is");
+    assert!(
+        parse_relay_host("[2001:db8::1]").is_err(),
+        "brackets are not a host here"
+    );
+    assert!(
+        parse_relay_host("2001:db8::1").is_ok(),
+        "a bare IPv6 literal is"
+    );
 }
 
 #[tokio::test]

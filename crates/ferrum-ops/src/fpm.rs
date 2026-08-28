@@ -245,7 +245,10 @@ mod tests {
         pool.retire();
 
         assert_eq!(pool.retire(), StockPool::Absent);
-        assert_eq!(std::fs::read_to_string(pool.disabled()).unwrap(), "original\n");
+        assert_eq!(
+            std::fs::read_to_string(pool.disabled()).unwrap(),
+            "original\n"
+        );
     }
 
     #[test]

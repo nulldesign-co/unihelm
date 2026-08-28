@@ -177,7 +177,9 @@ impl AccountSource for SystemAccounts {
             if pw.is_null() {
                 return None;
             }
-            let home = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
+            let home = std::ffi::CStr::from_ptr((*pw).pw_dir)
+                .to_string_lossy()
+                .into_owned();
             let shell = std::ffi::CStr::from_ptr((*pw).pw_shell)
                 .to_string_lossy()
                 .into_owned();
@@ -397,9 +399,7 @@ fn pick_root_shell() -> Result<PathBuf> {
         .map(Path::new)
         .find(|p| p.exists())
         .map(Path::to_path_buf)
-        .ok_or_else(|| {
-            FerrumError::internal("no usable login shell is installed on this server")
-        })
+        .ok_or_else(|| FerrumError::internal("no usable login shell is installed on this server"))
 }
 
 #[cfg(test)]
@@ -582,20 +582,19 @@ mod tests {
         give_plan(&w.db, w.subscription, true).await;
 
         // A second customer with their own subscription.
-        let other = w
-            .db
-            .users(&TenantScope::Global)
-            .create(NewUser {
-                role: Role::Customer,
-                email: Email::parse("other@example.com").unwrap(),
-                username: Username::parse("other").unwrap(),
-                password: "a-long-enough-password".into(),
-                reseller_id: None,
-                full_name: None,
-                locale: "en".into(),
-            })
-            .await
-            .unwrap();
+        let other =
+            w.db.users(&TenantScope::Global)
+                .create(NewUser {
+                    role: Role::Customer,
+                    email: Email::parse("other@example.com").unwrap(),
+                    username: Username::parse("other").unwrap(),
+                    password: "a-long-enough-password".into(),
+                    reseller_id: None,
+                    full_name: None,
+                    locale: "en".into(),
+                })
+                .await
+                .unwrap();
         let other_sub = w.db.create_subscription(other.id).await.unwrap();
         give_plan(&w.db, other_sub.id, true).await;
 
@@ -631,7 +630,9 @@ mod tests {
                 subscription_id: None,
             },
         ] {
-            let err = authorize(&w.db, &accounts, &auth, &target).await.unwrap_err();
+            let err = authorize(&w.db, &accounts, &auth, &target)
+                .await
+                .unwrap_err();
             assert_eq!(err.code, ErrorCode::PermissionDenied);
         }
     }
