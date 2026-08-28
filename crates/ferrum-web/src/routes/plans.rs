@@ -29,6 +29,47 @@ pub struct ListQuery {
     pub offset: Option<i64>,
 }
 
+/// `GET /api/subscriptions` — the tenants themselves.
+///
+/// Deliberately not under `/api/plans`: a subscription exists whether or not a
+/// plan is assigned, and a customer may read their own without holding
+/// `plan_manage`. The plans page derived this list from `site.list` until now,
+/// which made a subscription with no sites invisible and the suspension state
+/// unreadable — suspending leaves the site rows alone on purpose, so the one
+/// thing a client could see was the one thing that does not change.
+#[utoipa::path(
+    get,
+    path = "/api/subscriptions",
+    tag = "subscriptions",
+    params(ListQuery),
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Subscriptions in the caller's scope, each with its owner, site counts and suspension state", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn subscriptions(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::SiteRead)
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        ops::invoke_now(
+            &state,
+            &current.auth,
+            "subscription.list",
+            json!({ "limit": q.limit, "offset": q.offset }),
+        )
+        .await?,
+    ))
+}
+
 /// The plans this caller may see: all of them for an admin, own plus
 /// admin-global for a reseller.
 #[utoipa::path(

@@ -859,6 +859,21 @@ revealing nothing. The reply carries `over_limit` when the subscription already
 holds more sites than the new plan allows, so the UI can say so instead of the
 tenant discovering it at the next create.
 
+### `subscription.list`
+
+`SiteRead`. Immediate. The tenants themselves, scoped: an admin sees every
+subscription, a reseller sees their customers', a customer sees their own.
+
+Each row carries the owner's username, the number of sites it holds, and how
+many of those are actually serving. The site counts exist for the suspension
+confirmation, which has to be able to name the domains that will go dark before
+it asks.
+
+This exists because deriving the list from `site.list` — which the plans page
+did first — cannot work: a subscription with no sites is invisible, and the
+suspension state is unreadable, since suspending deliberately leaves the site
+rows alone and only changes the subscription's own status.
+
 ### `subscription.suspend`
 
 | | |

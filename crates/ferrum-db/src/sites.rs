@@ -481,6 +481,66 @@ impl SiteRepo<'_> {
         self.by_id(id).await
     }
 
+    /// Every site on one subscription, within the caller's scope.
+    ///
+    /// The scope check is not redundant with the subscription id: a customer
+    /// who guessed another tenant's id must get an empty list, not that
+    /// tenant's domains.
+    pub async fn for_subscription(&self, subscription_id: SubscriptionId) -> Result<Vec<Site>> {
+        let rows = match self.scope {
+            ScopeFilter::All => {
+                sqlx::query_as::<_, SiteRow>(
+                    "SELECT * FROM sites WHERE subscription_id = ?1 ORDER BY domain ASC",
+                )
+                .bind(subscription_id.get())
+                .fetch_all(self.db.pool())
+                .await?
+            }
+            ScopeFilter::Reseller(reseller_id) => {
+                sqlx::query_as::<_, SiteRow>(
+                    "SELECT s.* FROM sites s
+                     JOIN subscriptions sub ON sub.id = s.subscription_id
+                     JOIN users u ON u.id = sub.customer_id
+                     WHERE s.subscription_id = ?1 AND u.reseller_id = ?2
+                     ORDER BY s.domain ASC",
+                )
+                .bind(subscription_id.get())
+                .bind(reseller_id)
+                .fetch_all(self.db.pool())
+                .await?
+            }
+            ScopeFilter::Customer(customer_id) => {
+                sqlx::query_as::<_, SiteRow>(
+                    "SELECT s.* FROM sites s
+                     JOIN subscriptions sub ON sub.id = s.subscription_id
+                     WHERE s.subscription_id = ?1 AND sub.customer_id = ?2
+                     ORDER BY s.domain ASC",
+                )
+                .bind(subscription_id.get())
+                .bind(customer_id)
+                .fetch_all(self.db.pool())
+                .await?
+            }
+            ScopeFilter::Subscription {
+                subscription_id: scoped,
+                ..
+            } => {
+                // Asking about a different subscription than the one in scope
+                // is not an error, it is an empty answer.
+                if scoped != subscription_id.get() {
+                    return Ok(Vec::new());
+                }
+                sqlx::query_as::<_, SiteRow>(
+                    "SELECT * FROM sites WHERE subscription_id = ?1 ORDER BY domain ASC",
+                )
+                .bind(subscription_id.get())
+                .fetch_all(self.db.pool())
+                .await?
+            }
+        };
+        rows.into_iter().map(Site::try_from).collect()
+    }
+
     pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<Site>> {
         let limit = limit.clamp(1, 500);
         let rows = match self.scope {
@@ -713,6 +773,30 @@ mod tests {
         let sa = db.create_subscription(a.id).await.unwrap();
         let sb = db.create_subscription(b.id).await.unwrap();
         (db, sa.id, sb.id, a.id, b.id)
+    }
+
+    #[tokio::test]
+    async fn a_customer_guessing_another_tenants_subscription_id_gets_nothing() {
+        // `for_subscription` takes an id from the caller, so the scope filter is
+        // the whole defence: without it, "list the sites on subscription 1"
+        // would be a working cross-tenant read for anyone who can count.
+        let (db, mine, theirs, my_user, _) = seed().await;
+        db.create_site(php_site(theirs, "theirs.example")).await.unwrap();
+        db.create_site(php_site(mine, "mine.example")).await.unwrap();
+
+        let scope = TenantScope::Customer { customer_id: my_user };
+        let stolen = db.sites(&scope).for_subscription(theirs).await.unwrap();
+        assert!(stolen.is_empty(), "another tenant's sites must not be readable");
+
+        let own = db.sites(&scope).for_subscription(mine).await.unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].domain.as_str(), "mine.example");
+
+        // And an admin sees each of them for what they are.
+        assert_eq!(
+            db.sites(&TenantScope::Global).for_subscription(theirs).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

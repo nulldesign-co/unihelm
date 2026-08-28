@@ -94,6 +94,7 @@ fn protected() -> Router<SharedState> {
             axum::routing::patch(plans::update).delete(plans::delete),
         )
         .route("/api/plans/{id}/assign", post(plans::assign))
+        .route("/api/subscriptions", get(plans::subscriptions))
         .route("/api/subscriptions/{id}/suspend", post(plans::suspend))
         .route("/api/subscriptions/{id}/unsuspend", post(plans::unsuspend))
         .route("/api/alerts", get(alerts::events))

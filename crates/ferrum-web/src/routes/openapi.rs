@@ -48,6 +48,7 @@ use crate::auth::CurrentUser;
         super::panel_tls::status,
         super::quota::backend,
         super::plans::list,
+        super::plans::subscriptions,
         super::plans::create,
         super::plans::update,
         super::plans::delete,

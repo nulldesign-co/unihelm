@@ -264,6 +264,7 @@ impl OpRegistry {
         registry.register(crate::sftp::Enable);
         registry.register(crate::sftp::Disable);
         registry.register(crate::plan::List);
+        registry.register(crate::plan::ListSubscriptions);
         registry.register(crate::plan::Create);
         registry.register(crate::plan::Update);
         registry.register(crate::plan::Delete);

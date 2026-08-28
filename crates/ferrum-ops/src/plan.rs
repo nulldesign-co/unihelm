@@ -158,6 +158,98 @@ impl TypedOperation for List {
 }
 
 // ---------------------------------------------------------------------------
+// subscription.list
+// ---------------------------------------------------------------------------
+
+/// `subscription.list` — the tenants themselves, not their sites.
+///
+/// The plans page derived this from `site.list` until now, which had two
+/// consequences it could not fix from the client: a subscription with no sites
+/// was invisible, and the suspension state was unreadable, because suspending
+/// deliberately leaves the site rows alone (see the module docs) — so the one
+/// thing a client could see was the one thing that does not change.
+///
+/// Scoped like every other repository call: a reseller sees their customers'
+/// subscriptions, a customer sees their own.
+pub struct ListSubscriptions;
+
+#[derive(Debug, Deserialize)]
+pub struct ListSubscriptionsInput {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubscriptionView {
+    #[serde(flatten)]
+    pub subscription: Subscription,
+    /// The owner's username, so the UI can name a tenant instead of printing a
+    /// row id at somebody.
+    pub customer_username: Option<String>,
+    /// How many sites it holds, and how many of those are actually serving.
+    /// Suspending stops the serving ones; the confirmation dialog needs to be
+    /// able to say which those are before it asks.
+    pub sites: i64,
+    pub active_sites: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSubscriptionsOutput {
+    pub subscriptions: Vec<SubscriptionView>,
+}
+
+#[async_trait]
+impl TypedOperation for ListSubscriptions {
+    type Input = ListSubscriptionsInput;
+    type Output = ListSubscriptionsOutput;
+
+    const NAME: &'static str = "subscription.list";
+    // Not PlanManage: a customer must be able to see their own subscription and
+    // whether it is suspended. The scope filter is what keeps them to it.
+    const PERMISSION: Permission = Permission::SiteRead;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let db = ctx.db();
+        let subscriptions = db
+            .subscriptions(ctx.scope())
+            .list(input.limit.unwrap_or(200), input.offset.unwrap_or(0))
+            .await
+            .map_err(FerrumError::from)?;
+
+        let mut views = Vec::with_capacity(subscriptions.len());
+        for subscription in subscriptions {
+            let sites = db
+                .sites(ctx.scope())
+                .for_subscription(subscription.id)
+                .await
+                .map_err(FerrumError::from)?;
+            let customer_username = db
+                .users(ctx.scope())
+                .by_id(subscription.customer_id)
+                .await
+                .map_err(FerrumError::from)?
+                .map(|u| u.username.as_str().to_string());
+
+            views.push(SubscriptionView {
+                sites: sites.len() as i64,
+                active_sites: sites
+                    .iter()
+                    .filter(|s| s.status == SiteStatus::Active)
+                    .count() as i64,
+                customer_username,
+                subscription,
+            });
+        }
+        Ok(ListSubscriptionsOutput {
+            subscriptions: views,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // plan.create
 // ---------------------------------------------------------------------------
 
