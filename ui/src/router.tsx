@@ -9,8 +9,11 @@ import { AppShell } from "@/components/app-shell";
 import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { AppsPage } from "@/routes/apps";
+import { BackupsPage } from "@/routes/backups";
+import { CronPage } from "@/routes/cron";
 import { DashboardPage } from "@/routes/dashboard";
 import { DatabasesPage } from "@/routes/databases";
+import { DnsPage } from "@/routes/dns";
 import { FilesPage, validateFilesSearch } from "@/routes/files";
 import { LoginPage } from "@/routes/login";
 import { PlansPage } from "@/routes/plans";
@@ -82,6 +85,24 @@ const plansRoute = createRoute({
   component: PlansPage,
 });
 
+const cronRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cron",
+  component: CronPage,
+});
+
+const backupsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/backups",
+  component: BackupsPage,
+});
+
+const dnsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/dns",
+  component: DnsPage,
+});
+
 const stackRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/stack",
@@ -104,6 +125,9 @@ const routeTree = rootRoute.addChildren([
   appsRoute,
   databasesRoute,
   plansRoute,
+  cronRoute,
+  backupsRoute,
+  dnsRoute,
   stackRoute,
   filesRoute,
 ]);

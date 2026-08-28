@@ -1,5 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Boxes, Database, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Sun, Wallet } from "lucide-react";
+import { Archive, Boxes, Clock, Database, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Network, Sun, Wallet } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -28,6 +28,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       { id: "go-apps", label: t("nav.apps"), run: () => void navigate({ to: "/apps" }) },
       { id: "go-databases", label: t("nav.databases"), run: () => void navigate({ to: "/databases" }) },
       { id: "go-plans", label: t("nav.plans"), run: () => void navigate({ to: "/plans" }) },
+      { id: "go-cron", label: t("nav.cron"), run: () => void navigate({ to: "/cron" }) },
+      { id: "go-backups", label: t("nav.backups"), run: () => void navigate({ to: "/backups" }) },
+      { id: "go-dns", label: t("nav.dns"), run: () => void navigate({ to: "/dns" }) },
       { id: "go-stack", label: t("nav.stack"), run: () => void navigate({ to: "/stack" }) },
       { id: "go-files", label: t("nav.files"), run: () => void navigate({ to: "/files" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
@@ -50,6 +53,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { to: "/databases", label: t("nav.databases"), icon: Database },
     { to: "/files", label: t("nav.files"), icon: FolderOpen },
     { to: "/plans", label: t("nav.plans"), icon: Wallet },
+    { to: "/cron", label: t("nav.cron"), icon: Clock },
+    { to: "/backups", label: t("nav.backups"), icon: Archive },
+    { to: "/dns", label: t("nav.dns"), icon: Network },
     { to: "/stack", label: t("nav.stack"), icon: Layers },
   ];
 
@@ -67,11 +73,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             {t("common.appName")}
           </Link>
 
-          {/* Scrolls rather than pushing the page wide: the panel grew past what
-              fits on a phone, and a body that scrolls sideways is worse than a
-              nav bar that does. */}
+          {/* Scrolls rather than pushing the page wide: the panel has grown
+              past what fits on a phone, and a body that scrolls sideways is
+              worse than a nav bar that does. The negative margin plus matching
+              padding lets the first and last items sit flush while their focus
+              rings still have room. */}
           <nav
-            className="flex min-w-0 items-center gap-1 overflow-x-auto"
+            className="-mx-1 flex min-w-0 items-center gap-1 overflow-x-auto px-1"
             aria-label={t("nav.dashboard")}
           >
             {nav.map((item) => (

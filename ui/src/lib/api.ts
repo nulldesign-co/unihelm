@@ -88,6 +88,8 @@ export const api = {
     request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) }),
   patch: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "PATCH", body: body === undefined ? undefined : JSON.stringify(body) }),
+  put: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: "PUT", body: body === undefined ? undefined : JSON.stringify(body) }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 };
 
@@ -354,6 +356,162 @@ export interface AppLogsResponse {
 /** What the logs modal asks for. The agent clamps anything above 2000. */
 export const DEFAULT_LOG_LINES = 200;
 
+// --- cron -------------------------------------------------------------------
+
+/**
+ * One row of `GET /api/cron`.
+ *
+ * `last_error` is the field the page is built around: a job whose crontab could
+ * not be installed still has a row, still reads `enabled`, and is *not running*.
+ * Nothing else in the response says so.
+ */
+export interface CronJob {
+  id: number;
+  subscription_id: number;
+  schedule: string;
+  command: string;
+  enabled: boolean;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CronListResponse {
+  jobs: CronJob[];
+  max_jobs_per_subscription: number;
+}
+
+export interface CronSetRequest {
+  schedule: string;
+  command: string;
+  /** Create only: an update takes the job's existing subscription. */
+  subscription_id?: number;
+  enabled?: boolean;
+}
+
+export interface CronSetResponse {
+  job: CronJob;
+  /** How many jobs the crontab that was just installed actually schedules. */
+  scheduled: number;
+  linux_user: string;
+}
+
+// --- backups ----------------------------------------------------------------
+
+export type BackupRepoKind = "local" | "s3";
+export type BackupScopeKind = "panel" | "subscription";
+export type BackupRunStatus = "running" | "ok" | "failed";
+
+/**
+ * A repository as the API returns it.
+ *
+ * Note what is missing: there is no password field and no credentials field,
+ * because `ferrum_db::BackupRepo` has none. The password exists in exactly one
+ * response, `RepoInitResponse`, and exactly once.
+ */
+export interface BackupRepo {
+  id: number;
+  kind: BackupRepoKind;
+  label: string;
+  path_or_url: string;
+  has_credentials: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RepoInitRequest {
+  kind: BackupRepoKind;
+  label: string;
+  path_or_url: string;
+  s3?: { access_key_id: string; secret_access_key: string; region?: string };
+}
+
+/** The one response in the panel that carries a secret. See `backups.tsx`. */
+export interface RepoInitResponse {
+  repo_id: number;
+  label: string;
+  kind: BackupRepoKind;
+  repository: string;
+  password: string;
+  password_notice: string;
+}
+
+export interface BackupSchedule {
+  id: number;
+  repo_id: number;
+  scope: BackupScopeKind;
+  subscription_id: number | null;
+  cron: string;
+  keep_daily: number;
+  keep_weekly: number;
+  keep_monthly: number;
+  enabled: boolean;
+}
+
+export interface BackupScheduleRequest {
+  repo_id: number;
+  scope: BackupScopeKind;
+  subscription_id?: number;
+  cron: string;
+  keep_daily?: number;
+  keep_weekly?: number;
+  keep_monthly?: number;
+  enabled?: boolean;
+}
+
+export interface BackupRun {
+  id: number;
+  schedule_id: number | null;
+  repo_id: number;
+  scope: BackupScopeKind;
+  subscription_id: number | null;
+  started_at: string;
+  finished_at: string | null;
+  status: BackupRunStatus;
+  snapshot_id: string | null;
+  bytes: number | null;
+  error: string | null;
+}
+
+export interface BackupSnapshot {
+  id: string;
+  short_id: string;
+  time: string;
+  hostname: string;
+  paths: string[];
+  tags: string[];
+}
+
+// --- dns --------------------------------------------------------------------
+
+export interface DnsNameRecords {
+  name: string;
+  a: string[];
+  aaaa: string[];
+  /** Why there is nothing, when there is nothing: NXDOMAIN ≠ a timeout. */
+  error: string | null;
+}
+
+export interface DnsCheckResponse {
+  domain: string;
+  /** The apex and its `www.` form, in that order. */
+  records: DnsNameRecords[];
+  server_addresses: string[];
+  matches_server: boolean;
+  /** Resolves into Cloudflare's anycast space: not matching is then correct. */
+  proxied_hint: boolean;
+  advice: string;
+}
+
+export interface DnsProviderResponse {
+  id: number;
+  kind: string;
+  label: string;
+  token_status: string;
+  /** Every zone the token administers — the credential's blast radius. */
+  zones: string[];
+}
+
 export const endpoints = {
   login: (username: string, password: string) =>
     api.post<SessionResponse>("/api/auth/login", { username, password }),
@@ -387,6 +545,44 @@ export const endpoints = {
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),
   appLogs: (id: number, lines = DEFAULT_LOG_LINES) =>
     api.get<AppLogsResponse>(`/api/apps/${id}/logs?lines=${lines}`),
+
+  cron: () => api.get<CronListResponse>("/api/cron"),
+  createCronJob: (body: CronSetRequest) => api.post<CronSetResponse>("/api/cron", body),
+  // PUT, not POST: the id comes from the path so a body that echoed a different
+  // one cannot move the edit onto another job (see routes/cron.rs).
+  updateCronJob: (id: number, body: CronSetRequest) =>
+    api.put<CronSetResponse>(`/api/cron/${id}`, body),
+  deleteCronJob: (id: number) =>
+    api.del<{ id: number; subscription_id: number; scheduled: number }>(`/api/cron/${id}`),
+
+  backupRepos: () => api.get<{ repos: BackupRepo[] }>("/api/backups/repos"),
+  createBackupRepo: (body: RepoInitRequest) =>
+    api.post<RepoInitResponse>("/api/backups/repos", body),
+  deleteBackupRepo: (id: number) => api.del<{ id: number }>(`/api/backups/repos/${id}`),
+  backupSnapshots: (repoId: number, subscriptionId?: number) =>
+    api.get<{ repo_id: number; label: string; snapshots: BackupSnapshot[] }>(
+      `/api/backups/repos/${repoId}/snapshots${
+        subscriptionId === undefined ? "" : `?subscription_id=${subscriptionId}`
+      }`,
+    ),
+  backupSchedules: () => api.get<{ schedules: BackupSchedule[] }>("/api/backups/schedules"),
+  createBackupSchedule: (body: BackupScheduleRequest) =>
+    api.post<{ schedule: BackupSchedule }>("/api/backups/schedules", body),
+  deleteBackupSchedule: (id: number) => api.del<{ id: number }>(`/api/backups/schedules/${id}`),
+  backupRuns: (limit = 50) => api.get<{ runs: BackupRun[] }>(`/api/backups/runs?limit=${limit}`),
+  runBackup: (body: { repo_id: number; scope: BackupScopeKind; subscription_id?: number }) =>
+    api.post<TaskAccepted>("/api/backups/runs", body),
+  restoreBackup: (body: { repo_id: number; snapshot_id: string }) =>
+    api.post<TaskAccepted>("/api/backups/restores", body),
+
+  dnsCheck: (domain: string) =>
+    api.get<DnsCheckResponse>(`/api/dns/check?domain=${encodeURIComponent(domain)}`),
+  // An upsert keyed on (kind, label): re-sending a label rotates that credential
+  // in place rather than leaving a revoked row behind to be tried first.
+  setDnsProvider: (body: { kind: string; label: string; token: string }) =>
+    api.put<DnsProviderResponse>("/api/dns/provider", body),
+  issueWildcardCertificate: (siteId: number, staging: boolean) =>
+    api.post<TaskAccepted>(`/api/sites/${siteId}/certificate-wildcard`, { staging }),
 };
 
 /** PHP versions the panel knows about, newest first. */
