@@ -21,12 +21,14 @@ pub mod health;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
-pub mod quota;
 pub mod plans;
+pub mod plugins;
+pub mod quota;
 pub mod server;
 pub mod sites;
 pub mod stack;
 pub mod tasks;
+pub mod webhooks;
 pub mod wordpress;
 pub mod waf;
 
@@ -179,6 +181,24 @@ fn protected() -> Router<SharedState> {
         .route("/api/waf/disable", post(waf::disable))
         .route("/api/waf/rules", axum::routing::put(waf::rules_set))
         .route("/api/server/security-posture", get(waf::security_posture))
+        .route(
+            "/api/webhooks",
+            get(webhooks::list).post(webhooks::create),
+        )
+        .route(
+            "/api/webhooks/{id}",
+            get(webhooks::detail)
+                .put(webhooks::update)
+                .delete(webhooks::delete),
+        )
+        .route("/api/webhooks/{id}/test", post(webhooks::test))
+        .route("/api/plugins", get(plugins::list).post(plugins::install))
+        .route(
+            "/api/plugins/{slug}",
+            axum::routing::delete(plugins::remove),
+        )
+        .route("/api/plugins/{slug}/enable", post(plugins::enable))
+        .route("/api/plugins/{slug}/disable", post(plugins::disable))
 }
 
 /// Routes reachable without a session.

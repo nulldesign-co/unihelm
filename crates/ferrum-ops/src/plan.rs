@@ -709,6 +709,21 @@ impl TypedOperation for Suspend {
 
         let sites_switched = switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, true).await?;
 
+        // Billing systems integrate through webhooks rather than through a
+        // billing module the panel will never grow (spec §2.4), and
+        // "this tenant is now suspended" is the event they exist for.
+        crate::webhook::emit(
+            ctx,
+            "subscription.suspended",
+            serde_json::json!({
+                "subscription_id": subscription.id.get(),
+                "linux_user": subscription.linux_user,
+                "reason": reason,
+                "sites_switched": sites_switched,
+            }),
+        )
+        .await;
+
         Ok(SuspendOutput {
             subscription_id: subscription.id.get(),
             status: SubscriptionStatus::Suspended,

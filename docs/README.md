@@ -11,5 +11,9 @@
 - **API**
   - [Operations](operations.md) — every registered operation, its permission and its inputs
   - [Error codes](api/errors.md) — generated from the source
+  - [API versioning](api-versioning.md) — what may change without a version bump, and what may not
+- **Extending Ferrum**
+  - [Webhooks](webhooks.md) — the signature scheme, the delivery guarantees and the event catalogue
+  - [Plugins](plugins.md) — the sidecar contract: manifest, trust model and socket protocol
 
 The full product specification lives at [`../FERRUM_SPEC_1.md`](../FERRUM_SPEC_1.md).

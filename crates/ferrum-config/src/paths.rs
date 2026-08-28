@@ -387,6 +387,65 @@ pub fn nginx_waf() -> PathBuf {
     nginx_dir().join("03-waf.conf")
 }
 
+// ---------------------------------------------------------------------------
+// Plugins (spec §6 plugin note, §14 Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Where installed plugin payloads live.
+///
+/// Under the panel's data directory, root-owned, and **never** inside a tenant
+/// home or a webroot — the same reasoning as Adminer and the WP-CLI phar. A
+/// plugin's own unprivileged account may read and execute what is here; it must
+/// never be able to replace it, because the agent starts that code as a service.
+pub fn plugin_root() -> PathBuf {
+    data_dir().join("plugins")
+}
+
+/// One plugin's installed tree: `/var/lib/ferrum/plugins/<slug>`.
+pub fn plugin_dir(slug: &str) -> PathBuf {
+    plugin_root().join(slug)
+}
+
+/// The manifest inside an installed (or staged) plugin tree.
+pub fn plugin_manifest(dir: &Path) -> PathBuf {
+    dir.join("plugin.toml")
+}
+
+/// The detached minisign signature over the manifest.
+pub fn plugin_signature(dir: &Path) -> PathBuf {
+    dir.join("plugin.toml.minisig")
+}
+
+/// The runtime directory systemd creates for one plugin, owned by the plugin's
+/// own account so the sidecar can bind its socket inside it.
+///
+/// Under `/run` so it is recreated on boot and never leaves a stale socket
+/// behind, exactly like the FPM socket directory.
+pub fn plugin_runtime_dir(slug: &str) -> PathBuf {
+    under("/run/ferrum/plugins").join(slug)
+}
+
+/// The UDS the agent dials to reach one plugin.
+pub fn plugin_socket(slug: &str) -> PathBuf {
+    plugin_runtime_dir(slug).join("plugin.sock")
+}
+
+/// The `RuntimeDirectory=` value for a plugin unit — a path *relative to*
+/// `/run`, which is what systemd expects, and never rooted for development.
+pub fn plugin_runtime_dir_relative(slug: &str) -> String {
+    format!("ferrum/plugins/{slug}")
+}
+
+/// The unit file name for one plugin's sidecar.
+pub fn plugin_unit_file_name(slug: &str) -> String {
+    format!("ferrum-plugin-{slug}.service")
+}
+
+/// `/etc/systemd/system/ferrum-plugin-<slug>.service`.
+pub fn plugin_unit(slug: &str) -> PathBuf {
+    systemd_unit(&plugin_unit_file_name(slug))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

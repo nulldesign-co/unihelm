@@ -14,16 +14,25 @@ ferrum-metrics = { workspace = true }
 async-trait = { workspace = true }
 # Verifying the Adminer download against its pinned sha256 (spec §11.4).
 hex = { workspace = true }
+# HMAC-SHA256 signatures over webhook deliveries (spec §14 Phase 6).
+hmac = { workspace = true }
 sha2 = { workspace = true }
 # Show-once database passwords (spec §11.4): thread_rng is a CSPRNG.
 rand = { workspace = true }
 base64 = { workspace = true }
+# Verifying minisign signatures on plugin manifests in-process.
+blake2 = { workspace = true }
+ed25519-dalek = { workspace = true }
 flate2 = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true }
+# The plugin sidecar contract reuses the panel IPC framing rather than
+# inventing a second protocol (spec §6 plugin note).
+ferrum-ipc = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 zip = { workspace = true }
 zstd = { workspace = true }

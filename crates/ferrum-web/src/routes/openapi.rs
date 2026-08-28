@@ -19,16 +19,44 @@ use utoipa::{Modify, OpenApi};
 
 use crate::auth::CurrentUser;
 
+/// The version of the **API contract**, not of the panel binary.
+///
+/// Spec §14 Phase 6 asks for a "public API stability guarantee + versioning".
+/// A version is only half of that; the other half is a written policy saying
+/// what it promises, which lives in `docs/api-versioning.md` and is summarised
+/// in this document's `info.description`. Semver, read as:
+///
+/// * **patch** — the document got more accurate. Descriptions, examples, a
+///   response field that was always there being written down.
+/// * **minor** — something was *added*: a new endpoint, a new optional request
+///   field, a new field in a response, a new enum value in a field the docs
+///   already describe as open. A client written against an earlier minor keeps
+///   working.
+/// * **major** — something a client could depend on changed or went away.
+///
+/// Deliberately decoupled from `CARGO_PKG_VERSION`: tying the two would mean
+/// every panel release claimed an API change, which makes the number useless
+/// for the one thing it is for — telling an integrator whether they have to
+/// read anything.
+pub const API_VERSION: &str = "1.0.0";
+
 /// The whole documented surface. Handlers are listed here and annotated where
 /// they live; referenced request/response schemas are collected automatically.
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "Ferrum Panel API",
+        version = API_VERSION,
         description = "Everything the UI can do goes through these endpoints \
             (spec §2.6) — there is no private channel, so this document is the \
             product surface. Errors always carry the `FER-xxxx` envelope \
-            (`ApiErrorBody`); clients should branch on the `slug`.",
+            (`ApiErrorBody`); clients should branch on the `slug`.\n\n\
+            **Stability.** This document's `info.version` is the API contract \
+            version (semver), independent of the panel release it ships in. \
+            What may change inside a minor bump, what may not, and how a \
+            breaking change would be announced are written down in \
+            `docs/api-versioning.md` (spec §14 Phase 6: \"public API stability \
+            guarantee + versioning\").",
     ),
     paths(
         super::auth::login,
@@ -108,6 +136,17 @@ use crate::auth::CurrentUser;
         super::waf::disable,
         super::waf::rules_set,
         super::waf::security_posture,
+        super::webhooks::list,
+        super::webhooks::detail,
+        super::webhooks::create,
+        super::webhooks::update,
+        super::webhooks::delete,
+        super::webhooks::test,
+        super::plugins::list,
+        super::plugins::install,
+        super::plugins::enable,
+        super::plugins::disable,
+        super::plugins::remove,
         document,
     ),
     modifiers(&SecurityAddon),
@@ -128,6 +167,8 @@ use crate::auth::CurrentUser;
         (name = "backups", description = "restic repositories, schedules, run history and restores"),
         (name = "wordpress", description = "The WordPress toolkit: install, detect, core and plugin updates, and the restricted WP-CLI passthrough"),
         (name = "waf", description = "ModSecurity: module availability, per-site policy and rule exclusions"),
+        (name = "webhooks", description = "Outbound event delivery: registered endpoints, their signing secrets, and the delivery history"),
+        (name = "plugins", description = "Sidecar plugins: installing a verified payload, and starting or stopping its unprivileged process"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]
@@ -281,6 +322,49 @@ mod tests {
             "spec §13 says OpenAPI 3.1, got {version:?}"
         );
         assert!(doc["paths"].is_object());
+    }
+
+    /// Spec §14 Phase 6 promises a "public API stability guarantee +
+    /// versioning". A generated client reads `info.version` to decide whether
+    /// it has to change, so an absent or default version is the same as no
+    /// guarantee at all.
+    #[test]
+    fn the_document_declares_an_explicit_semver_api_version() {
+        let doc = document();
+        let version = doc["info"]["version"]
+            .as_str()
+            .expect("info.version must be a string");
+        assert_eq!(version, API_VERSION);
+
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(parts.len(), 3, "the API version must be semver: {version}");
+        for part in parts {
+            assert!(
+                !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()),
+                "`{part}` is not a semver component in {version}"
+            );
+        }
+
+        // Decoupled from the binary on purpose: tying them would make every
+        // panel release claim an API change (see API_VERSION's own docs).
+        assert_ne!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "the API contract version must not be the crate version"
+        );
+    }
+
+    /// The policy is half the promise: a version with nothing written down
+    /// beside it is only a number, so the document names the document that
+    /// explains what it guarantees.
+    #[test]
+    fn the_document_points_at_the_written_stability_policy() {
+        let doc = document();
+        let description = doc["info"]["description"].as_str().unwrap_or_default();
+        assert!(
+            description.contains("docs/api-versioning.md"),
+            "info.description must name the policy document: {description}"
+        );
     }
 
     #[test]

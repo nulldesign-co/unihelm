@@ -295,6 +295,20 @@ impl TypedOperation for Create {
                     .map_err(FerrumError::from)?;
                 ctx.log(format!("{} is live", site.domain));
 
+                // Tell whoever is integrating (spec §2.4, §14 Phase 6). Never
+                // fatal: a site that is live is live whether or not a
+                // notification could be queued.
+                crate::webhook::emit(
+                    ctx,
+                    "site.created",
+                    serde_json::json!({
+                        "site_id": site.id.get(),
+                        "domain": site.domain.to_string(),
+                        "subscription_id": site.subscription_id.get(),
+                    }),
+                )
+                .await;
+
                 Ok(CreateOutput {
                     site_id: site.id.get(),
                     domain: site.domain.clone(),
@@ -922,6 +936,20 @@ impl TypedOperation for Delete {
             .delete(id)
             .await
             .map_err(FerrumError::from)?;
+
+        // After the row is gone, so a receiver that reacts by listing sites
+        // sees a world consistent with the message (spec §14 Phase 6).
+        crate::webhook::emit(
+            ctx,
+            "site.deleted",
+            serde_json::json!({
+                "site_id": id.get(),
+                "domain": site.domain,
+                "files_removed": input.purge_files,
+            }),
+        )
+        .await;
+
         Ok(DeleteOutput {
             domain: site.domain,
             files_removed: input.purge_files,

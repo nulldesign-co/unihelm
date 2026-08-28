@@ -76,6 +76,17 @@ const JOBS: &[(&str, Duration, Duration)] = &[
         Duration::seconds(60),
         Duration::seconds(10),
     ),
+    // Webhook delivery (spec §14 Phase 6). Thirty seconds is the finest the
+    // 30 s `TICK` can actually honour, and it matters: the first retry after a
+    // failed delivery waits thirty seconds, so a slower job would turn every
+    // transient failure into a minutes-long delay for an integration that is
+    // watching for "backup failed". The pass is cheap when the queue is empty —
+    // one indexed query that returns nothing.
+    (
+        "webhook.deliver",
+        Duration::seconds(30),
+        Duration::seconds(5),
+    ),
 ];
 
 pub struct Scheduler {
@@ -169,6 +180,7 @@ impl Scheduler {
             "sentinel.scan" => self.sentinel_scan().await,
             "alerts.evaluate" => self.evaluate_alerts().await,
             "backup.scheduler" => self.run_due_backups().await,
+            "webhook.deliver" => self.deliver_webhooks().await,
             // A job left in the database by an older version. Not an error; it
             // simply has no handler any more.
             other => {
@@ -505,6 +517,26 @@ impl Scheduler {
     }
 
     // -----------------------------------------------------------------------
+    // webhooks
+    // -----------------------------------------------------------------------
+
+    /// Drain whatever webhook deliveries are due (spec §14 Phase 6).
+    ///
+    /// Not a Task, for the same reason as the alert and backup passes above: it
+    /// wakes twice a minute and decides there is nothing to send on almost all
+    /// of them. What a delivery *did* is recorded on its `webhook_deliveries`
+    /// row — attempts, last error, response status — which is the history the
+    /// webhooks page reads and the record an integrator needs when the question
+    /// is "did you ever send it".
+    async fn deliver_webhooks(&self) -> Result<String, String> {
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("webhook.deliver"),
+        );
+        ferrum_ops::webhook::delivery_tick(&ctx).await
+    }
+
+    // -----------------------------------------------------------------------
     // retention
     // -----------------------------------------------------------------------
 
@@ -541,10 +573,20 @@ impl Scheduler {
         // old it is (spec §11.11).
         let alerts = db.purge_alert_events(days).await.map_err(|e| e.to_string())?;
 
-        Ok(if n == 0 && alerts == 0 {
+        // Terminal webhook deliveries age out on the same sweep and the same
+        // setting. The queue is a queue, not a history: a panel that has been
+        // up for two years should not still be carrying the delivered rows of
+        // its first week (spec §14 Phase 6). Pending rows are never touched —
+        // they are current state, however old they are.
+        let deliveries = db.purge_deliveries(days).await.map_err(|e| e.to_string())?;
+
+        Ok(if n == 0 && alerts == 0 && deliveries == 0 {
             String::new()
         } else {
-            format!("purged {n} audit row(s) and {alerts} resolved alert(s)")
+            format!(
+                "purged {n} audit row(s), {alerts} resolved alert(s) and \
+                 {deliveries} finished webhook deliver(ies)"
+            )
         })
     }
 
