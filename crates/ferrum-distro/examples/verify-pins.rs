@@ -1,12 +1,21 @@
-//! Verify every pinned repository fingerprint against the key the vendor is
-//! actually serving today.
+//! Verify every pinned repository fingerprint — and every repository URL —
+//! against what the vendor is actually serving today.
 //!
 //!     cargo run -p ferrum-distro --example verify-pins
 //!
 //! This is the check that turns a researched fingerprint into a confirmed one.
+//! It also fetches the metadata index each repository would be added with,
+//! because a correct key on an unreachable URL is still a broken install: the
+//! panel once shipped a MariaDB repository whose host answers package managers
+//! with 403, the key verified perfectly, and the unit test asserted the broken
+//! host by name and passed for as long as the feature was broken. A URL test
+//! that never leaves the process cannot catch that; this one can.
 //! It is an example rather than a test because it needs the network, and a test
 //! suite that fails when a vendor's CDN hiccups is a test suite people learn to
-//! ignore.
+//! ignore. That is not hypothetical: two consecutive runs of this file
+//! disagreed by two failures purely on transient fetch errors, and the second
+//! run was clean. Read a non-zero count as "look at these", not "the pin is
+//! wrong" — the line above each failure says which it was.
 
 use ferrum_distro::detect::{Arch, DistroInfo, Family};
 use ferrum_distro::pgp;
@@ -33,9 +42,9 @@ async fn main() {
     let mut checked = std::collections::BTreeSet::new();
     let mut failures = 0;
 
-    for (label, info) in targets {
+    for (label, info) in &targets {
         println!("\n=== {label} ===");
-        for repo in ferrum_distro::repos::catalogue(&info) {
+        for repo in ferrum_distro::repos::catalogue(info) {
             let url = repo.definition.gpg_key_url.clone();
             let key = (repo.definition.id.clone(), url.clone());
             if checked.contains(&key) {
@@ -80,6 +89,41 @@ async fn main() {
                 Ok(matched) => println!("    PIN OK -> {}", matched.fingerprint),
                 Err(e) => {
                     println!("    PIN MISMATCH: {e}");
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    // The metadata index each repository would actually be fetched from.
+    //
+    // Debian and RHEL address a repository differently, so the URL a package
+    // manager would request is built here the same way the sources entry or the
+    // .repo file builds it — anything else would verify a URL nothing uses.
+    println!("\n=== repository metadata ===");
+    let mut seen_urls = std::collections::BTreeSet::new();
+    for (label, info) in &targets {
+        for repo in ferrum_distro::repos::catalogue(info) {
+            let d = &repo.definition;
+            let url = match (&d.suite, info.family) {
+                (Some(suite), Family::Debian) => {
+                    format!("{}/dists/{suite}/Release", d.base_url.trim_end_matches('/'))
+                }
+                _ => format!("{}/repodata/repomd.xml", d.base_url.trim_end_matches('/')),
+            };
+            if !seen_urls.insert(url.clone()) {
+                continue;
+            }
+            match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {:<10} {:<22} 200  {url}", d.id, label);
+                }
+                Ok(r) => {
+                    println!("  {:<10} {:<22} HTTP {}  {url}", d.id, label, r.status());
+                    failures += 1;
+                }
+                Err(e) => {
+                    println!("  {:<10} {:<22} unreachable: {e}  {url}", d.id, label);
                     failures += 1;
                 }
             }
