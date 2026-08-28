@@ -7,6 +7,7 @@ import { Field, Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { applyLanguage, LANGUAGES } from "@/i18n";
 import { ApiError } from "@/lib/api";
+import { assetUrl, safeSupportUrl, useApplyBranding, useBranding } from "@/lib/branding";
 import { useSession } from "@/lib/session";
 
 interface LoginForm {
@@ -18,6 +19,14 @@ export function LoginPage() {
   const { t, i18n } = useTranslation();
   const { signIn } = useSession();
   const [formError, setFormError] = useState<string | null>(null);
+  // The one place branding has to work without a session, which is why
+  // `GET /api/branding` is the panel's single unauthenticated read
+  // (spec §11.19). An unbranded panel renders the product's own identity.
+  const branding = useBranding();
+  useApplyBranding(branding);
+  const logo = assetUrl(branding, "logo");
+  const background = assetUrl(branding, "login_background");
+  const support = safeSupportUrl(branding.support_url);
 
   const {
     register,
@@ -43,16 +52,32 @@ export function LoginPage() {
   });
 
   return (
-    <div className="flex min-h-dvh flex-col items-center justify-center bg-canvas px-4">
+    <div
+      className="flex min-h-dvh flex-col items-center justify-center bg-canvas bg-cover bg-center px-4"
+      // A background image only when one was uploaded; otherwise the property
+      // is absent rather than set to `none`, so the canvas colour shows.
+      style={background ? { backgroundImage: `url("${background}")` } : undefined}
+    >
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
-          <span
-            className="mx-auto mb-4 grid h-11 w-11 place-items-center rounded-xl bg-accent text-lg font-bold text-on-accent"
-            aria-hidden
-          >
-            F
-          </span>
-          <h1 className="text-xl font-semibold tracking-tight text-ink">{t("login.title")}</h1>
+          {logo ? (
+            <img
+              src={logo}
+              alt=""
+              aria-hidden
+              className="mx-auto mb-4 h-11 max-w-48 object-contain"
+            />
+          ) : (
+            <span
+              className="mx-auto mb-4 grid h-11 w-11 place-items-center rounded-xl bg-accent text-lg font-bold text-on-accent"
+              aria-hidden
+            >
+              F
+            </span>
+          )}
+          <h1 className="text-xl font-semibold tracking-tight text-ink">
+            {branding.panel_name ?? t("login.title")}
+          </h1>
           <p className="mt-1 text-sm text-ink-muted">{t("login.subtitle")}</p>
         </div>
 
@@ -100,6 +125,22 @@ export function LoginPage() {
             )}
           </Button>
         </form>
+
+        {support ? (
+          <p className="mt-4 text-center text-sm">
+            {/* `noreferrer` as well as `noopener`: the support URL belongs to
+                the reseller, and the panel's own address is not theirs to
+                collect from a Referer header. */}
+            <a
+              href={support}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-accent hover:underline"
+            >
+              {t("login.support")}
+            </a>
+          </p>
+        ) : null}
 
         <div className="mt-6 flex justify-center gap-2">
           {LANGUAGES.map((language) => (

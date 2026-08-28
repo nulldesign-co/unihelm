@@ -60,6 +60,9 @@ time = { workspace = true }
 sha-crypt = { workspace = true }
 x509-parser = "0.18.1"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
+# The outbound SMTP relay's TLS (spec §11.18). Same provider as above.
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

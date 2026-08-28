@@ -327,6 +327,11 @@ impl OpRegistry {
         registry.register(crate::importer::Plan);
         registry.register(crate::importer::List);
         registry.register(crate::importer::Apply::live());
+        registry.register(crate::mail::RelayGet);
+        registry.register(crate::mail::RelaySet::live());
+        registry.register(crate::mail::RelayTest);
+        registry.register(crate::branding::Get);
+        registry.register(crate::branding::Set);
         registry
     }
 

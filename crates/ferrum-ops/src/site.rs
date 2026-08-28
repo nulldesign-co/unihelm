@@ -370,11 +370,46 @@ async fn provision_site(
 }
 
 /// Render and activate a site's PHP-FPM pool.
+///
+/// Picks up the configured mail relay on the way, so a site created after the
+/// relay was set gets `sendmail_path` without anybody re-running
+/// `mail.relay.set` (spec §11.18). A relay that is absent, switched off, or
+/// missing its sendmail agent renders no directive at all — see
+/// `mail::write_site_relay`.
 pub async fn render_pool(
     ctx: &OpContext,
     site: &Site,
     linux_user: &ferrum_core::LinuxUser,
     version: PhpVersion,
+) -> Result<()> {
+    let relay = ctx.db().mail_relay().await.map_err(FerrumError::from)?;
+    let sendmail = crate::mail::write_site_relay(ctx, &site.domain, linux_user, relay.as_ref())
+        .await
+        // Mail is not worth failing a site creation over: a site that serves
+        // but cannot send is a support ticket, a site that does not exist is
+        // an outage.
+        .unwrap_or_else(|e| {
+            ctx.log(format!(
+                "could not write the mail relay configuration for {}: {e}. The site is fine; \
+                 its PHP mail() will not work until this is fixed.",
+                site.domain
+            ));
+            None
+        });
+    render_pool_with_mail(ctx, site, linux_user, version, sendmail).await
+}
+
+/// [`render_pool`], with the mail wiring already decided by the caller.
+///
+/// Split out for `mail.relay.set`, which writes every site's relay
+/// configuration itself and must not have each pool re-read the relay row it
+/// just wrote.
+pub async fn render_pool_with_mail(
+    ctx: &OpContext,
+    site: &Site,
+    linux_user: &ferrum_core::LinuxUser,
+    version: PhpVersion,
+    sendmail_path: Option<String>,
 ) -> Result<()> {
     let distro = ctx.distro();
     let family = distro.info.family;
@@ -395,6 +430,7 @@ pub async fn render_pool(
         provision::nginx_user(distro),
     );
     pool.extra_ini = site.php_ini_overrides.clone();
+    pool.sendmail_path = sendmail_path;
 
     ctx.config()
         .apply(ApplyRequest {

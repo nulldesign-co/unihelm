@@ -81,6 +81,12 @@ const TEMPLATES: &[(&str, &str)] = &[
         "nginx/load-module.conf",
         include_str!("../templates/nginx/load-module.conf.j2"),
     ),
+    // The per-site outbound relay configuration (spec §11.18). Not a script:
+    // the panel never renders something it would then execute through a shell.
+    (
+        "mail/msmtprc",
+        include_str!("../templates/mail/msmtprc.j2"),
+    ),
     // Not nginx syntax: this is the ModSecurity rules file nginx's
     // `modsecurity_rules_file` points at (spec §11.9).
     (

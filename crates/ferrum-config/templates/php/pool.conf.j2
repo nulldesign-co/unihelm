@@ -95,6 +95,21 @@ php_admin_value[opcache.revalidate_freq] = 2
 ; Per-site cache file, so one tenant's opcache cannot be read by another.
 php_admin_value[opcache.file_cache] = {{ pool.tmp_dir }}/opcache
 
+; --- outbound mail --------------------------------------------------------
+{% if pool.sendmail_path %}
+; PHP's mail() with an external relay (spec §11.18). `php_admin_value` rather
+; than `php_value`: a script that could ini_set() its way to another
+; sendmail_path could run a program of its own choosing as this tenant.
+;
+; Rendered only while a relay is configured and enabled. There is no fallback
+; line: an empty sendmail_path makes mail() run nothing and return true, so
+; every message would be reported as sent.
+php_admin_value[sendmail_path] = {{ pool.sendmail_path }}
+{% else %}
+; No relay is configured, so nothing overrides PHP's own sendmail_path and
+; mail() fails the way an unconfigured server should.
+{% endif %}
+
 ; --- environment ----------------------------------------------------------
 ; FPM clears the environment by default; PATH is the one thing scripts that
 ; shell out reasonably expect to find.

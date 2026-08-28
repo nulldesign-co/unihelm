@@ -2223,143 +2223,6 @@ is true. The history is the last 50 attempts with their status, attempt count,
 response code and last error.
 
 ### `webhook.set`
-## Migration importers
-
-The `import.*` operations are `ferrum_ops::importer` (spec §11.15). They bring
-an account in from cPanel (a `cpmove`/full-backup tarball) or from aaPanel (its
-SQLite inventory plus `/www/wwwroot`). Five properties decide how all three
-behave.
-
-**The dry run is the feature.** An import is two steps and the first one
-changes nothing: `import.plan` reads the source and produces the complete
-mapping — which domains become which sites, which databases and users, which
-files, and an explicit list of everything that does *not* map — then stores that
-document and returns its id. `import.apply` takes the id and executes **the
-stored document**. It never re-scans, because if "apply" meant "read the source
-again and do whatever it says now" then the thing the operator reviewed and the
-thing that ran would be two different objects. The source is reopened only to
-fetch payload bytes, and only after its SHA-256 still matches what the plan was
-derived from; a source that changed answers `FER-1403 conflict` naming both
-hashes. For cPanel that hash is the tarball's own bytes. For aaPanel it is
-deliberately *not* the bytes of `default.db` — aaPanel is still running and
-rewrites that file constantly, so a byte hash would make every plan stale within
-minutes for reasons unrelated to the import; it is a hash over the inventory the
-mapping was read from (each site's name and document root, and each database's
-name), so a site added, removed or moved invalidates the plan and a heartbeat
-does not.
-
-**What does not map is listed per object, with a reason.** Mail accounts (by
-address, read from `homedir/etc/<domain>/passwd` — never from `shadow` next to
-it), stored mail, DNS zones, TLS certificates and private keys, cron entries,
-FTP accounts, Mailman lists, autoresponders, PostgreSQL dumps, bandwidth
-counters, and every credential. A migration tool that silently drops mailboxes
-is how somebody loses their email, so the `unmapped` list is a first-class part
-of the plan and the module's tests assert that each kind appears in it.
-
-**A hostile tarball is the expected input, and nothing is extracted to plan
-it.** `importer::scan` walks the archive read-only and shares the file
-manager's guards rather than restating them: entry names go through
-`fsops::archive::split_entry_name` (so `..`, absolute paths, `\` separators and
-NUL are refused, never normalised), and the entry count, total uncompressed size
-and compression ratio are counted by `fsops::archive::Budget` against the same
-`Limits` — 100 000 entries, 10 GB, 200:1 plus 1 MB of grace. Symlink, hardlink
-and device entries are recorded and never created. An entry name that is not
-valid UTF-8 is skipped rather than lossily converted, because a mangled name
-that then passes the component checks is a name nobody reviewed.
-
-**Payload files reach a tenant through `fs.extract`, as the tenant.** Apply
-re-tars exactly the subtree the plan named into a staging archive in the tenant
-home (`O_CREAT|O_EXCL|O_NOFOLLOW`, so a name the tenant planted first cannot be
-written through), then hands it to the existing `fs.extract` operation, which
-unpacks it in the privilege-dropped helper and applies every archive guard a
-second time. No root process ever writes a file whose name came from the
-archive — which matters more than it looks: `O_NOFOLLOW` defeats a symlink but
-not a *hardlink*, and a root extractor truncating a tenant's hardlink to
-`/etc/shadow` would be a server takeover. As the tenant it is a permission
-error. The staging archive stays root-owned, mode 0644 (the helper only reads
-it, and root ownership keeps it out of the tenant's quota while it exists) and
-is removed as soon as the extract returns. For an aaPanel site, whose files are
-a directory on this server rather than a tarball member, the staging archive is
-built by `fsops::archive::compress` — the same walker the file manager uses,
-which skips every symlink it meets, so an `uploads -> /etc` inside a source site
-is not followed.
-
-**A dump is loaded as the database's own new user, never as root.** A dump is a
-script somebody else wrote; run as `root@localhost` it could drop another
-tenant's database or create an account. The importer creates the database and
-its user through `db.user.create` and `db.create` — so the plan's `max_dbs`
-limit, the engine-ready check and the name-collision refusal all apply to an
-import exactly as they do to a click — and then runs `mariadb
---defaults-file=… --database=<name>` with the dump on **stdin**. The
-credentials are in a 0600 file inside a 0700 directory under
-`/var/lib/ferrum/state/import`, removed when the load returns, because
-`--password=` on an argv is world-readable in `/proc/<pid>/cmdline`. `--database`
-binds the session to one schema, so a dump that says `USE somebody_else` fails
-on privileges rather than succeeding. Dumps travel as bytes, not as a `String`:
-a mysqldump of a table with binary columns is not valid UTF-8 and a lossy
-conversion would silently corrupt the data being imported.
-
-**No credential is ever read.** Not cPanel's `shadow`, not the password hashes
-in its `mysql.sql` grants, not aaPanel's plaintext `databases.password` column.
-Every imported database gets a new user with a new password. That password
-exists only in memory for the length of the load and is then dropped: a task's
-`input_json` and logs persist, and a task's *output* never reaches the caller at
-all (the response is a task id), so there is no honest channel for it to travel
-on. Set a real one afterwards with `db.user.password`, which is Immediate and
-shows it once.
-
-All three operations need `server_manage`, which is administrator-only. That is
-not because the mapping is dangerous but because the input is an arbitrary
-absolute path on the server and the output describes what is in it: a
-server-wide read takes a server-wide permission.
-
-### `import.plan`
-
-| | |
-|---|---|
-| Permission | `server_manage` |
-| Execution | task (cancellable, idempotent) |
-| Input | `source` *(object)*, `subscription_id` *(i64)*, `php_version` *(optional)* |
-
-`source` is a tagged object and a closed set:
-`{"kind":"cpanel","path":"/root/cpmove-bob.tar.gz"}` or
-`{"kind":"aapanel","root":"/www"}` (`root` defaults to `/www`). The path must be
-absolute, must not contain `..` and must exist; a relative path would resolve
-against whatever directory the agent happens to be running in.
-`subscription_id` is required and not defaulted — an administrator running an
-import usually has no subscription of their own, and "wherever" is not an answer
-to whose account this becomes. `php_version` is the version imported PHP sites
-are created with when the source's own version is unknown or is one Ferrum does
-not offer (`ea-php56` is read, recognised as unsupported, and reported).
-
-Reads the source, writes one `import_plans` row and answers with `plan_id` and
-the whole plan. Because it is a task, the plan is read back with `import.list`
-rather than from the task; nothing on the server has changed, so re-running it
-is always safe and simply produces a second plan.
-
-For cPanel it reads `cp/<user>`, `userdata/main` and `userdata/<domain>` (a
-deliberately small YAML subset — `key: value`, indented `- item` sequences,
-indented `key: value` maps, and the inline empties `{}` and `[]`; a general YAML
-parser would be a large attack surface pointed at somebody else's file, and what
-the subset cannot read is reported as unmapped rather than guessed). A domain
-whose document root is not inside the account's home is unmapped: it is not in
-the archive at all. An addon domain's internal subdomain (`addon.example.com`
-for `addon.com`) is *not* made a second site — two sites serving one directory
-would fight over the vhost. Parked domains become aliases of the main site.
-
-For aaPanel it opens `<root>/server/panel/data/default.db` **read-only and
-immutable** — it belongs to a panel that may still be running, and `immutable=1`
-also stops SQLite from recovering a hot journal, which is a write — and reads
-`sites`, `domain`, `databases` (never the `password` column), `ftps` and
-`crontab`. Document roots must be under `<root>/wwwroot`; PHP versions come from
-the site's nginx vhost (`enable-php-74.conf`, `php-cgi-74.sock`). Every aaPanel
-plan carries two notes, because both are true and neither is obvious: aaPanel
-still owns its own nginx and its vhosts must go before Ferrum can serve those
-domains, and the imported databases are *copies* under new names in the same
-MariaDB, so each application's configuration has to be repointed or it will keep
-using the aaPanel copy.
-
-### `import.list`
 
 | | |
 |---|---|
@@ -2398,17 +2261,6 @@ rather than as a read-then-write, so two concurrent creates cannot both see
 "19 hooks" and both insert; past it the answer is `FER-1403 conflict`.
 
 ### `webhook.delete`
-| Input | `plan_id` *(optional i64)*, `limit` *(optional, default 50)*, `offset` *(optional)* |
-
-Stored plans, newest first. Without `plan_id` it returns summaries — id, source,
-totals, whether it has been applied — because a list page showing fifty full
-mappings would be megabytes of JSON nobody reads. With `plan_id` it returns that
-one plan's full document *and* its outcome, which is how the result of an apply
-is read: an applied plan carries a per-step record of what worked and what did
-not. Plans are scoped through the subscription they target, so a plan outside
-the caller's scope reads as `not_found`.
-
-### `import.apply`
 
 | | |
 |---|---|
@@ -2608,6 +2460,164 @@ reason `plugin.install` does not unwind it.
 - **A UI page and the micro-frontend mount.** A manifest may declare a
   `ui_panel` with its `[ui]` mount point and the panel validates and stores it,
   but nothing in `ui/` renders it yet.
+
+## Migration importers
+
+The `import.*` operations are `ferrum_ops::importer` (spec §11.15). They bring
+an account in from cPanel (a `cpmove`/full-backup tarball) or from aaPanel (its
+SQLite inventory plus `/www/wwwroot`). Five properties decide how all three
+behave.
+
+**The dry run is the feature.** An import is two steps and the first one
+changes nothing: `import.plan` reads the source and produces the complete
+mapping — which domains become which sites, which databases and users, which
+files, and an explicit list of everything that does *not* map — then stores that
+document and returns its id. `import.apply` takes the id and executes **the
+stored document**. It never re-scans, because if "apply" meant "read the source
+again and do whatever it says now" then the thing the operator reviewed and the
+thing that ran would be two different objects. The source is reopened only to
+fetch payload bytes, and only after its SHA-256 still matches what the plan was
+derived from; a source that changed answers `FER-1403 conflict` naming both
+hashes. For cPanel that hash is the tarball's own bytes. For aaPanel it is
+deliberately *not* the bytes of `default.db` — aaPanel is still running and
+rewrites that file constantly, so a byte hash would make every plan stale within
+minutes for reasons unrelated to the import; it is a hash over the inventory the
+mapping was read from (each site's name and document root, and each database's
+name), so a site added, removed or moved invalidates the plan and a heartbeat
+does not.
+
+**What does not map is listed per object, with a reason.** Mail accounts (by
+address, read from `homedir/etc/<domain>/passwd` — never from `shadow` next to
+it), stored mail, DNS zones, TLS certificates and private keys, cron entries,
+FTP accounts, Mailman lists, autoresponders, PostgreSQL dumps, bandwidth
+counters, and every credential. A migration tool that silently drops mailboxes
+is how somebody loses their email, so the `unmapped` list is a first-class part
+of the plan and the module's tests assert that each kind appears in it.
+
+**A hostile tarball is the expected input, and nothing is extracted to plan
+it.** `importer::scan` walks the archive read-only and shares the file
+manager's guards rather than restating them: entry names go through
+`fsops::archive::split_entry_name` (so `..`, absolute paths, `\` separators and
+NUL are refused, never normalised), and the entry count, total uncompressed size
+and compression ratio are counted by `fsops::archive::Budget` against the same
+`Limits` — 100 000 entries, 10 GB, 200:1 plus 1 MB of grace. Symlink, hardlink
+and device entries are recorded and never created. An entry name that is not
+valid UTF-8 is skipped rather than lossily converted, because a mangled name
+that then passes the component checks is a name nobody reviewed.
+
+**Payload files reach a tenant through `fs.extract`, as the tenant.** Apply
+re-tars exactly the subtree the plan named into a staging archive in the tenant
+home (`O_CREAT|O_EXCL|O_NOFOLLOW`, so a name the tenant planted first cannot be
+written through), then hands it to the existing `fs.extract` operation, which
+unpacks it in the privilege-dropped helper and applies every archive guard a
+second time. No root process ever writes a file whose name came from the
+archive — which matters more than it looks: `O_NOFOLLOW` defeats a symlink but
+not a *hardlink*, and a root extractor truncating a tenant's hardlink to
+`/etc/shadow` would be a server takeover. As the tenant it is a permission
+error. The staging archive stays root-owned, mode 0644 (the helper only reads
+it, and root ownership keeps it out of the tenant's quota while it exists) and
+is removed as soon as the extract returns. For an aaPanel site, whose files are
+a directory on this server rather than a tarball member, the staging archive is
+built by `fsops::archive::compress` — the same walker the file manager uses,
+which skips every symlink it meets, so an `uploads -> /etc` inside a source site
+is not followed.
+
+**A dump is loaded as the database's own new user, never as root.** A dump is a
+script somebody else wrote; run as `root@localhost` it could drop another
+tenant's database or create an account. The importer creates the database and
+its user through `db.user.create` and `db.create` — so the plan's `max_dbs`
+limit, the engine-ready check and the name-collision refusal all apply to an
+import exactly as they do to a click — and then runs `mariadb
+--defaults-file=… --database=<name>` with the dump on **stdin**. The
+credentials are in a 0600 file inside a 0700 directory under
+`/var/lib/ferrum/state/import`, removed when the load returns, because
+`--password=` on an argv is world-readable in `/proc/<pid>/cmdline`. `--database`
+binds the session to one schema, so a dump that says `USE somebody_else` fails
+on privileges rather than succeeding. Dumps travel as bytes, not as a `String`:
+a mysqldump of a table with binary columns is not valid UTF-8 and a lossy
+conversion would silently corrupt the data being imported.
+
+**No credential is ever read.** Not cPanel's `shadow`, not the password hashes
+in its `mysql.sql` grants, not aaPanel's plaintext `databases.password` column.
+Every imported database gets a new user with a new password. That password
+exists only in memory for the length of the load and is then dropped: a task's
+`input_json` and logs persist, and a task's *output* never reaches the caller at
+all (the response is a task id), so there is no honest channel for it to travel
+on. Set a real one afterwards with `db.user.password`, which is Immediate and
+shows it once.
+
+All three operations need `server_manage`, which is administrator-only. That is
+not because the mapping is dangerous but because the input is an arbitrary
+absolute path on the server and the output describes what is in it: a
+server-wide read takes a server-wide permission.
+
+### `import.plan`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (cancellable, idempotent) |
+| Input | `source` *(object)*, `subscription_id` *(i64)*, `php_version` *(optional)* |
+
+`source` is a tagged object and a closed set:
+`{"kind":"cpanel","path":"/root/cpmove-bob.tar.gz"}` or
+`{"kind":"aapanel","root":"/www"}` (`root` defaults to `/www`). The path must be
+absolute, must not contain `..` and must exist; a relative path would resolve
+against whatever directory the agent happens to be running in.
+`subscription_id` is required and not defaulted — an administrator running an
+import usually has no subscription of their own, and "wherever" is not an answer
+to whose account this becomes. `php_version` is the version imported PHP sites
+are created with when the source's own version is unknown or is one Ferrum does
+not offer (`ea-php56` is read, recognised as unsupported, and reported).
+
+Reads the source, writes one `import_plans` row and answers with `plan_id` and
+the whole plan. Because it is a task, the plan is read back with `import.list`
+rather than from the task; nothing on the server has changed, so re-running it
+is always safe and simply produces a second plan.
+
+For cPanel it reads `cp/<user>`, `userdata/main` and `userdata/<domain>` (a
+deliberately small YAML subset — `key: value`, indented `- item` sequences,
+indented `key: value` maps, and the inline empties `{}` and `[]`; a general YAML
+parser would be a large attack surface pointed at somebody else's file, and what
+the subset cannot read is reported as unmapped rather than guessed). A domain
+whose document root is not inside the account's home is unmapped: it is not in
+the archive at all. An addon domain's internal subdomain (`addon.example.com`
+for `addon.com`) is *not* made a second site — two sites serving one directory
+would fight over the vhost. Parked domains become aliases of the main site.
+
+For aaPanel it opens `<root>/server/panel/data/default.db` **read-only and
+immutable** — it belongs to a panel that may still be running, and `immutable=1`
+also stops SQLite from recovering a hot journal, which is a write — and reads
+`sites`, `domain`, `databases` (never the `password` column), `ftps` and
+`crontab`. Document roots must be under `<root>/wwwroot`; PHP versions come from
+the site's nginx vhost (`enable-php-74.conf`, `php-cgi-74.sock`). Every aaPanel
+plan carries two notes, because both are true and neither is obvious: aaPanel
+still owns its own nginx and its vhosts must go before Ferrum can serve those
+domains, and the imported databases are *copies* under new names in the same
+MariaDB, so each application's configuration has to be repointed or it will keep
+using the aaPanel copy.
+
+### `import.list`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `plan_id` *(optional i64)*, `limit` *(optional, default 50)*, `offset` *(optional)* |
+
+Stored plans, newest first. Without `plan_id` it returns summaries — id, source,
+totals, whether it has been applied — because a list page showing fifty full
+mappings would be megabytes of JSON nobody reads. With `plan_id` it returns that
+one plan's full document *and* its outcome, which is how the result of an apply
+is read: an applied plan carries a per-step record of what worked and what did
+not. Plans are scoped through the subscription they target, so a plan outside
+the caller's scope reads as `not_found`.
+
+### `import.apply`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
 | Execution | task (not cancellable, not idempotent) |
 | Input | `plan_id` *(i64)* |
 
@@ -2657,3 +2667,269 @@ client reads its batch from stdin, so the bytes are buffered in the agent, and a
 - **A UI page.** There is no `ui/src/routes/imports.tsx`. The flow is
   API- and CLI-driven: a two-step migration that an operator reviews as a
   document is a worse fit for a form than for a terminal.
+
+## Outbound mail (relay-only)
+
+Ferrum v1 runs **no mail server** (spec §11.18). It stores the address of
+somebody else's SMTP submission service, points every PHP site's `mail()` at
+it, and can send one test message to prove the path works. There are no
+mailboxes, no inbound mail, no domains, no aliases and no queue. The full
+Stalwart stack is Phase 5 and explicitly optional; nothing here is a partial
+version of it, and the schema (`mail_relay`, migration 0018) has no table that
+implies otherwise.
+
+**SPF, DKIM and DMARC are guidance, not management.** `mail.relay.get` returns
+the records the configured relay needs, in the same advisory shape `dns.check`
+uses — a structured record, a purpose and one sentence — and every record
+carries `managed: false`. The DKIM row has no value at all: the key pair
+belongs to the relay and only the relay knows the selector, so printing a
+made-up record would be worse than printing none.
+
+### The shim is a configuration file, not a script
+
+`sendmail_path` in each site's FPM pool points at `msmtp` with an argv of flags
+and a `--file=` naming the per-site configuration Ferrum renders at
+`/etc/ferrum/mail/<domain>.msmtprc`. The panel never generates a shell script
+for PHP to run: a rendered script would be a shell string the panel causes to
+be executed, which is the category spec §12 rule 2 removes. msmtp is the agent
+because it is a single-binary SMTP client with no daemon, no queue directory
+and no setuid bit — the smallest thing that can be a `sendmail` for a tenant.
+It is packaged on both families; on RHEL it comes from EPEL, which the Remi
+repository already pulls in for PHP.
+
+The pool directive is `php_admin_value[sendmail_path]`, not `php_value`: a
+script that could `ini_set()` its way to another `sendmail_path` could run a
+program of its own choosing as that tenant. When no relay is configured, is
+switched off, or msmtp is not installed, **no directive is rendered at all** —
+an empty `sendmail_path` makes `mail()` execute nothing and return *true*, so
+an application would report every message as delivered.
+
+The envelope sender is the configured `from_address`, never the message's own
+`From:` header (`--read-envelope-from` is deliberately absent). SPF is
+evaluated against the envelope, and a relay rejects senders it is not
+authorised for however a PHP application chose to address the message.
+
+### The relay credential is readable by the tenant
+
+PHP's `mail()` runs as the site's own Linux user (spec §5), so whatever
+configuration the shim reads is configuration that user can read. There is no
+arrangement in which a tenant can send through an authenticated relay and
+cannot recover the credential; the only way out is a local submission agent
+holding the secret, which is an MTA, which is Phase 5.
+
+What the panel does about it: the per-site file is `0640`, owned
+`root:<that tenant's group>`, so the exposure is one tenant per file rather
+than every user on the box; it lives under `/etc/ferrum/mail` rather than in
+the tenant's home, so a tenant can read it but never *edit* it (an editable
+copy would let them redirect their site's mail to a relay of their own while
+still sending as the operator's domain); and `mail.relay.get` returns the
+exposure as a `credential_note` field so an operator chooses a send-only
+credential scoped to this server on purpose rather than discovering it later.
+
+### `mail.relay.get`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | none |
+
+The configured relay, whether the sendmail agent is installed, and the advisory
+DNS records. `has_password` says whether a password is stored, never which one:
+there is no field on this operation, or on any path from the agent to the
+browser, that could carry it.
+
+`agent_installed` is its own field rather than a note in a message, because
+`false` means sites cannot send however well the relay is configured.
+
+Not a tenant-visible read. The username plus the sending domain is most of what
+somebody would need to work out which provider the credential came from.
+
+### `mail.relay.set`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `host`; `port`; `tls_mode` (`none` \| `starttls` \| `implicit`); `username` *(optional)*; `password` *(optional — see below)*; `from_address`; `from_name` *(optional)*; `enabled` *(optional, default true)* |
+
+Stores the relay and re-renders every PHP site's mail configuration and FPM
+pool. A task, not an immediate operation: it writes one file per site and
+reloads PHP-FPM once per PHP version, and the per-site log lines are the only
+way to see which site did not take. Every site is attempted even when one
+fails; the tally comes back with the first error and a re-run converges the
+stragglers.
+
+**Omitting `password` keeps the stored one; sending an empty string clears
+it.** The value is write-only, so an operator editing the port of a working
+relay has no way to re-type a secret they can no longer read. The password is
+sealed with the panel master key before storage (spec §12 rule 6) and is never
+returned.
+
+**A username with `tls_mode: none` is refused**, before anything is stored.
+base64 is an encoding, not encryption, so a credential configured against a
+plaintext relay is a credential that would cross the network in the clear.
+Refusing at configuration time means it never reaches the disk either. A
+plaintext relay *without* a credential is allowed: authorising by source IP is
+how most in-datacentre relays work.
+
+`host` accepts only letters, digits, dots, hyphens, underscores and colons, and
+`from_address` only a conservative address shape. Both are rendered into a
+line-oriented configuration file and into an SMTP conversation, where a space
+or a newline is not a formatting problem but a way to add a directive or a
+command.
+
+Switching `enabled` off re-renders every pool *without* `sendmail_path` rather
+than only flipping a flag, and keeps the credential.
+
+### `mail.relay.test`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `to` *(optional; defaults to the relay's own `from_address`)* |
+
+Opens a real SMTP session, hands over a real message, and reports the
+conversation's outcome: `delivered`, the `stage` it reached
+(`connect`/`tls`/`greeting`/`ehlo`/`starttls`/`auth`/`mail_from`/`rcpt_to`/`data`/`body`/`quit`),
+the relay's own words verbatim, the last reply code, whether the session was
+encrypted, and the transcript with the credential redacted.
+
+**A rejection is an answer, not an error.** `550 5.7.1 Sender address rejected`
+at `MAIL FROM` and `535 5.7.8 Authentication credentials invalid` at `AUTH` are
+two different support tickets, and both would arrive as "send failed" from an
+operation that returned an error code. Only a caller mistake (a recipient that
+is not an address) and "no relay is configured" are errors.
+
+The client is written in-tree (`ferrum_ops::mail::smtp`) for exactly that
+reason, and it refuses two things on principle: it will not send a credential
+over an unencrypted connection, and a failed or absent `STARTTLS` aborts rather
+than falling back to plaintext — an attacker who can strip the capability from
+the greeting would otherwise get the whole session. After `STARTTLS` it also
+checks that nothing was already buffered: data pipelined before the handshake
+arrived in the clear, and honouring it is the plaintext-injection attack
+RFC 3207 §4.2 exists to prevent.
+
+Immediate, with a 20-second conversation budget chosen to sit inside the
+30-second IPC call timeout, so a dead relay produces a report naming the stage
+it stalled at rather than `agent_timeout` with no transcript.
+
+Audited, because it sends mail from this server on somebody's authority, and
+because a stream of tests is what an attacker holding an admin session would do
+to enumerate valid recipients.
+
+## Branding (white-label)
+
+Panel name, logo, favicon, login background, support URL, primary colour and
+custom login host, stored per reseller with the panel default underneath
+(spec §11.19). Migration 0018 owns `branding` and `branding_assets`.
+
+**Branding is data, not configuration.** Nothing renders a file, reloads a
+service or touches `/etc`. Spec §11.19's acceptance criterion is "switching
+branding requires no restart", and the cheapest way to guarantee that is never
+to make branding configuration in the first place: the next request reads the
+new rows. There is nothing to validate, nothing to roll back, and no window in
+which the browser and the database disagree.
+
+**Inheritance is per field.** Every column is nullable and every NULL means
+"inherit from the panel default" — row `reseller_id = 0`. A reseller who has
+uploaded a logo and nothing else gets the panel's name, colour and support URL,
+and an operator who later changes the panel's colour changes theirs with it.
+Partial branding is the common case.
+
+### SVG is refused, and the serving headers assume the refusal could fail
+
+An uploaded image is served from the panel's own origin, so the format question
+is a script-execution question. SVG is not an image format in the sense that
+matters: it is an XML document that may contain `<script>`, `onload=` handlers,
+`<foreignObject>` HTML and external references, so a logo an attacker could
+upload and then persuade an administrator to open would run in the panel's
+origin with the administrator's session cookie.
+
+**The choice made is to refuse SVG entirely** — in
+`ferrum_ops::branding::sniff_image`, which identifies uploads by their magic
+bytes and accepts only PNG, JPEG, GIF, WebP and ICO, and again in the
+`branding_assets.content_type` CHECK constraint, so no other code path can
+reintroduce it. Refusing rather than sanitising is deliberate: sanitising SVG
+is an open-ended arms race against a parser differential, and a hosting panel
+does not need to win it to let somebody upload a logo.
+
+The route that serves the bytes then assumes that refusal could still be
+defeated by a polyglot — a file that is a valid GIF by its first six bytes and
+a valid HTML document to a lenient parser:
+
+- `Content-Type` comes from a closed enum, never from the upload;
+- `X-Content-Type-Options: nosniff` (set globally) stops the browser
+  second-guessing it;
+- `Content-Disposition: attachment` means a top-level navigation *downloads*
+  rather than renders, so a polyglot can never execute as a document. It is
+  ignored for subresource loads, so `<img src>`, `<link rel="icon">` and CSS
+  `url()` — the three ways branding is actually used — are unaffected.
+
+The panel's global CSP (`script-src 'self'`, no `unsafe-inline`) already blocks
+inline script and event handlers in anything served from this origin, and it is
+applied by an overriding layer, so the asset route deliberately does not set a
+per-response policy that would be replaced anyway.
+
+### Two fields are injection sites
+
+`primary_color` is interpolated into a CSS custom property and must be exactly
+`#rrggbb` — validated in the operation and again by a schema CHECK, because
+`#3b82f6; background: url(//evil)` is what the difference looks like.
+`support_url` becomes an anchor's `href` on the login page and must start with
+`https://` or `http://`; `javascript:`, `data:` and `vbscript:` are script
+execution in the panel's origin, one click away.
+
+### `branding.get`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `reseller_id` *(optional; admin only)* |
+
+The owner's own row (where a NULL means "inherits"), the values after
+inheritance, the per-kind upload limits, and the accepted formats with a note
+saying why SVG is not among them.
+
+`user_manage` rather than `server_manage`: a reseller has to be able to read
+and write their own branding, and `user_manage` is the permission a reseller
+holds over what is below them. An admin holds it too.
+
+A reseller naming another reseller's id gets `not_found` — the same answer a
+non-existent one gives, so this cannot enumerate resellers. A reseller's own id
+is taken from their authenticated scope, never from the request.
+
+### `branding.set`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `reseller_id` *(optional; admin only)*; `panel_name` *(optional)*; `support_url` *(optional)*; `primary_color` *(optional)*; `login_host` *(optional)*; `clear` *(optional list of `panel_name` \| `support_url` \| `primary_color` \| `login_host`)*; `logo`, `favicon`, `login_background` *(optional `{ action: keep \| clear \| set, content_b64 }`)* |
+
+Immediate, and that is the feature rather than an optimisation: there is
+nothing to render, validate or reload.
+
+An omitted text field is left as it is; listing it in `clear` sets it back to
+inheriting. Two mechanisms rather than one, because "do not change the name"
+and "go back to inheriting the name" are different intentions and a wire format
+that expresses the difference as a missing key versus a null is one nobody gets
+right by accident. The image fields use the same three-state shape explicitly.
+
+Images arrive base64-encoded inside the operation JSON, the same transport the
+file manager uses for binary content (spec §11.7), and are size-capped from the
+*encoded* length before anything is allocated: 64 KiB for a favicon, 512 KiB
+for a logo, 2 MiB for a login background. PNG and GIF also have their declared
+dimensions checked against an 8192-pixel limit — a 40000 x 40000 PNG is a few
+kilobytes on disk and gigabytes in the browser that decodes it, which a byte
+cap alone does not catch.
+
+Images are applied before the text fields, so a refused upload leaves the rest
+of the form untouched: nothing changed is a comprehensible partial failure.
+
+`login_host` is unique across resellers; a second claim is `FER-1403 conflict`.
+It is what `GET /api/branding` matches an incoming `Host` header against, which
+is how a reseller's own login page finds its branding before there is a
+session.

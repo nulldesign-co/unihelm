@@ -814,7 +814,176 @@ export const endpoints = {
     api.post<{ channel: NotifyChannel }>("/api/alerts/channels", body),
   deleteChannel: (id: number) => api.del<{ deleted: boolean }>(`/api/alerts/channels/${id}`),
   testChannel: (id: number) => api.post<ChannelTestResult>(`/api/alerts/channels/${id}/test`),
+
+  mailRelay: () => api.get<MailRelayResponse>("/api/mail/relay"),
+  // PUT because there is exactly one relay and this is an upsert of it.
+  // `password` is write-only: leave the field out to keep the stored one, send
+  // an empty string to clear it. A `null` would be neither.
+  setMailRelay: (body: MailRelayRequest) => api.put<TaskAccepted>("/api/mail/relay", body),
+  // A rejected message answers 200 with `delivered: false` — it is an answer,
+  // not an error, and the stage is what makes it actionable.
+  testMailRelay: (to?: string) =>
+    api.post<MailTestReport>("/api/mail/relay/test", to ? { to } : {}),
+
+  // The authenticated half. `GET /api/branding` is public and is fetched by the
+  // login page before there is a session; see lib/branding.ts.
+  brandingSettings: (resellerId?: number) =>
+    api.get<BrandingSettings>(
+      `/api/branding/settings${resellerId === undefined ? "" : `?reseller_id=${resellerId}`}`,
+    ),
+  setBranding: (body: BrandingRequest) =>
+    api.put<BrandingSetResult>("/api/branding/settings", body),
 };
+
+// --- mail -------------------------------------------------------------------
+
+/** How the connection to the relay is protected. */
+export type TlsMode = "none" | "starttls" | "implicit";
+
+/**
+ * One record the operator should publish.
+ *
+ * `managed` is always false and the UI says so out loud: Ferrum surfaces
+ * SPF/DKIM/DMARC as guidance and does not publish or verify them (spec §11.18).
+ * `value` is null for DKIM, because only the relay provider knows the selector
+ * and the public key.
+ */
+export interface MailDnsRecord {
+  name: string;
+  record_type: string;
+  value: string | null;
+  managed: boolean;
+  purpose: string;
+}
+
+export interface MailRelayResponse {
+  configured: boolean;
+  host: string | null;
+  port: number | null;
+  tls_mode: TlsMode | null;
+  username: string | null;
+  /** Whether a password is stored — never which one. */
+  has_password: boolean;
+  from_address: string | null;
+  from_name: string | null;
+  enabled: boolean;
+  /** False means sites cannot send however well the relay is configured. */
+  agent_installed: boolean;
+  agent: string;
+  credential_note: string;
+  dns: { records: MailDnsRecord[]; advice: string };
+}
+
+export interface MailRelayRequest {
+  host: string;
+  port: number;
+  tls_mode: TlsMode;
+  username?: string;
+  /** Omit to keep the stored password; empty string clears it. */
+  password?: string;
+  from_address: string;
+  from_name?: string;
+  enabled?: boolean;
+}
+
+export type MailStage =
+  | "connect"
+  | "tls"
+  | "greeting"
+  | "ehlo"
+  | "starttls"
+  | "auth"
+  | "mail_from"
+  | "rcpt_to"
+  | "data"
+  | "body"
+  | "quit";
+
+/** The SMTP conversation's outcome. A failure is data, not an error. */
+export interface MailTestReport {
+  delivered: boolean;
+  stage: MailStage;
+  detail: string;
+  code: number | null;
+  transcript: string[];
+  encrypted: boolean;
+}
+
+// --- branding ---------------------------------------------------------------
+
+export type BrandingAssetKind = "logo" | "favicon" | "login_background";
+
+export interface BrandingAssetInfo {
+  kind: BrandingAssetKind;
+  /** The reseller whose upload it is, or 0 for the panel default. */
+  owner_id: number;
+  content_type: string;
+  sha256: string;
+  size_bytes: number;
+}
+
+export interface ResolvedBranding {
+  reseller_id: number;
+  panel_name: string | null;
+  support_url: string | null;
+  primary_color: string | null;
+  assets: BrandingAssetInfo[];
+}
+
+/** The stored row. Every null means "inherits from the panel default". */
+export interface BrandingRow {
+  reseller_id: number;
+  panel_name: string | null;
+  support_url: string | null;
+  primary_color: string | null;
+  login_host: string | null;
+  updated_at: string;
+}
+
+export interface BrandingSettings {
+  reseller_id: number;
+  own: BrandingRow | null;
+  resolved: ResolvedBranding;
+  limits: { kind: BrandingAssetKind; max_bytes: number }[];
+  accepted_formats: string[];
+  svg_note: string;
+}
+
+/**
+ * Three states, spelled out.
+ *
+ * "leave the logo alone" and "go back to the panel's logo" are different
+ * intentions, and expressing the difference as a missing key versus a null is
+ * how one of them gets sent by accident.
+ */
+export type BrandingAssetChange =
+  | { action: "keep" }
+  | { action: "clear" }
+  | { action: "set"; content_b64: string };
+
+export interface BrandingRequest {
+  reseller_id?: number;
+  panel_name?: string;
+  support_url?: string;
+  primary_color?: string;
+  login_host?: string;
+  /** Fields to reset to "inherit". */
+  clear?: ("panel_name" | "support_url" | "primary_color" | "login_host")[];
+  logo?: BrandingAssetChange;
+  favicon?: BrandingAssetChange;
+  login_background?: BrandingAssetChange;
+}
+
+export interface BrandingSetResult {
+  reseller_id: number;
+  resolved: ResolvedBranding;
+  assets: {
+    kind: BrandingAssetKind;
+    action: "kept" | "cleared" | "replaced";
+    content_type: string | null;
+    size_bytes: number | null;
+  }[];
+}
 
 /** PHP versions the panel knows about, newest first. */
 export const PHP_VERSIONS = ["8.5", "8.4", "8.3", "8.2", "8.1", "8.0", "7.4"] as const;

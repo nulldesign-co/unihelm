@@ -1,5 +1,5 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Archive, BellRing, Boxes, Clock, Database, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Monitor, Moon, Network, ShieldCheck, Sun, Wallet } from "lucide-react";
+import { Archive, BellRing, Boxes, Clock, Database, FolderOpen, Gauge, Globe, Languages, Layers, ListChecks, LogOut, Mail, Monitor, Moon, Network, Palette, ShieldCheck, Sun, Wallet } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -7,6 +7,7 @@ import { CommandPalette, type Command } from "@/components/command-palette";
 import { TaskDrawer } from "@/components/task-drawer";
 import { Button } from "@/components/ui/button";
 import { applyLanguage, LANGUAGES } from "@/i18n";
+import { assetUrl, useApplyBranding, useBranding } from "@/lib/branding";
 import { useSession } from "@/lib/session";
 import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
@@ -19,6 +20,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
+  // Branding is data, so the accent colour, the tab title and the favicon
+  // follow a save with no reload (spec §11.19).
+  const branding = useBranding();
+  useApplyBranding(branding);
+  const logo = assetUrl(branding, "logo");
 
   const commands = useMemo<Command[]>(
     () => [
@@ -35,6 +41,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       { id: "go-files", label: t("nav.files"), run: () => void navigate({ to: "/files" }) },
       { id: "go-firewall", label: t("nav.firewall"), run: () => void navigate({ to: "/firewall" }) },
       { id: "go-alerts", label: t("nav.alerts"), run: () => void navigate({ to: "/alerts" }) },
+      { id: "go-mail", label: t("nav.mail"), run: () => void navigate({ to: "/mail" }) },
+      { id: "go-branding", label: t("nav.branding"), run: () => void navigate({ to: "/branding" }) },
       { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, run: () => setTheme("light") },
       { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, run: () => setTheme("dark") },
       { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, run: () => setTheme("system") },
@@ -60,6 +68,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { to: "/dns", label: t("nav.dns"), icon: Network },
     { to: "/firewall", label: t("nav.firewall"), icon: ShieldCheck },
     { to: "/alerts", label: t("nav.alerts"), icon: BellRing },
+    { to: "/mail", label: t("nav.mail"), icon: Mail },
+    { to: "/branding", label: t("nav.branding"), icon: Palette },
     { to: "/stack", label: t("nav.stack"), icon: Layers },
   ];
 
@@ -67,14 +77,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <div className="min-h-dvh bg-canvas">
       <header className="sticky top-0 z-30 border-b border-border bg-surface/85 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-6xl items-center gap-4 px-4 sm:px-6">
+          {/* The reseller's mark and name where the product's used to be
+              (spec §11.19). Both fall back per field, so a reseller with only
+              a logo keeps the product name and vice versa. */}
           <Link to="/" className="flex items-center gap-2 font-semibold tracking-tight text-ink">
-            <span
-              className="grid h-6 w-6 place-items-center rounded-md bg-accent text-[11px] font-bold text-on-accent"
-              aria-hidden
-            >
-              F
-            </span>
-            {t("common.appName")}
+            {logo ? (
+              <img src={logo} alt="" aria-hidden className="h-6 max-w-24 object-contain" />
+            ) : (
+              <span
+                className="grid h-6 w-6 place-items-center rounded-md bg-accent text-[11px] font-bold text-on-accent"
+                aria-hidden
+              >
+                F
+              </span>
+            )}
+            {branding.panel_name ?? t("common.appName")}
           </Link>
 
           {/* Scrolls rather than pushing the page wide: the panel has grown

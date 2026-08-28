@@ -243,6 +243,15 @@ pub struct PoolContext {
 
     pub env: Vec<EnvEntry>,
     pub extra_ini: Option<String>,
+
+    /// What PHP's `mail()` runs, or `None` for "leave PHP's own default".
+    ///
+    /// `None` renders no `sendmail_path` line at all rather than an empty one:
+    /// an empty `sendmail_path` makes `mail()` execute nothing and return
+    /// *true*, so an application would report every message as sent. Absent,
+    /// PHP falls back to whatever the system has — usually nothing, which at
+    /// least fails honestly (spec §11.18).
+    pub sendmail_path: Option<String>,
 }
 
 /// Functions disabled by default.
@@ -335,6 +344,10 @@ impl PoolContext {
 
             env: Vec::new(),
             extra_ini: None,
+            // Filled in by `ferrum_ops::mail` when a relay is configured. A
+            // pool rendered without one is a pool whose sites cannot send
+            // mail, which is the correct state for a panel with no relay.
+            sendmail_path: None,
         }
     }
 }
@@ -601,6 +614,100 @@ mod tests {
         // Things frameworks need must NOT be disabled.
         assert!(!out.contains("putenv"), "disabling putenv breaks Composer");
         assert!(!out.contains(",getenv"));
+    }
+
+    #[test]
+    fn a_pool_without_a_relay_renders_no_sendmail_path_at_all() {
+        // Not an empty one: PHP's mail() with an empty sendmail_path executes
+        // nothing and returns true, so an application would report every
+        // message as delivered (spec §11.18).
+        let set = TemplateSet::load().unwrap();
+        let pool = PoolContext::new("example.com", "ft_a", PhpVersion::V83, 1024, "nginx");
+        let out = set
+            .render("php/pool.conf", &serde_json::json!({ "pool": pool }))
+            .unwrap();
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("php_admin_value[sendmail_path]")),
+            "an unconfigured relay must leave the directive out entirely"
+        );
+    }
+
+    #[test]
+    fn a_configured_relay_renders_sendmail_path_where_a_script_cannot_change_it() {
+        let set = TemplateSet::load().unwrap();
+        let mut pool = PoolContext::new("example.com", "ft_a", PhpVersion::V83, 1024, "nginx");
+        pool.sendmail_path =
+            Some("/usr/bin/msmtp --file=/etc/ferrum/mail/example.com.msmtprc -t".into());
+        let out = set
+            .render("php/pool.conf", &serde_json::json!({ "pool": pool }))
+            .unwrap();
+        assert!(out.contains(
+            "php_admin_value[sendmail_path] = /usr/bin/msmtp \
+             --file=/etc/ferrum/mail/example.com.msmtprc -t"
+        ));
+        // `php_value` would let a script ini_set() its way to running a
+        // program of its own choosing as this tenant.
+        assert!(!out.contains("php_value[sendmail_path]"));
+    }
+
+    #[test]
+    fn the_relay_config_keeps_certificate_checking_on_and_never_logs_to_a_tenant_file() {
+        let set = TemplateSet::load().unwrap();
+        let out = set
+            .render(
+                "mail/msmtprc",
+                &serde_json::json!({ "mail": {
+                    "site_domain": "example.com",
+                    "group": "ft_a",
+                    "host": "smtp.example.net",
+                    "port": 587,
+                    "tls_mode": "starttls",
+                    "tls_trust_file": "/etc/ssl/certs/ca-certificates.crt",
+                    "username": "panel@example.com",
+                    "password": "s3cret",
+                    "from_address": "noreply@example.com",
+                    "timeout_seconds": 20,
+                }}),
+            )
+            .unwrap();
+        assert!(out.contains("tls             on"));
+        assert!(out.contains("tls_starttls    on"));
+        assert!(out.contains("tls_certcheck   on"), "verification must stay on");
+        assert!(out.contains("auth            on"));
+        assert!(out.contains("from            noreply@example.com"));
+        // The tenant runs this; a log file they could write is a log file they
+        // could forge or fill.
+        assert!(out.contains("syslog          on"));
+        assert!(!out.contains("logfile"));
+    }
+
+    #[test]
+    fn a_plaintext_relay_renders_tls_off_and_no_credential() {
+        let set = TemplateSet::load().unwrap();
+        let out = set
+            .render(
+                "mail/msmtprc",
+                &serde_json::json!({ "mail": {
+                    "site_domain": "example.com",
+                    "group": "ft_a",
+                    "host": "127.0.0.1",
+                    "port": 25,
+                    "tls_mode": "none",
+                    "tls_trust_file": "",
+                    "username": serde_json::Value::Null,
+                    "password": serde_json::Value::Null,
+                    "from_address": "noreply@example.com",
+                    "timeout_seconds": 20,
+                }}),
+            )
+            .unwrap();
+        assert!(out.contains("tls             off"));
+        assert!(out.contains("auth            off"));
+        assert!(
+            !out.contains("password  "),
+            "no credential may be rendered here"
+        );
     }
 
     #[test]

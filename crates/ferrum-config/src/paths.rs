@@ -376,6 +376,27 @@ pub fn waf_audit_log() -> PathBuf {
     under("/var/log/ferrum/waf/audit.log")
 }
 
+/// Where the per-site mail relay configuration lives (spec §11.18).
+///
+/// Under `/etc/ferrum` rather than in the tenant home: the file holds the
+/// relay credential, and a tenant who could edit it could point their site's
+/// mail at a server they control while still sending as the operator's domain.
+/// The tenant only ever needs to *read* it.
+pub fn mail_dir() -> PathBuf {
+    config_dir().join("mail")
+}
+
+/// One site's relay configuration, read by the sendmail shim PHP's
+/// `sendmail_path` points at.
+///
+/// Per site rather than one shared file so the mode can be `0640` owned
+/// `root:<tenant group>`: the relay credential is readable by the tenant whose
+/// PHP sends the mail — that is inherent to `mail()` running as the tenant —
+/// and no wider.
+pub fn mail_site_config(domain: &str) -> PathBuf {
+    mail_dir().join(format!("{domain}.msmtprc"))
+}
+
 /// The http-context nginx include that turns ModSecurity on.
 ///
 /// `03-` so it sorts after the catch-all, panel and Adminer server blocks and

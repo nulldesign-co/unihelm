@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod apps;
 pub mod auth;
 pub mod backups;
+pub mod branding;
 pub mod certs;
 pub mod cron;
 pub mod databases;
@@ -19,6 +20,7 @@ pub mod files;
 pub mod firewall;
 pub mod health;
 pub mod imports;
+pub mod mail;
 pub mod openapi;
 pub mod ops;
 pub mod panel_tls;
@@ -203,6 +205,18 @@ fn protected() -> Router<SharedState> {
         )
         .route("/api/plugins/{slug}/enable", post(plugins::enable))
         .route("/api/plugins/{slug}/disable", post(plugins::disable))
+        .route(
+            "/api/mail/relay",
+            get(mail::relay_get).put(mail::relay_set),
+        )
+        .route("/api/mail/relay/test", post(mail::relay_test))
+        // The *authenticated* half of branding. `GET /api/branding` and the
+        // asset route are in `public()`: the login page renders before there
+        // is a session (spec §11.19).
+        .route(
+            "/api/branding/settings",
+            get(branding::settings_get).put(branding::settings_set),
+        )
 }
 
 /// Routes reachable without a session.
@@ -212,6 +226,13 @@ fn public() -> Router<SharedState> {
         // Liveness, for systemd and for a load balancer. Says nothing an
         // unauthenticated caller should not know.
         .route("/healthz", get(health::healthz))
+        // Branding, because the login page has to render before anybody has a
+        // session (spec §11.19). Read-only, and deliberately narrow: a name, a
+        // support URL, a colour and up to three image URLs — no identifiers, no
+        // counts, and the same response shape whether or not the `Host` header
+        // matched a reseller. See routes/branding.rs.
+        .route("/api/branding", get(branding::public_get))
+        .route("/api/branding/assets/{kind}", get(branding::asset))
 }
 
 pub fn api() -> Router<SharedState> {
