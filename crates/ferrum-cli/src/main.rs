@@ -39,8 +39,8 @@ use ferrum_distro::{Distro, SupportStatus};
 use ferrum_ipc::IpcClient;
 
 use crate::cli::{
-    BackupCommand, BackupRepoCommand, Cli, Command, DnsCommand, OpsCommand, SftpCommand,
-    UserCommand,
+    BackupCommand, BackupRepoCommand, Cli, Command, DnsCommand, MailCommand, MailRelayCommand,
+    OpsCommand, SftpCommand, UserCommand,
 };
 use crate::invoke::{Action, Secrets, action_for};
 use crate::report::{Report, human_bytes};
@@ -197,6 +197,9 @@ fn resolve_secrets(command: &Command) -> Result<Secrets> {
         }
         Command::Sftp(SftpCommand::Enable { password_stdin, .. }) => {
             secrets.sftp_password = secret(*password_stdin, "FERRUM_SFTP_PASSWORD")?;
+        }
+        Command::Mail(MailCommand::Relay(MailRelayCommand::Set { password_stdin, .. })) => {
+            secrets.mail_relay_password = secret(*password_stdin, "FERRUM_MAIL_RELAY_PASSWORD")?;
         }
         _ => {}
     }

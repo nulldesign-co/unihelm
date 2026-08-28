@@ -106,6 +106,7 @@ pub struct Secrets {
     pub dns_token: Option<String>,
     pub s3_secret_access_key: Option<String>,
     pub sftp_password: Option<String>,
+    pub mail_relay_password: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,9 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Alert(cmd) => alert(cmd)?,
         Command::Webhook(cmd) => webhook(cmd)?,
         Command::Plugin(cmd) => plugin(cmd)?,
+        Command::Import(cmd) => import(cmd)?,
+        Command::Mail(cmd) => mail(cmd, secrets),
+        Command::Branding(cmd) => branding(cmd),
         Command::Quota(cmd) => quota(cmd),
         Command::Sftp(cmd) => sftp(cmd, secrets),
         Command::Security(SecurityCommand::Posture) => call("security.posture", json!({})),
@@ -961,6 +965,134 @@ fn plugin(cmd: &PluginCommand) -> Result<Action> {
         PluginCommand::Disable { slug } => call("plugin.disable", json!({ "slug": slug })),
         PluginCommand::Remove { slug } => call("plugin.remove", json!({ "slug": slug })),
     })
+}
+
+fn import(cmd: &ImportCommand) -> Result<Action> {
+    Ok(match cmd {
+        ImportCommand::Plan {
+            source,
+            path,
+            subscription,
+            php,
+        } => {
+            // `source` is a tagged enum on the operation side, and the two tags
+            // do not carry the same field: cPanel names a tarball, aaPanel
+            // names an installation root the operation defaults to `/www`.
+            let source = match source {
+                ImportSourceArg::Cpanel => Input::new().set("kind", "cpanel").set(
+                    "path",
+                    path.clone().context(
+                        "`import plan --source cpanel` needs --path, the cpmove tarball",
+                    )?,
+                ),
+                ImportSourceArg::Aapanel => Input::new()
+                    .set("kind", "aapanel")
+                    .maybe("root", path.clone()),
+            };
+            let input = Input::new()
+                .set("source", source.done())
+                .set("subscription_id", *subscription)
+                .maybe("php_version", php.clone())
+                .done();
+            call("import.plan", input)
+        }
+        ImportCommand::List { plan, page } => {
+            let input = Input::new()
+                .maybe("plan_id", *plan)
+                .maybe("limit", page.limit)
+                .maybe("offset", page.offset)
+                .done();
+            call("import.list", input)
+        }
+        ImportCommand::Apply { plan_id } => call("import.apply", json!({ "plan_id": plan_id })),
+    })
+}
+
+fn mail(cmd: &MailCommand, secrets: &Secrets) -> Action {
+    match cmd {
+        MailCommand::Relay(MailRelayCommand::Get) => call("mail.relay.get", json!({})),
+        MailCommand::Relay(MailRelayCommand::Set {
+            host,
+            port,
+            tls,
+            from,
+            from_name,
+            username,
+            password_stdin: _,
+            enabled,
+        }) => {
+            let tls_mode = match tls {
+                TlsModeArg::None => "none",
+                TlsModeArg::Starttls => "starttls",
+                TlsModeArg::Implicit => "implicit",
+            };
+            let input = Input::new()
+                .set("host", host.clone())
+                .set("port", *port)
+                .set("tls_mode", tls_mode)
+                .set("from_address", from.clone())
+                .maybe("from_name", from_name.clone())
+                .maybe("username", username.clone())
+                // Absent means "keep the stored one". The password is
+                // write-only, so a missing key is the only way to say it.
+                .maybe("password", secrets.mail_relay_password.clone())
+                .maybe("enabled", *enabled)
+                .done();
+            call("mail.relay.set", input)
+        }
+        MailCommand::Relay(MailRelayCommand::Test { to }) => call(
+            "mail.relay.test",
+            Input::new().maybe("to", to.clone()).done(),
+        ),
+    }
+}
+
+fn branding(cmd: &BrandingCommand) -> Action {
+    match cmd {
+        BrandingCommand::Get { reseller } => call(
+            "branding.get",
+            Input::new().maybe("reseller_id", *reseller).done(),
+        ),
+        BrandingCommand::Set {
+            reseller,
+            panel_name,
+            support_url,
+            primary_color,
+            login_host,
+            clear,
+            clear_logo,
+            clear_favicon,
+            clear_login_background,
+        } => {
+            let cleared: Vec<Value> = clear
+                .iter()
+                .map(|field| {
+                    Value::from(match field {
+                        BrandingFieldArg::PanelName => "panel_name",
+                        BrandingFieldArg::SupportUrl => "support_url",
+                        BrandingFieldArg::PrimaryColor => "primary_color",
+                        BrandingFieldArg::LoginHost => "login_host",
+                    })
+                })
+                .collect();
+            // An asset the operator said nothing about is left alone: the
+            // operation defaults each one to `keep`, so the key stays absent
+            // rather than being sent as an explicit no-op.
+            let clear_asset = |yes: bool| yes.then(|| json!({ "action": "clear" }));
+            let input = Input::new()
+                .maybe("reseller_id", *reseller)
+                .maybe("panel_name", panel_name.clone())
+                .maybe("support_url", support_url.clone())
+                .maybe("primary_color", primary_color.clone())
+                .maybe("login_host", login_host.clone())
+                .maybe("clear", (!cleared.is_empty()).then_some(cleared))
+                .maybe("logo", clear_asset(*clear_logo))
+                .maybe("favicon", clear_asset(*clear_favicon))
+                .maybe("login_background", clear_asset(*clear_login_background))
+                .done();
+            call("branding.set", input)
+        }
+    }
 }
 
 fn alert(cmd: &AlertCommand) -> Result<Action> {

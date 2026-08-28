@@ -57,6 +57,8 @@ pub const COVERAGE: &[(&str, &[&str])] = &[
     ("backup.run", &["ferrum", "backup", "run", "--repo", "1", "--scope", "panel"]),
     ("backup.schedule.delete", &["ferrum", "backup", "schedule", "delete", "1"]),
     ("backup.schedule.set", &["ferrum", "backup", "schedule", "set", "--repo", "1", "--scope", "panel", "--cron", "0 3 * * *"]),
+    ("branding.get", &["ferrum", "branding", "get"]),
+    ("branding.set", &["ferrum", "branding", "set", "--panel-name", "Acme Hosting"]),
     ("cert.issue", &["ferrum", "cert", "issue", "1"]),
     ("cert.issue_wildcard", &["ferrum", "dns", "issue-wildcard", "1"]),
     ("cert.list", &["ferrum", "cert", "list"]),
@@ -81,6 +83,12 @@ pub const COVERAGE: &[(&str, &[&str])] = &[
     ("fw.port.open", &["ferrum", "firewall", "open", "8080"]),
     ("fw.rules", &["ferrum", "firewall", "rules"]),
     ("fw.unban", &["ferrum", "firewall", "unban", "203.0.113.7"]),
+    ("import.apply", &["ferrum", "import", "apply", "1"]),
+    ("import.list", &["ferrum", "import", "list"]),
+    ("import.plan", &["ferrum", "import", "plan", "--source", "cpanel", "--path", "/srv/backups/cpmove-shop.tar.gz", "--subscription", "1"]),
+    ("mail.relay.get", &["ferrum", "mail", "relay", "get"]),
+    ("mail.relay.set", &["ferrum", "mail", "relay", "set", "smtp.example.com", "--port", "587", "--tls", "starttls", "--from", "panel@example.com"]),
+    ("mail.relay.test", &["ferrum", "mail", "relay", "test", "--to", "ops@example.com"]),
     ("metrics.snapshot", &["ferrum", "status"]),
     ("panel.tls.issue", &["ferrum", "cert", "panel", "panel.example.com"]),
     ("plan.assign", &["ferrum", "plan", "assign", "--subscription", "1", "--plan", "2"]),
@@ -159,6 +167,7 @@ mod tests {
             dns_token: Some("test-token".into()),
             s3_secret_access_key: Some("test-secret".into()),
             sftp_password: Some("test-password".into()),
+            mail_relay_password: Some("test-password".into()),
         }
     }
 
@@ -247,7 +256,10 @@ mod tests {
     /// struct, so this reads the struct.
     ///
     /// `type_path` is `stringify!`d from the table below, and its first segment
-    /// is the module, which is the file.
+    /// is the module, which is the file — or, once a module has grown enough
+    /// to be split up, the directory. Both spellings are tried, the same way
+    /// `module_file()` in `tests/gates/cli-parity.sh` does it, so a module
+    /// becoming a directory does not turn this check into a panic.
     fn keys_are_real_fields(op: &str, type_path: &str, input: &Value) {
         let Some(fields) = input.as_object() else {
             return;
@@ -256,12 +268,15 @@ mod tests {
             .split("::")
             .next()
             .expect("a module-qualified type");
-        let path = format!(
-            "{}/../ferrum-ops/src/{module}.rs",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let base = format!("{}/../ferrum-ops/src/{module}", env!("CARGO_MANIFEST_DIR"));
+        let flat = format!("{base}.rs");
+        let path = if std::path::Path::new(&flat).is_file() {
+            flat
+        } else {
+            format!("{base}/mod.rs")
+        };
         let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("could not read {path} for `{op}` ({e}); did the module become a directory?")
+            panic!("could not read {path} for `{op}` ({e}); where does module `{module}` live?")
         });
         for key in fields.keys() {
             assert!(
@@ -328,6 +343,8 @@ mod tests {
             "backup.run" => backup::RunInput,
             "backup.schedule.delete" => backup::ScheduleDeleteInput,
             "backup.schedule.set" => backup::ScheduleSetInput,
+            "branding.get" => branding::GetInput,
+            "branding.set" => branding::SetInput,
             "cert.issue" => cert::IssueInput,
             "cert.issue_wildcard" => dns::IssueWildcardInput,
             "cert.list" => cert::ListInput,
@@ -352,6 +369,12 @@ mod tests {
             "fw.port.open" => fwops::PortInput,
             "fw.rules" => fwops::RulesInput,
             "fw.unban" => fwops::UnbanInput,
+            "import.apply" => importer::ApplyInput,
+            "import.list" => importer::ListInput,
+            "import.plan" => importer::PlanInput,
+            "mail.relay.get" => mail::RelayGetInput,
+            "mail.relay.set" => mail::RelaySetInput,
+            "mail.relay.test" => mail::RelayTestInput,
             "metrics.snapshot" => metrics::SnapshotInput,
             "panel.tls.issue" => panel::IssueInput,
             "plan.assign" => plan::AssignInput,
@@ -359,6 +382,11 @@ mod tests {
             "plan.delete" => plan::DeleteInput,
             "plan.list" => plan::ListInput,
             "plan.update" => plan::UpdateInput,
+            "plugin.disable" => plugin::SlugInput,
+            "plugin.enable" => plugin::SlugInput,
+            "plugin.install" => plugin::InstallInput,
+            "plugin.list" => plugin::ListInput,
+            "plugin.remove" => plugin::SlugInput,
             "quota.backend" => quota::BackendInput,
             "quota.set" => quota::SetInput,
             "quota.usage" => quota::UsageInput,
@@ -385,6 +413,10 @@ mod tests {
             "waf.enable" => waf::EnableInput,
             "waf.rules.set" => waf::RulesSetInput,
             "waf.status" => waf::StatusInput,
+            "webhook.delete" => webhook::DeleteInput,
+            "webhook.list" => webhook::ListInput,
+            "webhook.set" => webhook::SetInput,
+            "webhook.test" => webhook::TestInput,
             "wp.cli" => wordpress::CliInput,
             "wp.detect" => wordpress::DetectInput,
             "wp.install" => wordpress::InstallInput,

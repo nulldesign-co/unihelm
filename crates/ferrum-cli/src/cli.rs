@@ -116,6 +116,18 @@ pub enum Command {
     /// Plugin sidecars: install, enable, remove.
     #[command(subcommand)]
     Plugin(PluginCommand),
+
+    /// Migrations from cPanel and aaPanel: plan first, then apply.
+    #[command(subcommand)]
+    Import(ImportCommand),
+
+    /// The outbound mail relay: where PHP's mail() hands messages over.
+    #[command(subcommand)]
+    Mail(MailCommand),
+
+    /// Panel branding: name, colour, support URL, login host and images.
+    #[command(subcommand)]
+    Branding(BrandingCommand),
     /// Per-subscription disk quotas.
     #[command(subcommand)]
     Quota(QuotaCommand),
@@ -1283,6 +1295,177 @@ pub enum AlertKindArg {
 pub enum ChannelKindArg {
     Webhook,
     Telegram,
+}
+
+// ---------------------------------------------------------------------------
+// import, mail, branding
+// ---------------------------------------------------------------------------
+
+/// `ferrum import …`
+///
+/// A migration is two steps, and the first one changes nothing: `plan` reads a
+/// cPanel tarball or an aaPanel installation and stores the whole mapping —
+/// which domains become which sites, which databases, and everything that does
+/// not map — and `apply` executes that stored document by id. Apply never
+/// re-scans, so the thing an operator read is the thing that runs (spec
+/// §11.15).
+#[derive(Debug, Subcommand)]
+pub enum ImportCommand {
+    /// Read a source and store the mapping. Nothing is created.
+    Plan {
+        /// Which panel the source came from.
+        #[arg(long, value_enum)]
+        source: ImportSourceArg,
+        /// The cpmove tarball for `cpanel`, or the installation root for
+        /// `aapanel`, which defaults to `/www`. Absolute, on this server.
+        #[arg(long)]
+        path: Option<String>,
+        /// Which subscription the imported sites and databases land in.
+        #[arg(long)]
+        subscription: i64,
+        /// PHP version for imported sites whose own version Ferrum does not
+        /// offer, e.g. `8.3`.
+        #[arg(long)]
+        php: Option<String>,
+    },
+    /// Stored plans, newest first. One plan in full with `--plan`.
+    List {
+        /// Show this plan's whole document and its outcome.
+        #[arg(long)]
+        plan: Option<i64>,
+        #[command(flatten)]
+        page: Page,
+    },
+    /// Execute a stored plan: sites, databases and files are created.
+    Apply {
+        /// Plan id, as `ferrum import list` shows it.
+        plan_id: i64,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum ImportSourceArg {
+    Cpanel,
+    Aapanel,
+}
+
+/// `ferrum mail …`
+///
+/// Ferrum runs no mail server. This is the address of somebody else's
+/// submission service, the credential to use with it, and one test message —
+/// no mailboxes, no inbound mail, no queue (spec §11.18).
+#[derive(Debug, Subcommand)]
+pub enum MailCommand {
+    /// The outbound relay.
+    #[command(subcommand)]
+    Relay(MailRelayCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MailRelayCommand {
+    /// The configured relay, and the DNS records it needs.
+    Get,
+    /// Store the relay and point every PHP site at it.
+    Set {
+        /// The submission host, e.g. `smtp.example.com`.
+        host: String,
+        /// The submission port. 587 for STARTTLS, 465 for implicit TLS.
+        #[arg(long)]
+        port: u16,
+        /// How the connection is protected. A relay with a username needs one
+        /// of the encrypted modes; the operation refuses the other pairing.
+        #[arg(long, value_enum)]
+        tls: TlsModeArg,
+        /// The envelope sender every site sends as.
+        #[arg(long)]
+        from: String,
+        /// The display name that goes with it.
+        #[arg(long)]
+        from_name: Option<String>,
+        /// The relay username.
+        #[arg(long)]
+        username: Option<String>,
+        /// Read the relay password from stdin.
+        ///
+        /// Omitted, the stored password is kept: it is write-only, so an
+        /// operator changing the port has no way to re-type it. Pass an empty
+        /// line to clear it.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Whether sites actually send through it.
+        #[arg(long, value_name = "BOOL")]
+        enabled: Option<bool>,
+    },
+    /// Send one test message and report what the relay said.
+    Test {
+        /// Where to send it. Defaults to the relay's own from address, which
+        /// is the one address the relay certainly accepts mail from.
+        #[arg(long)]
+        to: Option<String>,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum TlsModeArg {
+    None,
+    Starttls,
+    Implicit,
+}
+
+/// `ferrum branding …`
+///
+/// Images are not settable from here: the bytes travel base64-encoded inside
+/// the operation, which is a job for the UI or the API and not for a shell.
+/// `--clear-*` is, because removing an image needs no bytes.
+#[derive(Debug, Subcommand)]
+pub enum BrandingCommand {
+    /// The stored branding for one owner, and what it resolves to.
+    Get {
+        /// Admin only. A reseller always reads their own.
+        #[arg(long)]
+        reseller: Option<i64>,
+    },
+    /// Set the panel name, colour, support URL and login host.
+    Set {
+        /// Admin only. A reseller always writes their own.
+        #[arg(long)]
+        reseller: Option<i64>,
+        /// What the panel calls itself.
+        #[arg(long)]
+        panel_name: Option<String>,
+        /// Where "support" links to. `http:` or `https:` only.
+        #[arg(long)]
+        support_url: Option<String>,
+        /// The accent colour, as `#rrggbb`.
+        #[arg(long)]
+        primary_color: Option<String>,
+        /// The hostname this branding answers on.
+        #[arg(long)]
+        login_host: Option<String>,
+        /// Reset a field to inheriting. Repeat the flag, or comma-separate.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        clear: Vec<BrandingFieldArg>,
+        /// Remove this owner's logo, uncovering the panel's.
+        #[arg(long)]
+        clear_logo: bool,
+        /// Remove this owner's favicon.
+        #[arg(long)]
+        clear_favicon: bool,
+        /// Remove this owner's login background.
+        #[arg(long)]
+        clear_login_background: bool,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum BrandingFieldArg {
+    PanelName,
+    SupportUrl,
+    PrimaryColor,
+    LoginHost,
 }
 
 // ---------------------------------------------------------------------------
