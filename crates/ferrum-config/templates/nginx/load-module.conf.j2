@@ -1,0 +1,13 @@
+# Load the ModSecurity connector (spec §11.9).
+#
+# `load_module` is a main-context directive, so this file only works when
+# nginx.conf includes its directory *above* the `events` block. The panel
+# checks that before writing here and refuses the whole feature otherwise — it
+# will not add the include to nginx.conf itself, because nginx.conf belongs to
+# the nginx package (spec §10.4 rule 1).
+#
+# If the module was built against a different nginx, this line is where that
+# shows up: `nginx -t` answers "module ... is not binary compatible", the
+# config engine restores the previous state and the change never reaches a
+# reload.
+load_module {{ module_path }};

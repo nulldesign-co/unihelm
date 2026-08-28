@@ -45,6 +45,7 @@ pub mod stack;
 pub mod subscriptions;
 pub mod tasks;
 pub mod users;
+pub mod waf;
 
 use std::path::Path;
 use std::str::FromStr;
@@ -74,6 +75,7 @@ pub use secrets::MasterKey;
 pub use sites::{NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPolicy};
 pub use stack::{ComponentStatus, StackComponent};
 pub use subscriptions::{Subscription, SubscriptionStatus};
+pub use waf::{NewWafExclusion, WafExclusion, WafMode, WafSitePolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {

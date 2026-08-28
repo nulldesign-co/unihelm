@@ -26,6 +26,7 @@ pub mod server;
 pub mod sites;
 pub mod stack;
 pub mod tasks;
+pub mod waf;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -144,6 +145,11 @@ fn protected() -> Router<SharedState> {
             get(backups::runs_list).post(backups::runs_create),
         )
         .route("/api/backups/restores", post(backups::restores_create))
+        .route("/api/waf", get(waf::status))
+        .route("/api/waf/enable", post(waf::enable))
+        .route("/api/waf/disable", post(waf::disable))
+        .route("/api/waf/rules", axum::routing::put(waf::rules_set))
+        .route("/api/server/security-posture", get(waf::security_posture))
 }
 
 /// Routes reachable without a session.

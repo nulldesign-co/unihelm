@@ -1,0 +1,17 @@
+# ModSecurity, switched on at http level and inherited by every server block
+# (spec §11.9).
+#
+# This file is the whole nginx-side footprint of the WAF, and that is
+# deliberate. The alternative — a `modsecurity on;` inside each site's server
+# block — would mean editing `site.conf.j2` and re-rendering every vhost to
+# turn one site's WAF on, and a site whose owner had hand-edited their vhost
+# could not be governed at all. Instead the engine is loaded once here, in
+# DetectionOnly, and each site's real policy is a phase-1 rule keyed on its own
+# hostnames inside {{ rules_file }}. Turning a site on or off re-renders one
+# file and reloads nginx.
+#
+# `modsecurity_rules_file` is parsed by nginx at configuration load, so a
+# broken rules file fails `nginx -t` and the config engine rolls the whole
+# change back before anything reloads (spec §10.4 rule 4).
+modsecurity on;
+modsecurity_rules_file {{ rules_file }};

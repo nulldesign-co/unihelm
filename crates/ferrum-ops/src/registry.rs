@@ -303,6 +303,11 @@ impl OpRegistry {
         registry.register(crate::backup::Run::live());
         registry.register(crate::backup::List::live());
         registry.register(crate::backup::Restore::live());
+        registry.register(crate::waf::Status);
+        registry.register(crate::waf::Enable::live());
+        registry.register(crate::waf::Disable);
+        registry.register(crate::waf::RulesSet);
+        registry.register(crate::posture::Posture);
         registry
     }
 

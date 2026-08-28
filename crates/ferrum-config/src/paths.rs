@@ -289,6 +289,85 @@ pub fn app_dir(linux_user: &str, app: &str) -> PathBuf {
     tenant_home(linux_user).join("apps").join(app)
 }
 
+// ---------------------------------------------------------------------------
+// ModSecurity WAF (spec §11.9)
+// ---------------------------------------------------------------------------
+
+/// The stock `sshd_config`, read by the security posture scan when `sshd -T`
+/// cannot be run. Its `Include` line is what makes [`sshd_dropin`] work.
+pub fn sshd_config() -> PathBuf {
+    under("/etc/ssh/sshd_config")
+}
+
+/// The drop-in directory sshd includes. Read — never written — by the posture
+/// scan, which reports what the *effective* configuration says.
+pub fn sshd_config_dir() -> PathBuf {
+    under("/etc/ssh/sshd_config.d")
+}
+
+/// nginx's own top-level configuration. Ferrum never writes it; the WAF
+/// preflight *reads* it to find out whether it offers a main-context `include`
+/// that a `load_module` line could live in (see `ferrum_ops::waf`).
+pub fn nginx_conf() -> PathBuf {
+    under("/etc/nginx/nginx.conf")
+}
+
+/// Where nginx looks for dynamic modules on both families. The nginx.org
+/// packages ship `/etc/nginx/modules` as a symlink to their real module
+/// directory (`/usr/lib/nginx/modules` on deb, `/usr/lib64/nginx/modules` on
+/// rpm), so this one path resolves correctly on both.
+pub fn nginx_modules_dir() -> PathBuf {
+    under("/etc/nginx/modules")
+}
+
+/// The WAF's configuration directory: everything ModSecurity reads that Ferrum
+/// generates.
+pub fn waf_dir() -> PathBuf {
+    config_dir().join("waf")
+}
+
+/// The single rules file nginx points ModSecurity at. It `Include`s the Core
+/// Rule Set and carries the per-site policy Ferrum renders from the database.
+pub fn waf_main_conf() -> PathBuf {
+    waf_dir().join("main.conf")
+}
+
+/// The unpacked OWASP Core Rule Set, under the panel's data directory rather
+/// than `/etc`: it is a downloaded artefact with a pinned checksum, not
+/// configuration an operator edits.
+pub fn waf_crs_dir() -> PathBuf {
+    data_dir().join("waf/crs")
+}
+
+/// Where one CRS release unpacks to. Version-suffixed so an upgrade lands
+/// beside the running set rather than half-overwriting it.
+pub fn waf_crs_release_dir(version: &str) -> PathBuf {
+    waf_crs_dir().join(format!("coreruleset-{version}"))
+}
+
+/// ModSecurity's persistence directory (`SecDataDir`). Under the panel's data
+/// directory and 0700: it holds request fragments from live traffic.
+pub fn waf_data_dir() -> PathBuf {
+    data_dir().join("waf/data")
+}
+
+/// The WAF audit log, beside the per-site logs rather than in the tenant home:
+/// it records what attackers sent, which is not a tenant's file to edit.
+pub fn waf_audit_log() -> PathBuf {
+    under("/var/log/ferrum/waf/audit.log")
+}
+
+/// The http-context nginx include that turns ModSecurity on.
+///
+/// `03-` so it sorts after the catch-all, panel and Adminer server blocks and
+/// before any `site-*.conf` — the directives are inherited by every server
+/// block that follows, and nginx inheritance does not depend on order, but a
+/// human reading the directory should meet the global switch before the sites
+/// it governs.
+pub fn nginx_waf() -> PathBuf {
+    nginx_dir().join("03-waf.conf")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +375,33 @@ mod tests {
     // These tests run in the same process, so the root is whatever it defaults
     // to — `/`. `set_root` is exercised by the dev-mode integration path, where
     // it is called before anything else.
+
+    #[test]
+    fn every_waf_file_the_panel_writes_is_inside_a_directory_it_owns() {
+        // The WAF is the one feature that would be tempting to wire up by
+        // editing nginx.conf. Nothing here may land outside `ferrum.d`,
+        // `/etc/ferrum` or `/var/lib/ferrum` (spec §10.4 rule 1).
+        assert!(nginx_waf().starts_with(nginx_dir()));
+        assert!(waf_main_conf().starts_with(config_dir()));
+        assert!(waf_crs_release_dir("4.29.0").starts_with(data_dir()));
+        assert!(waf_data_dir().starts_with(data_dir()));
+    }
+
+    #[test]
+    fn the_paths_the_posture_scan_reads_are_never_written_by_the_panel() {
+        // Read-only inputs. Listed here so a later refactor that starts
+        // *writing* one of them has to delete this assertion first.
+        assert_eq!(nginx_conf().to_str().unwrap(), "/etc/nginx/nginx.conf");
+        assert_eq!(sshd_config().to_str().unwrap(), "/etc/ssh/sshd_config");
+        assert_eq!(
+            sshd_config_dir().to_str().unwrap(),
+            "/etc/ssh/sshd_config.d"
+        );
+        // The panel's own sshd drop-in lives in that directory, so the scan
+        // reads Ferrum's chrooted-SFTP block too — as it should, since that
+        // block is part of the effective configuration.
+        assert!(sshd_dropin().starts_with(sshd_config_dir()));
+    }
 
     #[test]
     fn fpm_layouts_differ_by_family() {
