@@ -30,10 +30,23 @@ the distribution's stock PHP-FPM `www` pool quietly providing a second,
 unisolated path into PHP. Both are fixed, with regression tests. The details
 are in the git log, which is written to be read.
 
-Phase 2 (multi-tenancy and databases) is in progress: MariaDB and PostgreSQL
-management, Adminer, per-tenant cgroup slices, and the file manager's web layer
-are merged; quotas, plans, cron, DNS, backups and more are being built on
-parallel branches. The [roadmap table](#roadmap) below is the honest ledger.
+**Phases 2 and 3 are merged and exercised on that same server.** MariaDB 11.8
+was installed through the panel's own API, a database created through the API
+exists in the engine, a tenant cron job landed in a real crontab, and a restic
+backup of the panel ran to a real repository. The [roadmap table](#roadmap)
+below is the honest ledger.
+
+Live verification kept earning its place. It found that the panel could not
+install MariaDB at all — the repository host it used answers package managers
+with 403, and the unit test that should have caught it asserted that broken
+host by name and passed the whole time. It found that a successful install left
+MariaDB listening on `0.0.0.0:3306` with two anonymous accounts and a shared
+`test` database, which on a multi-tenant host is not a wart but an isolation
+failure: every tenant's PHP is a local client. It found that the file manager's
+recycle bin could never be created, so nothing could be deleted, because
+chrooted SFTP deliberately makes the tenant home root-owned. None of those were
+reachable from a test suite that runs in a temporary directory without root or
+a network.
 
 **Not yet a product.** There is no release, no binary download, and the Debian
 family — implemented and unit-tested — has not yet been exercised on a real
@@ -115,8 +128,8 @@ below are real measurements, with where they were taken.
 | Metric | Budget (spec §3) | Measured |
 |---|---|---|
 | Idle RSS, both daemons combined | ≤ 80 MB (target 50) | **18.9 MB** on the live AlmaLinux 9.8 server, `/proc/*/smaps_rollup` |
-| Binary size, stripped | ≤ 25 MB each | 3.6 / 4.6 / 5.6 MB at the Phase 0 gate |
-| UI initial route, gzipped | ≤ 350 KB | 153 KB with the file manager merged (its code editor is a 282 KB lazy chunk, loaded only when a file is opened) |
+| Binary size, stripped | ≤ 25 MB each | 3.8 / 9.2 / 15.8 MB (`ferrum`, `ferrum-web`, `ferrum-agentd`) with every Phase 1–3 module merged |
+| UI initial route, gzipped | ≤ 350 KB | 160 KB (its code editor is a 278 KB lazy chunk, loaded only when a file is opened) |
 | Cold start to ready | ≤ 3 s | budget defined; gate not built yet |
 | API p95, non-task endpoints | ≤ 150 ms | budget defined; gate not built yet |
 
@@ -175,9 +188,9 @@ says where.
 |---|---|---|
 | 0 — Walking skeleton | Two daemons under systemd, privilege boundary, auth, task engine, distro abstraction, CI gates | **Done.** 231 tests at the gate; budgets enforced since. |
 | 1 — Web serving core | nginx + vhost engine, PHP versions from Sury/Remi, site CRUD, HTTP-01 certificates, renewal scheduler, panel's own vhost + certificate | **Done.** Site serving, issuance and unattended renewal verified live on AlmaLinux 9.8; the Debian family is implemented and unit-tested but has not run on a real server. Merged since the live run, so not yet live-verified: the panel's own vhost + certificate, and the file manager's UI and API (its privileged `fs.*` backend is still landing). |
-| 2 — Multi-tenancy & databases | Tenant isolation, plans, quotas, MariaDB/PostgreSQL, Adminer, cron, DNS + wildcards, SFTP | **In progress.** Merged: MariaDB/PostgreSQL install and db/user/grant management, Adminer (loopback-only by design), per-tenant cgroup slices. On unmerged parallel branches: quotas, SFTP chroot, plans and suspension, cron, Cloudflare DNS + DNS-01 wildcards. |
-| 3 — Node.js, monitoring, backups | Node apps, reverse proxies, metrics dashboards and alerts, restic-format backups | **Not merged.** In progress on parallel branches. |
-| 4 — App store, WordPress, migration | App store, WP toolkit, cPanel importer, Sentinel brute-force defense, WAF | Not started, except firewall groundwork (firewalld/ufw/nftables backends are implemented and live-tested; the Sentinel module that uses them is on a parallel branch). |
+| 2 — Multi-tenancy & databases | Tenant isolation, plans, quotas, MariaDB/PostgreSQL, Adminer, cron, DNS + wildcards, SFTP | **Done.** MariaDB installed through the panel on AlmaLinux 9.8 and a database created through the API verified present in the engine; a cron job verified in a real crontab. Also merged: PostgreSQL, Adminer (loopback-only by design), per-tenant cgroup slices, XFS/ext4/du quotas, chrooted SFTP, plans and suspension, Cloudflare DNS with DNS-01 wildcards. The engine is hardened at install — loopback-only, no anonymous accounts, no `test` database — because the first live install proved it needed to be. |
+| 3 — Node.js, monitoring, backups | Node apps, reverse proxies, metrics dashboards and alerts, restic-format backups | **Done.** Node apps with a systemd unit per app; alert rules with span-based debounce so a metric flapping at its threshold sends one message, not twenty; restic backups verified by running one — a real snapshot of the panel, taking a consistent database copy through `VACUUM INTO` rather than copying a live WAL file. |
+| 4 — App store, WordPress, migration | App store, WP toolkit, cPanel importer, Sentinel brute-force defense, WAF | **Partly done.** Sentinel and the firewall UI surface are merged: firewalld/ufw/nftables backends, managed rules with drift detection, and brute-force banning that ships disabled so a fresh install cannot lock its operator out. WordPress toolkit, app store, cPanel importer and the WAF are in progress. |
 | 5 — Email & polish | Mail stack, webmail, white-label, docs site | Not started. |
 | 6 — Extensibility | Plugin system (sidecar model), stable public API, multi-server seams | Not started. |
 
