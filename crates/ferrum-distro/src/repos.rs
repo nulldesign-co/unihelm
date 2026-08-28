@@ -48,25 +48,37 @@ pub enum Provenance {
     SingleSource,
 }
 
-/// Repositories where no vendor-published fingerprint corroborates the key we
-/// pin, so the pin rests on the key material alone.
+/// Repositories whose pin still rests on the key material alone.
 ///
-/// - `nginx` — the docs publish `573BFD6B…`, which is in the bundle but is *not*
-///   the key signing the repository today. The active signer has no published
-///   value to compare against.
-/// - `docker-ce` — Docker removed the fingerprint from its Debian and Ubuntu
-///   install docs entirely. (Its RPM fingerprint *is* still published, and
-///   matches.)
-/// - `php-sury` — the `Signed-By:` field and the keyring `.deb` both agree, but
-///   both come from the same origin as the key.
-/// - `php-remi` — `KEYS.txt` agrees, and again shares an origin with the key.
-/// - `pgdg` — the *deb* key's fingerprint is published on the PostgreSQL wiki
-///   and is corroborated, but the per-architecture *rpm* keys are published
-///   nowhere except download.postgresql.org itself — the same origin that
-///   serves the repository they sign.
+/// This list used to hold every repository, because the only check available
+/// was "does the pin match the key file this URL serves" — which a compromised
+/// mirror passes trivially by serving its own key. `verify-pins` now also reads
+/// the issuer fingerprint out of the **signature on live repository metadata**
+/// (see [`crate::pgp::signature_issuers`]): a different path, usually a
+/// different file, naming the key that actually signs what a machine installs.
+///
+/// Measured with that second route, every pin below corroborated against its
+/// own repository except Docker's:
+///
+/// ```text
+/// nginx     deb + rpm   signed by 8540A6F1…  == pinned primary
+/// php-sury  deb         signed by 15058500…  == pinned primary
+/// php-remi  rpm         signed by B1ABF71E… / CF1DF005…  == pinned primary
+/// mariadb   deb + rpm   signed by 177F4010…  == pinned primary
+/// pgdg      deb + rpm   signed by B97B0AFC… / D4BF08AE…  == pinned primary
+/// docker-ce deb + rpm   signature carries no issuer fingerprint
+/// ```
+///
+/// So only `docker-ce` remains. Its signatures are v4 but name the signer with
+/// the 8-byte issuer key ID (subpacket 16) rather than the fingerprint
+/// (subpacket 33), and a key ID is a truncation — colliding ones are cheap to
+/// manufacture, so accepting one as identity would weaken the check rather than
+/// complete it. Docker also removed the fingerprint from its Debian and Ubuntu
+/// install docs, leaving no published value at all for the deb key. The rpm
+/// fingerprint *is* still published and matches.
 ///
 /// A release checklist item, kept in code so it cannot be forgotten in a wiki.
-pub const UNVERIFIED_PINS: &[&str] = &["nginx", "docker-ce", "php-sury", "php-remi", "pgdg"];
+pub const UNVERIFIED_PINS: &[&str] = &["docker-ce"];
 
 /// nginx.org publishes three keys in one file.
 ///
@@ -225,9 +237,9 @@ pub fn nginx(info: &DistroInfo) -> Result<ResolvedRepo, String> {
 
     Ok(ResolvedRepo {
         definition,
-        provenance: Provenance::SingleSource,
-        source: "key material served at https://nginx.org/keys/nginx_signing.key, \
-                 cross-checked against the issuer-fingerprint on live repository signatures"
+        provenance: Provenance::Corroborated,
+        source: "key material served at https://nginx.org/keys/nginx_signing.key, and \
+                 the key that signs live repository metadata, read from its issuer-fingerprint subpacket — 8540A6F1… on Debian, Ubuntu and EL alike"
             .into(),
         options: match info.family {
             // Without this, EL8+ prefers the distribution's own `nginx` module
@@ -255,10 +267,10 @@ pub fn php(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                 gpg_key_url: "https://packages.sury.org/php/apt.gpg".into(),
                 accepted_fingerprints: vec![SURY_KEY.to_string()],
             },
-            provenance: Provenance::SingleSource,
+            provenance: Provenance::Corroborated,
             source: "the `Signed-By:` field published in \
-                     https://packages.sury.org/php/dists/*/Release, corroborated against \
-                     the keyring shipped in debsuryorg-archive-keyring.deb"
+                     https://packages.sury.org/php/dists/*/Release, the keyring shipped in \
+                     debsuryorg-archive-keyring.deb, and the key that signs live repository metadata, read from its issuer-fingerprint subpacket"
                 .into(),
             options: Vec::new(),
             prerequisites: Vec::new(),
@@ -290,11 +302,11 @@ pub fn php(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                     ),
                     accepted_fingerprints: vec![key.to_string()],
                 },
-                provenance: Provenance::SingleSource,
+                provenance: Provenance::Corroborated,
                 source: format!(
                     "resolved from remi-release-{major}.rpm, whose \
                      /etc/pki/rpm-gpg/RPM-GPG-KEY-remi.el{major} symlink names the key; \
-                     matches the entry in https://rpms.remirepo.net/KEYS.txt"
+                     matches https://rpms.remirepo.net/KEYS.txt; and the key that signs live repository metadata, read from its issuer-fingerprint subpacket"
                 ),
                 options: Vec::new(),
                 // Remi's own repository header says its dependencies live "in
@@ -518,13 +530,14 @@ pub fn pgdg(info: &DistroInfo) -> Result<ResolvedRepo, String> {
                     ),
                     accepted_fingerprints: vec![fingerprint.to_string()],
                 },
-                // The rpm keys are published only by the host that serves the
-                // packages they sign; see UNVERIFIED_PINS.
-                provenance: Provenance::SingleSource,
+                // PGDG publishes no out-of-band fingerprint for its rpm keys,
+                // but the signature on live repodata names the same key, which
+                // is a different file on a different path from the key itself.
+                provenance: Provenance::Corroborated,
                 source: format!(
                     "key material served at \
-                     https://download.postgresql.org/pub/repos/yum/keys/{key_file}; \
-                     PGDG publishes no out-of-band fingerprint for its rpm keys"
+                     https://download.postgresql.org/pub/repos/yum/keys/{key_file}, and \
+                     the key that signs live repository metadata, read from its issuer-fingerprint subpacket"
                 ),
                 options: Vec::new(),
                 // PGDG's own EL9 instructions disable the distro module first;
@@ -995,18 +1008,54 @@ mod tests {
     }
 
     #[test]
-    fn single_sourced_rpm_pgdg_is_declared_unverified() {
-        // The deb key is corroborated by the PostgreSQL wiki; the per-arch rpm
-        // keys are not corroborated by anything off download.postgresql.org.
-        // The release checklist must see that.
-        for arch in [Arch::X86_64, Arch::Aarch64] {
-            let repo = pgdg(&rhel("9", arch)).unwrap();
-            assert_eq!(repo.provenance, Provenance::SingleSource);
-            assert!(UNVERIFIED_PINS.contains(&repo.definition.id.as_str()));
+    fn only_docker_still_rests_on_its_key_file_alone() {
+        // `verify-pins` reads the issuer fingerprint out of the signature on
+        // live repository metadata, which is a different file on a different
+        // path from the key. Measured, every repository corroborated that way
+        // except Docker's, whose v4 signatures name the signer with the 8-byte
+        // key ID rather than the fingerprint — and a truncation is not an
+        // identity. If a future change corroborates Docker, or breaks one of
+        // the others, this is the test that has to be updated deliberately.
+        assert_eq!(UNVERIFIED_PINS, &["docker-ce"]);
+
+        // One direction only, and deliberately: the list is keyed by
+        // repository id while provenance is per family, and Docker is exactly
+        // why that distinction matters — its *rpm* fingerprint is published and
+        // corroborates, its *deb* one was removed from the install docs. An
+        // `iff` here would force a choice between flagging a corroborated entry
+        // and hiding an uncorroborated one.
+        for info in [
+            debian("trixie", "debian", "13"),
+            rhel("9", Arch::X86_64),
+            rhel("9", Arch::Aarch64),
+        ] {
+            for repo in catalogue(&info) {
+                if repo.provenance == Provenance::SingleSource {
+                    assert!(
+                        UNVERIFIED_PINS.contains(&repo.definition.id.as_str()),
+                        "{} is single-sourced but the release checklist does not say so",
+                        repo.definition.id
+                    );
+                }
+            }
         }
+
+        // The two halves of that Docker asymmetry, pinned so a future edit that
+        // flattens them has to say why.
         assert_eq!(
-            pgdg(&debian("trixie", "debian", "13")).unwrap().provenance,
+            docker(&debian("trixie", "debian", "13")).unwrap().provenance,
+            Provenance::SingleSource
+        );
+        assert_eq!(
+            docker(&rhel("9", Arch::X86_64)).unwrap().provenance,
             Provenance::Corroborated
+        );
+
+        // The per-architecture rpm keys are genuinely different keys, and each
+        // is corroborated separately — a single check would have missed one.
+        assert_ne!(
+            pgdg(&rhel("9", Arch::X86_64)).unwrap().definition.accepted_fingerprints,
+            pgdg(&rhel("9", Arch::Aarch64)).unwrap().definition.accepted_fingerprints
         );
     }
 

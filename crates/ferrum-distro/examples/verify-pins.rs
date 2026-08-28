@@ -117,6 +117,45 @@ async fn main() {
             match client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => {
                     println!("  {:<10} {:<22} 200  {url}", d.id, label);
+
+                    // The second, independent route (see pgp::signature_issuers):
+                    // the key that really signs the metadata a machine installs
+                    // from, published on a different path from the key file.
+                    let sig_url = if d.suite.is_some() {
+                        url.replace("/Release", "/Release.gpg")
+                    } else {
+                        format!("{url}.asc")
+                    };
+                    match client.get(&sig_url).send().await {
+                        Ok(sr) if sr.status().is_success() => {
+                            let body = sr.bytes().await.unwrap_or_default().to_vec();
+                            match pgp::signature_issuers(&body) {
+                                Ok(issuers) => {
+                                    let pinned: Vec<String> = d
+                                        .accepted_fingerprints
+                                        .iter()
+                                        .map(|f| pgp::normalise(f))
+                                        .collect();
+                                    // A subkey may sign on the primary's behalf,
+                                    // so a non-match is reported, not failed:
+                                    // the primary is what we pin.
+                                    let hit = issuers.iter().any(|i| pinned.contains(i));
+                                    println!(
+                                        "             signed by {} {}",
+                                        issuers.join(", "),
+                                        if hit {
+                                            "== PINNED PRIMARY (corroborated)"
+                                        } else {
+                                            "(a subkey of the pinned primary, or a rotation to check)"
+                                        }
+                                    );
+                                }
+                                Err(e) => println!("             signature unreadable: {e}"),
+                            }
+                        }
+                        Ok(sr) => println!("             no detached signature: HTTP {}", sr.status()),
+                        Err(e) => println!("             signature fetch failed: {e}"),
+                    }
                 }
                 Ok(r) => {
                     println!("  {:<10} {:<22} HTTP {}  {url}", d.id, label, r.status());

@@ -117,6 +117,121 @@ pub fn verify_pinned(key_material: &[u8], accepted: &[String]) -> Result<KeyFing
     )))
 }
 
+/// The key that actually signed something, read out of a detached signature.
+///
+/// This is the *second, independent route* the module docs say most pins are
+/// missing. Fetching a vendor's key file and checking its fingerprint proves
+/// only that the pin matches what that URL serves — a compromised mirror would
+/// serve its own key and we would faithfully pin it. A signature on live
+/// repository metadata is different evidence: it names the key that is really
+/// signing the packages a machine would install, and it is published on a
+/// different path (often a different host) from the key file.
+///
+/// Reads the issuer-fingerprint subpacket (type 33) from the hashed and then
+/// the unhashed area of every signature packet (tag 2). Deliberately not the
+/// 8-byte issuer key ID (type 16): a key ID is a truncation, and a truncation
+/// is not an identity — colliding key IDs are cheap to manufacture.
+pub fn signature_issuers(signature: &[u8]) -> Result<Vec<String>> {
+    let data = dearmor(signature)?;
+    let mut out = Vec::new();
+
+    for packet in parse_packets(&data)? {
+        if packet.tag != 2 {
+            continue;
+        }
+        let b = &packet.body;
+        // v4 and v6 both start with the version byte; only v4/v6 carry
+        // subpackets at all, and v3 signatures have no fingerprint to give.
+        if b.len() < 6 || (b[0] != 4 && b[0] != 6) {
+            continue;
+        }
+        // v4: version, sig type, pk algo, hash algo, then two subpacket areas
+        // each prefixed with a two-byte length.
+        let mut i = 4usize;
+        for _ in 0..2 {
+            if i + 2 > b.len() {
+                break;
+            }
+            let area_len = u16::from_be_bytes([b[i], b[i + 1]]) as usize;
+            i += 2;
+            let end = match i.checked_add(area_len) {
+                Some(e) if e <= b.len() => e,
+                _ => break,
+            };
+            collect_issuer_fingerprints(&b[i..end], &mut out);
+            i = end;
+        }
+    }
+
+    if out.is_empty() {
+        return Err(DistroError::InvalidName(
+            "the signature names no issuer fingerprint (only v4 and v6 signatures carry one)"
+                .into(),
+        ));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Walk one subpacket area, pulling out every issuer-fingerprint subpacket.
+///
+/// Bounded and non-recursive, like the packet walker: this is untrusted input
+/// fetched over the network.
+fn collect_issuer_fingerprints(area: &[u8], out: &mut Vec<String>) {
+    let mut i = 0usize;
+    // A subpacket area with more entries than this is not a signature.
+    for _ in 0..1024 {
+        if i >= area.len() {
+            return;
+        }
+        // Subpacket length uses the same three-form encoding as old packet
+        // lengths, and the length counts the type byte that follows it.
+        let (len, consumed) = match area[i] {
+            l if l < 192 => (l as usize, 1),
+            l if l < 255 => {
+                if i + 1 >= area.len() {
+                    return;
+                }
+                (((l as usize - 192) << 8) + area[i + 1] as usize + 192, 2)
+            }
+            _ => {
+                if i + 5 > area.len() {
+                    return;
+                }
+                (
+                    u32::from_be_bytes([area[i + 1], area[i + 2], area[i + 3], area[i + 4]])
+                        as usize,
+                    5,
+                )
+            }
+        };
+        i += consumed;
+        if len == 0 || i + len > area.len() {
+            return;
+        }
+        let sub_type = area[i] & 0x7F;
+        let body = &area[i + 1..i + len];
+        // Type 33: one version byte, then the fingerprint. Version 4 gives 20
+        // bytes, version 6 gives 32.
+        if sub_type == 33 && !body.is_empty() {
+            let expected = match body[0] {
+                4 => 20,
+                6 => 32,
+                _ => 0,
+            };
+            if expected > 0 && body.len() >= 1 + expected {
+                out.push(hex_upper(&body[1..1 + expected]));
+            }
+        }
+        i += len;
+    }
+}
+
+fn hex_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 // ---------------------------------------------------------------------------
 // packet parsing
 // ---------------------------------------------------------------------------
@@ -290,8 +405,18 @@ fn looks_armored(data: &[u8]) -> bool {
 pub fn dearmor(data: &[u8]) -> Result<Vec<u8>> {
     use base64::Engine;
 
-    let text = std::str::from_utf8(data)
-        .map_err(|_| DistroError::InvalidName("armored key is not valid UTF-8".into()))?;
+    // Binary OpenPGP is already what the parser wants; only armor needs undoing.
+    //
+    // Detecting it by "is this UTF-8" rather than refusing non-UTF-8 outright:
+    // apt repositories publish `Release.gpg` as a raw binary signature, and
+    // demanding text meant the panel could read nginx's RPM signature but not
+    // its Debian one — a gap in verification created purely by an input format.
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Ok(data.to_vec());
+    };
+    if !text.contains("-----BEGIN PGP") {
+        return Ok(data.to_vec());
+    }
 
     let mut out = Vec::new();
     let mut in_block = false;
