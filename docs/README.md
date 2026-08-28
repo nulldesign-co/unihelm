@@ -2,6 +2,7 @@
 
 - **Operators**
   - [Installing](operator/install.md)
+  - [The `ferrum` command line](operator/cli.md) — every operation, `--json`, exit codes, completions
   - [Configuration safety](config-safety.md) — what happens when you edit a generated file
 - **Developers**
   - [Architecture](architecture.md) — the two daemons, the operation registry, the config contract

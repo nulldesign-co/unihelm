@@ -1,110 +1,112 @@
 //! `ferrum` — the command-line half of the panel (spec §11.20).
 //!
-//! Two jobs in Phase 0:
+//! The CLI reaches every operation the UI does, over the same Unix socket, with
+//! the same identity model. It is not a second API: `session.rs` opens the
+//! agent socket `ferrum-web` opens, and the agent re-derives the acting
+//! account's rights from the database before it does anything (spec §12 rule 4).
+//! There is no CLI-only privilege, no CLI-only endpoint and no CLI-only auth
+//! path to keep in step.
+//!
+//! Three commands are answered without the agent, because they have to work
+//! when it is not there:
 //!
 //! - **`ferrum doctor`**, the first thing to run when something looks wrong. It
 //!   checks the pieces in the order they depend on each other, so the first
 //!   failure is usually the real one.
 //! - **`ferrum user create-admin`**, which the installer calls to create the
-//!   first account. This is the one command that must work before any session,
-//!   any HTTP listener, or any agent exists.
+//!   first account, before any session, listener or agent exists.
+//! - **`ferrum task …`**, which reads the task table directly; see `tasks.rs`.
 //!
-//! TODO(scope): spec §11.20 has the CLI talking to the REST API over
-//! `panel.cli_socket`. That needs the API surface Phase 1 introduces; until then
-//! the CLI reads the database directly (as root, on the same host), which is what
-//! `doctor` and first-run setup need anyway.
+//! Output is a table by default and `--json` everywhere for scripting, and the
+//! exit code is meaningful — see the table in `session.rs`.
 
+mod cli;
+mod completions;
+mod invoke;
+mod output;
+mod parity;
 mod report;
-
-use std::path::PathBuf;
+mod session;
+mod tasks;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use ferrum_core::config::{FerrumConfig, paths};
-use ferrum_core::{AuthContext, Email, Role, TenantScope, Username};
+use clap::Parser;
+use ferrum_core::config::FerrumConfig;
+use ferrum_core::{Email, Role, TenantScope, Username};
 use ferrum_db::Db;
 use ferrum_db::users::NewUser;
 use ferrum_distro::{Distro, SupportStatus};
 use ferrum_ipc::IpcClient;
 
+use crate::cli::{
+    BackupCommand, BackupRepoCommand, Cli, Command, DnsCommand, OpsCommand, SftpCommand,
+    UserCommand,
+};
+use crate::invoke::{Action, Secrets, action_for};
 use crate::report::{Report, human_bytes};
-
-#[derive(Parser, Debug)]
-#[command(name = "ferrum", version, about = "Ferrum hosting panel")]
-struct Cli {
-    #[arg(long, default_value = paths::CONFIG, global = true)]
-    config: PathBuf,
-
-    /// Operate on a development instance rooted at this directory.
-    #[arg(long, global = true)]
-    dev: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Full health report: config, database, agent, system.
-    Doctor {
-        /// Emit JSON instead of a human-readable report.
-        #[arg(long)]
-        json: bool,
-    },
-    /// One-line status of the panel and the machine.
-    Status,
-    /// Account management.
-    #[command(subcommand)]
-    User(UserCommand),
-    /// Inspect the operation registry.
-    #[command(subcommand)]
-    Ops(OpsCommand),
-}
-
-#[derive(Subcommand, Debug)]
-enum UserCommand {
-    /// Create the first administrator. Refuses if any account already exists.
-    CreateAdmin {
-        #[arg(long)]
-        username: String,
-        #[arg(long)]
-        email: String,
-        /// Read the password from stdin instead of generating one.
-        #[arg(long)]
-        password_stdin: bool,
-    },
-    /// List accounts.
-    List,
-}
-
-#[derive(Subcommand, Debug)]
-enum OpsCommand {
-    /// List every operation the running agent will accept.
-    List,
-}
+use crate::session::{EXIT_LOCAL_FAILURE, Session, TransportFailure};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
+    let code = match run(cli).await {
+        Ok(code) => code,
+        Err(error) => report_failure(&error, json),
+    };
+    std::process::exit(code);
+}
+
+async fn run(cli: Cli) -> Result<i32> {
     let config = load_config(&cli)?;
 
-    let exit = match cli.command {
-        Command::Doctor { json } => doctor(&config, json).await?,
-        Command::Status => {
-            status(&config).await?;
-            0
-        }
+    match &cli.command {
+        Command::Doctor => return doctor(&config, cli.json).await,
         Command::User(cmd) => {
             user(&config, cmd).await?;
-            0
+            return Ok(0);
         }
-        Command::Ops(cmd) => {
-            ops(&config, cmd).await?;
-            0
+        Command::Ops(OpsCommand::List) => {
+            let table = parity::as_json();
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&table)?);
+            } else {
+                print!("{}", output::render("cli.ops", &table));
+            }
+            return Ok(0);
         }
-    };
+        Command::Completions { shell } => {
+            completions::generate(*shell, &mut std::io::stdout());
+            return Ok(0);
+        }
+        Command::Task(cmd) => {
+            // Reading tasks must work when the agent is down — that is exactly
+            // when somebody wants to see why the last one failed. Only `cancel`
+            // needs the socket.
+            let session = if matches!(cmd, cli::TaskCommand::Cancel { .. }) {
+                Session::connected(&config, cli.json, cli.follow).await?
+            } else {
+                Session::local(&config, cli.json, cli.follow).await?
+            };
+            let code = tasks::run(&session, cmd).await;
+            session.close().await;
+            return code;
+        }
+        _ => {}
+    }
 
-    std::process::exit(exit);
+    // Secrets are read here, once, so the planner stays a pure function.
+    let secrets = resolve_secrets(&cli.command)?;
+    let action = action_for(&cli.command, &secrets)?;
+    debug_assert!(
+        !matches!(action, Action::Local),
+        "a local command reached the agent path"
+    );
+
+    let session = Session::connected(&config, cli.json, cli.follow).await?;
+    let code = session.execute(&action).await;
+    session.close().await;
+    code
 }
 
 fn load_config(cli: &Cli) -> Result<FerrumConfig> {
@@ -124,6 +126,101 @@ fn load_config(cli: &Cli) -> Result<FerrumConfig> {
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
     Ok(config)
+}
+
+/// Print a failure that never reached an operation, and answer with its exit
+/// code.
+///
+/// A transport failure carries a real `FER-15xx` code and gets the same
+/// treatment as an operation that ran and said no; anything else is the CLI
+/// failing before it could ask, which is exit 1.
+fn report_failure(error: &anyhow::Error, json: bool) -> i32 {
+    if let Some(TransportFailure(ferrum)) = error.downcast_ref::<TransportFailure>() {
+        if json {
+            print_json(&serde_json::json!({
+                "error": {
+                    "code": ferrum.code.code(),
+                    "slug": ferrum.code.slug(),
+                    "detail": ferrum.detail,
+                }
+            }));
+        } else {
+            // The same shape `Session::report_error` uses, so a human sees one
+            // format and a log grep matches both.
+            eprintln!(
+                "error: {} {}: {}",
+                ferrum.code.code(),
+                ferrum.code.slug(),
+                ferrum.detail
+            );
+        }
+        return session::exit_code_for(ferrum.code);
+    }
+
+    if json {
+        print_json(&serde_json::json!({
+            "error": { "code": null, "slug": "cli_error", "detail": format!("{error:#}") }
+        }));
+    } else {
+        eprintln!("error: {error:#}");
+    }
+    EXIT_LOCAL_FAILURE
+}
+
+fn print_json(value: &serde_json::Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("could not serialise the error: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// secrets
+// ---------------------------------------------------------------------------
+
+/// Resolve the one secret a command may need, from stdin or the environment.
+///
+/// Never from argv: a token given as `--token hunter2` is visible in
+/// `/proc/<pid>/cmdline` to every account on the machine for as long as the
+/// command runs, and lands in the shell history for ever after. No command in
+/// `cli.rs` has a flag that takes one.
+fn resolve_secrets(command: &Command) -> Result<Secrets> {
+    let mut secrets = Secrets::default();
+    match command {
+        Command::Dns(DnsCommand::ProviderSet { token_stdin, .. }) => {
+            secrets.dns_token = secret(*token_stdin, "FERRUM_DNS_TOKEN")?;
+        }
+        Command::Backup(BackupCommand::Repo(BackupRepoCommand::Init {
+            s3_secret_stdin, ..
+        })) => {
+            secrets.s3_secret_access_key = secret(*s3_secret_stdin, "FERRUM_S3_SECRET_ACCESS_KEY")?;
+        }
+        Command::Sftp(SftpCommand::Enable { password_stdin, .. }) => {
+            secrets.sftp_password = secret(*password_stdin, "FERRUM_SFTP_PASSWORD")?;
+        }
+        _ => {}
+    }
+    Ok(secrets)
+}
+
+fn secret(from_stdin: bool, env_var: &str) -> Result<Option<String>> {
+    if from_stdin {
+        return Ok(Some(read_secret_line()?));
+    }
+    Ok(std::env::var(env_var).ok().filter(|v| !v.is_empty()))
+}
+
+/// One line from stdin, with the trailing newline removed and nothing else
+/// touched — a token may legitimately contain anything else.
+fn read_secret_line() -> Result<String> {
+    let mut buffer = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buffer)
+        .context("could not read the secret from stdin")?;
+    let value = buffer.trim_end_matches(['\n', '\r']).to_string();
+    if value.is_empty() {
+        anyhow::bail!("nothing arrived on stdin");
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,76 +398,10 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// status
-// ---------------------------------------------------------------------------
-
-async fn status(config: &FerrumConfig) -> Result<()> {
-    let client = IpcClient::connect(&config.agent.socket)
-        .await
-        .with_context(|| {
-            format!(
-                "could not reach the agent at {}",
-                config.agent.socket.display()
-            )
-        })?;
-
-    // The CLI runs as root on the same host; the agent still re-checks this
-    // context against the database before acting on it.
-    let auth = admin_auth(config).await?;
-
-    let snapshot = client
-        .call_ok("metrics.snapshot", &auth, serde_json::json!({}))
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let cpu = snapshot["cpu"]["usage_pct"].as_f64().unwrap_or(0.0);
-    let cores = snapshot["cpu"]["cores"].as_u64().unwrap_or(0);
-    let mem_used = snapshot["memory"]["used_bytes"].as_u64().unwrap_or(0);
-    let mem_total = snapshot["memory"]["total_bytes"].as_u64().unwrap_or(0);
-    let load = snapshot["load"]["one"].as_f64().unwrap_or(0.0);
-    let uptime = snapshot["uptime_seconds"].as_u64().unwrap_or(0);
-
-    println!("cpu      {cpu:.1}% of {cores} core(s), load {load:.2}");
-    println!(
-        "memory   {} / {}",
-        human_bytes(mem_used),
-        human_bytes(mem_total)
-    );
-    println!("uptime   {}", format_uptime(uptime));
-
-    if let Some(disks) = snapshot["disks"].as_array() {
-        for disk in disks {
-            let mount = disk["mount"].as_str().unwrap_or("?");
-            let used = disk["used_bytes"].as_u64().unwrap_or(0);
-            let total = disk["total_bytes"].as_u64().unwrap_or(1);
-            println!(
-                "disk     {mount}: {} / {} ({:.0}%)",
-                human_bytes(used),
-                human_bytes(total),
-                used as f64 / total as f64 * 100.0
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn format_uptime(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let hours = (seconds % 86_400) / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    match (days, hours) {
-        (0, 0) => format!("{minutes}m"),
-        (0, h) => format!("{h}h {minutes}m"),
-        (d, h) => format!("{d}d {h}h"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // user
 // ---------------------------------------------------------------------------
 
-async fn user(config: &FerrumConfig, cmd: UserCommand) -> Result<()> {
+async fn user(config: &FerrumConfig, cmd: &UserCommand) -> Result<()> {
     let db = Db::open(&config.panel.database)
         .await
         .with_context(|| format!("could not open {}", config.panel.database.display()))?;
@@ -388,7 +419,7 @@ async fn user(config: &FerrumConfig, cmd: UserCommand) -> Result<()> {
                 );
             }
 
-            let password = if password_stdin {
+            let password = if *password_stdin {
                 let mut buf = String::new();
                 std::io::Write::flush(&mut std::io::stdout())?;
                 std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)?;
@@ -401,8 +432,8 @@ async fn user(config: &FerrumConfig, cmd: UserCommand) -> Result<()> {
                 .users(&TenantScope::Global)
                 .create(NewUser {
                     role: Role::Admin,
-                    email: Email::parse(&email)?,
-                    username: Username::parse(&username)?,
+                    email: Email::parse(email)?,
+                    username: Username::parse(username)?,
                     password: password.clone(),
                     reseller_id: None,
                     full_name: None,
@@ -414,7 +445,7 @@ async fn user(config: &FerrumConfig, cmd: UserCommand) -> Result<()> {
                 "created administrator `{}` (id {})",
                 created.username, created.id
             );
-            if !password_stdin {
+            if !*password_stdin {
                 println!();
                 println!("  password: {password}");
                 println!();
@@ -428,6 +459,7 @@ async fn user(config: &FerrumConfig, cmd: UserCommand) -> Result<()> {
             let users = db.users(&TenantScope::Global).list(500, 0).await?;
             if users.is_empty() {
                 println!("no accounts yet");
+                db.close().await;
                 return Ok(());
             }
             println!(
@@ -465,69 +497,10 @@ fn generate_password() -> String {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// ops
-// ---------------------------------------------------------------------------
-
-async fn ops(config: &FerrumConfig, cmd: OpsCommand) -> Result<()> {
-    match cmd {
-        OpsCommand::List => {
-            let client = IpcClient::connect(&config.agent.socket)
-                .await
-                .with_context(|| {
-                    format!(
-                        "could not reach the agent at {}",
-                        config.agent.socket.display()
-                    )
-                })?;
-            let auth = admin_auth(config).await?;
-            let info = client
-                .call_ok("sys.ping", &auth, serde_json::json!({}))
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("agent {} on {}", info["agent_version"], info["distro"]);
-            // TODO(scope): a `sys.operations` op would let the CLI list the
-            // registry directly. Not needed until there is more than a handful.
-        }
-    }
-    Ok(())
-}
-
-/// Build an auth context for the local administrator.
-///
-/// The CLI does not invent privileges: it names an existing admin account, and
-/// the agent re-derives that account's rights from the database before acting
-/// (spec §12 rule 4).
-async fn admin_auth(config: &FerrumConfig) -> Result<AuthContext> {
-    let db = Db::open(&config.panel.database).await?;
-    let admin = db
-        .users(&TenantScope::Global)
-        .list(500, 0)
-        .await?
-        .into_iter()
-        .find(|u| u.role == Role::Admin && u.status.can_log_in())
-        .context("no active administrator account exists; run `ferrum user create-admin`")?;
-    db.close().await;
-
-    Ok(AuthContext::from_role(
-        admin.id,
-        Role::Admin,
-        TenantScope::Global,
-        format!("cli-{}", uuid_like()),
-    ))
-}
-
-/// A short random request id. The CLI does not need real UUIDs, only something
-/// unique enough to correlate one invocation's log lines.
-fn uuid_like() -> String {
-    use rand::Rng;
-    let n: u64 = rand::thread_rng().r#gen();
-    format!("{n:016x}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Report;
 
     #[test]
     fn generated_passwords_are_long_and_unambiguous() {
@@ -543,19 +516,41 @@ mod tests {
     }
 
     #[test]
-    fn uptime_reads_naturally() {
-        assert_eq!(format_uptime(45), "0m");
-        assert_eq!(format_uptime(600), "10m");
-        assert_eq!(format_uptime(3_700), "1h 1m");
-        assert_eq!(format_uptime(90_000), "1d 1h");
-    }
-
-    #[test]
     fn report_levels_drive_the_exit_code() {
         let mut r = Report::default();
         r.warn("docker", "not installed");
         assert_eq!(r.exit_code(), 0, "a warning must not fail a monitoring run");
         r.fail("agent", "socket missing");
         assert_eq!(r.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_secret_flag_prefers_stdin_but_falls_back_to_the_environment() {
+        // SAFETY: single-threaded test, and the variable is removed again
+        // before it can reach another one.
+        unsafe { std::env::set_var("FERRUM_TEST_SECRET", "from-env") };
+        assert_eq!(
+            secret(false, "FERRUM_TEST_SECRET").unwrap(),
+            Some("from-env".to_string())
+        );
+        unsafe { std::env::set_var("FERRUM_TEST_SECRET", "") };
+        assert_eq!(
+            secret(false, "FERRUM_TEST_SECRET").unwrap(),
+            None,
+            "an empty variable is not a credential"
+        );
+        unsafe { std::env::remove_var("FERRUM_TEST_SECRET") };
+        assert_eq!(secret(false, "FERRUM_TEST_SECRET").unwrap(), None);
+    }
+
+    #[test]
+    fn a_command_with_no_secret_resolves_none_and_never_reads_stdin() {
+        // If this ever blocked, `ferrum site list` in a script with no stdin
+        // would hang for ever.
+        let cli = Cli::try_parse_from(["ferrum", "site", "list"]).unwrap();
+        let secrets = resolve_secrets(&cli.command).unwrap();
+        assert!(secrets.dns_token.is_none());
+        assert!(secrets.s3_secret_access_key.is_none());
+        assert!(secrets.sftp_password.is_none());
     }
 }

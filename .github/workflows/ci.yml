@@ -70,6 +70,14 @@ jobs:
       - name: Registered operations are documented
         run: bash tests/gates/ops-docs.sh
 
+      # The CLI verb is the half of §16.5 nobody notices missing, because the UI
+      # is what gets demonstrated (spec §11.20).
+      - name: Registered operations are reachable from the CLI
+        run: bash tests/gates/cli-parity.sh
+
+      - name: CLI parity gate self-test
+        run: bash tests/gates/cli-parity.sh --self-test
+
       # Fixture builds, no npm: this checks the UI budget's own logic. The real
       # measurement happens in the `ui` job, which has a build to measure.
       - name: Budget gate self-test

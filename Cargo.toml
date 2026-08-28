@@ -57,6 +57,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "json", "time", "uuid"] }
 clap = { version = "4", features = ["derive", "env"] }
+# Shell completions for `ferrum completions <shell>` (spec §11.20). Generated
+# from the same clap tree the binary parses with, so they cannot drift.
+clap_complete = "4"
 async-trait = "0.1"
 futures = "0.3"
 libc = "0.2"
