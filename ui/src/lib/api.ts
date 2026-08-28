@@ -204,6 +204,35 @@ export interface Task {
 export interface TaskListResponse {
   tasks: Task[];
   active: number;
+  /** Op names present in this account's history — the filter's own options. */
+  ops: string[];
+}
+
+/**
+ * What the task history page is asking for (spec §11.17).
+ *
+ * Every field is optional and they combine with AND, which is how a row of
+ * filter controls reads. Empty strings are dropped rather than sent, so
+ * clearing a control means "no filter" and not "match the empty string".
+ */
+export interface TaskQuery {
+  op?: string;
+  status?: TaskStatus | "";
+  /** RFC 3339, inclusive. */
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export function taskQueryString(query: TaskQuery = {}): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const encoded = params.toString();
+  return encoded ? `?${encoded}` : "";
 }
 
 export interface TaskLogLine {
@@ -721,9 +750,15 @@ export const endpoints = {
   me: () => api.get<SessionResponse>("/api/auth/me"),
   overview: () => api.get<Overview>("/api/server/overview"),
   services: () => api.get<ServicesResponse>("/api/server/services"),
-  tasks: () => api.get<TaskListResponse>("/api/tasks"),
+  tasks: (query: TaskQuery = {}) =>
+    api.get<TaskListResponse>(`/api/tasks${taskQueryString(query)}`),
   taskLogs: (id: string, afterSeq = 0) =>
     api.get<{ lines: TaskLogLine[] }>(`/api/tasks/${id}/logs?after_seq=${afterSeq}`),
+  cancelTask: (id: string) =>
+    api.post<{ task_id: string; requested: boolean }>(`/api/tasks/${id}/cancel`),
+  // A retry starts a *new* task, so the failed one keeps its logs and its
+  // reason — the history is the point of this page.
+  retryTask: (id: string) => api.post<TaskAccepted>(`/api/tasks/${id}/retry`),
 
   stack: () => api.get<StackResponse>("/api/stack"),
   installComponent: (component: { component: "nginx" } | { component: "php"; version: string }) =>

@@ -22,6 +22,8 @@ import { PlansPage } from "@/routes/plans";
 import { SiteDetailPage } from "@/routes/site-detail";
 import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
+import { TasksPage } from "@/routes/tasks";
+import { TerminalPage } from "@/routes/terminal";
 
 /**
  * One gate for the whole app.
@@ -126,6 +128,18 @@ const firewallRoute = createRoute({
   component: FirewallPage,
 });
 
+const tasksRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/tasks",
+  component: TasksPage,
+});
+
+const terminalRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/terminal",
+  component: TerminalPage,
+});
+
 const alertsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/alerts",
@@ -146,6 +160,8 @@ const routeTree = rootRoute.addChildren([
   filesRoute,
   firewallRoute,
   alertsRoute,
+  tasksRoute,
+  terminalRoute,
 ]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });
