@@ -50,6 +50,25 @@ fn last_error() -> io::Error {
     io::Error::last_os_error()
 }
 
+/// Mark a descriptor close-on-exec.
+///
+/// Set through `fcntl` rather than an `O_CLOEXEC` open flag because
+/// `posix_openpt` only accepts the flag on some platforms, and this has to
+/// hold everywhere the agent builds.
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `fd` is a valid descriptor owned by the caller for this call.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags < 0 {
+            return Err(last_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(last_error());
+        }
+    }
+    Ok(())
+}
+
 /// Allocate a pty and set its initial window size.
 pub fn open_pty(cols: u16, rows: u16) -> io::Result<PtyPair> {
     // O_NOCTTY on the master: the agent must not accidentally acquire this
@@ -63,6 +82,14 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<PtyPair> {
     // Owned immediately, so every early return below closes it.
     // SAFETY: `raw` is a fresh, valid, exclusively-owned descriptor.
     let master = unsafe { OwnedFd::from_raw_fd(raw) };
+    // The master is the agent's end. It must not survive the `execve` into the
+    // tenant's shell: that shell runs as the tenant after `drop_privileges`,
+    // and a descriptor to its own terminal's *master* would let it write its
+    // own input and would keep the terminal alive after `kill()` closes our
+    // copy. `attach_child_to_pty` already promises "no descriptor to the
+    // terminal survives that the shell does not know about"; this is what
+    // makes that true of the master as well as the slave.
+    set_cloexec(master.as_raw_fd())?;
 
     // SAFETY: `master` is open for the duration of both calls.
     unsafe {
@@ -88,6 +115,11 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<PtyPair> {
     }
     // SAFETY: `raw_slave` is a fresh, valid, exclusively-owned descriptor.
     let slave = unsafe { OwnedFd::from_raw_fd(raw_slave) };
+    // The child still receives the slave: it is passed as stdio, and both
+    // `Stdio::from` and `attach_child_to_pty` reach it through `dup2`, which
+    // clears `FD_CLOEXEC` on the descriptor it creates. What this stops is the
+    // *original* leaking in alongside fds 0, 1 and 2.
+    set_cloexec(slave.as_raw_fd())?;
 
     set_window_size(master.as_raw_fd(), cols, rows)?;
 
@@ -216,6 +248,29 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn neither_end_of_the_pty_survives_an_exec() {
+        // The shell runs as the tenant. A descriptor to the master would let it
+        // write its own terminal's input and would hold the terminal open after
+        // the agent drops its copy, which is what `kill()` relies on to hang a
+        // shell up. Both ends are therefore close-on-exec; the child still gets
+        // the slave, because it arrives through `dup2`, which clears the flag.
+        let pair = open_pty(80, 24).expect("a pty");
+        for (what, fd) in [
+            ("master", pair.master.as_raw_fd()),
+            ("slave", pair.slave.as_raw_fd()),
+        ] {
+            // SAFETY: both descriptors are open and owned by `pair`.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "could not read the {what} descriptor flags");
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "the pty {what} must not be inherited across execve"
+            );
+        }
     }
 
     #[test]

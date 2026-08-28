@@ -88,6 +88,16 @@ const TICKET_TTL: Duration = Duration::from_secs(60);
 /// minute; this only ever trips under abuse.
 const MAX_PENDING_TICKETS: usize = 256;
 
+/// And the most any one account may hold of that budget.
+///
+/// `terminal::session` already refuses to let one account take every session
+/// (`Limits::max_per_user`, 3). The ticket in front of a session needs the same
+/// rule, or the cheaper endpoint becomes the way around the expensive one: a
+/// loop of mint requests would fill the global table and every *other* account
+/// — including the admin reaching for a root shell mid-incident — would be
+/// refused. Four leaves room for a re-attach racing an unredeemed open.
+const MAX_PENDING_TICKETS_PER_USER: usize = 4;
+
 /// The largest message the browser may send us, matching the agent's own input
 /// ceiling once base64 expansion is accounted for.
 const MAX_CLIENT_MESSAGE: usize = 128 * 1024;
@@ -126,6 +136,13 @@ impl TicketStore {
         let now = time::OffsetDateTime::now_utc();
         tickets.retain(|_, t| t.expires > now);
         if tickets.len() >= MAX_PENDING_TICKETS {
+            return None;
+        }
+        let mine = tickets
+            .values()
+            .filter(|t| t.user_id == ticket.user_id)
+            .count();
+        if mine >= MAX_PENDING_TICKETS_PER_USER {
             return None;
         }
         // Two v4 UUIDs: 244 bits from the platform CSPRNG, which is what a
@@ -794,16 +811,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_account_cannot_spend_the_whole_ticket_budget() {
+        // Otherwise the cheap endpoint is the way around the expensive one: a
+        // customer who cannot even be given a shell loops the mint route, fills
+        // the table, and the admin's root shell is refused for as long as it
+        // runs.
+        let store = TicketStore::default();
+        for _ in 0..MAX_PENDING_TICKETS_PER_USER {
+            assert!(store.issue(ticket(7, 60)).await.is_some());
+        }
+        assert!(
+            store.issue(ticket(7, 60)).await.is_none(),
+            "an account past its share is refused"
+        );
+        assert!(
+            store.issue(ticket(8, 60)).await.is_some(),
+            "and everybody else is unaffected"
+        );
+    }
+
+    #[tokio::test]
     async fn tickets_are_unguessable_and_bounded_in_number() {
         let store = TicketStore::default();
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..MAX_PENDING_TICKETS {
-            let token = store.issue(ticket(1, 60)).await.unwrap();
+        // Spread over accounts: one account cannot reach the global cap on its
+        // own any more, which is what the next test is about.
+        for i in 0..MAX_PENDING_TICKETS {
+            let token = store
+                .issue(ticket(i as u32 / MAX_PENDING_TICKETS_PER_USER as u32, 60))
+                .await
+                .unwrap();
             assert_eq!(token.len(), 64, "two v4 UUIDs' worth of hex");
             assert!(seen.insert(token), "tickets must never repeat");
         }
         assert!(
-            store.issue(ticket(1, 60)).await.is_none(),
+            store.issue(ticket(9999, 60)).await.is_none(),
             "a loop of open requests must not grow the process without bound"
         );
     }
@@ -811,8 +853,11 @@ mod tests {
     #[tokio::test]
     async fn expired_tickets_are_swept_so_the_cap_is_not_a_permanent_lockout() {
         let store = TicketStore::default();
-        for _ in 0..MAX_PENDING_TICKETS {
-            store.issue(ticket(1, -1)).await.unwrap();
+        for i in 0..MAX_PENDING_TICKETS {
+            store
+                .issue(ticket(i as u32 / MAX_PENDING_TICKETS_PER_USER as u32, -1))
+                .await
+                .unwrap();
         }
         assert!(
             store.issue(ticket(1, 60)).await.is_some(),
