@@ -727,13 +727,16 @@ pub struct RelaySetInput {
     pub from_address: String,
     #[serde(default)]
     pub from_name: Option<String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// Omit to keep the stored setting; `true`/`false` to change it.
+    ///
+    /// Absent has to mean "leave it alone" for the same reason it does for
+    /// `password` above: an operator who turned the relay off and later edits
+    /// the port is not asking to start sending mail again, and this operation
+    /// writes the whole row.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
-const fn default_true() -> bool {
-    true
-}
 
 #[derive(Debug, Serialize)]
 pub struct RelaySetOutput {
@@ -833,7 +836,10 @@ impl TypedOperation for RelaySet {
                 password_sealed,
                 from_address,
                 from_name,
-                enabled: input.enabled,
+                enabled: input
+                    .enabled
+                    .or_else(|| existing.as_ref().map(|r| r.enabled))
+                    .unwrap_or(true),
             })
             .await
             .map_err(FerrumError::from)?;

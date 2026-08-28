@@ -151,7 +151,7 @@ pub async fn relay_set(
                 "port": body.port,
                 "tls_mode": body.tls_mode,
                 "authenticated": body.username.is_some(),
-                "enabled": body.enabled.unwrap_or(true),
+                "enabled": body.enabled,
             }),
             request_id: Some(current.auth.request_id.clone()),
             subscription_id: current.auth.tenant_scope.subscription_id(),
@@ -178,10 +178,12 @@ fn relay_input(body: &RelayRequest) -> serde_json::Value {
         "username": body.username,
         "from_address": body.from_address,
         "from_name": body.from_name,
-        "enabled": body.enabled.unwrap_or(true),
     });
     if let Some(password) = &body.password {
         input["password"] = json!(password);
+    }
+    if let Some(enabled) = body.enabled {
+        input["enabled"] = json!(enabled);
     }
     input
 }
@@ -297,11 +299,26 @@ mod tests {
     }
 
     #[test]
-    fn a_relay_defaults_to_enabled_when_the_field_is_absent() {
-        assert_eq!(relay_input(&request(base()))["enabled"], json!(true));
-        let mut off = base();
-        off["enabled"] = json!(false);
-        assert_eq!(relay_input(&request(off))["enabled"], json!(false));
+    fn omitting_enabled_leaves_the_field_out_so_the_operation_keeps_the_setting() {
+        // Same rule as the password above, and for the same reason: this
+        // operation writes the whole row, so a layer that invents `true` here
+        // would silently switch a relay the operator had turned off back on
+        // the next time they corrected the port. Absent has to reach the
+        // operation as absent.
+        let input = relay_input(&request(base()));
+        assert!(
+            !input.as_object().unwrap().contains_key("enabled"),
+            "{input}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_enabled_is_forwarded_either_way() {
+        for want in [true, false] {
+            let mut body = base();
+            body["enabled"] = json!(want);
+            assert_eq!(relay_input(&request(body))["enabled"], json!(want));
+        }
     }
 
     #[test]

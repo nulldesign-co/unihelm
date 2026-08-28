@@ -199,7 +199,8 @@ fn resolve_secrets(command: &Command) -> Result<Secrets> {
             secrets.sftp_password = secret(*password_stdin, "FERRUM_SFTP_PASSWORD")?;
         }
         Command::Mail(MailCommand::Relay(MailRelayCommand::Set { password_stdin, .. })) => {
-            secrets.mail_relay_password = secret(*password_stdin, "FERRUM_MAIL_RELAY_PASSWORD")?;
+            secrets.mail_relay_password =
+                secret_allowing_empty(*password_stdin, "FERRUM_MAIL_RELAY_PASSWORD", true)?;
         }
         _ => {}
     }
@@ -207,20 +208,31 @@ fn resolve_secrets(command: &Command) -> Result<Secrets> {
 }
 
 fn secret(from_stdin: bool, env_var: &str) -> Result<Option<String>> {
+    secret_allowing_empty(from_stdin, env_var, false)
+}
+
+/// As `secret`, but `clearable` decides what an empty line means.
+///
+/// For a token or an access key it means the pipe delivered nothing and the
+/// only honest answer is an error. For a password the operation lets you
+/// clear, an empty line is a real instruction — so it has to survive as
+/// `Some("")` rather than being rejected here or silently read as absent,
+/// which the operation would take as "keep what is stored".
+fn secret_allowing_empty(from_stdin: bool, env_var: &str, clearable: bool) -> Result<Option<String>> {
     if from_stdin {
-        return Ok(Some(read_secret_line()?));
+        return Ok(Some(read_secret_line(clearable)?));
     }
     Ok(std::env::var(env_var).ok().filter(|v| !v.is_empty()))
 }
 
 /// One line from stdin, with the trailing newline removed and nothing else
 /// touched — a token may legitimately contain anything else.
-fn read_secret_line() -> Result<String> {
+fn read_secret_line(allow_empty: bool) -> Result<String> {
     let mut buffer = String::new();
     std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buffer)
         .context("could not read the secret from stdin")?;
     let value = buffer.trim_end_matches(['\n', '\r']).to_string();
-    if value.is_empty() {
+    if value.is_empty() && !allow_empty {
         anyhow::bail!("nothing arrived on stdin");
     }
     Ok(value)

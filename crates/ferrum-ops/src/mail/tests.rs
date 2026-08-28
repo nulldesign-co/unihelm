@@ -306,6 +306,53 @@ async fn disabling_the_relay_takes_the_wiring_back_off_every_site() {
 }
 
 #[tokio::test]
+async fn omitting_enabled_keeps_the_stored_setting_rather_than_switching_it_on() {
+    // The operation writes the whole row, so an absent `enabled` used to be
+    // read as `true`: an operator who had switched the relay off and later
+    // corrected the port would have silently started sending mail again.
+    // Absent means "leave it alone" here for the same reason it does for the
+    // password.
+    let (reg, admin, customer) = registry().await;
+    seed_php_site(&db_of(&reg), customer, "one.example.com", true).await;
+    let pools = std::sync::Arc::new(RecordingPools::default());
+
+    let mut off = relay_input();
+    off["enabled"] = json!(false);
+    run_set(&reg, admin, pools.clone(), off).await.unwrap();
+
+    // The same relay, one field changed, `enabled` not mentioned.
+    let mut repoint = relay_input();
+    repoint["port"] = json!(2525);
+    repoint.as_object_mut().unwrap().remove("enabled");
+    let after = run_set(&reg, admin, pools.clone(), repoint).await.unwrap();
+
+    assert!(
+        !after.relay.enabled,
+        "a relay the operator turned off must stay off when another field is edited"
+    );
+    let seen = pools.seen.lock().unwrap().clone();
+    assert!(
+        !seen.last().unwrap().1,
+        "and the pools must still be rendered without sendmail_path"
+    );
+}
+
+#[tokio::test]
+async fn a_relay_configured_for_the_first_time_is_enabled_by_default() {
+    // "Keep what is stored" has nothing to keep on the first write, so the
+    // absent case still has to land on `true` — otherwise configuring a relay
+    // would leave it inert with no way to tell why.
+    let (reg, admin, _) = registry().await;
+    let pools = std::sync::Arc::new(RecordingPools::default());
+
+    let mut fresh = relay_input();
+    fresh.as_object_mut().unwrap().remove("enabled");
+    let out = run_set(&reg, admin, pools.clone(), fresh).await.unwrap();
+
+    assert!(out.relay.enabled, "a first relay with no `enabled` is on");
+}
+
+#[tokio::test]
 async fn a_hostile_relay_host_is_refused_rather_than_rendered() {
     // The value goes into a line-oriented config file; a newline in it is a
     // way to add a directive.
