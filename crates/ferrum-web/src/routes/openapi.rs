@@ -131,6 +131,10 @@ pub const API_VERSION: &str = "1.0.0";
         super::wordpress::plugins,
         super::wordpress::plugins_update,
         super::wordpress::cli,
+        super::imports::create,
+        super::imports::list,
+        super::imports::detail,
+        super::imports::apply,
         super::waf::status,
         super::waf::enable,
         super::waf::disable,
@@ -169,6 +173,7 @@ pub const API_VERSION: &str = "1.0.0";
         (name = "waf", description = "ModSecurity: module availability, per-site policy and rule exclusions"),
         (name = "webhooks", description = "Outbound event delivery: registered endpoints, their signing secrets, and the delivery history"),
         (name = "plugins", description = "Sidecar plugins: installing a verified payload, and starting or stopping its unprivileged process"),
+        (name = "imports", description = "Migrating an account in from cPanel or aaPanel: the dry-run plan, and applying one"),
         (name = "meta", description = "The API describing itself"),
     ),
 )]

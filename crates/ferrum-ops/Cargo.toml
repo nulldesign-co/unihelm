@@ -27,6 +27,9 @@ flate2 = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The aaPanel importer reads that panel's own SQLite inventory, read-only and
+# immutable (spec §11.15). Same driver the panel's own database uses.
+sqlx = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true }
 # The plugin sidecar contract reuses the panel IPC framing rather than

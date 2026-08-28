@@ -324,6 +324,9 @@ impl OpRegistry {
         registry.register(crate::plugin::Enable);
         registry.register(crate::plugin::Disable);
         registry.register(crate::plugin::Remove);
+        registry.register(crate::importer::Plan);
+        registry.register(crate::importer::List);
+        registry.register(crate::importer::Apply::live());
         registry
     }
 

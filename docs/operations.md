@@ -2223,6 +2223,143 @@ is true. The history is the last 50 attempts with their status, attempt count,
 response code and last error.
 
 ### `webhook.set`
+## Migration importers
+
+The `import.*` operations are `ferrum_ops::importer` (spec §11.15). They bring
+an account in from cPanel (a `cpmove`/full-backup tarball) or from aaPanel (its
+SQLite inventory plus `/www/wwwroot`). Five properties decide how all three
+behave.
+
+**The dry run is the feature.** An import is two steps and the first one
+changes nothing: `import.plan` reads the source and produces the complete
+mapping — which domains become which sites, which databases and users, which
+files, and an explicit list of everything that does *not* map — then stores that
+document and returns its id. `import.apply` takes the id and executes **the
+stored document**. It never re-scans, because if "apply" meant "read the source
+again and do whatever it says now" then the thing the operator reviewed and the
+thing that ran would be two different objects. The source is reopened only to
+fetch payload bytes, and only after its SHA-256 still matches what the plan was
+derived from; a source that changed answers `FER-1403 conflict` naming both
+hashes. For cPanel that hash is the tarball's own bytes. For aaPanel it is
+deliberately *not* the bytes of `default.db` — aaPanel is still running and
+rewrites that file constantly, so a byte hash would make every plan stale within
+minutes for reasons unrelated to the import; it is a hash over the inventory the
+mapping was read from (each site's name and document root, and each database's
+name), so a site added, removed or moved invalidates the plan and a heartbeat
+does not.
+
+**What does not map is listed per object, with a reason.** Mail accounts (by
+address, read from `homedir/etc/<domain>/passwd` — never from `shadow` next to
+it), stored mail, DNS zones, TLS certificates and private keys, cron entries,
+FTP accounts, Mailman lists, autoresponders, PostgreSQL dumps, bandwidth
+counters, and every credential. A migration tool that silently drops mailboxes
+is how somebody loses their email, so the `unmapped` list is a first-class part
+of the plan and the module's tests assert that each kind appears in it.
+
+**A hostile tarball is the expected input, and nothing is extracted to plan
+it.** `importer::scan` walks the archive read-only and shares the file
+manager's guards rather than restating them: entry names go through
+`fsops::archive::split_entry_name` (so `..`, absolute paths, `\` separators and
+NUL are refused, never normalised), and the entry count, total uncompressed size
+and compression ratio are counted by `fsops::archive::Budget` against the same
+`Limits` — 100 000 entries, 10 GB, 200:1 plus 1 MB of grace. Symlink, hardlink
+and device entries are recorded and never created. An entry name that is not
+valid UTF-8 is skipped rather than lossily converted, because a mangled name
+that then passes the component checks is a name nobody reviewed.
+
+**Payload files reach a tenant through `fs.extract`, as the tenant.** Apply
+re-tars exactly the subtree the plan named into a staging archive in the tenant
+home (`O_CREAT|O_EXCL|O_NOFOLLOW`, so a name the tenant planted first cannot be
+written through), then hands it to the existing `fs.extract` operation, which
+unpacks it in the privilege-dropped helper and applies every archive guard a
+second time. No root process ever writes a file whose name came from the
+archive — which matters more than it looks: `O_NOFOLLOW` defeats a symlink but
+not a *hardlink*, and a root extractor truncating a tenant's hardlink to
+`/etc/shadow` would be a server takeover. As the tenant it is a permission
+error. The staging archive stays root-owned, mode 0644 (the helper only reads
+it, and root ownership keeps it out of the tenant's quota while it exists) and
+is removed as soon as the extract returns. For an aaPanel site, whose files are
+a directory on this server rather than a tarball member, the staging archive is
+built by `fsops::archive::compress` — the same walker the file manager uses,
+which skips every symlink it meets, so an `uploads -> /etc` inside a source site
+is not followed.
+
+**A dump is loaded as the database's own new user, never as root.** A dump is a
+script somebody else wrote; run as `root@localhost` it could drop another
+tenant's database or create an account. The importer creates the database and
+its user through `db.user.create` and `db.create` — so the plan's `max_dbs`
+limit, the engine-ready check and the name-collision refusal all apply to an
+import exactly as they do to a click — and then runs `mariadb
+--defaults-file=… --database=<name>` with the dump on **stdin**. The
+credentials are in a 0600 file inside a 0700 directory under
+`/var/lib/ferrum/state/import`, removed when the load returns, because
+`--password=` on an argv is world-readable in `/proc/<pid>/cmdline`. `--database`
+binds the session to one schema, so a dump that says `USE somebody_else` fails
+on privileges rather than succeeding. Dumps travel as bytes, not as a `String`:
+a mysqldump of a table with binary columns is not valid UTF-8 and a lossy
+conversion would silently corrupt the data being imported.
+
+**No credential is ever read.** Not cPanel's `shadow`, not the password hashes
+in its `mysql.sql` grants, not aaPanel's plaintext `databases.password` column.
+Every imported database gets a new user with a new password. That password
+exists only in memory for the length of the load and is then dropped: a task's
+`input_json` and logs persist, and a task's *output* never reaches the caller at
+all (the response is a task id), so there is no honest channel for it to travel
+on. Set a real one afterwards with `db.user.password`, which is Immediate and
+shows it once.
+
+All three operations need `server_manage`, which is administrator-only. That is
+not because the mapping is dangerous but because the input is an arbitrary
+absolute path on the server and the output describes what is in it: a
+server-wide read takes a server-wide permission.
+
+### `import.plan`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (cancellable, idempotent) |
+| Input | `source` *(object)*, `subscription_id` *(i64)*, `php_version` *(optional)* |
+
+`source` is a tagged object and a closed set:
+`{"kind":"cpanel","path":"/root/cpmove-bob.tar.gz"}` or
+`{"kind":"aapanel","root":"/www"}` (`root` defaults to `/www`). The path must be
+absolute, must not contain `..` and must exist; a relative path would resolve
+against whatever directory the agent happens to be running in.
+`subscription_id` is required and not defaulted — an administrator running an
+import usually has no subscription of their own, and "wherever" is not an answer
+to whose account this becomes. `php_version` is the version imported PHP sites
+are created with when the source's own version is unknown or is one Ferrum does
+not offer (`ea-php56` is read, recognised as unsupported, and reported).
+
+Reads the source, writes one `import_plans` row and answers with `plan_id` and
+the whole plan. Because it is a task, the plan is read back with `import.list`
+rather than from the task; nothing on the server has changed, so re-running it
+is always safe and simply produces a second plan.
+
+For cPanel it reads `cp/<user>`, `userdata/main` and `userdata/<domain>` (a
+deliberately small YAML subset — `key: value`, indented `- item` sequences,
+indented `key: value` maps, and the inline empties `{}` and `[]`; a general YAML
+parser would be a large attack surface pointed at somebody else's file, and what
+the subset cannot read is reported as unmapped rather than guessed). A domain
+whose document root is not inside the account's home is unmapped: it is not in
+the archive at all. An addon domain's internal subdomain (`addon.example.com`
+for `addon.com`) is *not* made a second site — two sites serving one directory
+would fight over the vhost. Parked domains become aliases of the main site.
+
+For aaPanel it opens `<root>/server/panel/data/default.db` **read-only and
+immutable** — it belongs to a panel that may still be running, and `immutable=1`
+also stops SQLite from recovering a hot journal, which is a write — and reads
+`sites`, `domain`, `databases` (never the `password` column), `ftps` and
+`crontab`. Document roots must be under `<root>/wwwroot`; PHP versions come from
+the site's nginx vhost (`enable-php-74.conf`, `php-cgi-74.sock`). Every aaPanel
+plan carries two notes, because both are true and neither is obvious: aaPanel
+still owns its own nginx and its vhosts must go before Ferrum can serve those
+domains, and the imported databases are *copies* under new names in the same
+MariaDB, so each application's configuration has to be repointed or it will keep
+using the aaPanel copy.
+
+### `import.list`
 
 | | |
 |---|---|
@@ -2261,6 +2398,17 @@ rather than as a read-then-write, so two concurrent creates cannot both see
 "19 hooks" and both insert; past it the answer is `FER-1403 conflict`.
 
 ### `webhook.delete`
+| Input | `plan_id` *(optional i64)*, `limit` *(optional, default 50)*, `offset` *(optional)* |
+
+Stored plans, newest first. Without `plan_id` it returns summaries — id, source,
+totals, whether it has been applied — because a list page showing fifty full
+mappings would be megabytes of JSON nobody reads. With `plan_id` it returns that
+one plan's full document *and* its outcome, which is how the result of an apply
+is read: an applied plan carries a per-step record of what worked and what did
+not. Plans are scoped through the subscription they target, so a plan outside
+the caller's scope reads as `not_found`.
+
+### `import.apply`
 
 | | |
 |---|---|
@@ -2460,3 +2608,52 @@ reason `plugin.install` does not unwind it.
 - **A UI page and the micro-frontend mount.** A manifest may declare a
   `ui_panel` with its `[ui]` mount point and the panel validates and stores it,
   but nothing in `ui/` renders it yet.
+| Execution | task (not cancellable, not idempotent) |
+| Input | `plan_id` *(i64)* |
+
+Executes a stored plan. The order of the checks is the design: the plan must
+exist in the caller's scope, must not already have been applied
+(`FER-1401 already_exists` — make a fresh plan rather than applying one twice,
+because a second apply would try to create the same sites and databases again),
+must still parse, and its source's SHA-256 must still match. Only then is the
+plan *claimed*, with a conditional `UPDATE … WHERE applied_at IS NULL` so that
+two administrators pressing apply at the same moment cannot both proceed.
+
+Per site: `site.create` (which enforces the plan's site limit, refuses a
+suspended subscription, creates the Linux account and the tree, renders the
+vhost and the FPM pool, and reloads nginx), then any aliases, then one
+`site.update` to re-render the vhost with them in it, then the files. Per
+database: `db.user.create`, `db.create` with that user as owner, then the dump.
+A failure at any step is *recorded* and the next object is attempted — an import
+that stops on the third of ten sites and says nothing about the other seven is
+worse than one that tells you exactly which three worked. The whole record is
+written to the plan row whether the apply succeeded or not, because a half-done
+import is precisely the state somebody has to clean up.
+
+Limits worth knowing before you start: a dump larger than 128 MiB is refused,
+and it is refused **in the plan** — before anything is created — with the remedy
+(create the database in Ferrum, restore the dump with the MariaDB client). The
+client reads its batch from stdin, so the bytes are buffered in the agent, and a
+2 GB server has better uses for its memory.
+
+### Not implemented, on purpose
+
+- **Mail, DNS zones, certificates, cron and FTP accounts.** Each is listed in
+  the plan with a reason. Ferrum v1 has no mail server (spec §11.18 is
+  relay-only), is not an authoritative nameserver (§11.13 manages Cloudflare
+  zones), issues its own certificates from Let's Encrypt, and treats another
+  panel's cron commands as shell command lines written for another server's
+  paths — worth reading before recreating with `cron.set`, not worth importing
+  blind.
+- **PostgreSQL dumps.** `psql/` members are listed as unmapped; create the
+  database with `db.create` and restore the dump with `psql`.
+- **Loading a dump larger than 128 MiB**, and **importing an aaPanel database
+  that is not on this server** (a copied `/www` tree has no dumps in it; the
+  step fails and says so).
+- **`.htaccess` semantics.** The files are copied — they are the tenant's — but
+  nginx does not read them, and every cPanel plan says so. Apache rewrite
+  rules, auth and redirects have to be re-expressed in the site's nginx
+  snippet.
+- **A UI page.** There is no `ui/src/routes/imports.tsx`. The flow is
+  API- and CLI-driven: a two-step migration that an operator reviews as a
+  document is a worse fit for a form than for a terminal.
