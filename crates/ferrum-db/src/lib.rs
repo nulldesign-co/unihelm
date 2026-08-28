@@ -23,11 +23,13 @@
 pub mod alerts;
 pub mod audit;
 pub mod backups;
+pub mod branding;
 pub mod certificates;
 pub mod cron;
 pub mod databases;
 pub mod dns;
 pub mod firewall;
+pub mod mail;
 pub mod models;
 pub mod node_apps;
 pub mod panel;
@@ -60,11 +62,16 @@ pub use backups::{
     BackupRepo, BackupRun, BackupSchedule, BackupScope, NewBackupRepo, NewBackupSchedule, RepoKind,
     RepoSecrets, RunOutcome, RunStatus,
 };
+pub use branding::{
+    AssetKind, Branding, BrandingAsset, BrandingField, BrandingUpdate, ImageType,
+    ResolvedAsset, ResolvedBranding,
+};
 pub use certificates::{AcmeAccount, CertKind, CertStatus, Certificate};
 pub use cron::{CronJob, CronJobUpdate, NewCronJob};
 pub use databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 pub use dns::{DnsProvider, DnsProviderKind};
 pub use firewall::{FwRuleRecord, SentinelBan};
+pub use mail::{MailRelay, NewMailRelay, TlsMode};
 pub use models::*;
 pub use node_apps::{NewNodeApp, NodeApp, NodeEnv};
 pub use quota::{QuotaLimits, QuotaProject};

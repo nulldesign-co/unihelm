@@ -998,7 +998,9 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
  "x509-parser",
  "zip",
  "zstd",
@@ -2605,6 +2607,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

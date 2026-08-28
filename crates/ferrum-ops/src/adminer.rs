@@ -289,6 +289,10 @@ pub fn adminer_pool_context(php: PhpVersion, nginx_user: &str) -> PoolContext {
 
         env: Vec::new(),
         extra_ini: None,
+        // Never. Adminer is a database browser; a database browser that can
+        // hand a message to the outbound relay is a spam relay with a login
+        // form (spec §11.18).
+        sendmail_path: None,
     }
 }
 

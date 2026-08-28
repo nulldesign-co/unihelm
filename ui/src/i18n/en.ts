@@ -22,6 +22,7 @@ export const en = {
     passwordRequired: "Enter your password",
     genericError: "Could not sign in. Check the details and try again.",
     rateLimited: "Too many attempts. Wait a few minutes before trying again.",
+    support: "Need help?",
   },
   nav: {
     dashboard: "Dashboard",
@@ -36,6 +37,8 @@ export const en = {
     dns: "DNS",
     firewall: "Firewall",
     alerts: "Alerts",
+    mail: "Mail",
+    branding: "Branding",
     tasks: "Tasks",
     commandPalette: "Command palette",
     theme: "Theme",
@@ -1110,6 +1113,144 @@ export const en = {
       secretWriteOnly: "The panel seals this and will not show it again.",
       enabled: "Enabled",
     },
+  },
+  mail: {
+    title: "Mail",
+    subtitle: "Send mail from this server's sites through an external SMTP relay.",
+    scopeNote:
+      "Ferrum does not run a mail server. There are no mailboxes here: this configures a relay somebody else operates and points every PHP site's mail() at it.",
+    agentMissing: "The sending program is not installed",
+    agentMissingHint:
+      "PHP has nothing to hand a message to, so mail will not send however the relay is configured. Install {{agent}} and save the relay again.",
+    credentialNote:
+      "PHP's mail() runs as each site's own Linux user, so that user can read the relay password for their own site — and for no other site. Use a send-only credential made for this server, and rotate it here rather than reusing an account password.",
+    relay: {
+      title: "SMTP relay",
+      hint: "Where mail from this server is handed over. The panel never delivers mail itself.",
+      on: "Sending",
+      off: "Switched off",
+      host: "Host",
+      port: "Port",
+      tls: "Encryption",
+      tlsMode: {
+        starttls: "STARTTLS (usually port 587)",
+        implicit: "Implicit TLS (usually port 465)",
+        none: "None — plaintext",
+      },
+      tlsHint: {
+        starttls:
+          "Connects in the clear and upgrades. If the upgrade fails the message is not sent; there is no fallback to plaintext.",
+        implicit: "Encrypted from the first byte.",
+        none: "Everything crosses the network readable. Only defensible for a relay on this machine or a private network, and the panel will not store a password alongside it.",
+      },
+      username: "Username",
+      password: "Password",
+      passwordStored: "Stored — leave empty to keep it",
+      passwordHint:
+        "The password cannot be read back. Leave the field empty to keep the stored one; clear the username to remove the credential entirely. Leave both empty for a relay that authorises by IP address.",
+      credentialNeedsTls:
+        "A relay with a username needs encryption. Base64 is an encoding, not encryption, so the panel will not store or send a password for a plaintext relay.",
+      fromAddress: "Sender address",
+      fromName: "Sender name",
+      fromHint:
+        "Mail leaves as this address whatever a site's own code puts in its From: header. Relays reject senders they are not authorised for, so this is the field most likely to be why a message bounced.",
+      enabled: "Send through this relay",
+      enabledHint:
+        "Switching this off takes the setting back out of every site's PHP configuration. The password is kept.",
+      save: "Save relay",
+    },
+    test: {
+      title: "Send a test message",
+      hint: "Opens a real SMTP session and reports exactly what the relay said.",
+      to: "Recipient",
+      toPlaceholder: "Defaults to the sender address",
+      send: "Send test",
+      delivered: "Accepted by the relay",
+      failed: "Not accepted",
+      encrypted: "Encrypted session",
+      plaintext: "Plaintext session",
+      transcript: "Show the conversation",
+      transcriptNote: "The password is replaced before the transcript is written, so this is safe to paste into a support ticket.",
+    },
+    stage: {
+      connect: "Connecting",
+      tls: "TLS handshake",
+      greeting: "Greeting",
+      ehlo: "EHLO",
+      starttls: "STARTTLS",
+      auth: "Authentication",
+      mail_from: "Sender",
+      rcpt_to: "Recipient",
+      data: "DATA",
+      body: "Message",
+      quit: "Closing",
+    },
+    stageHint: {
+      connect:
+        "The host and port could not be reached. Check the address, and check that outbound connections on that port are not blocked.",
+      tls: "The TLS handshake failed. A self-signed or private-CA certificate will not verify against the public roots.",
+      greeting: "Something is listening on that port but it did not answer as an SMTP server.",
+      ehlo: "The relay refused the greeting. Some relays reject clients they do not recognise here.",
+      starttls:
+        "The relay did not offer or did not complete STARTTLS. Try implicit TLS on port 465, or plain submission only if the relay is on a private network.",
+      auth: "The relay rejected the username and password. Many providers issue SMTP credentials separate from the account login.",
+      mail_from:
+        "The relay rejected the sender address. Usually that address, or its domain, is not one the relay may send for.",
+      rcpt_to:
+        "The relay rejected the recipient. On a sandboxed provider account only verified recipients are accepted.",
+      data: "The relay accepted the envelope but rejected the message itself.",
+      body: "The relay accepted the envelope but rejected the message itself.",
+      quit: "The message was accepted; only the closing handshake was untidy.",
+    },
+    dns: {
+      title: "SPF, DKIM and DMARC",
+      hint: "The records the configured relay needs. Ferrum shows them; it does not publish or check them.",
+      none: "Configure the relay first — which records are needed depends on which provider it is.",
+      notManaged: "Not managed by Ferrum",
+      noValue:
+        "Only the relay provider can supply this. Copy the selector and value from their dashboard.",
+      copy: "Copy",
+      copied: "Copied",
+    },
+  },
+  branding: {
+    title: "Branding",
+    subtitle: "The name, colour and images your customers see.",
+    identity: {
+      title: "Identity",
+      hint: "Leave a field empty to inherit it. The placeholder shows what would be inherited.",
+    },
+    images: {
+      title: "Images",
+      hint: "Uploaded images replace the panel's own on the login page and in the header.",
+      logo: "Logo",
+      favicon: "Favicon",
+      login_background: "Login background",
+      limit: "Up to {{limit}} KB",
+      tooLarge: "That file is larger than {{limit}} KB.",
+      upload: "Choose file",
+      clear: "Remove",
+      inherited: "Inherited",
+      stagedUpload: "New file — save to apply",
+      stagedClear: "Will be removed on save",
+      applyHint: "Images are applied when you save.",
+    },
+    panelName: "Panel name",
+    supportUrl: "Support link",
+    supportUrlHint:
+      "Shown on the login page. Must start with https:// or http:// — any other scheme would run as a script when someone clicks it.",
+    primaryColor: "Primary colour",
+    primaryColorPicker: "Pick a primary colour",
+    primaryColorHint:
+      "Six hexadecimal digits after a hash, for example #3b82f6. The hover and tint shades are derived from it.",
+    loginHost: "Login hostname",
+    loginHostHint:
+      "The hostname your customers reach the panel on. It is how the login page knows whose branding to show, before anyone has signed in.",
+    svgNote:
+      "PNG, JPEG, GIF, WebP and ICO. SVG is not accepted: an SVG is a document that can carry scripts, and it would be served from the panel's own address. Files are identified by their contents, so renaming one changes nothing.",
+    save: "Save branding",
+    saved: "Saved",
+    noRestart: "Applies immediately — nothing restarts.",
   },
   error: {
     title: "Something went wrong",

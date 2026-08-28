@@ -315,6 +315,11 @@ impl OpRegistry {
         registry.register(crate::waf::Disable);
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
+        registry.register(crate::mail::RelayGet);
+        registry.register(crate::mail::RelaySet::live());
+        registry.register(crate::mail::RelayTest);
+        registry.register(crate::branding::Get);
+        registry.register(crate::branding::Set);
         registry
     }
 
