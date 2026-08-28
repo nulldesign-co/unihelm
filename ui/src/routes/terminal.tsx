@@ -365,9 +365,22 @@ function SshKeysCard() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["ssh-keys"] }),
   });
 
-  // A plan without `can_ssh` answers 403 here, which is a statement about the
-  // plan rather than an error to shout about.
-  const forbidden = keys.error instanceof ApiError && keys.error.status === 403;
+  // Three different "no list for you" answers, and they mean different things:
+  //
+  // * 403 — the plan has no `can_ssh`. A statement about the plan, not an
+  //   error to shout about.
+  // * 400 — an administrator asked for "my keys" when their scope is the whole
+  //   server, so there is no "my". The server's own wording says so.
+  // * anything else — show what the server said rather than an empty list,
+  //   because an empty list here reads as "this account has no keys" and that
+  //   would be a lie.
+  const problem = keys.error instanceof ApiError ? keys.error : null;
+  const problemText =
+    problem === null
+      ? null
+      : problem.slug === "permission_denied" || problem.slug === "plan_feature_disabled"
+        ? t("sshKeys.notOnPlan")
+        : problem.message;
 
   return (
     <Card>
@@ -377,8 +390,8 @@ function SshKeysCard() {
           <h2 className="text-sm font-semibold text-ink">{t("sshKeys.title")}</h2>
         </div>
 
-        {forbidden ? (
-          <p className="text-sm text-ink-muted">{t("sshKeys.notOnPlan")}</p>
+        {problemText !== null ? (
+          <p className="text-sm text-ink-muted">{problemText}</p>
         ) : keys.isPending ? (
           <div className="flex justify-center py-6 text-ink-muted">
             <Spinner className="h-5 w-5" />
