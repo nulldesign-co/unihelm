@@ -699,7 +699,15 @@ impl Target {
                 ErrorCode::PermissionDenied => Err(FerrumError::new(
                     ErrorCode::PermissionDenied,
                     format!(
-                        "cannot create `~/.ssh` for this account: its home is not                          writable by the account itself, which is how a home looks                          once SFTP has made it a chroot root. Re-run `ferrum sftp                          enable` for this subscription to create the directory,                          then add the key again ({})",
+                        "cannot create `~/.ssh` for this account: its home is \
+                         owned by root, so the account cannot create anything \
+                         directly inside it. That is the layout `sftp.enable` \
+                         leaves behind and `sftp.disable` deliberately does not \
+                         undo. `sftp.enable` now creates `~/.ssh` as one of the \
+                         chroot's tenant-owned directories, so running it is one \
+                         fix; the other is to create `~/.ssh` owned by the \
+                         account with mode 0700, which is what sshd requires of \
+                         it in any case ({})",
                         e.detail
                     ),
                 )),
