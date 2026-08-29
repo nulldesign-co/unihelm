@@ -524,8 +524,8 @@ fn home_step(home: &Path) -> OwnershipStep {
 
 /// The tenant-owned islands inside the chroot.
 ///
-/// Only a fixed allowlist is ever touched — `sites/` and `.trash` — and a
-/// symlink where a directory should be is refused outright rather than
+/// Only a fixed allowlist is ever touched — `sites/`, `.trash` and `.ssh` — and
+/// a symlink where a directory should be is refused outright rather than
 /// followed: `chown` through a tenant-planted symlink would hand the tenant
 /// ownership of whatever it points at. Everything else under the home is left
 /// exactly as the tenant made it.
@@ -538,12 +538,21 @@ fn subdir_steps(home: &Path, user: &LinuxUser, sites_group: &str) -> Result<Vec<
     };
 
     // (name, owner, mode, create-if-missing)
-    let wanted: [(&str, String, u32, bool); 2] = [
+    let wanted: [(&str, String, u32, bool); 3] = [
         // 0750 tenant:nginx — provision.rs's contract for the site tree,
         // re-asserted here because it is now the privacy boundary.
         ("sites", sites_owner, 0o750, true),
         // The recycle bin is the tenant's alone; nginx has no business in it.
         (".trash", format!("{tenant}:{tenant}"), 0o700, false),
+        // `ssh.keys.*` writes `~/.ssh/authorized_keys` **as the tenant**, on
+        // purpose: root writing into a tenant home is how a symlink turns a key
+        // manager into an `/etc/shadow` editor (see terminal::keys). Once the
+        // home is root-owned the tenant can no longer create `.ssh` itself, so
+        // without this the two features are mutually exclusive and
+        // `ssh.keys.add` fails with a bare EACCES. Created for the same reason
+        // `sites/` is: a chroot needs its tenant-writable islands to exist.
+        // 0700 is what sshd insists on before it will read the file at all.
+        (".ssh", format!("{tenant}:{tenant}"), 0o700, true),
     ];
 
     let mut steps = Vec::new();
@@ -900,13 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn tenant_keeps_ownership_of_sites_and_trash_inside_the_chroot() {
+    fn tenant_keeps_ownership_of_sites_trash_and_ssh_inside_the_chroot() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sites")).unwrap();
         std::fs::create_dir(dir.path().join(".trash")).unwrap();
+        std::fs::create_dir(dir.path().join(".ssh")).unwrap();
 
         let steps = subdir_steps(dir.path(), &user(), "nginx").unwrap();
-        assert_eq!(steps.len(), 2);
+        assert_eq!(steps.len(), 3);
 
         let sites = &steps[0];
         assert_eq!(sites.path, dir.path().join("sites"));
@@ -921,6 +931,14 @@ mod tests {
         assert_eq!(trash.path, dir.path().join(".trash"));
         assert_eq!(trash.owner, "ft_abc12345:ft_abc12345");
         assert_eq!(trash.mode, 0o700, "nginx has no business in the trash");
+
+        let ssh = &steps[2];
+        assert_eq!(ssh.path, dir.path().join(".ssh"));
+        assert_eq!(ssh.owner, "ft_abc12345:ft_abc12345");
+        assert_eq!(
+            ssh.mode, 0o700,
+            "sshd reads authorized_keys only out of a 0700 directory"
+        );
     }
 
     #[test]
@@ -929,9 +947,18 @@ mod tests {
         // SFTP session could look but never upload.
         let dir = tempfile::tempdir().unwrap();
         let steps = subdir_steps(dir.path(), &user(), "").unwrap();
-        assert_eq!(steps.len(), 1, "no .trash step when .trash is absent");
-        assert!(steps[0].create);
+        assert_eq!(
+            steps.len(),
+            2,
+            "sites/ and .ssh are created; no .trash step when .trash is absent"
+        );
+        assert!(steps.iter().all(|s| s.create));
         assert_eq!(steps[0].path, dir.path().join("sites"));
+        assert_eq!(
+            steps[1].path,
+            dir.path().join(".ssh"),
+            "ssh.keys.* writes as the tenant, so the tenant must own somewhere              to write it"
+        );
         assert_eq!(
             steps[0].owner, "ft_abc12345:ft_abc12345",
             "without an nginx group the tenant's own group is the fallback, \
@@ -966,15 +993,24 @@ mod tests {
     fn unknown_entries_under_the_home_are_left_exactly_alone() {
         // Reconciliation touches a fixed allowlist, never "everything under
         // the home" — a tenant's own directories are not ours to re-own.
+        //
+        // `.ssh` used to be one of the examples here. It is on the allowlist
+        // now, deliberately: the panel already manages the *contents* of
+        // `~/.ssh/authorized_keys` through `ssh.keys.*`, and that operation
+        // writes as the tenant, so inside a root-owned chroot the directory has
+        // to be tenant-owned or the write cannot happen at all. A dotfile the
+        // panel does not manage, like `.bashrc`, is still none of its business.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sites")).unwrap();
         std::fs::create_dir(dir.path().join("my-backups")).unwrap();
-        std::fs::create_dir(dir.path().join(".ssh")).unwrap();
+        std::fs::create_dir(dir.path().join(".config")).unwrap();
+        std::fs::write(dir.path().join(".bashrc"), b"export PS1=x").unwrap();
 
         let steps = subdir_steps(dir.path(), &user(), "nginx").unwrap();
         let touched: Vec<_> = steps.iter().map(|s| s.path.clone()).collect();
         assert!(!touched.contains(&dir.path().join("my-backups")));
-        assert!(!touched.contains(&dir.path().join(".ssh")));
+        assert!(!touched.contains(&dir.path().join(".config")));
+        assert!(!touched.contains(&dir.path().join(".bashrc")));
     }
 
     #[test]

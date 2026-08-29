@@ -687,12 +687,23 @@ impl Target {
             )
             .await
             // Already there is the common case, not a failure.
-            .or_else(|e| {
-                if e.code == ErrorCode::AlreadyExists {
-                    Ok((FsData::Done, Vec::new()))
-                } else {
-                    Err(e)
-                }
+            .or_else(|e| match e.code {
+                ErrorCode::AlreadyExists => Ok((FsData::Done, Vec::new())),
+                // The write runs as the tenant on purpose (module docs), so a
+                // home the tenant cannot write into stops it dead. That is what
+                // a chroot root looks like: `sftp.enable` surrenders the home to
+                // `root:root 0755` and hands the tenant islands inside it.
+                // `.ssh` is one of those islands now, but an account enabled
+                // before that was so has none, and the bare EACCES says nothing
+                // about which of the two features to reach for.
+                ErrorCode::PermissionDenied => Err(FerrumError::new(
+                    ErrorCode::PermissionDenied,
+                    format!(
+                        "cannot create `~/.ssh` for this account: its home is not                          writable by the account itself, which is how a home looks                          once SFTP has made it a chroot root. Re-run `ferrum sftp                          enable` for this subscription to create the directory,                          then add the key again ({})",
+                        e.detail
+                    ),
+                )),
+                _ => Err(e),
             })?;
         self.chmod(SSH_DIR, SSH_DIR_MODE).await?;
 
