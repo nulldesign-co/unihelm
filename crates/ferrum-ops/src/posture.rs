@@ -121,8 +121,15 @@ pub struct Finding {
 /// An `Option` would have collapsed "sshd says no" and "we could not ask sshd"
 /// into the same `None`, and the whole point of this module is that those two
 /// must not render the same.
+///
+/// Adjacently tagged, not internally tagged. An internal tag can only be folded
+/// into a variant that serialises as a map, so `Known(T)` worked for
+/// `SshdFacts` and failed at runtime for the two fields whose `T` is a sequence
+/// or a number — `security.posture` could not return at all. Nothing consumed
+/// the flattened shape, so the discriminator moved beside the value rather than
+/// into it, which is uniform for every `T`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Observed<T> {
     Known(T),
     Unavailable { reason: String },
@@ -1477,6 +1484,42 @@ Obsoleting Packages
         assert!(evaluate(&facts).is_empty());
         facts.panel_tls.days_remaining = Some(PANEL_CERT_WARN_DAYS - 1);
         assert_eq!(ids(&evaluate(&facts)), vec!["panel.tls_expiring"]);
+    }
+
+    #[test]
+    fn every_observed_shape_survives_serialisation() {
+        // The bug this pins: `Observed` was internally tagged, which serde can
+        // only fold into a variant that serialises as a map. `Known(SshdFacts)`
+        // is a map and worked; `Known(Vec<_>)` and `Known(usize)` are not, and
+        // failed at *runtime* — so `security.posture` could not return on any
+        // machine where those two checks actually succeeded.
+        //
+        // Every existing test ran where the checks could not run, so they all
+        // took the `Unavailable` path, which is a struct variant and always
+        // serialised. That is why this reached a server before it was noticed.
+        let listeners = Observed::Known(vec![PublicListener {
+            address: "0.0.0.0".to_string(),
+            port: 3306,
+        }]);
+        let count = Observed::Known(3usize);
+        let unavailable: Observed<usize> = Observed::Unavailable {
+            reason: "dnf is not installed".to_string(),
+        };
+
+        let a = serde_json::to_value(&listeners).expect("a sequence must serialise");
+        assert_eq!(a["kind"], "known");
+        assert_eq!(a["value"][0]["address"], "0.0.0.0");
+        assert_eq!(a["value"][0]["port"], 3306);
+
+        let b = serde_json::to_value(&count).expect("a number must serialise");
+        assert_eq!(b["kind"], "known");
+        assert_eq!(b["value"], 3);
+
+        let c = serde_json::to_value(&unavailable).expect("the reason must serialise");
+        assert_eq!(c["kind"], "unavailable");
+        // Adjacent tagging nests the variant's own fields under `value` too,
+        // so the reason moved with them. Nothing consumed the old shape.
+        assert_eq!(c["value"]["reason"], "dnf is not installed");
     }
 
     #[test]
