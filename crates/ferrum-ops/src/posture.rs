@@ -745,7 +745,10 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
                    unavailable."
                 .into(),
             remedy: "Install firewalld (RHEL family) or ufw (Debian family) and \
-                     let the panel manage the rules from the firewall page."
+                     let the panel manage the rules from the firewall page. The \
+                     agent picks the backend by what is installed when it starts, \
+                     so restart `ferrum-agentd` afterwards or it will go on \
+                     reporting that there is no firewall."
                 .into(),
             subject: None,
         });
@@ -831,6 +834,14 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
 
     // -- Panel TLS ----------------------------------------------------------
     match facts.panel_tls.days_remaining {
+        // No certificate, and no domain to put one on. The panel ships bound to
+        // loopback (`listen = "127.0.0.1:8088"`), and until somebody publishes it
+        // under a name there is nothing for a CA to attest and no browser warning
+        // for an administrator to learn to click through — they reach it through
+        // an SSH tunnel. Reporting High here fired on every fresh install, which
+        // teaches exactly the habit the rest of this module exists to prevent:
+        // that a High finding is something you scroll past.
+        None if facts.panel_tls.domain.is_none() => {}
         None => findings.push(Finding {
             id: "panel.tls_missing",
             severity: Severity::High,
@@ -840,8 +851,8 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
                    which is exactly the habit that makes an interception attack \
                    against the panel's login form work."
                 .into(),
-            remedy: "Point a domain at this server and issue a certificate from \
-                     the panel's TLS page (`panel.tls.issue`)."
+            remedy: "Issue a certificate for it from the panel's TLS page \
+                     (`panel.tls.issue`)."
                 .into(),
             subject: facts.panel_tls.domain.clone(),
         }),
@@ -1461,6 +1472,33 @@ Obsoleting Packages
             active: Some(false),
         };
         assert_eq!(ids(&evaluate(&facts)), vec!["firewall.inactive"]);
+    }
+
+    #[test]
+    fn a_panel_that_was_never_published_is_not_asked_for_a_certificate() {
+        // The shipped config binds the panel to loopback, so a fresh install has
+        // no domain and no certificate. Reporting that as High fired on every
+        // first run of `security.posture`, for a panel reachable only through an
+        // SSH tunnel — no browser warning, nothing for a CA to attest. A High
+        // finding that is wrong out of the box teaches operators to scroll past
+        // High findings.
+        let mut facts = clean();
+        facts.panel_tls.domain = None;
+        facts.panel_tls.days_remaining = None;
+        assert!(
+            !ids(&evaluate(&facts)).contains(&"panel.tls_missing"),
+            "a panel with no domain has nothing to certify"
+        );
+    }
+
+    #[test]
+    fn a_published_panel_without_a_certificate_is_still_reported() {
+        // The other half: once somebody puts a name on the panel, its login form
+        // is reachable and the missing certificate is real.
+        let mut facts = clean();
+        facts.panel_tls.domain = Some("panel.example.com".into());
+        facts.panel_tls.days_remaining = None;
+        assert_eq!(ids(&evaluate(&facts)), vec!["panel.tls_missing"]);
     }
 
     #[test]
