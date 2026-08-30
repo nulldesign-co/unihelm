@@ -38,7 +38,17 @@ fail() { printf '\033[31mFAIL\033[0m %s\n' "$1"; failures=$((failures + 1)); }
 # not a check — deleting `minisign -S -s ...` while leaving the paragraph above
 # it explaining what minisign does would sail straight through. So every pattern
 # is matched against the workflow with comment lines stripped first.
-workflow_code() { grep -Ev '^[[:space:]]*#' "$WORKFLOW"; }
+# Read once into a variable rather than re-running a producer into every grep.
+#
+# `workflow_code | grep -Eq …` is a pipeline, and `grep -q` exits the moment it
+# matches. That closes the pipe, the producer takes SIGPIPE, and under
+# `set -o pipefail` the pipeline reports the producer's death rather than grep's
+# success — so a check FAILED precisely when its pattern matched early enough
+# for grep to leave before the producer finished writing. Whether that happened
+# depended on the match's position and on how the platform's grep buffers: every
+# check passed on macOS and three failed on Linux, which is the worst way for a
+# gate to be wrong.
+workflow_code() { printf '%s\n' "$WORKFLOW_CODE"; }
 
 # has <description> <regex>            — the workflow's code must match
 has() {
@@ -57,6 +67,8 @@ if [ ! -f "$WORKFLOW" ]; then
   echo "no $WORKFLOW — there is no release pipeline to check" >&2
   exit 1
 fi
+
+WORKFLOW_CODE="$(grep -Ev '^[[:space:]]*#' "$WORKFLOW")"
 
 # --- 1. trigger -------------------------------------------------------------
 has "triggered on v* tags" '^ *- "v\*"'

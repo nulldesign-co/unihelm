@@ -1614,13 +1614,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(unit_file_name(&user(), &name()));
 
+        // `/bin/sh`, not `/usr/bin/node`. This test is about writing the managed
+        // unit and reloading systemd, but `apply_app_unit_at` finishes by running
+        // `systemd-analyze verify`, and that refuses a unit whose ExecStart does
+        // not exist: "Command /usr/bin/node is not executable". A developer
+        // machine with no systemd skips the check and never sees it; CI has
+        // systemd and no node, so this failed there and passed here. `/bin/sh` is
+        // on every machine either can run on.
         let outcome = apply_app_unit_at(
             &ctx,
             &path,
             &app_row(20_000, "apps/blog/server.js"),
             &name(),
             &user(),
-            Path::new("/usr/bin/node"),
+            Path::new("/bin/sh"),
             vec![],
             None,
         )

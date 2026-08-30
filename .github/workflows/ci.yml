@@ -226,7 +226,14 @@ jobs:
             apt-get update -qq
             apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config
           else
-            dnf install -y --setopt=install_weak_deps=False curl ca-certificates gcc make
+            # --allowerasing: the AlmaLinux images ship `curl-minimal`, which
+            # conflicts with `curl`, and dnf refuses the swap without being told
+            # it may remove the incumbent. Without it the job dies at
+            # "cannot install the best candidate for the job" before building
+            # anything, which is what almalinux:9 did while almalinux:10 (whose
+            # image carries full curl) passed.
+            dnf install -y --allowerasing --setopt=install_weak_deps=False \
+              curl ca-certificates gcc make
           fi
 
       - uses: actions/checkout@v4
