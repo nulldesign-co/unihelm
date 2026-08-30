@@ -2,7 +2,7 @@
 -- (spec §11.8).
 --
 -- One row per job. The rows are the panel's *intent*; the tenant's crontab is
--- a rendering of them (`unihelm_ops::cron::render_crontab`), regenerated in
+-- a rendering of them (`ferrum_ops::cron::render_crontab`), regenerated in
 -- full on every change rather than patched line by line. That direction is
 -- deliberate: a crontab edited in place has no identity for a line, so an
 -- update would have to find "the line that used to be this job" by string
@@ -16,7 +16,7 @@
 -- file itself; the rows must not be what keeps a deleted tenant alive.
 --
 -- `schedule` and `command` are stored as the *canonical* text the validator
--- produced, not as the caller typed it: `unihelm_ops::cron` collapses a
+-- produced, not as the caller typed it: `ferrum_ops::cron` collapses a
 -- schedule to five single-space-separated fields before it is stored, so two
 -- spellings of one schedule cannot render two different crontabs. SQLite
 -- cannot express either rule as a CHECK, so the renderer validates every row
@@ -34,7 +34,7 @@ CREATE TABLE cron_jobs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     subscription_id INTEGER NOT NULL REFERENCES subscriptions (id) ON DELETE CASCADE,
     -- Five whitespace-separated fields, canonicalised. Never `@reboot` or an
-    -- `@alias`: see `unihelm_ops::cron` for why a tenant may not have one.
+    -- `@alias`: see `ferrum_ops::cron` for why a tenant may not have one.
     schedule        TEXT    NOT NULL,
     -- The command line cron hands to the user's shell. Validated to hold no
     -- control characters at all — a newline here would append a second job to

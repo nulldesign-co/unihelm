@@ -26,7 +26,7 @@ ALTER TABLE subscriptions ADD COLUMN quota_hard_mb INTEGER;
 
 CREATE TABLE quota_projects (
     -- The XFS project id passed to `xfs_quota -x -c 'project ...'`. Allocation
-    -- starts at 100 (see `unihelm_db::quota`) so ids an operator assigned by
+    -- starts at 100 (see `ferrum_db::quota`) so ids an operator assigned by
     -- hand in /etc/projid before installing the panel stay out of our range.
     project_id      INTEGER PRIMARY KEY,
     subscription_id INTEGER NOT NULL UNIQUE

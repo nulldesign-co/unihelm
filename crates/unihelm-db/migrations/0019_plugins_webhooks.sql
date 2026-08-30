@@ -4,7 +4,7 @@
 -- Two features, one migration, because they are the same promise from two
 -- sides: spec §2.4 says "no billing/invoicing — expose a clean API + webhooks
 -- so WHMCS/FOSSBilling can integrate later", and §14 Phase 6 says "third
--- parties can extend Unihelm without patching the core". Webhooks are how the
+-- parties can extend Ferrum without patching the core". Webhooks are how the
 -- panel talks *out*; plugins are how somebody else's code talks *in*.
 --
 -- ---------------------------------------------------------------------------
@@ -32,14 +32,14 @@
 -- Owned by a user, not by a subscription. A webhook is a property of an
 -- *account* — a reseller integrating their billing system wants one hook for
 -- everything they own, not one per subscription — and the tenant-scope filter
--- in `unihelm_db::webhooks` resolves ownership through `users.reseller_id` the
+-- in `ferrum_db::webhooks` resolves ownership through `users.reseller_id` the
 -- same way the user repository does.
 
 CREATE TABLE webhooks (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     -- Validated to http:// or https:// with no control characters before it is
-    -- stored (`unihelm_ops::webhook::validate_url`). SQLite cannot express that
+    -- stored (`ferrum_ops::webhook::validate_url`). SQLite cannot express that
     -- as a CHECK, so the delivery loop validates again on the way out and
     -- refuses a row it would not have accepted — a hand-edited database gets a
     -- named error, never a request nobody vouched for.
@@ -76,7 +76,7 @@ CREATE INDEX webhooks_active_idx ON webhooks (active);
 --
 -- At-least-once, never exactly-once. The row is marked delivered only after a
 -- 2xx is seen, so a response lost on the wire produces a second POST with the
--- **same** `id` — which is why that id travels in the `X-Unihelm-Delivery`
+-- **same** `id` — which is why that id travels in the `X-Ferrum-Delivery`
 -- header and why the docs tell receivers to de-duplicate on it.
 --
 -- `payload_json` is frozen at emit time rather than re-derived at send time.
@@ -93,7 +93,7 @@ CREATE TABLE webhook_deliveries (
     payload_json    TEXT    NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
     -- When the delivery loop may next pick this row up. Bounded exponential
-    -- backoff (`unihelm_ops::webhook::backoff`).
+    -- backoff (`ferrum_ops::webhook::backoff`).
     next_attempt_at TEXT    NOT NULL,
     status          TEXT    NOT NULL DEFAULT 'pending'
                             CHECK (status IN ('pending', 'delivered', 'failed')),
@@ -133,7 +133,7 @@ CREATE INDEX webhook_deliveries_hook_idx ON webhook_deliveries (webhook_id);
 -- reasoning is in docs/plugins.md.
 
 CREATE TABLE plugins (
-    -- `[a-z0-9][a-z0-9-]{1,31}`, validated by `unihelm_ops::plugin::PluginSlug`.
+    -- `[a-z0-9][a-z0-9-]{1,31}`, validated by `ferrum_ops::plugin::PluginSlug`.
     -- It becomes part of a unit name, a Unix account name and a socket path, so
     -- its alphabet is the intersection of what all three accept.
     slug             TEXT    NOT NULL PRIMARY KEY,
@@ -149,7 +149,7 @@ CREATE TABLE plugins (
     -- Where the payload was unpacked. Root-owned; the plugin account may read
     -- and execute, never write.
     install_dir      TEXT    NOT NULL,
-    -- The dedicated system account the sidecar runs as: `unihelm-plug-<slug>`.
+    -- The dedicated system account the sidecar runs as: `ferrum-plug-<slug>`.
     run_user         TEXT    NOT NULL,
     signature        TEXT    NOT NULL CHECK (signature IN ('minisign', 'unsigned')),
     enabled          INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),

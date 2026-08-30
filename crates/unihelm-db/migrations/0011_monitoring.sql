@@ -50,7 +50,7 @@ CREATE TABLE notify_channels (
     kind          TEXT    NOT NULL CHECK (kind IN ('webhook', 'telegram')),
     label         TEXT    NOT NULL,
     -- The whole channel configuration, sealed with the MasterKey
-    -- (XChaCha20-Poly1305, see unihelm_db::secrets) — spec §12 rule 6.
+    -- (XChaCha20-Poly1305, see ferrum_db::secrets) — spec §12 rule 6.
     --
     -- The *entire* config is sealed, not just the obvious secret: a Telegram
     -- bot token is plainly a credential, but so is a webhook URL, because the
@@ -104,7 +104,7 @@ CREATE INDEX alert_events_open_idx ON alert_events (rule_id) WHERE resolved_at I
 -- disable or re-threshold them; an operator who never opens the alerts page is
 -- still covered.
 --
--- `strftime` here formats exactly as `unihelm_db::to_sql_time` does
+-- `strftime` here formats exactly as `ferrum_db::to_sql_time` does
 -- (RFC 3339, seconds, Z), so these rows are indistinguishable from ones the
 -- panel wrote.
 INSERT INTO alert_rules (kind, target, threshold, enabled, created_at, updated_at)

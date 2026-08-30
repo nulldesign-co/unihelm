@@ -56,4 +56,4 @@ CREATE INDEX sentinel_bans_active_idx ON sentinel_bans (lifted_at, expires_at);
 -- in the existing `settings` table. They are deliberately *not* seeded here:
 -- an absent key reads as the code's default, and `sentinel.enabled` defaults to
 -- false so a fresh install cannot lock its operator out of a server they have
--- not configured yet (spec §11.9, and see `unihelm_ops::fwops`).
+-- not configured yet (spec §11.9, and see `ferrum_ops::fwops`).

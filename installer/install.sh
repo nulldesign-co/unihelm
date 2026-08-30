@@ -65,7 +65,7 @@ set -euo pipefail
 # --- release identity ------------------------------------------------------
 # The repository releases come from. A fork changes this and UNIHELM_PUBKEY and
 # needs to change nothing else.
-UNIHELM_REPO="${UNIHELM_REPO:-farzam/unihelm}"
+UNIHELM_REPO="${UNIHELM_REPO:-farzam-seyedhashem/unihelm}"
 
 # The minisign public key every release is signed with (spec §5.5 — the same
 # ed25519/minisign format self-update verifies). The literal below is rewritten

@@ -1,4 +1,4 @@
--- Unihelm panel schema, migration 0001 (Phase 0).
+-- Ferrum panel schema, migration 0001 (Phase 0).
 --
 -- Naming follows spec §9 exactly; later phases extend it with new migrations
 -- and never by editing this file.
@@ -17,7 +17,7 @@ CREATE TABLE users (
     email           TEXT    NOT NULL,
     username        TEXT    NOT NULL,
     pass_hash       TEXT    NOT NULL,
-    -- libsodium sealed box under the master key in /etc/unihelm/secret.key.
+    -- libsodium sealed box under the master key in /etc/ferrum/secret.key.
     totp_secret     TEXT,
     totp_enabled    INTEGER NOT NULL DEFAULT 0 CHECK (totp_enabled IN (0, 1)),
     status          TEXT    NOT NULL DEFAULT 'active'

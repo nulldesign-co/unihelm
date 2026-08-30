@@ -1,2 +1,2 @@
-untrusted comment: PLACEHOLDER - NOT THE UNIHELM RELEASE KEY. Generate the real one with `minisign -G -W -p minisign.pub -s minisign.key`, commit the public half over this file, and store the secret half as the MINISIGN_SECRET_KEY repository secret. See docs/releasing.md. The release workflow refuses to publish while the word PLACEHOLDER is still in this file.
-RWRPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERREPLACEMEBEFORERELEASE0000
+untrusted comment: Unihelm release signing key. Release tarballs are signed with the secret half; verify with: minisign -Vm <file> -P RWSj0olr2XQ6OU9F7XmaNUTsVQMelXpx6b4mK/NZ22cxRB75xdu/RGQs
+RWSj0olr2XQ6OU9F7XmaNUTsVQMelXpx6b4mK/NZ22cxRB75xdu/RGQs

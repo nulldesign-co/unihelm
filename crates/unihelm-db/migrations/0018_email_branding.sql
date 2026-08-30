@@ -40,7 +40,7 @@ CREATE TABLE mail_relay (
     port            INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
     -- `none` — plaintext, only sane to a relay on localhost or a private LAN.
     -- `starttls` — connect in the clear, upgrade, and refuse to continue if
-    --              the upgrade fails (see unihelm_ops::mail::smtp).
+    --              the upgrade fails (see ferrum_ops::mail::smtp).
     -- `implicit` — TLS from the first byte (SMTPS, port 465).
     tls_mode        TEXT    NOT NULL CHECK (tls_mode IN ('none', 'starttls', 'implicit')),
     -- NULL means an unauthenticated relay: legitimate for a relay that
@@ -126,7 +126,7 @@ CREATE TABLE branding_assets (
     kind         TEXT    NOT NULL CHECK (kind IN ('logo', 'favicon', 'login_background')),
     -- The type the panel *sniffed*, not one a client claimed. Constrained to
     -- the raster formats the upload path accepts: SVG is refused outright
-    -- (see unihelm_ops::branding::sniff_image for why), so no value here can
+    -- (see ferrum_ops::branding::sniff_image for why), so no value here can
     -- ever name a document format a browser would script.
     content_type TEXT    NOT NULL CHECK (content_type IN (
                      'image/png', 'image/jpeg', 'image/gif',

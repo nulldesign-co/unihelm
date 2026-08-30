@@ -11,7 +11,7 @@ CREATE TABLE subscriptions (
     -- Plans are Phase 2. Until then a subscription is simply an owner and a
     -- Linux account.
     plan_id          INTEGER,
-    -- `uh_<short-id>`; the account PHP-FPM pools and cron jobs run as.
+    -- `ft_<short-id>`; the account PHP-FPM pools and cron jobs run as.
     linux_user       TEXT    NOT NULL,
     home_dir         TEXT    NOT NULL,
     status           TEXT    NOT NULL DEFAULT 'active'
@@ -138,7 +138,7 @@ CREATE TABLE stack_components (
 ) WITHOUT ROWID;
 
 -- The panel's ACME account. The private key is sealed under the master key in
--- /etc/unihelm/secret.key and never appears in an API response (spec §12 rule 6).
+-- /etc/ferrum/secret.key and never appears in an API response (spec §12 rule 6).
 CREATE TABLE acme_accounts (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     directory_url         TEXT    NOT NULL,

@@ -1,7 +1,7 @@
 -- Migration 0015 (Phase 4, ModSecurity WAF): per-site policy and the rule
 -- exclusion list (spec §11.9).
 --
--- These two tables are the *whole* input to `/etc/unihelm/waf/main.conf`. That
+-- These two tables are the *whole* input to `/etc/ferrum/waf/main.conf`. That
 -- is the organising idea: the rules file is a pure render of this state, so
 -- "why is this rule not firing on that site" is answerable from two SELECTs
 -- rather than from reading a generated file. A row here is intent; whether
@@ -74,4 +74,4 @@ CREATE INDEX waf_exclusions_site_idx ON waf_exclusions (site_id);
 -- existing `settings` table, for the same reason Sentinel's do: an absent key
 -- must read as the code's default, and seeding rows at install time would mean
 -- a later release could never change a default it had already written into
--- every database. See `unihelm_ops::waf`.
+-- every database. See `ferrum_ops::waf`.

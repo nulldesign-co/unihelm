@@ -9,14 +9,14 @@
 -- migration, which is exactly the review moment a new provider deserves.
 --
 -- `credentials_sealed` holds a **Cloudflare API Token**, sealed with the panel
--- master key (XChaCha20-Poly1305, see `unihelm_db::MasterKey`) exactly the way
+-- master key (XChaCha20-Poly1305, see `ferrum_db::MasterKey`) exactly the way
 -- `acme_accounts.credentials_encrypted` holds the ACME account key. It is never
 -- stored, logged or returned in the clear (spec §12 rule 6), and the column name
 -- says `sealed` so a reader of the schema knows the value is not a password to
 -- be compared but a ciphertext to be opened.
 --
 -- Never a Global API Key. That distinction is the whole security story of this
--- table and it is argued at length in `unihelm_ops::dns`: a Global Key
+-- table and it is argued at length in `ferrum_ops::dns`: a Global Key
 -- authenticates every action on every zone in the account (and the account's
 -- billing), while a token can be scoped to Zone:Read + DNS:Edit on one zone. A
 -- panel that stores the first has taken the customer's entire Cloudflare account

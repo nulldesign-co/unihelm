@@ -12,7 +12,7 @@
 -- makes a duplicate impossible to store even if two allocations race, and the
 -- CHECK keeps the panel inside the range documented for tenant apps (20000 to
 -- 25000, unprivileged and clear of the ephemeral range). Deleting an app frees
--- its port for the next allocation; see `unihelm_db::node_apps` for why reuse
+-- its port for the next allocation; see `ferrum_db::node_apps` for why reuse
 -- is deliberate.
 --
 -- `site_id` is the optional reverse-proxy vhost in front of the app. ON DELETE
@@ -31,10 +31,10 @@ CREATE TABLE node_apps (
     subscription_id INTEGER NOT NULL REFERENCES subscriptions (id) ON DELETE RESTRICT,
     -- The reverse-proxy site published in front of this app, if any.
     site_id         INTEGER          REFERENCES sites (id) ON DELETE SET NULL,
-    -- Validated by `unihelm_core::AppName`: [a-z0-9][a-z0-9_-]{0,31}. Safe to
+    -- Validated by `ferrum_core::AppName`: [a-z0-9][a-z0-9_-]{0,31}. Safe to
     -- paste into a unit name and a path with no quoting.
     name            TEXT    NOT NULL,
-    -- Tenant-home-relative path to the JS entry point (`unihelm_core::TenantPath`).
+    -- Tenant-home-relative path to the JS entry point (`ferrum_core::TenantPath`).
     entry           TEXT    NOT NULL,
     port            INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 20000 AND 25000),
     node_env        TEXT    NOT NULL DEFAULT 'production'
@@ -45,7 +45,7 @@ CREATE TABLE node_apps (
 );
 
 -- Per tenant, not server-wide: two customers may each have an app called
--- `blog`. The unit name that carries both (`unihelm-app-<linux_user>-<name>`)
+-- `blog`. The unit name that carries both (`ferrum-app-<linux_user>-<name>`)
 -- is unique because `subscriptions.linux_user` is.
 CREATE UNIQUE INDEX node_apps_subscription_name_uq ON node_apps (subscription_id, name);
 CREATE INDEX node_apps_subscription_idx            ON node_apps (subscription_id);

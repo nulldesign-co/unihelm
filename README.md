@@ -135,13 +135,18 @@ below are real measurements, with where they were taken.
 
 ## Installing
 
-There is no release yet. After the first release, this will be the install
-path — **it does not work today**:
-
 ```bash
-# PLACEHOLDER — not live until the first release:
-curl -fsSL https://unihelm.sh/install | bash
+curl -fsSL https://raw.githubusercontent.com/farzam-seyedhashem/unihelm/main/installer/install.sh | sudo bash
 ```
+
+The installer downloads the latest release's tarball for your architecture,
+verifies its minisign signature against the key committed to this repository,
+and refuses to install anything it cannot verify. To read it before running it —
+which you should, for any script piped to a shell — it is
+[`installer/install.sh`](installer/install.sh).
+
+Pin a version with `UNIHELM_VERSION=v0.1.0`, or point the installer at a fork
+with `UNIHELM_REPO=owner/name`.
 
 ### From source (works today)
 

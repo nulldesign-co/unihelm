@@ -320,9 +320,13 @@ else
       continue
     fi
 
-    if [ "$original_path" != "$path" ]; then
-      # A rename changes the version sqlx recorded, so it is a rewrite of an
-      # applied migration by another name.
+    if [ "$(basename "$original_path")" != "$base" ]; then
+      # Compared by file name, not by path. sqlx derives the version and the
+      # description from the name alone — `0010_node_apps.sql` — and finds the
+      # file by scanning whichever directory it is handed, so moving the crate
+      # that holds it changes nothing a database has recorded. Renaming the file
+      # is the hazard this exists for: it re-numbers or re-describes a migration
+      # somebody's database already applied under the old name.
       fail "$base" "renamed since ${first_commit:0:8} (was $original_path)"
       continue
     fi

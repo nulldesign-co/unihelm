@@ -9,7 +9,7 @@
 -- A restic repository is encrypted, and its password is the only key. Storing
 -- it sealed here is what lets the scheduler run an unattended 03:00 backup
 -- without a human present. The consequence is stated plainly in
--- `unihelm_ops::backup`'s module documentation and repeated in the operator
+-- `ferrum_ops::backup`'s module documentation and repeated in the operator
 -- docs: a panel-scope backup whose password exists *only* inside the panel
 -- database cannot be restored after the panel is lost, because the password
 -- is inside the thing that burned down. `backup.repo.init` therefore returns
@@ -21,7 +21,7 @@
 -- `password_sealed` and `credentials_sealed` hold `MasterKey` ciphertext
 -- (XChaCha20-Poly1305, hex) exactly like `acme_accounts.private_key_sealed`
 -- (spec §12 rule 6). Reading this table with `sqlite3` during an incident
--- reveals nothing; the master key lives at /etc/unihelm/secret.key, 0600.
+-- reveals nothing; the master key lives at /etc/ferrum/secret.key, 0600.
 --
 -- WITHOUT ROWID is deliberately *not* used: every one of these tables has a
 -- synthetic autoincrementing id, which is the rowid, so there is no natural
@@ -59,7 +59,7 @@ CREATE TABLE backup_schedules (
     scope           TEXT    NOT NULL CHECK (scope IN ('panel', 'subscription')),
     subscription_id INTEGER          REFERENCES subscriptions (id) ON DELETE CASCADE,
     -- Five-field cron (`m h dom mon dow`), evaluated by
-    -- `unihelm_ops::backup::cron`. Stored as text rather than parsed columns so
+    -- `ferrum_ops::backup::cron`. Stored as text rather than parsed columns so
     -- an operator sees back what they typed.
     cron            TEXT    NOT NULL,
     -- restic's `forget --keep-daily/--keep-weekly/--keep-monthly`. Zero means
