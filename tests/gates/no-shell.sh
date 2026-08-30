@@ -7,7 +7,7 @@
 #   1. No process is ever started through a shell. `sh -c "$user_input"` is the
 #      bug class this whole design exists to avoid.
 #   2. `std::process::Command` (and tokio's) may only be constructed inside
-#      `ferrum-distro`'s exec module. Everything else goes through `Cmd`, which
+#      `unihelm-distro`'s exec module. Everything else goes through `Cmd`, which
 #      takes argv arrays and resolves programs against a fixed list of trusted
 #      directories.
 #
@@ -31,8 +31,8 @@ set -euo pipefail
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-SCAN_ROOT="${FERRUM_NO_SHELL_ROOT:-crates/}"
-ALLOWLIST="${FERRUM_NO_SHELL_ALLOWLIST:-tests/gates/no-shell-allowlist.txt}"
+SCAN_ROOT="${UNIHELM_NO_SHELL_ROOT:-crates/}"
+ALLOWLIST="${UNIHELM_NO_SHELL_ALLOWLIST:-tests/gates/no-shell-allowlist.txt}"
 
 failures=0
 suppressed_log=$(mktemp)
@@ -203,7 +203,7 @@ RUST
   local rules=(shell-program shell-string shell-argv shell-owned dash-c command-new metachars)
   local rule ok_all=0
 
-  out=$(NO_COLOR=1 FERRUM_NO_SHELL_ROOT="$dir/crates/" FERRUM_NO_SHELL_ALLOWLIST=/dev/null \
+  out=$(NO_COLOR=1 UNIHELM_NO_SHELL_ROOT="$dir/crates/" UNIHELM_NO_SHELL_ALLOWLIST=/dev/null \
     bash "$SELF" 2>&1) && status=0 || status=$?
 
   if [ "$status" -eq 0 ]; then
@@ -246,8 +246,8 @@ RUST
   mkdir -p "$owned_dir/crates/evil/src"
   cp "$dir/crates/evil/src/owned.rs" "$owned_dir/crates/evil/src/owned.rs"
   local owned_out owned_status=0
-  owned_out=$(NO_COLOR=1 FERRUM_NO_SHELL_ROOT="$owned_dir/crates/" \
-    FERRUM_NO_SHELL_ALLOWLIST=/dev/null bash "$SELF" 2>&1) || owned_status=$?
+  owned_out=$(NO_COLOR=1 UNIHELM_NO_SHELL_ROOT="$owned_dir/crates/" \
+    UNIHELM_NO_SHELL_ALLOWLIST=/dev/null bash "$SELF" 2>&1) || owned_status=$?
   if [ "$owned_status" -ne 0 ] &&
     printf '%s' "$owned_out" | grep -q 'FAIL shell-owned' &&
     printf '%s' "$owned_out" | grep -q 'FAIL dash-c'; then
@@ -267,7 +267,7 @@ RUST
     done
   done
 
-  out=$(NO_COLOR=1 FERRUM_NO_SHELL_ROOT="$dir/crates/" FERRUM_NO_SHELL_ALLOWLIST="$allow" \
+  out=$(NO_COLOR=1 UNIHELM_NO_SHELL_ROOT="$dir/crates/" UNIHELM_NO_SHELL_ALLOWLIST="$allow" \
     bash "$SELF" 2>&1) && status=0 || status=$?
   if [ "$status" -eq 0 ]; then
     echo "ok   an_allowlisted_file_is_not_reported"
@@ -279,7 +279,7 @@ RUST
 
   # An entry for a file with nothing to suppress must be called out.
   printf 'dash-c %s stale on purpose\n' "$dir/crates/evil/src/nonexistent.rs" >>"$allow"
-  out=$(NO_COLOR=1 FERRUM_NO_SHELL_ROOT="$dir/crates/" FERRUM_NO_SHELL_ALLOWLIST="$allow" \
+  out=$(NO_COLOR=1 UNIHELM_NO_SHELL_ROOT="$dir/crates/" UNIHELM_NO_SHELL_ALLOWLIST="$allow" \
     bash "$SELF" 2>&1) || true
   if printf '%s' "$out" | grep -q 'stale .*nonexistent.rs'; then
     echo "ok   an_allowlist_entry_that_suppresses_nothing_is_reported_stale"
@@ -308,7 +308,7 @@ report_stale_allowlist
 echo
 if [ "$failures" -gt 0 ]; then
   echo "no-shell gate failed with $failures violation(s)" >&2
-  echo "Every privileged command goes through ferrum_distro::Cmd with an argv array." >&2
+  echo "Every privileged command goes through unihelm_distro::Cmd with an argv array." >&2
   echo "A verified false positive goes in $ALLOWLIST, with a reason." >&2
   exit 1
 fi

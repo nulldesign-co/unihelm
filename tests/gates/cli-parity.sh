@@ -8,11 +8,11 @@
 #
 # It compares two lists:
 #
-#   1. Every operation registered in `crates/ferrum-ops/src/registry.rs` —
+#   1. Every operation registered in `crates/unihelm-ops/src/registry.rs` —
 #      the whitelist, and therefore the definition of what exists.
 #   2. Every operation named in `COVERAGE` in
-#      `crates/ferrum-cli/src/parity.rs`, which pairs an operation with a real
-#      `ferrum …` command line.
+#      `crates/unihelm-cli/src/parity.rs`, which pairs an operation with a real
+#      `unihelm …` command line.
 #
 # The second list is only worth reading because a unit test
 # (`parity::tests::every_listed_command_really_plans_that_operation`) parses
@@ -37,10 +37,10 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 # Overridable for the self-test only.
-REGISTRY="${FERRUM_PARITY_REGISTRY:-crates/ferrum-ops/src/registry.rs}"
-OPS_SRC="${FERRUM_PARITY_OPS_SRC:-crates/ferrum-ops/src}"
-COVERAGE_SRC="${FERRUM_PARITY_COVERAGE:-crates/ferrum-cli/src/parity.rs}"
-ALLOWLIST="${FERRUM_PARITY_ALLOWLIST:-tests/gates/cli-parity-allowlist.txt}"
+REGISTRY="${UNIHELM_PARITY_REGISTRY:-crates/unihelm-ops/src/registry.rs}"
+OPS_SRC="${UNIHELM_PARITY_OPS_SRC:-crates/unihelm-ops/src}"
+COVERAGE_SRC="${UNIHELM_PARITY_COVERAGE:-crates/unihelm-cli/src/parity.rs}"
+ALLOWLIST="${UNIHELM_PARITY_ALLOWLIST:-tests/gates/cli-parity-allowlist.txt}"
 
 if [ -n "${NO_COLOR:-}" ]; then
   C_RED='' C_GREEN='' C_YELLOW='' C_OFF=''
@@ -268,8 +268,8 @@ run_gate() {
     printf '       %s\n' "${missing[@]}"
     cat >&2 <<'EOF'
 
-This list is the checklist. Each one needs a `ferrum …` subcommand and an entry
-in COVERAGE in crates/ferrum-cli/src/parity.rs — or, if it genuinely does not
+This list is the checklist. Each one needs a `unihelm …` subcommand and an entry
+in COVERAGE in crates/unihelm-cli/src/parity.rs — or, if it genuinely does not
 belong on a command line, a line in tests/gates/cli-parity-allowlist.txt saying
 why. Spec §11.20: the CLI reaches everything the UI can.
 EOF
@@ -308,16 +308,16 @@ RUST
   # Covers alpha only.
   cat >"$dir/parity.rs" <<'RUST'
 pub const COVERAGE: &[(&str, &[&str])] = &[
-    ("thing.alpha", &["ferrum", "thing", "alpha"]),
+    ("thing.alpha", &["unihelm", "thing", "alpha"]),
 ];
 RUST
 
   run_fixture() {
     NO_COLOR=1 \
-      FERRUM_PARITY_REGISTRY="$dir/registry.rs" \
-      FERRUM_PARITY_OPS_SRC="$dir/ops" \
-      FERRUM_PARITY_COVERAGE="$dir/parity.rs" \
-      FERRUM_PARITY_ALLOWLIST="$1" \
+      UNIHELM_PARITY_REGISTRY="$dir/registry.rs" \
+      UNIHELM_PARITY_OPS_SRC="$dir/ops" \
+      UNIHELM_PARITY_COVERAGE="$dir/parity.rs" \
+      UNIHELM_PARITY_ALLOWLIST="$1" \
       bash "$SELF" 2>&1
   }
 
@@ -370,9 +370,9 @@ RUST
   # otherwise read as coverage.
   cat >"$dir/parity.rs" <<'RUST'
 pub const COVERAGE: &[(&str, &[&str])] = &[
-    ("thing.alpha", &["ferrum", "thing", "alpha"]),
-    ("thing.beta", &["ferrum", "thing", "beta"]),
-    ("thing.gamma", &["ferrum", "thing", "gamma"]),
+    ("thing.alpha", &["unihelm", "thing", "alpha"]),
+    ("thing.beta", &["unihelm", "thing", "beta"]),
+    ("thing.gamma", &["unihelm", "thing", "gamma"]),
 ];
 RUST
   out=$(run_fixture "$dir/empty-allow.txt") && status=0 || status=$?
@@ -389,11 +389,11 @@ RUST
 pub const COVERAGE: &[(&str, &[&str])] = &[
     (
         "thing.alpha",
-        &["ferrum", "thing", "alpha"],
+        &["unihelm", "thing", "alpha"],
     ),
     (
         "thing.beta",
-        &["ferrum", "thing", "beta"],
+        &["unihelm", "thing", "beta"],
     ),
 ];
 RUST

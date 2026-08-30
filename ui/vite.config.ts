@@ -12,7 +12,7 @@ export default defineConfig({
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
   build: {
-    outDir: "../crates/ferrum-web/ui-dist",
+    outDir: "../crates/unihelm-web/ui-dist",
     emptyOutDir: true,
     // The initial route has a 350 KB gzipped budget (spec §3); warn well before
     // that so a heavy import is noticed in the PR that adds it.

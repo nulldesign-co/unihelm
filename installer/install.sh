@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ferrum installer (spec §14 Phase 0; release verification per spec §5.5).
+# Unihelm installer (spec §14 Phase 0; release verification per spec §5.5).
 #
 # Two ways in. The default is a signed release binary — the thing almost
 # everybody wants, and the thing that does not need a Rust toolchain, 2 GB of
 # build artefacts and twenty minutes on a 1 GB VPS:
 #
 #     sudo ./install.sh                          # the latest release
-#     sudo FERRUM_VERSION=v0.4.1 ./install.sh    # a pinned one
+#     sudo UNIHELM_VERSION=v0.4.1 ./install.sh    # a pinned one
 #
 # and a source build stays available for developers, for architectures we do
 # not publish binaries for, and for anyone who would rather compile than trust
@@ -22,7 +22,7 @@
 #   2. Normalise `uname -m` into a release architecture. x86_64 and aarch64 are
 #      the only two we build; anything else stops here with a sentence that
 #      says so and points at --from-source, rather than 404ing on a download.
-#   3. Refuse outright while FERRUM_PUBKEY is still the release-time
+#   3. Refuse outright while UNIHELM_PUBKEY is still the release-time
 #      placeholder. This is the fork trap: a repository someone cloned and
 #      pointed at their own releases would otherwise download a tarball,
 #      "verify" it against nothing in particular and install it. Refusing costs
@@ -30,10 +30,10 @@
 #      everything on the box.
 #   4. Install minisign from the distribution's own repositories — EPEL on the
 #      RHEL family, using the same epel-release + `crb` sequence the repo layer
-#      in crates/ferrum-distro/src/pkg.rs applies before any third-party repo.
+#      in crates/unihelm-distro/src/pkg.rs applies before any third-party repo.
 #      No minisign, no install: there is no code path below that continues
 #      without a verified signature, and no flag that creates one.
-#   5. Resolve the version — $FERRUM_VERSION if set, otherwise the GitHub
+#   5. Resolve the version — $UNIHELM_VERSION if set, otherwise the GitHub
 #      release API — and validate it *before* it becomes part of a URL or a
 #      filename. The API response is somebody else's data (spec §12).
 #   6. Download <tarball>, SHA256SUMS and SHA256SUMS.minisig.
@@ -45,8 +45,8 @@
 #      expect out of it — never whatever layout the archive happens to have.
 #
 # From there both paths run the same functions: create the unprivileged
-# `ferrum` account, install the binaries and the directory layout from spec
-# §4.3, write /etc/ferrum/config.toml and generate the master key, install and
+# `unihelm` account, install the binaries and the directory layout from spec
+# §4.3, write /etc/unihelm/config.toml and generate the master key, install and
 # start the two systemd units, and create the first administrator whose
 # password is printed exactly once.
 #
@@ -63,26 +63,26 @@
 set -euo pipefail
 
 # --- release identity ------------------------------------------------------
-# The repository releases come from. A fork changes this and FERRUM_PUBKEY and
+# The repository releases come from. A fork changes this and UNIHELM_PUBKEY and
 # needs to change nothing else.
-FERRUM_REPO="${FERRUM_REPO:-farzam/ferrum}"
+UNIHELM_REPO="${UNIHELM_REPO:-farzam/unihelm}"
 
 # The minisign public key every release is signed with (spec §5.5 — the same
 # ed25519/minisign format self-update verifies). The literal below is rewritten
 # when a release is cut; packaging/README.md is the other half of that
 # contract. Until it is rewritten, `require_signing_key` refuses to install
-# anything at all. Setting FERRUM_PUBKEY in the environment points this
+# anything at all. Setting UNIHELM_PUBKEY in the environment points this
 # installer at a fork's own key; note what that cannot do — there is no value
 # of it, including the empty string, that skips verification.
-FERRUM_PUBKEY="${FERRUM_PUBKEY:-PLACEHOLDER-REPLACE-AT-RELEASE}"
+UNIHELM_PUBKEY="${UNIHELM_PUBKEY:-PLACEHOLDER-REPLACE-AT-RELEASE}"
 
-readonly BIN_DIR=/usr/local/ferrum/bin
-readonly CONFIG_DIR=/etc/ferrum
-readonly DATA_DIR=/var/lib/ferrum
-readonly LOG_DIR=/var/log/ferrum
+readonly BIN_DIR=/usr/local/unihelm/bin
+readonly CONFIG_DIR=/etc/unihelm
+readonly DATA_DIR=/var/lib/unihelm
+readonly LOG_DIR=/var/log/unihelm
 readonly UNIT_DIR=/etc/systemd/system
-readonly SERVICE_USER=ferrum
-readonly BINARIES=(ferrum-agentd ferrum-web ferrum)
+readonly SERVICE_USER=unihelm
+readonly BINARIES=(unihelm-agentd unihelm-web unihelm)
 
 SOURCE_DIR=""
 FROM_SOURCE=0
@@ -90,7 +90,7 @@ ADMIN_USER="admin"
 ADMIN_EMAIL=""
 LISTEN=""
 SKIP_PREFLIGHT=0
-RELEASE_VERSION="${FERRUM_VERSION:-}"
+RELEASE_VERSION="${UNIHELM_VERSION:-}"
 STAGED_BIN_DIR=""
 WORKDIR=""
 
@@ -122,9 +122,9 @@ verifies its minisign signature and SHA-256 checksum, and installs it.
   -h, --help          This text
 
 Environment:
-  FERRUM_VERSION      Same as --version
-  FERRUM_REPO         owner/name of the GitHub repository to fetch from
-  FERRUM_PUBKEY       minisign public key releases must be signed with
+  UNIHELM_VERSION      Same as --version
+  UNIHELM_REPO         owner/name of the GitHub repository to fetch from
+  UNIHELM_PUBKEY       minisign public key releases must be signed with
 
 There is deliberately no option to skip signature verification.
 USAGE
@@ -186,7 +186,7 @@ normalize_arch() {
     x86_64 | amd64) printf 'x86_64\n' ;;
     aarch64 | arm64) printf 'aarch64\n' ;;
     *)
-      die "no Ferrum release is published for $1 — x86_64 and aarch64 only. Build one with: sudo ./install.sh --from-source"
+      die "no Unihelm release is published for $1 — x86_64 and aarch64 only. Build one with: sudo ./install.sh --from-source"
       ;;
   esac
   return 0
@@ -209,12 +209,12 @@ resolve_version() {
   fi
 
   local body tag
-  body="$(fetch_stdout "https://api.github.com/repos/$FERRUM_REPO/releases/latest")" ||
-    die "could not reach the GitHub release API for $FERRUM_REPO; pin a version with FERRUM_VERSION=vX.Y.Z"
+  body="$(fetch_stdout "https://api.github.com/repos/$UNIHELM_REPO/releases/latest")" ||
+    die "could not reach the GitHub release API for $UNIHELM_REPO; pin a version with UNIHELM_VERSION=vX.Y.Z"
   tag="$(printf '%s\n' "$body" |
     sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$tag" ] ||
-    die "$FERRUM_REPO has no published releases yet; build from source with --from-source"
+    die "$UNIHELM_REPO has no published releases yet; build from source with --from-source"
   valid_version "$tag" ||
     die "the release API answered with \"$tag\", which is not a version tag; refusing to build a download URL out of it"
 
@@ -222,27 +222,27 @@ resolve_version() {
   return 0
 }
 
-# Release artefacts are named ferrum-<version>-<arch>-linux.tar.gz, with the
+# Release artefacts are named unihelm-<version>-<arch>-linux.tar.gz, with the
 # leading `v` of the tag dropped. packaging/README.md is the other half of this
 # contract; changing one without the other breaks every install.
 release_tarball_name() {
-  printf 'ferrum-%s-%s-linux.tar.gz\n' "${RELEASE_VERSION#v}" "$(release_arch)"
+  printf 'unihelm-%s-%s-linux.tar.gz\n' "${RELEASE_VERSION#v}" "$(release_arch)"
 }
 
 release_base_url() {
-  printf 'https://github.com/%s/releases/download/%s\n' "$FERRUM_REPO" "$RELEASE_VERSION"
+  printf 'https://github.com/%s/releases/download/%s\n' "$UNIHELM_REPO" "$RELEASE_VERSION"
 }
 
 # --- verification ----------------------------------------------------------
 # The gate that stops a half-configured fork. It runs before anything is
 # downloaded, so a clone that nobody signed for never even makes a request.
 require_signing_key() {
-  case "$FERRUM_PUBKEY" in
+  case "$UNIHELM_PUBKEY" in
     PLACEHOLDER-* | "")
       die "this installer has no release signing key: the placeholder is still in place.
     That means nothing it downloaded could be verified, so it will not download anything.
-    If you are running a fork, set FERRUM_PUBKEY to your minisign public key.
-    If you are building Ferrum yourself, use --from-source."
+    If you are running a fork, set UNIHELM_PUBKEY to your minisign public key.
+    If you are building Unihelm yourself, use --from-source."
       ;;
   esac
 
@@ -251,8 +251,8 @@ require_signing_key() {
   # Checking the shape turns a truncated copy-paste into a sentence rather than
   # an opaque minisign error three steps later.
   local pattern='^RW[A-Za-z0-9+/]{54}$'
-  [[ $FERRUM_PUBKEY =~ $pattern ]] ||
-    die "FERRUM_PUBKEY does not look like a minisign public key (56 characters starting RW)"
+  [[ $UNIHELM_PUBKEY =~ $pattern ]] ||
+    die "UNIHELM_PUBKEY does not look like a minisign public key (56 characters starting RW)"
   return 0
 }
 
@@ -267,7 +267,7 @@ enable_rhel_repo() {
   # `dnf config-manager` lives in dnf-plugins-core, which a minimal image may
   # not have. Best-effort after that: `crb` is named differently on RHEL proper
   # than on the rebuilds, and an install that does not need it should not fail
-  # over a name (mirrors Prerequisite::EnableRepo in ferrum-distro).
+  # over a name (mirrors Prerequisite::EnableRepo in unihelm-distro).
   dnf install -y dnf-plugins-core >/dev/null 2>&1 || true
   if dnf -y config-manager --set-enabled "$repo" >/dev/null 2>&1; then
     info "enabled the \`$repo\` repository"
@@ -283,7 +283,7 @@ ensure_minisign() {
   fi
 
   step "Installing minisign to verify the download"
-  case "${FERRUM_FAMILY:-}" in
+  case "${UNIHELM_FAMILY:-}" in
     debian)
       DEBIAN_FRONTEND=noninteractive apt-get update -qq ||
         warn "apt-get update failed; trying the install anyway"
@@ -292,7 +292,7 @@ ensure_minisign() {
     rhel)
       # minisign is an EPEL package on the RHEL family, and epel-release itself
       # is signed by the distribution — no pin of ours needed, which is exactly
-      # why ferrum-distro models it as Prerequisite::DistroPackage.
+      # why unihelm-distro models it as Prerequisite::DistroPackage.
       dnf install -y epel-release || warn "could not install epel-release; minisign may not resolve"
       enable_rhel_repo crb
       dnf install -y minisign || true
@@ -315,8 +315,8 @@ ensure_minisign() {
 
 verify_signature() { # sums-file sig-file
   local sums="$1" sig="$2" output
-  info "checking the signature against $FERRUM_PUBKEY"
-  if output="$(minisign -V -P "$FERRUM_PUBKEY" -m "$sums" -x "$sig" 2>&1)"; then
+  info "checking the signature against $UNIHELM_PUBKEY"
+  if output="$(minisign -V -P "$UNIHELM_PUBKEY" -m "$sums" -x "$sig" 2>&1)"; then
     return 0
   fi
   printf '%s\n' "$output" >&2
@@ -402,7 +402,7 @@ download_and_verify_release() { # workdir; sets STAGED_BIN_DIR
   ensure_minisign
 
   install -d -m 0700 "$work"
-  step "Downloading Ferrum $RELEASE_VERSION ($arch)"
+  step "Downloading Unihelm $RELEASE_VERSION ($arch)"
   fetch_to "$base/$tarball" "$work/$tarball" ||
     die "could not download $base/$tarball"
   fetch_to "$base/SHA256SUMS" "$work/SHA256SUMS" ||
@@ -431,22 +431,22 @@ build_from_source() {
   local root
   root="$(cd "$here/.." && pwd)"
   [ -f "$root/Cargo.toml" ] ||
-    die "--from-source needs the Ferrum source tree, and $root has no Cargo.toml"
+    die "--from-source needs the Unihelm source tree, and $root has no Cargo.toml"
   command -v cargo >/dev/null 2>&1 ||
     die "--from-source needs cargo on PATH (see https://rustup.rs)"
 
-  # ferrum-web embeds the built interface, so the UI has to exist before the
+  # unihelm-web embeds the built interface, so the UI has to exist before the
   # Rust build rather than after it.
   if [ -f "$root/ui/package-lock.json" ]; then
     if command -v npm >/dev/null 2>&1; then
       step "Building the interface"
       ( cd "$root/ui" && npm ci && npm run build )
     else
-      warn "npm is not installed; ferrum-web will be built without its interface"
+      warn "npm is not installed; unihelm-web will be built without its interface"
     fi
   fi
 
-  step "Building Ferrum (this takes a while)"
+  step "Building Unihelm (this takes a while)"
   ( cd "$root" && cargo build --release )
   SOURCE_DIR="${CARGO_TARGET_DIR:-$root/target}/release"
   return 0
@@ -464,7 +464,7 @@ run_preflight() {
   # Guarded: with --skip-preflight on a system without /etc/os-release these
   # are never assigned, and `set -u` would kill the installer here rather than
   # let the operator through the door they explicitly asked for.
-  info "${FERRUM_OS_NAME:-unknown system} (${FERRUM_FAMILY:-?}, ${FERRUM_ARCH:-?})"
+  info "${UNIHELM_OS_NAME:-unknown system} (${UNIHELM_FAMILY:-?}, ${UNIHELM_ARCH:-?})"
   return 0
 }
 
@@ -478,10 +478,10 @@ create_service_account() {
   # a database file, not to be signed into.
   useradd --system --user-group --no-create-home \
     --home-dir "$DATA_DIR" --shell /usr/sbin/nologin \
-    --comment "Ferrum panel" "$SERVICE_USER" 2>/dev/null ||
+    --comment "Unihelm panel" "$SERVICE_USER" 2>/dev/null ||
     useradd --system --user-group --no-create-home \
       --home-dir "$DATA_DIR" --shell /sbin/nologin \
-      --comment "Ferrum panel" "$SERVICE_USER"
+      --comment "Unihelm panel" "$SERVICE_USER"
   info "created"
   return 0
 }
@@ -508,8 +508,8 @@ create_layout() {
   install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR/state"
   install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$LOG_DIR"
 
-  # `ferrum` on PATH, without putting our whole bin directory there.
-  ln -sf "$BIN_DIR/ferrum" /usr/local/bin/ferrum
+  # `unihelm` on PATH, without putting our whole bin directory there.
+  ln -sf "$BIN_DIR/unihelm" /usr/local/bin/unihelm
   return 0
 }
 
@@ -541,23 +541,23 @@ write_configuration() {
 
 install_units() {
   step "Installing systemd units"
-  install -m 0644 "$here/systemd/ferrum-agentd.service" "$UNIT_DIR/ferrum-agentd.service"
-  install -m 0644 "$here/systemd/ferrum-web.service" "$UNIT_DIR/ferrum-web.service"
+  install -m 0644 "$here/systemd/unihelm-agentd.service" "$UNIT_DIR/unihelm-agentd.service"
+  install -m 0644 "$here/systemd/unihelm-web.service" "$UNIT_DIR/unihelm-web.service"
   systemctl daemon-reload
-  systemctl enable --now ferrum-agentd.service
-  info "ferrum-agentd started"
+  systemctl enable --now unihelm-agentd.service
+  info "unihelm-agentd started"
 
   # The agent creates the database on first start; wait for it before the web
   # process and the CLI need it.
   for _ in $(seq 1 30); do
-    [ -S /run/ferrum/agent.sock ] && break
+    [ -S /run/unihelm/agent.sock ] && break
     sleep 0.5
   done
-  [ -S /run/ferrum/agent.sock ] ||
-    die "ferrum-agentd did not come up; check: journalctl -u ferrum-agentd"
+  [ -S /run/unihelm/agent.sock ] ||
+    die "unihelm-agentd did not come up; check: journalctl -u unihelm-agentd"
 
-  systemctl enable --now ferrum-web.service
-  info "ferrum-web started"
+  systemctl enable --now unihelm-web.service
+  info "unihelm-web started"
   return 0
 }
 
@@ -567,10 +567,10 @@ create_first_admin() {
     ADMIN_EMAIL="admin@$(hostname -f 2>/dev/null || hostname)"
   fi
 
-  if "$BIN_DIR/ferrum" user list 2>/dev/null | grep -q admin; then
+  if "$BIN_DIR/unihelm" user list 2>/dev/null | grep -q admin; then
     info "an account already exists; skipping"
   else
-    "$BIN_DIR/ferrum" user create-admin --username "$ADMIN_USER" --email "$ADMIN_EMAIL"
+    "$BIN_DIR/unihelm" user create-admin --username "$ADMIN_USER" --email "$ADMIN_EMAIL"
   fi
   return 0
 }
@@ -580,11 +580,11 @@ print_summary() {
   listen_addr="$(awk -F'"' '/^listen = /{print $2}' "$CONFIG_DIR/config.toml")"
   cat <<DONE
 
-$(printf '\033[1m')Ferrum is installed.$(printf '\033[0m')
+$(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
   Panel     http://${listen_addr}
-  Health    ferrum doctor
-  Logs      journalctl -u ferrum-agentd -u ferrum-web -f
+  Health    unihelm doctor
+  Logs      journalctl -u unihelm-agentd -u unihelm-web -f
 
 The panel listens on ${listen_addr}. If that is loopback, reach it over an SSH
 tunnel until you have pointed a domain at this server and issued a certificate:
@@ -619,7 +619,7 @@ main() {
     build_from_source
   else
     trap cleanup EXIT
-    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ferrum-install.XXXXXX")"
+    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/unihelm-install.XXXXXX")"
     download_and_verify_release "$WORKDIR"
     SOURCE_DIR="$STAGED_BIN_DIR"
   fi

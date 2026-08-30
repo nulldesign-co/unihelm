@@ -15,29 +15,29 @@
 
 # --- the file manager (spec §11.7) -----------------------------------------
 #
-# These sixteen exist so a *browser* can have a filesystem. `ferrum` runs as
+# These sixteen exist so a *browser* can have a filesystem. `unihelm` runs as
 # root on the machine itself, where the shell it was launched from already has
 # a better version of every one of them, with tab completion, pipes and a
-# pager. A `ferrum files list` would be a worse `ls` that has to round-trip
+# pager. A `unihelm files list` would be a worse `ls` that has to round-trip
 # through a socket, and the tenant-uid confinement that makes the operations
 # safe for the web process buys nothing for a caller who is already root.
 #
 # The one that is arguably not covered by that argument is `fs.usage`, and it
 # is listed with its own reason.
 
-fs.list       the shell that launched ferrum already has ls, with completion and a pager
-fs.stat       the shell that launched ferrum already has stat
-fs.read       the shell that launched ferrum already has cat
-fs.write      the shell that launched ferrum already has a text editor and shell redirection
-fs.mkdir      the shell that launched ferrum already has mkdir
-fs.rename     the shell that launched ferrum already has mv
-fs.copy       the shell that launched ferrum already has cp
-fs.delete     the shell that launched ferrum already has rm
-fs.chmod      the shell that launched ferrum already has chmod
-fs.search     the shell that launched ferrum already has find and grep
-fs.compress   the shell that launched ferrum already has tar and zip
-fs.extract    the shell that launched ferrum already has tar and unzip
+fs.list       the shell that launched unihelm already has ls, with completion and a pager
+fs.stat       the shell that launched unihelm already has stat
+fs.read       the shell that launched unihelm already has cat
+fs.write      the shell that launched unihelm already has a text editor and shell redirection
+fs.mkdir      the shell that launched unihelm already has mkdir
+fs.rename     the shell that launched unihelm already has mv
+fs.copy       the shell that launched unihelm already has cp
+fs.delete     the shell that launched unihelm already has rm
+fs.chmod      the shell that launched unihelm already has chmod
+fs.search     the shell that launched unihelm already has find and grep
+fs.compress   the shell that launched unihelm already has tar and zip
+fs.extract    the shell that launched unihelm already has tar and unzip
 fs.trash.list      the recycle bin is a file-manager affordance; on the host it is a directory
 fs.trash.restore   the recycle bin is a file-manager affordance; on the host it is a mv
 fs.trash.purge     the recycle bin is a file-manager affordance; on the host it is an rm
-fs.usage      du answers this on the host; `ferrum quota usage` is the tenant-facing number
+fs.usage      du answers this on the host; `unihelm quota usage` is the tenant-facing number

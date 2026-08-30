@@ -71,7 +71,7 @@ jobs:
 
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
-          echo "Releasing ferrum $version from $tag" >>"$GITHUB_STEP_SUMMARY"
+          echo "Releasing unihelm $version from $tag" >>"$GITHUB_STEP_SUMMARY"
 
       # The repository ships minisign.pub as a placeholder so the file exists and
       # the tarball layout is right from day one. Shipping the placeholder itself
@@ -92,8 +92,8 @@ jobs:
           echo "Signing key: $(sed -n 1p minisign.pub)" >>"$GITHUB_STEP_SUMMARY"
 
   # --- 1. the UI, built once ------------------------------------------------
-  # `ferrum-web` embeds the UI with rust-embed (`#[folder = "ui-dist"]` in
-  # crates/ferrum-web/src/ui.rs), which reads the directory at *compile* time.
+  # `unihelm-web` embeds the UI with rust-embed (`#[folder = "ui-dist"]` in
+  # crates/unihelm-web/src/ui.rs), which reads the directory at *compile* time.
   # So the UI must exist on disk before cargo runs, on every architecture. It is
   # architecture-independent, so it is built once here and downloaded by each
   # build job — building it twice would also risk two different bundles carrying
@@ -127,7 +127,7 @@ jobs:
         run: npm run typecheck
         working-directory: ui
 
-      # vite.config.ts writes straight to crates/ferrum-web/ui-dist.
+      # vite.config.ts writes straight to crates/unihelm-web/ui-dist.
       - name: Build
         run: npm run build
         working-directory: ui
@@ -138,7 +138,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ui-dist
-          path: crates/ferrum-web/ui-dist
+          path: crates/unihelm-web/ui-dist
           if-no-files-found: error
           retention-days: 7
 
@@ -153,7 +153,7 @@ jobs:
         include:
           # Both architectures build natively on GitHub-hosted runners.
           # `ubuntu-24.04-arm` is free for public repositories and available on
-          # Team/Enterprise plans for private ones; Ferrum is AGPL and public, so
+          # Team/Enterprise plans for private ones; Unihelm is AGPL and public, so
           # native is the primary path — it avoids a cross toolchain and it runs
           # the resulting binary's own test suite on its own architecture.
           #
@@ -190,30 +190,30 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # Overwrites the placeholder crates/ferrum-web/ui-dist/index.html that is
+      # Overwrites the placeholder crates/unihelm-web/ui-dist/index.html that is
       # checked in only so rust-embed always has a folder to read.
       - name: Fetch the UI built in the `ui` job
         uses: actions/download-artifact@v4
         with:
           name: ui-dist
-          path: crates/ferrum-web/ui-dist
+          path: crates/unihelm-web/ui-dist
 
       # The placeholder index.html references /assets/index-*.js. If the download
-      # silently produced nothing, cargo would still build and ferrum-web would
+      # silently produced nothing, cargo would still build and unihelm-web would
       # still start — and serve a white page to every operator. Cheap check, whole
       # class of "the release is broken and nobody noticed until it shipped".
       - name: The real UI is present before cargo reads it
         run: |
           set -euo pipefail
-          test -d crates/ferrum-web/ui-dist/assets ||
+          test -d crates/unihelm-web/ui-dist/assets ||
             { echo "::error::ui-dist has no assets/ — the UI artifact did not land, the binary would embed an empty shell" >&2; exit 1; }
-          test -f crates/ferrum-web/ui-dist/index.html
-          ls -l crates/ferrum-web/ui-dist/assets | head
+          test -f crates/unihelm-web/ui-dist/index.html
+          ls -l crates/unihelm-web/ui-dist/assets | head
 
       - name: Build release binaries
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
-            -p ferrum-agentd -p ferrum-web -p ferrum-cli
+            -p unihelm-agentd -p unihelm-web -p unihelm-cli
 
       # Reuses tests/gates/budgets.sh rather than re-deriving the 25 MB number
       # (spec §3) here, so there is exactly one place the budget lives. That
@@ -235,7 +235,7 @@ jobs:
         run: |
           set -euo pipefail
           bindir="target/${{ matrix.target }}/release"
-          floor=$(objdump -T "$bindir"/ferrum-agentd "$bindir"/ferrum-web "$bindir"/ferrum |
+          floor=$(objdump -T "$bindir"/unihelm-agentd "$bindir"/unihelm-web "$bindir"/unihelm |
             grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V -u | tail -1)
           echo "${{ matrix.arch }}: glibc >= ${floor}" | tee "$RUNNER_TEMP/glibc-${{ matrix.arch }}.txt"
           echo "- \`${{ matrix.arch }}\` requires glibc >= ${floor}" >>"$GITHUB_STEP_SUMMARY"
@@ -243,24 +243,24 @@ jobs:
       # The layout mirrors installer/ exactly, because install.sh sources
       # $here/preflight.sh, $here/config.toml.example and $here/systemd/*.service
       # by relative path. Untar, run ./install.sh --from ./bin, done.
-      - name: Package ferrum-${{ needs.version.outputs.version }}-${{ matrix.arch }}.tar.gz
+      - name: Package unihelm-${{ needs.version.outputs.version }}-${{ matrix.arch }}.tar.gz
         env:
           VERSION: ${{ needs.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          stage="$RUNNER_TEMP/stage/ferrum-${VERSION}-${ARCH}"
+          stage="$RUNNER_TEMP/stage/unihelm-${VERSION}-${ARCH}"
           mkdir -p "$stage/bin" "$stage/systemd" "$RUNNER_TEMP/dist"
 
-          install -m 0755 "target/${{ matrix.target }}/release/ferrum-agentd" "$stage/bin/"
-          install -m 0755 "target/${{ matrix.target }}/release/ferrum-web"    "$stage/bin/"
-          install -m 0755 "target/${{ matrix.target }}/release/ferrum"        "$stage/bin/"
+          install -m 0755 "target/${{ matrix.target }}/release/unihelm-agentd" "$stage/bin/"
+          install -m 0755 "target/${{ matrix.target }}/release/unihelm-web"    "$stage/bin/"
+          install -m 0755 "target/${{ matrix.target }}/release/unihelm"        "$stage/bin/"
 
           install -m 0755 installer/install.sh    "$stage/install.sh"
           install -m 0755 installer/preflight.sh  "$stage/preflight.sh"
           install -m 0644 installer/config.toml.example "$stage/config.toml.example"
-          install -m 0644 installer/systemd/ferrum-agentd.service "$stage/systemd/"
-          install -m 0644 installer/systemd/ferrum-web.service    "$stage/systemd/"
+          install -m 0644 installer/systemd/unihelm-agentd.service "$stage/systemd/"
+          install -m 0644 installer/systemd/unihelm-web.service    "$stage/systemd/"
 
           # Shipped so an operator can verify the *next* release (and so
           # self-update has a key on disk before it has a network) — spec §5.5.
@@ -268,7 +268,7 @@ jobs:
           install -m 0644 LICENSE "$stage/LICENSE"
 
           cat >"$stage/README" <<EOF
-          Ferrum ${VERSION} (${ARCH}, Linux)
+          Unihelm ${VERSION} (${ARCH}, Linux)
 
             sudo ./install.sh --from ./bin
 
@@ -278,15 +278,15 @@ jobs:
 
           Verify what you downloaded, from the directory you downloaded it into:
 
-            minisign -Vm ferrum-${VERSION}-${ARCH}.tar.gz \\
-              -p ferrum-${VERSION}-${ARCH}/minisign.pub
+            minisign -Vm unihelm-${VERSION}-${ARCH}.tar.gz \\
+              -p unihelm-${VERSION}-${ARCH}/minisign.pub
             sha256sum -c SHA256SUMS
 
           The copy of minisign.pub inside the tarball is only a convenience for
           verifying the *next* release. The first time, take the key from the
           repository or the release page, not from the file you are checking.
 
-          Documentation: https://github.com/farzam/ferrum/tree/v${VERSION}/docs
+          Documentation: https://github.com/farzam-seyedhashem/unihelm/tree/v${VERSION}/docs
           EOF
 
           # Deterministic tarball: rebuilding the same tag on the same runner
@@ -310,8 +310,8 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime="@${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" \
             -C "$RUNNER_TEMP/stage" \
-            -cf - "ferrum-${VERSION}-${ARCH}" |
-            gzip -n -9 >"$RUNNER_TEMP/dist/ferrum-${VERSION}-${ARCH}.tar.gz"
+            -cf - "unihelm-${VERSION}-${ARCH}" |
+            gzip -n -9 >"$RUNNER_TEMP/dist/unihelm-${VERSION}-${ARCH}.tar.gz"
 
           cp "$RUNNER_TEMP/glibc-${ARCH}.txt" "$RUNNER_TEMP/dist/"
           ls -l "$RUNNER_TEMP/dist"
@@ -328,15 +328,15 @@ jobs:
           set -euo pipefail
           check="$RUNNER_TEMP/check"
           mkdir -p "$check"
-          tar -xzf "$RUNNER_TEMP/dist/ferrum-${VERSION}-${ARCH}.tar.gz" -C "$check"
-          root="$check/ferrum-${VERSION}-${ARCH}"
+          tar -xzf "$RUNNER_TEMP/dist/unihelm-${VERSION}-${ARCH}.tar.gz" -C "$check"
+          root="$check/unihelm-${VERSION}-${ARCH}"
           # Everything install.sh reads by relative path from its own directory.
           test -x "$root/install.sh"
           test -x "$root/preflight.sh"
           test -f "$root/config.toml.example"
-          test -f "$root/systemd/ferrum-agentd.service"
-          test -f "$root/systemd/ferrum-web.service"
-          for binary in ferrum ferrum-agentd ferrum-web; do
+          test -f "$root/systemd/unihelm-agentd.service"
+          test -f "$root/systemd/unihelm-web.service"
+          for binary in unihelm unihelm-agentd unihelm-web; do
             reported=$("$root/bin/$binary" --version)
             echo "$reported"
             [ "$reported" = "$binary $VERSION" ] ||
@@ -384,7 +384,7 @@ jobs:
           set -euo pipefail
           # Explicit glob: the per-arch glibc notes travel in the same artifact
           # and are release *notes*, not release *assets*.
-          sha256sum ferrum-*.tar.gz | sort -k2 >SHA256SUMS
+          sha256sum unihelm-*.tar.gz | sort -k2 >SHA256SUMS
           cat SHA256SUMS
 
       # `minisign -S` over both the checksum file and each tarball:
@@ -408,10 +408,10 @@ jobs:
           key="$RUNNER_TEMP/minisign.key"
           printf '%s\n' "$MINISIGN_SECRET_KEY" >"$key"
 
-          trusted="ferrum ${VERSION} — tag ${{ needs.version.outputs.tag }}, commit ${GITHUB_SHA}, run ${GITHUB_RUN_ID}"
+          trusted="unihelm ${VERSION} — tag ${{ needs.version.outputs.tag }}, commit ${GITHUB_SHA}, run ${GITHUB_RUN_ID}"
           cd dist
           minisign -S -s "$key" -t "$trusted" -m SHA256SUMS
-          for tarball in ferrum-*.tar.gz; do
+          for tarball in unihelm-*.tar.gz; do
             minisign -S -s "$key" -t "$trusted" -m "$tarball"
           done
           ls -l
@@ -425,7 +425,7 @@ jobs:
         run: |
           set -euo pipefail
           minisign -Vm SHA256SUMS -p ../minisign.pub
-          for tarball in ferrum-*.tar.gz; do
+          for tarball in unihelm-*.tar.gz; do
             minisign -Vm "$tarball" -p ../minisign.pub
           done
           sha256sum -c SHA256SUMS
@@ -443,16 +443,16 @@ jobs:
             echo "## Install"
             echo
             echo '```bash'
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/ferrum-${VERSION}-\$(uname -m).tar.gz"
-            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/ferrum-${VERSION}-\$(uname -m).tar.gz.minisig"
-            echo "minisign -Vm ferrum-${VERSION}-\$(uname -m).tar.gz -P \$(sed -n 2p minisign.pub)"
-            echo "tar -xzf ferrum-${VERSION}-\$(uname -m).tar.gz"
-            echo "cd ferrum-${VERSION}-\$(uname -m) && sudo ./install.sh --from ./bin"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/unihelm-${VERSION}-\$(uname -m).tar.gz"
+            echo "curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/unihelm-${VERSION}-\$(uname -m).tar.gz.minisig"
+            echo "minisign -Vm unihelm-${VERSION}-\$(uname -m).tar.gz -P \$(sed -n 2p minisign.pub)"
+            echo "tar -xzf unihelm-${VERSION}-\$(uname -m).tar.gz"
+            echo "cd unihelm-${VERSION}-\$(uname -m) && sudo ./install.sh --from ./bin"
             echo '```'
             echo
             echo "## Verifying"
             echo
-            echo "Signed with the Ferrum release key; the public half is \`minisign.pub\` in the repository and in every tarball:"
+            echo "Signed with the Unihelm release key; the public half is \`minisign.pub\` in the repository and in every tarball:"
             echo
             echo '```'
             cat minisign.pub
@@ -499,10 +499,10 @@ jobs:
           gh release create "$TAG" \
             --draft \
             --verify-tag \
-            --title "Ferrum $VERSION" \
+            --title "Unihelm $VERSION" \
             --notes-file notes.md \
-            dist/ferrum-*.tar.gz \
-            dist/ferrum-*.tar.gz.minisig \
+            dist/unihelm-*.tar.gz \
+            dist/unihelm-*.tar.gz.minisig \
             dist/SHA256SUMS \
             dist/SHA256SUMS.minisig
           echo "Draft release created: publish it at $(gh release view "$TAG" --json url -q .url)" >>"$GITHUB_STEP_SUMMARY"

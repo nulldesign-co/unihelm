@@ -1,0 +1,32 @@
+[package]
+name = "unihelm-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "unihelm"
+path = "src/main.rs"
+
+[dependencies]
+unihelm-core = { workspace = true }
+unihelm-db = { workspace = true }
+unihelm-distro = { workspace = true }
+unihelm-ipc = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# Tests only, and deliberately: `parity.rs` deserialises every payload the CLI
+# would send into the operation's *own* `Input` type, which is the only way to
+# prove `unihelm site create` sends what `site.create` parses without a running
+# agent. It is a dev-dependency, so none of this reaches the binary — and CI
+# already builds unihelm-ops for the workspace, so it costs nothing there.
+unihelm-ops = { workspace = true }
+serde = { workspace = true }

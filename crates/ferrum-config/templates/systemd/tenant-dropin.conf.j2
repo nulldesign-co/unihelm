@@ -1,7 +1,0 @@
-{# Lands one per-tenant service in its tenant's slice (spec §6.3). A drop-in
-   rather than an edit: systemd merges every <unit>.d/*.conf over the unit
-   file, so the unit itself stays clean and the slice assignment is one small
-   file the panel fully owns. Rendered by
-   ferrum_ops::slices::apply_unit_slice_dropin. #}
-[Service]
-Slice={{ dropin.slice_unit }}

@@ -1,6 +1,6 @@
 export const en = {
   common: {
-    appName: "Ferrum",
+    appName: "Unihelm",
     loading: "Loading…",
     retry: "Try again",
     dismiss: "Dismiss",
@@ -830,7 +830,7 @@ export const en = {
     passwordSubtitle: "Repository “{{label}}” was created.",
     passwordOnce: "Shown once. The panel cannot show it again.",
     passwordNotice:
-      "This password is shown once and cannot be recovered from the panel. Store it off this server, together with /etc/ferrum/secret.key: without both, a panel-scope backup cannot be restored after the panel is lost.",
+      "This password is shown once and cannot be recovered from the panel. Store it off this server, together with /etc/unihelm/secret.key: without both, a panel-scope backup cannot be restored after the panel is lost.",
     password: "Repository password",
     copy: "Copy",
     copied: "Copied",
@@ -866,7 +866,7 @@ export const en = {
     scopePanel: "The panel itself",
     scopeSubscription: "One subscription",
     scopePanelHint:
-      "The panel database, /etc/ferrum and the state directory — certificates and ACME accounts included.",
+      "The panel database, /etc/unihelm and the state directory — certificates and ACME accounts included.",
     subscription: "Subscription",
     subscriptionHint: "Which subscription's home directory to back up.",
     runNow: "Run a backup now",
@@ -954,7 +954,7 @@ export const en = {
     },
     noneTitle: "No firewall is installed on this server",
     noneBody:
-      "Ferrum found no firewalld, ufw or nftables to work with, so it is enforcing nothing. Every port this server listens on is reachable from the network.",
+      "Unihelm found no firewalld, ufw or nftables to work with, so it is enforcing nothing. Every port this server listens on is reachable from the network.",
     noneHint:
       "Install one of them and this page starts managing it. Until then no rule and no ban here can be applied.",
     inactiveTitle: "{{backend}} is installed but not running",
@@ -983,7 +983,7 @@ export const en = {
         "This is not an empty firewall — it is no firewall. Nothing on this server is being filtered by the panel.",
       empty: "No ports have been opened through the panel",
       emptyHint:
-        "Rules you wrote by hand are left alone and are not listed here; only rules Ferrum marked as its own.",
+        "Rules you wrote by hand are left alone and are not listed here; only rules Unihelm marked as its own.",
       port: "Port",
       portInvalid: "A port is a number between 1 and 65535",
       proto: "Protocol",
@@ -999,7 +999,7 @@ export const en = {
         "The panel opened this port but the firewall has no such rule. Something flushed the ruleset — re-open it to restore the hole.",
       driftUnrecorded: "Enforced, not recorded",
       driftUnrecordedHint:
-        "The firewall is holding a Ferrum rule the panel has no row for, usually a restored database or an older build.",
+        "The firewall is holding a Unihelm rule the panel has no row for, usually a restored database or an older build.",
     },
     bans: {
       title: "Ban list",
@@ -1025,7 +1025,7 @@ export const en = {
       unrecorded: "{{count}} address is blocked without a panel record",
       unrecorded_other: "{{count}} addresses are blocked without a panel record",
       unrecordedHint:
-        "The firewall is dropping these and Ferrum never banned them — somebody else's rule, or a leftover from an earlier install.",
+        "The firewall is dropping these and Unihelm never banned them — somebody else's rule, or a leftover from an earlier install.",
       minutes: "Ban for (minutes)",
       minutesHint: "Leave it empty for Sentinel's configured duration. 0 makes the ban permanent.",
       minutesInvalid: "Enter a whole number of minutes",
@@ -1176,7 +1176,7 @@ export const en = {
     title: "Mail",
     subtitle: "Send mail from this server's sites through an external SMTP relay.",
     scopeNote:
-      "Ferrum does not run a mail server. There are no mailboxes here: this configures a relay somebody else operates and points every PHP site's mail() at it.",
+      "Unihelm does not run a mail server. There are no mailboxes here: this configures a relay somebody else operates and points every PHP site's mail() at it.",
     agentMissing: "The sending program is not installed",
     agentMissingHint:
       "PHP has nothing to hand a message to, so mail will not send however the relay is configured. Install {{agent}} and save the relay again.",
@@ -1262,9 +1262,9 @@ export const en = {
     },
     dns: {
       title: "SPF, DKIM and DMARC",
-      hint: "The records the configured relay needs. Ferrum shows them; it does not publish or check them.",
+      hint: "The records the configured relay needs. Unihelm shows them; it does not publish or check them.",
       none: "Configure the relay first — which records are needed depends on which provider it is.",
-      notManaged: "Not managed by Ferrum",
+      notManaged: "Not managed by Unihelm",
       noValue:
         "Only the relay provider can supply this. Copy the selector and value from their dashboard.",
       copy: "Copy",

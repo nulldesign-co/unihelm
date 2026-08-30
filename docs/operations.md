@@ -1,7 +1,7 @@
 # Operations reference
 
-Every privileged thing Ferrum can do is an *operation*: a named entry in the
-registry at `crates/ferrum-ops/src/registry.rs`, with a typed input, a declared
+Every privileged thing Unihelm can do is an *operation*: a named entry in the
+registry at `crates/unihelm-ops/src/registry.rs`, with a typed input, a declared
 permission and a declared execution mode. The registry is a whitelist — a name
 that is not in it does not exist, and the agent answers `FER-1504
 unknown_operation` rather than falling back to anything (spec §5.2).
@@ -52,7 +52,7 @@ Where an operation takes `subscription_id` as *(optional)*, omitting it means
 Is the agent alive, and what is it running on? Answers with the agent version,
 the detected distribution and family, the architecture, and which package,
 firewall and security-module backends were selected. The simplest operation and
-the one `ferrum doctor` leans on: if it answers, the socket, the peer check,
+the one `unihelm doctor` leans on: if it answers, the socket, the peer check,
 the registry and the database handle all work.
 
 ### `metrics.snapshot`
@@ -122,7 +122,7 @@ be verified, which the UI surfaces rather than hides.
 | Input | `component` *(flattened)* — `nginx`, `php` (with `version`), `mariadb` or `postgres`; `extensions` *(optional list of `PhpExt`)* |
 
 Adds the component's repository, verifies its signing key against a full 40-hex
-fingerprint pin (`crates/ferrum-distro/src/repos.rs`), installs the packages
+fingerprint pin (`crates/unihelm-distro/src/repos.rs`), installs the packages
 and starts the service. `component` is a typed enum precisely so an API caller
 cannot ask the panel to `apt install` something of their choosing. For PHP, an
 empty `extensions` list means the default set mainstream applications assume.
@@ -292,7 +292,7 @@ anyone logs in to.
 
 ## DNS
 
-Ferrum does not run authoritative DNS in v1. It holds an API credential for
+Unihelm does not run authoritative DNS in v1. It holds an API credential for
 somebody who does, and drives DNS-01 through it (spec §11.13; own authoritative
 DNS is Phase 5). Cloudflare is the only provider this build speaks, and the
 `dns_providers.kind` CHECK constraint says so rather than accepting a name the
@@ -387,7 +387,7 @@ than accumulating a dead row whose revoked token would be tried first.
 ## Databases
 
 All `db.*` operations run the engine's own client through
-`ferrum_distro::Cmd` — argv array, binary resolved against a fixed list of
+`unihelm_distro::Cmd` — argv array, binary resolved against a fixed list of
 trusted directories, scrubbed environment, SQL delivered on stdin. No SQL is
 ever interpolated into a shell string (spec §12 rule 2, and
 `tests/gates/no-shell.sh`).
@@ -775,7 +775,7 @@ runtime.
 | Input | `subscription_id`; `password` *(optional string)* |
 
 Chroots a tenant's home and opens SFTP access to it. One managed sshd drop-in
-carries a single `Match Group ferrum-sftp` block (`ChrootDirectory %h`,
+carries a single `Match Group unihelm-sftp` block (`ChrootDirectory %h`,
 `ForceCommand internal-sftp`, forwarding off), so enabling SFTP for the second
 tenant is a group membership change and not a config change. sshd requires
 every component of a chroot path to be root-owned and not group- or
@@ -936,7 +936,7 @@ can audit.
 | Input | the same fields as `fw.port.open` |
 
 Removes a rule **the panel created**. Rules the operator wrote by hand are
-never touched: every rule Ferrum adds carries a `ferrum:` comment, and that
+never touched: every rule Unihelm adds carries a `unihelm:` comment, and that
 mark is what tells them apart.
 
 ### `fw.rules`
@@ -1019,9 +1019,9 @@ setup.
 
 ## Web application firewall (ModSecurity)
 
-**On a stock Ferrum server this feature refuses to enable, and it says exactly
-why.** Ferrum installs nginx from nginx.org, and nginx.org publishes no
-ModSecurity module. Checked on 2026-08-28 against every package tree Ferrum
+**On a stock Unihelm server this feature refuses to enable, and it says exactly
+why.** Unihelm installs nginx from nginx.org, and nginx.org publishes no
+ModSecurity module. Checked on 2026-08-28 against every package tree Unihelm
 installs from — `packages/debian`, `packages/ubuntu`, `packages/mainline/debian`
 and `packages/centos/10` — the published modules are acme, geoip, image-filter,
 njs, otel, perl and xslt. There is no `nginx-module-modsecurity` in any of them.
@@ -1041,7 +1041,7 @@ contains no main-context `include` at all; its only include is
 disk there is nowhere to put the line that loads it except `nginx.conf` itself,
 which the panel does not edit (spec §10.4 rule 1).
 
-Spec §11.9's answer is a prebuilt dynamic module from Ferrum's own package
+Spec §11.9's answer is a prebuilt dynamic module from Unihelm's own package
 repository, the same rule as brotli in §11.2. That repository does not exist in
 this build. `waf.enable` therefore refuses with `FER-1403 conflict` and a
 message naming both conditions and what would fix them. Everything below the
@@ -1052,16 +1052,16 @@ nginx change.
 ### How per-site policy works
 
 ModSecurity's nginx directives are valid at http, server and location level, so
-the obvious design is `modsecurity on;` inside each vhost. Ferrum does not do
+the obvious design is `modsecurity on;` inside each vhost. Unihelm does not do
 that. It would mean re-rendering every vhost to change one site's WAF, and a
 site whose owner had hand-edited their vhost (which the config engine detects
 and refuses to overwrite) could not be governed at all.
 
 Instead the engine is switched on once at http level in
-`/etc/nginx/ferrum.d/03-waf.conf`, starting in `DetectionOnly`, and each site's
+`/etc/nginx/unihelm.d/03-waf.conf`, starting in `DetectionOnly`, and each site's
 policy is a phase-1 `SecRule` matching that site's own hostnames which uses
 `ctl:ruleEngine` and `setvar:tx.*_paranoia_level` to set the mode and paranoia
-level for that transaction. One generated file (`/etc/ferrum/waf/main.conf`)
+level for that transaction. One generated file (`/etc/unihelm/waf/main.conf`)
 holds every site's policy; turning a site on is one render and one reload.
 
 Rule ids come from the 20,000 block — inside the 1–99,999 range the Core Rule
@@ -1081,7 +1081,7 @@ bytes served; GitHub's release API reports the same asset. Both observations
 come from github.com, so this is a **single-source pin**: it detects a later
 tampered or truncated download, not a source that was already wrong. CRS
 publishes a detached OpenPGP signature beside every asset, and this build does
-not verify it — Ferrum's in-tree OpenPGP code parses keys and computes
+not verify it — Unihelm's in-tree OpenPGP code parses keys and computes
 fingerprints but does not check signatures. `waf.status` reports that state in
 `crs.pin_provenance` so an operator does not have to read the source to learn
 it.
@@ -1149,7 +1149,7 @@ Without `site_id`, switches the WAF off server-wide by **removing** the nginx
 include. Removal rather than rendering `modsecurity off;`: if the module is not
 loaded, *any* `modsecurity` directive is an unknown directive and nginx will not
 start, so removal is the only spelling of "off" that is safe in both worlds.
-`/etc/ferrum/waf/main.conf` is left in place — nothing reads it once the include
+`/etc/unihelm/waf/main.conf` is left in place — nothing reads it once the include
 is gone, and keeping it means re-enabling restores the policy that was there.
 
 With `site_id`, writes an explicit `off` policy for that site rather than
@@ -1237,7 +1237,7 @@ answer with `Include` resolved. When it cannot run, `/etc/ssh/sshd_config` and
 `/etc/ssh/sshd_config.d/*.conf` are parsed directly and the finding's remedy
 says so, because file parsing is an approximation of sshd's resolution. sshd's
 rule is **first value wins**, the opposite of nearly every other configuration
-format, and settings inside a `Match` block are skipped — Ferrum's own
+format, and settings inside a `Match` block are skipped — Unihelm's own
 chrooted-SFTP drop-in is such a block, and reading its contents as global
 settings would report the SFTP group's policy as the server's.
 `KbdInteractiveAuthentication` is checked alongside `PasswordAuthentication`
@@ -1254,7 +1254,7 @@ day it matters. Only sockets in state `0A` (LISTEN) count, so an outbound
 connection to somebody else's database is not reported, and an IPv4-mapped
 loopback address is normalised so `::ffff:127.0.0.1` is not read as public.
 `mariadb.off_loopback` is the exact state a live AlmaLinux box was found in
-after a panel install; `ferrum_ops::harden` now prevents it at install time and
+after a panel install; `unihelm_ops::harden` now prevents it at install time and
 this check is what catches it coming back.
 
 **The update count uses cached package metadata only** (`apt-get --no-download`,
@@ -1426,7 +1426,7 @@ implementation. It also requires `site_manage` **in addition to** `node_apps`:
 creating a site is creating a site, whichever operation asks for it.
 
 Three refusals are worth knowing about, because each is a systemd rule rather
-than a Ferrum preference:
+than a Unihelm preference:
 
 - `PORT` and `NODE_ENV` cannot appear in `env`. The panel sets both, systemd
   keeps the *last* assignment of a name, and a tenant override would either
@@ -1524,7 +1524,7 @@ schedule cannot render two different crontabs.
 
 **`@reboot` and every other `@` alias are refused for tenants**, and not for
 tidiness. A `@reboot` job runs when cron starts at boot, which is *before*
-`ferrum-agentd` has re-applied the tenant's systemd slice and disk quota: the
+`unihelm-agentd` has re-applied the tenant's systemd slice and disk quota: the
 job would run with no memory ceiling, no CPU quota and no quota accounting —
 precisely the window in which a runaway job is unbounded. Every alias has a
 five-field spelling (`@daily` is `0 0 * * *`), so the refusal costs a tenant
@@ -1552,7 +1552,7 @@ command they like as themselves.
 Before anything is stored, the account's existing crontab is read with
 `crontab -u <user> -l` (exit 1 tolerated as "no crontab", which is how both
 implementations say it). It counts as the panel's only if the
-`# FERRUM-MANAGED cron` header appears **before any line that is not a
+`# UNIHELM-MANAGED cron` header appears **before any line that is not a
 comment**; otherwise the operation refuses with `FER-1403 conflict` and tells
 the operator how to save and remove the file. The rule is that shape rather than
 "the header is line one" because some `crontab` implementations prepend a banner
@@ -1569,7 +1569,7 @@ panel *does* own carry a header saying in as many words that edits are replaced.
 **Cron jobs do not run inside the tenant's systemd slice.** A crontab line is
 executed by cron as the tenant, and an unprivileged process cannot place itself
 into a system slice — so a tenant's cron job is bounded by the server, not by
-the plan. This is written up in full in `ferrum_ops::slices`, along with the fix
+the plan. This is written up in full in `unihelm_ops::slices`, along with the fix
 (render each job as a systemd timer written by the root agent, where `Slice=`
 and `User=` are ordinary directives). Rendering from the database is what makes
 that a change of renderer and nothing else.
@@ -1659,7 +1659,7 @@ crontab entirely, so the panel's ownership marker — and with it the right to
 re-render without asking again — stays where it is.
 ## Backups
 
-Backups are restic repositories driven over argv by `ferrum_ops::backup`
+Backups are restic repositories driven over argv by `unihelm_ops::backup`
 (spec §11.10). Three properties of that module decide how these operations
 behave, and each of them is a decision rather than an accident:
 
@@ -1676,8 +1676,8 @@ and the task log renders argv only.
 `backup.repo.init` below; this is the disaster-recovery decision of the whole
 area, and it has an operator obligation attached to it.
 
-**Snapshots are tagged by scope.** A panel backup is tagged `ferrum-panel` and
-a tenant's is `ferrum-sub-<subscription id>` — the id, never the Linux user
+**Snapshots are tagged by scope.** A panel backup is tagged `unihelm-panel` and
+a tenant's is `unihelm-sub-<subscription id>` — the id, never the Linux user
 name, which can be recycled when a tenant is deleted and recreated. Retention
 runs `restic forget --prune --tag <tag> --group-by tags`, so one repository can
 hold the panel's history and every tenant's without one policy deleting
@@ -1686,7 +1686,7 @@ another's snapshots.
 Every operation below needs `backup_manage`, and every one except `backup.run`
 and `backup.list` additionally requires **administrator scope**: repositories
 carry credentials that cover the whole server, and a restored tree can contain
-`/etc/ferrum/secret.key` and any tenant's private files. A scoped caller
+`/etc/unihelm/secret.key` and any tenant's private files. A scoped caller
 reaching one of those gets `FER-1002 permission_denied`.
 
 restic itself is installed on first use through the package backend. If it
@@ -1728,12 +1728,12 @@ restored after losing the panel.** The key to the safe would be inside the safe.
 Recovering a lost panel therefore needs two things kept **off this server**:
 
 1. the password returned here, at creation; and
-2. `/etc/ferrum/secret.key`, the master key — because every other secret in the
+2. `/etc/unihelm/secret.key`, the master key — because every other secret in the
    restored database (ACME account keys, database passwords, notifier tokens) is
    sealed under it and is ciphertext without it.
 
 With both, `restic restore` against the repository yields `panel.db`,
-`/etc/ferrum` and the state directory, which is the whole of the panel's state.
+`/etc/unihelm` and the state directory, which is the whole of the panel's state.
 
 Immediate rather than a task, for two reasons that are both about secrets: a
 task persists its *input* verbatim in `tasks.input` — which here would write the
@@ -1809,7 +1809,7 @@ not to emit a summary still took a perfectly good backup, so its absence is
 recorded as a nameless snapshot rather than a failed run.
 
 **Panel scope** writes a consistent copy of the panel database with `VACUUM
-INTO`, then backs that copy up together with `/etc/ferrum` and the state
+INTO`, then backs that copy up together with `/etc/unihelm` and the state
 directory (certificates and ACME accounts). It never copies `panel.db` itself:
 the panel runs SQLite in WAL mode, where the `.db` file alone is an arbitrarily
 stale prefix of the truth — committed transactions live in `panel.db-wal` until
@@ -1879,7 +1879,7 @@ omit it for everything in the repository.
 Restores a snapshot into a fresh **staging directory** under
 `<state>/restore/<timestamp>-<snapshot>` and reports where it landed. Nothing
 live is touched. The directory is 0700 before restic writes a byte, because a
-restored tree can contain `/etc/ferrum/secret.key` and every tenant's private
+restored tree can contain `/etc/unihelm/secret.key` and every tenant's private
 files — and the response says so, along with a reminder to delete the staging
 directory once it has been picked over. One directory per restore, so two
 restores of the same snapshot cannot merge into one tree and an operator can
@@ -1892,7 +1892,7 @@ never be read by restic as a flag.
 ### The `backup.scheduler` job
 
 Not an operation — a job in the agent's internal scheduler
-(`crates/ferrum-agentd/src/scheduler.rs`), running every 60 s with 10 s of
+(`crates/unihelm-agentd/src/scheduler.rs`), running every 60 s with 10 s of
 jitter. Every minute, because the schedules are cron expressions whose finest
 granularity is one minute; a slower job would silently skip the minute a nightly
 backup asked for.
@@ -1930,15 +1930,15 @@ backup that night.
 
 ## WordPress toolkit
 
-The `wp.*` operations are `ferrum_ops::wordpress` (spec §11.12). Four
+The `wp.*` operations are `unihelm_ops::wordpress` (spec §11.12). Four
 properties of that module decide how all six behave, and each is a decision
 rather than an accident.
 
 **WP-CLI runs as the tenant, never as root.** WP-CLI is a PHP program that
 loads the site's own `wp-config.php`, plugins and themes — that is, code the
 tenant controls, and on a shared box a plugin is not trusted input. Every run
-therefore goes through `ferrum-agentd --wp-helper`, which re-execs the agent
-binary (`ferrum_distro::exec::reexec_current`), calls
+therefore goes through `unihelm-agentd --wp-helper`, which re-execs the agent
+binary (`unihelm_distro::exec::reexec_current`), calls
 `setgroups`/`setgid`/`setuid`, and **proves** the drop by checking that
 `setuid(0)` now fails, before a single byte of PHP is loaded. It is the same
 `drop_privileges` the file manager's helper uses (spec §5.2 rule 3).
@@ -1967,7 +1967,7 @@ where the privilege boundary is, and a bug on the agent side must not become
 arbitrary code execution inside a tenant account.
 
 The metacharacter refusal is worth a sentence of its own. Through
-`ferrum_distro::Cmd` an argv reaches `execve` untouched, so `;` and backticks
+`unihelm_distro::Cmd` an argv reaches `execve` untouched, so `;` and backticks
 are already inert *for us* — but WP-CLI builds its own `mysql` and `mysqldump`
 command lines for parts of `wp db`, and our argv discipline does not extend
 into another program's process spawning.
@@ -1975,7 +1975,7 @@ into another program's process spawning.
 **The WP-CLI phar is pinned, and its pin has one source.** The panel installs
 WP-CLI 2.12.0 from the upstream GitHub release, refuses to install it unless
 the SHA-256 matches `WP_CLI_SHA256`, and stores it root-owned 0755 under
-`/var/lib/ferrum/wp-cli/` — a tenant runs it but must never be able to replace
+`/var/lib/unihelm/wp-cli/` — a tenant runs it but must never be able to replace
 it. The checksum was computed from the asset and agrees with the publisher's
 own `.sha512` file in the same release; the release also carries a detached
 OpenPGP signature (issuer `63AF7AA1 5067C056 16FDDD88 A3A2E8F2 26F0BC06`,
@@ -2153,7 +2153,7 @@ endpoint, and an audit row is browsable by anyone holding `audit_read`
 - **A UI page.** The backend and the REST surface are complete; no
   `ui/src/routes/wordpress.tsx` exists yet.
 - **Verifying the WP-CLI release signature.** The fingerprint is recorded in
-  `WP_CLI_SIGNING_KEY_FPR`; verifying it through `ferrum_distro::pgp` (the way
+  `WP_CLI_SIGNING_KEY_FPR`; verifying it through `unihelm_distro::pgp` (the way
   repository keys already are) is what would make the pin multi-source.
 - **The auto-update runner.** `wp_installs.auto_update` is stored and
   `Db::wp_installs_with_auto_update()` exposes it, but no scheduler job walks
@@ -2164,7 +2164,7 @@ endpoint, and an audit row is browsable by anyone holding `audit_read`
 
 ## Webhooks
 
-Outbound event delivery (spec §2.4, §9 `webhooks`, §14 Phase 6). Ferrum will
+Outbound event delivery (spec §2.4, §9 `webhooks`, §14 Phase 6). Unihelm will
 never grow a billing module, so it has to be a panel somebody else's billing
 module can watch. Four operations register endpoints; a scheduler job
 (`webhook.deliver`, every 30 s) does the sending.
@@ -2172,8 +2172,8 @@ module can watch. Four operations register endpoints; a scheduler job
 Three properties shape every operation below, and each is explained in full in
 **`docs/webhooks.md`**, which is the contract an integrator implements against:
 
-- **Deliveries are signed.** `X-Ferrum-Signature: v1=<hex>` is an HMAC-SHA256
-  over `v1:<X-Ferrum-Timestamp>:<raw body>`, so a receiver can prove the panel
+- **Deliveries are signed.** `X-Unihelm-Signature: v1=<hex>` is an HMAC-SHA256
+  over `v1:<X-Unihelm-Timestamp>:<raw body>`, so a receiver can prove the panel
   sent it *and* refuse a replay — the timestamp is inside the MAC precisely so
   it cannot be edited by anyone who did not have the secret.
 - **Delivery is at-least-once and bounded at both ends.** Each delivery gets
@@ -2213,7 +2213,7 @@ does: an admin sees everything, a reseller its own hooks and its customers',
 a customer only its own.
 
 **The signing secret is never in the answer.** It is not merely omitted from
-this output — `ferrum_db::Webhook` marks the field `#[serde(skip)]`, so no
+this output — `unihelm_db::Webhook` marks the field `#[serde(skip)]`, so no
 future caller can serialise it by accident.
 
 With `id`, the hook is resolved through the caller's scope *first*, so an id
@@ -2305,8 +2305,8 @@ The extension system (spec §6 plugin note, §14 Phase 6), **sidecar model only*
 Spec §6 is explicit — *"Do NOT let plugins run in-process as root"* — so a
 plugin is a separate process, started under a dedicated unprivileged system
 account, inside a systemd unit carrying the same hardening as the panel's own
-`ferrum-web` unit, speaking the panel's existing length-prefixed JSON framing
-(`ferrum-ipc`) over its own Unix socket.
+`unihelm-web` unit, speaking the panel's existing length-prefixed JSON framing
+(`unihelm-ipc`) over its own Unix socket.
 
 The full contract — the manifest format, the trust model, the socket protocol
 and a working sidecar in twenty lines — is **`docs/plugins.md`**. Two properties
@@ -2438,7 +2438,7 @@ Stops the sidecar, removes the unit and reloads systemd, removes the installed
 tree, and deletes the row. Every step is "make sure this is gone", which is why
 it is safe to re-run: a unit that is already absent reports an error that means
 "already done", and the tree is only ever removed from inside
-`/var/lib/ferrum/plugins`, so a hand-edited `install_dir` cannot turn this into
+`/var/lib/unihelm/plugins`, so a hand-edited `install_dir` cannot turn this into
 a recursive delete of somewhere else.
 
 The dedicated account is left behind and the result names it, for the same
@@ -2452,7 +2452,7 @@ reason `plugin.install` does not unwind it.
 - **In-place upgrade.** Remove and install. Reconciling a running sidecar, a
   changed manifest and a changed extension set is its own operation with its own
   failure modes, and getting it half-right is worse than not offering it.
-- **Calling plugins from the core modules.** `ferrum_ops::plugin::call` is the
+- **Calling plugins from the core modules.** `unihelm_ops::plugin::call` is the
   routed, permission-respecting entry point and is tested end to end against a
   real socket, but no core module consults a plugin yet: `dns.rs` still knows
   only Cloudflare, `backup.rs` only its built-in targets, `alerts.rs` only its
@@ -2463,7 +2463,7 @@ reason `plugin.install` does not unwind it.
 
 ## Migration importers
 
-The `import.*` operations are `ferrum_ops::importer` (spec §11.15). They bring
+The `import.*` operations are `unihelm_ops::importer` (spec §11.15). They bring
 an account in from cPanel (a `cpmove`/full-backup tarball) or from aaPanel (its
 SQLite inventory plus `/www/wwwroot`). Five properties decide how all three
 behave.
@@ -2530,7 +2530,7 @@ limit, the engine-ready check and the name-collision refusal all apply to an
 import exactly as they do to a click — and then runs `mariadb
 --defaults-file=… --database=<name>` with the dump on **stdin**. The
 credentials are in a 0600 file inside a 0700 directory under
-`/var/lib/ferrum/state/import`, removed when the load returns, because
+`/var/lib/unihelm/state/import`, removed when the load returns, because
 `--password=` on an argv is world-readable in `/proc/<pid>/cmdline`. `--database`
 binds the session to one schema, so a dump that says `USE somebody_else` fails
 on privileges rather than succeeding. Dumps travel as bytes, not as a `String`:
@@ -2567,7 +2567,7 @@ against whatever directory the agent happens to be running in.
 `subscription_id` is required and not defaulted — an administrator running an
 import usually has no subscription of their own, and "wherever" is not an answer
 to whose account this becomes. `php_version` is the version imported PHP sites
-are created with when the source's own version is unknown or is one Ferrum does
+are created with when the source's own version is unknown or is one Unihelm does
 not offer (`ea-php56` is read, recognised as unsupported, and reported).
 
 Reads the source, writes one `import_plans` row and answers with `plan_id` and
@@ -2592,7 +2592,7 @@ also stops SQLite from recovering a hot journal, which is a write — and reads
 `crontab`. Document roots must be under `<root>/wwwroot`; PHP versions come from
 the site's nginx vhost (`enable-php-74.conf`, `php-cgi-74.sock`). Every aaPanel
 plan carries two notes, because both are true and neither is obvious: aaPanel
-still owns its own nginx and its vhosts must go before Ferrum can serve those
+still owns its own nginx and its vhosts must go before Unihelm can serve those
 domains, and the imported databases are *copies* under new names in the same
 MariaDB, so each application's configuration has to be repointed or it will keep
 using the aaPanel copy.
@@ -2642,14 +2642,14 @@ import is precisely the state somebody has to clean up.
 
 Limits worth knowing before you start: a dump larger than 128 MiB is refused,
 and it is refused **in the plan** — before anything is created — with the remedy
-(create the database in Ferrum, restore the dump with the MariaDB client). The
+(create the database in Unihelm, restore the dump with the MariaDB client). The
 client reads its batch from stdin, so the bytes are buffered in the agent, and a
 2 GB server has better uses for its memory.
 
 ### Not implemented, on purpose
 
 - **Mail, DNS zones, certificates, cron and FTP accounts.** Each is listed in
-  the plan with a reason. Ferrum v1 has no mail server (spec §11.18 is
+  the plan with a reason. Unihelm v1 has no mail server (spec §11.18 is
   relay-only), is not an authoritative nameserver (§11.13 manages Cloudflare
   zones), issues its own certificates from Let's Encrypt, and treats another
   panel's cron commands as shell command lines written for another server's
@@ -2670,7 +2670,7 @@ client reads its batch from stdin, so the bytes are buffered in the agent, and a
 
 ## Outbound mail (relay-only)
 
-Ferrum v1 runs **no mail server** (spec §11.18). It stores the address of
+Unihelm v1 runs **no mail server** (spec §11.18). It stores the address of
 somebody else's SMTP submission service, points every PHP site's `mail()` at
 it, and can send one test message to prove the path works. There are no
 mailboxes, no inbound mail, no domains, no aliases and no queue. The full
@@ -2688,8 +2688,8 @@ made-up record would be worse than printing none.
 ### The shim is a configuration file, not a script
 
 `sendmail_path` in each site's FPM pool points at `msmtp` with an argv of flags
-and a `--file=` naming the per-site configuration Ferrum renders at
-`/etc/ferrum/mail/<domain>.msmtprc`. The panel never generates a shell script
+and a `--file=` naming the per-site configuration Unihelm renders at
+`/etc/unihelm/mail/<domain>.msmtprc`. The panel never generates a shell script
 for PHP to run: a rendered script would be a shell string the panel causes to
 be executed, which is the category spec §12 rule 2 removes. msmtp is the agent
 because it is a single-binary SMTP client with no daemon, no queue directory
@@ -2719,7 +2719,7 @@ holding the secret, which is an MTA, which is Phase 5.
 
 What the panel does about it: the per-site file is `0640`, owned
 `root:<that tenant's group>`, so the exposure is one tenant per file rather
-than every user on the box; it lives under `/etc/ferrum/mail` rather than in
+than every user on the box; it lives under `/etc/unihelm/mail` rather than in
 the tenant's home, so a tenant can read it but never *edit* it (an editable
 copy would let them redirect their site's mail to a relay of their own while
 still sending as the operator's domain); and `mail.relay.get` returns the
@@ -2802,7 +2802,7 @@ two different support tickets, and both would arrive as "send failed" from an
 operation that returned an error code. Only a caller mistake (a recipient that
 is not an address) and "no relay is configured" are errors.
 
-The client is written in-tree (`ferrum_ops::mail::smtp`) for exactly that
+The client is written in-tree (`unihelm_ops::mail::smtp`) for exactly that
 reason, and it refuses two things on principle: it will not send a credential
 over an unencrypted connection, and a failed or absent `STARTTLS` aborts rather
 than falling back to plaintext — an attacker who can strip the capability from
@@ -2848,7 +2848,7 @@ upload and then persuade an administrator to open would run in the panel's
 origin with the administrator's session cookie.
 
 **The choice made is to refuse SVG entirely** — in
-`ferrum_ops::branding::sniff_image`, which identifies uploads by their magic
+`unihelm_ops::branding::sniff_image`, which identifies uploads by their magic
 bytes and accepts only PNG, JPEG, GIF, WebP and ICO, and again in the
 `branding_assets.content_type` CHECK constraint, so no other code path can
 reintroduce it. Refusing rather than sanitising is deliberate: sanitising SVG
@@ -2939,7 +2939,7 @@ session.
 ## Web terminal and SSH keys
 
 Spec §11.16. Two very different things share a section because they share one
-plan flag (`can_ssh`) and one module, `crates/ferrum-ops/src/terminal/`.
+plan flag (`can_ssh`) and one module, `crates/unihelm-ops/src/terminal/`.
 
 **The web terminal is the most dangerous surface in the panel, and it is not an
 operation.** Every other entry on this page is a narrow verb with a typed
@@ -2983,15 +2983,15 @@ outside `terminal::ALLOWED_SHELLS`.
 
 ### How a session runs
 
-The PTY, the child process and the scrollback all live in `ferrum-agentd`, and
-`ferrum-web` holds nothing but a WebSocket and a session id. That is what makes
+The PTY, the child process and the scrollback all live in `unihelm-agentd`, and
+`unihelm-web` holds nothing but a WebSocket and a session id. That is what makes
 spec §11.16's acceptance criterion true: restarting the panel's web process
 drops the socket and nothing else, and the browser reconnects with
 `TerminalAttach` to get its scrollback and its live stream back. It also means
 the network-facing process never holds a descriptor to a root shell.
 
 A tenant session re-execs the agent binary as
-`ferrum-agentd --pty-helper --uid N --gid N --home PATH --shell PATH`, which
+`unihelm-agentd --pty-helper --uid N --gid N --home PATH --shell PATH`, which
 calls the *same* `drop_privileges` as `--fs-helper` and `--wp-helper`,
 `setuid(0)`-must-fail proof included. An admin's root session passes `--root`
 instead, which is the one entry point in that binary that deliberately does not
@@ -3010,7 +3010,7 @@ never goes idle. The agent sweeps every 60 seconds, and every close writes a
 
 ### One agent connection, many browsers
 
-`ferrum-web` multiplexes every browser it serves over a *single* IPC
+`unihelm-web` multiplexes every browser it serves over a *single* IPC
 connection, which means the agent's terminal events arrive in the web process
 on one broadcast that every open socket can see, and every control frame leaves
 by the same wire. Routing either direction by session id alone would put one
@@ -3030,9 +3030,9 @@ Either check alone would be an identifier standing in for an authorisation.
 
 | Action | Written by | When |
 |---|---|---|
-| `terminal.request` | `ferrum-web` | a ticket was minted; carries the caller's IP, which the agent cannot see |
-| `terminal.open` | `ferrum-agentd` | before the PTY exists; carries the account, whether it is root, and the shell |
-| `terminal.close` | `ferrum-agentd` | on close, with the reason and the duration |
+| `terminal.request` | `unihelm-web` | a ticket was minted; carries the caller's IP, which the agent cannot see |
+| `terminal.open` | `unihelm-agentd` | before the PTY exists; carries the account, whether it is root, and the shell |
+| `terminal.close` | `unihelm-agentd` | on close, with the reason and the duration |
 
 ### `ssh.keys.list`
 
@@ -3042,7 +3042,7 @@ Either check alone would be an identifier standing in for an authorisation.
 | Execution | immediate |
 | Input | `subscription_id` *(optional)* |
 
-The keys inside the Ferrum-managed block of the account's
+The keys inside the Unihelm-managed block of the account's
 `~/.ssh/authorized_keys`. Returns each key's `SHA256:…` fingerprint, algorithm,
 comment and size, plus `has_unmanaged_keys` — true when the file holds entries
 outside the block, so the UI can say that the list is not the whole story
@@ -3100,9 +3100,9 @@ idempotent because a double click should not be a failure.
 ```text
 ssh-ed25519 AAAA… a key the tenant added by hand, before the panel existed
 
-# ---- BEGIN FERRUM-MANAGED KEYS ----
+# ---- BEGIN UNIHELM-MANAGED KEYS ----
 ssh-ed25519 AAAA… laptop
-# ---- END FERRUM-MANAGED KEYS ----
+# ---- END UNIHELM-MANAGED KEYS ----
 ```
 
 Everything outside the markers is the tenant's and is copied through byte for

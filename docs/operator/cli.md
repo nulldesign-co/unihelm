@@ -1,7 +1,7 @@
-# The `ferrum` command line
+# The `unihelm` command line
 
-`ferrum` reaches everything the web panel does (spec §11.20). It is not a
-parallel API: it opens the same Unix socket `ferrum-web` opens, sends the same
+`unihelm` reaches everything the web panel does (spec §11.20). It is not a
+parallel API: it opens the same Unix socket `unihelm-web` opens, sends the same
 typed operations, and the root agent re-derives the acting account's rights from
 the database before it does anything. There is no CLI-only privilege and no
 CLI-only endpoint.
@@ -13,18 +13,18 @@ root-only by design.
 ## The shape of a command
 
 ```
-ferrum [--config PATH] [--dev DIR] [--json] [--follow] <group> <verb> [args]
+unihelm [--config PATH] [--dev DIR] [--json] [--follow] <group> <verb> [args]
 ```
 
 | Flag | What it does |
 |------|--------------|
 | `--json` | Print the agent's reply verbatim instead of a table. Works everywhere, including on failures. |
 | `--follow`, `-f` | When the operation becomes a task, stream its log and exit with the task's outcome. |
-| `--config PATH` | Read a different `config.toml`. Defaults to `/etc/ferrum/config.toml`. |
+| `--config PATH` | Read a different `config.toml`. Defaults to `/etc/unihelm/config.toml`. |
 | `--dev DIR` | Operate on a development instance rooted at `DIR`. |
 
 Both `--json` and `--follow` are global, so they work before *or* after the
-subcommand: `ferrum site list --json` and `ferrum --json site list` are the same
+subcommand: `unihelm site list --json` and `unihelm --json site list` are the same
 command.
 
 ## Exit codes
@@ -53,7 +53,7 @@ The digit pair is the block of the `FER-1xxx` code from the error taxonomy
 printed:
 
 ```console
-$ ferrum site create shop.example
+$ unihelm site create shop.example
 error: FER-1402 domain_already_exists: shop.example is already served here
 $ echo $?
 14
@@ -62,7 +62,7 @@ $ echo $?
 With `--json` the same failure goes to **stdout**, so a script reads one stream:
 
 ```console
-$ ferrum --json site create shop.example
+$ unihelm --json site create shop.example
 {
   "error": {
     "code": "FER-1402",
@@ -82,23 +82,23 @@ Anything that installs packages, talks to a CA or runs restic comes back as a
 task id:
 
 ```console
-$ ferrum php install 8.3
+$ unihelm php install 8.3
 task 6a3f… started
-follow it with: ferrum task logs 6a3f… --follow
+follow it with: unihelm task logs 6a3f… --follow
 ```
 
 `--follow` on the original command does the same thing in one step, and makes
 the exit code the task's:
 
 ```console
-$ ferrum php install 8.3 --follow
+$ unihelm php install 8.3 --follow
 …
 task 6a3f… ok
 ```
 
-`ferrum task list`, `ferrum task show <id>` and `ferrum task logs <id>` read the
+`unihelm task list`, `unihelm task show <id>` and `unihelm task logs <id>` read the
 task table directly, so they still work when the agent is down — which is
-exactly when you want to know why the last task failed. `ferrum task cancel`
+exactly when you want to know why the last task failed. `unihelm task cancel`
 needs the agent, and reports the task's actual state rather than assuming the
 request was honoured: a task that did not opt in to cancellation cannot be
 cancelled, and the CLI says so instead of printing "cancelled".
@@ -111,21 +111,21 @@ the command runs, and stays in the shell history for ever after. Secrets arrive
 on stdin, or from an environment variable:
 
 ```console
-$ printf '%s\n' "$CF_TOKEN" | ferrum dns provider-set --label cloudflare --token-stdin
-$ FERRUM_S3_SECRET_ACCESS_KEY=… ferrum backup repo init --kind s3 \
+$ printf '%s\n' "$CF_TOKEN" | unihelm dns provider-set --label cloudflare --token-stdin
+$ UNIHELM_S3_SECRET_ACCESS_KEY=… unihelm backup repo init --kind s3 \
     --label offsite --path s3.example.com/backups --s3-access-key-id AKIA…
 ```
 
 | Command | stdin flag | Environment variable |
 |---------|-----------|----------------------|
-| `dns provider-set` | `--token-stdin` | `FERRUM_DNS_TOKEN` |
-| `backup repo init` | `--s3-secret-stdin` | `FERRUM_S3_SECRET_ACCESS_KEY` |
-| `sftp enable` | `--password-stdin` | `FERRUM_SFTP_PASSWORD` |
+| `dns provider-set` | `--token-stdin` | `UNIHELM_DNS_TOKEN` |
+| `backup repo init` | `--s3-secret-stdin` | `UNIHELM_S3_SECRET_ACCESS_KEY` |
+| `sftp enable` | `--password-stdin` | `UNIHELM_SFTP_PASSWORD` |
 | `user create-admin` | `--password-stdin` | — (generated and printed once) |
 
 ## What each group covers
 
-`ferrum --help` lists the groups and `ferrum <group> --help` the verbs; both are
+`unihelm --help` lists the groups and `unihelm <group> --help` the verbs; both are
 generated from the same tree the binary parses with, so neither can go stale.
 
 - `site` — create, list, update, delete, and check a vhost for drift
@@ -144,14 +144,14 @@ generated from the same tree the binary parses with, so neither can go stale.
   chrooted SFTP, managed units
 - `task` — list, show, follow, cancel
 
-`ferrum firewall settings-set` reads the current settings, applies the flags you
+`unihelm firewall settings-set` reads the current settings, applies the flags you
 gave and writes the whole struct back, so changing one knob cannot silently
 reset the other four.
 
 To see exactly which operation a command reaches:
 
 ```console
-$ ferrum ops list
+$ unihelm ops list
 count: 82
 
 operation               command
@@ -172,9 +172,9 @@ two places.)
 Generated from the same command tree, by a hidden subcommand:
 
 ```console
-# ferrum completions bash > /usr/share/bash-completion/completions/ferrum
-# ferrum completions zsh  > /usr/share/zsh/site-functions/_ferrum
-# ferrum completions fish > /usr/share/fish/vendor_completions.d/ferrum.fish
+# unihelm completions bash > /usr/share/bash-completion/completions/unihelm
+# unihelm completions zsh  > /usr/share/zsh/site-functions/_unihelm
+# unihelm completions fish > /usr/share/fish/vendor_completions.d/unihelm.fish
 ```
 
 A subcommand cannot exist without being completable, because the script is
@@ -182,7 +182,7 @@ rendered from the parser rather than written by hand.
 
 ## When something is wrong
 
-`ferrum doctor` checks the pieces in the order they depend on each other — the
+`unihelm doctor` checks the pieces in the order they depend on each other — the
 system, the database, the agent socket, disk space — so the first failure it
 reports is usually the real one. It exits non-zero only on failures, never on
 warnings, so it is safe in a monitoring cron.

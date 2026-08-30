@@ -1096,7 +1096,7 @@ function AdminerCard() {
             </div>
 
             {/* Not a link. Adminer binds 127.0.0.1 because nginx cannot check a
-                Ferrum session cookie, so publishing a database login form on a
+                Unihelm session cookie, so publishing a database login form on a
                 real interface is not on the table until the panel proxies it
                 itself. An <a href> here would be a promise the panel breaks. */}
             <div className="rounded-lg border border-border bg-canvas p-3">

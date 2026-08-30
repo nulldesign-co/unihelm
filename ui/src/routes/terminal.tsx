@@ -34,7 +34,7 @@ const XtermView = lazy(() => import("@/components/terminal/xterm-view"));
  * at is exactly who the warning is for.
  *
  * The session id is kept in `sessionStorage`, which is what makes reconnecting
- * work: the shell lives in `ferrum-agentd`, so a reload, a dropped Wi-Fi
+ * work: the shell lives in `unihelm-agentd`, so a reload, a dropped Wi-Fi
  * connection or a panel restart all leave it running, and the page reattaches
  * to the same one instead of starting a second.
  */
@@ -45,7 +45,7 @@ type Phase =
   | { kind: "closed"; reason: string | null }
   | { kind: "denied"; reason: string };
 
-const SESSION_KEY = "ferrum.terminal.session";
+const SESSION_KEY = "unihelm.terminal.session";
 
 function rememberedSession(): string | null {
   try {

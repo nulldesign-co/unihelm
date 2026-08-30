@@ -12,7 +12,7 @@
  *    resetting it. The UI's job is to make that unmissable *before* the
  *    operator closes the dialog.
  * 2. **Identifiers are a type, not a string.** The agent parses every name
- *    through `ferrum_core::DbName` (`[A-Za-z0-9_]`, not reserved), which is
+ *    through `unihelm_core::DbName` (`[A-Za-z0-9_]`, not reserved), which is
  *    what makes identifier injection impossible by construction. The mirror of
  *    that rule below is for the error message only — it turns a round trip
  *    into a red line under the field. It is not the security boundary and must
@@ -22,7 +22,7 @@
 import { api, type TaskAccepted } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
-// Wire shapes (mirrors ferrum-ops `db` and `adminer`)
+// Wire shapes (mirrors unihelm-ops `db` and `adminer`)
 // ---------------------------------------------------------------------------
 
 /** The engine strings are stable across the schema, the API and the audit log. */
@@ -134,7 +134,7 @@ export const databasesApi = {
 // Client-side mirrors of the agent's rules (messages, not boundaries)
 // ---------------------------------------------------------------------------
 
-/** Names the engines own. Same list as `ferrum_core::RESERVED_DB_NAMES`. */
+/** Names the engines own. Same list as `unihelm_core::RESERVED_DB_NAMES`. */
 const RESERVED_DB_NAMES = new Set([
   "information_schema",
   "mysql",

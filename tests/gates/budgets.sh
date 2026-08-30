@@ -23,7 +23,7 @@ readonly RSS_TARGET_BYTES=$((50 * 1024 * 1024))
 # budget itself is not overridable: a threshold with an escape hatch is not a
 # threshold, so the self-test uses real incompressible bytes to cross the real
 # 350 KB line.
-readonly UI_DIST="${FERRUM_UI_DIST:-crates/ferrum-web/ui-dist}"
+readonly UI_DIST="${UNIHELM_UI_DIST:-crates/unihelm-web/ui-dist}"
 
 failures=0
 mode="${1:-all}"
@@ -49,7 +49,7 @@ check_binaries() {
     fail "binary size" "no release build at $target (run: cargo build --release)"
     return
   fi
-  for binary in ferrum-agentd ferrum-web ferrum; do
+  for binary in unihelm-agentd unihelm-web unihelm; do
     local path="$target/$binary"
     if [ ! -f "$path" ]; then
       fail "binary size: $binary" "not built"
@@ -74,8 +74,8 @@ ensure_ui_build() {
     note "ui build" "measuring existing $UI_DIST"
     return 0
   fi
-  if [ "${FERRUM_BUDGET_SKIP_UI_BUILD:-0}" = "1" ]; then
-    fail "ui bundle" "no build at $UI_DIST and FERRUM_BUDGET_SKIP_UI_BUILD=1"
+  if [ "${UNIHELM_BUDGET_SKIP_UI_BUILD:-0}" = "1" ]; then
+    fail "ui bundle" "no build at $UI_DIST and UNIHELM_BUDGET_SKIP_UI_BUILD=1"
     return 1
   fi
   if ! command -v npm >/dev/null 2>&1; then
@@ -186,7 +186,7 @@ check_bundle() {
 # --- idle memory -----------------------------------------------------------
 # Starts both daemons against a throwaway directory, lets them settle, and reads
 # their real resident memory. Linux-only: `smaps_rollup` is where the honest
-# number lives, and Linux is the only platform Ferrum runs on in production.
+# number lives, and Linux is the only platform Unihelm runs on in production.
 check_rss() {
   if [ "$(uname -s)" != "Linux" ]; then
     note "idle RSS" "skipped (measured on Linux in CI)"
@@ -195,18 +195,18 @@ check_rss() {
 
   local target="${CARGO_TARGET_DIR:-target}/release"
   local dir
-  dir=$(mktemp -d /tmp/ferrum-rss.XXXXXX)
+  dir=$(mktemp -d /tmp/unihelm-rss.XXXXXX)
   trap 'rm -rf "$dir"' RETURN
 
-  "$target/ferrum-agentd" --dev "$dir" >"$dir/agentd.log" 2>&1 &
+  "$target/unihelm-agentd" --dev "$dir" >"$dir/agentd.log" 2>&1 &
   local agent_pid=$!
-  "$target/ferrum-web" --dev "$dir" --listen 127.0.0.1:18099 >"$dir/web.log" 2>&1 &
+  "$target/unihelm-web" --dev "$dir" --listen 127.0.0.1:18099 >"$dir/web.log" 2>&1 &
   local web_pid=$!
   # shellcheck disable=SC2064
   trap "kill $agent_pid $web_pid 2>/dev/null; rm -rf '$dir'" RETURN
 
   # The budget is idle RSS after settling, not peak during startup.
-  local settle="${FERRUM_RSS_SETTLE_SECONDS:-60}"
+  local settle="${UNIHELM_RSS_SETTLE_SECONDS:-60}"
   note "idle RSS" "settling for ${settle}s"
   sleep "$settle"
 
@@ -256,7 +256,7 @@ _huge() { head -c 400000 /dev/urandom >"$1"; }
 _case() {
   local name="$1" dist="$2" want_status="$3" want_text="$4"
   local out status=0
-  out=$(NO_COLOR=1 FERRUM_UI_DIST="$dist" bash "$SELF" bundle 2>&1) || status=$?
+  out=$(NO_COLOR=1 UNIHELM_UI_DIST="$dist" bash "$SELF" bundle 2>&1) || status=$?
 
   if [ "$status" -ne "$want_status" ]; then
     printf 'FAIL %s: exit %d, expected %d\n' "$name" "$status" "$want_status"

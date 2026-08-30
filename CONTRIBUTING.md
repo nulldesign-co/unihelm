@@ -1,4 +1,4 @@
-# Contributing to Ferrum
+# Contributing to Unihelm
 
 This is the working agreement (spec §16), with the parts that are actually
 enforced marked as such. The short version: the invariants below are CI gates,
@@ -9,16 +9,16 @@ however good it is otherwise.
 
 ```
 crates/
-  ferrum-core/     domain types, validated newtypes, RBAC, error taxonomy
-  ferrum-db/       SQLite schema, migrations, tenant-scoped repositories, sealed secrets
-  ferrum-ipc/      the framed protocol between the two daemons
-  ferrum-distro/   the ONLY place OS differences live; pinned repos; Cmd (argv exec)
-  ferrum-config/   minijinja templates + the render/validate/activate/rollback engine
-  ferrum-ops/      the operation registry — every privileged action is a module here
-  ferrum-metrics/  the metrics collector
-  ferrum-web/      unprivileged HTTP server + embedded UI   (binary)
-  ferrum-agentd/   root daemon: operations, tasks, scheduler (binary)
-  ferrum-cli/      the `ferrum` CLI                          (binary)
+  unihelm-core/     domain types, validated newtypes, RBAC, error taxonomy
+  unihelm-db/       SQLite schema, migrations, tenant-scoped repositories, sealed secrets
+  unihelm-ipc/      the framed protocol between the two daemons
+  unihelm-distro/   the ONLY place OS differences live; pinned repos; Cmd (argv exec)
+  unihelm-config/   minijinja templates + the render/validate/activate/rollback engine
+  unihelm-ops/      the operation registry — every privileged action is a module here
+  unihelm-metrics/  the metrics collector
+  unihelm-web/      unprivileged HTTP server + embedded UI   (binary)
+  unihelm-agentd/   root daemon: operations, tasks, scheduler (binary)
+  unihelm-cli/      the `unihelm` CLI                          (binary)
 ui/                React 18 + TypeScript + Vite + Tailwind, en+fa with full RTL
 installer/         preflight, install script, systemd units
 packaging/         .deb / .rpm build (not yet implemented)
@@ -26,9 +26,9 @@ tests/gates/       the CI gates described below
 docs/              operator, developer and API documentation
 ```
 
-Dependency direction flows downward: `ferrum-core` depends on nothing of ours;
+Dependency direction flows downward: `unihelm-core` depends on nothing of ours;
 the binaries depend on everything. A feature module that knows whether it is on
-Debian or RHEL is a bug — that knowledge lives in `ferrum-distro` behind four
+Debian or RHEL is a bug — that knowledge lives in `unihelm-distro` behind four
 traits (packages, services, firewall, security module), and nowhere else.
 
 ## Non-negotiable invariants
@@ -41,19 +41,19 @@ security model; there is no "just this once".
 No `sh -c`, no `bash -c`, no building a command line out of user input — that
 is the entire injection class this design deletes. `tests/gates/no-shell.sh`
 proves it, and also proves that `Command::new` appears in exactly one file
-(`crates/ferrum-distro/src/exec.rs`); everything else goes through `Cmd`.
+(`crates/unihelm-distro/src/exec.rs`); everything else goes through `Cmd`.
 
 **Typed, validated newtypes at every boundary.** Anything that reaches a
 command line, a config template, a filesystem path or a SQL identifier is a
 newtype whose only constructor validates: `Domain`, `DbName`, `TenantPath`,
-`LinuxUser`, `PhpVersion`, `ManagedUnit` (`crates/ferrum-core/src/newtypes.rs`).
+`LinuxUser`, `PhpVersion`, `ManagedUnit` (`crates/unihelm-core/src/newtypes.rs`).
 They validate through `serde` too, so a hostile IPC frame or API body is
 rejected at the protocol edge, not deep inside an operation. If you find
 yourself passing a `String` toward a privileged action, stop and mint the
 newtype.
 
-**Authorization twice.** `ferrum-web` authorizes from the session;
-`ferrum-agentd` re-derives the same rights from the database and intersects
+**Authorization twice.** `unihelm-web` authorizes from the session;
+`unihelm-agentd` re-derives the same rights from the database and intersects
 them with what the frame claimed. A forged permission set can only ever lose
 privileges. Repositories take a `TenantScope`, not an id — you cannot write an
 unscoped tenant query by accident, you have to ask for `TenantScope::Global`
@@ -70,15 +70,15 @@ applies to every file the panel writes, without exception:
 4. rolled back byte-for-byte on any failure, including a failed post-check;
 5. recorded as a revision;
 6. and **never overwrites a human's edit** — managed files carry a
-   `FERRUM-MANAGED sha256:` header; a body that no longer matches is drift,
+   `UNIHELM-MANAGED sha256:` header; a body that no longer matches is drift,
    reported with a diff, and only an explicit "discard my edit" re-renders it.
 
-New file-writing code goes through `ferrum_config::apply::ApplyRequest`. If
+New file-writing code goes through `unihelm_config::apply::ApplyRequest`. If
 that seems like overhead, read the six-bugs commit in the git log for what
 happens between "the file is right" and "the server is serving it".
 
 **Secrets are sealed or they do not exist.** Anything credential-shaped is
-encrypted through `ferrum_db::MasterKey` (XChaCha20-Poly1305) before it
+encrypted through `unihelm_db::MasterKey` (XChaCha20-Poly1305) before it
 touches SQLite, is never logged, and is masked in API responses and audit
 rows.
 
@@ -105,7 +105,7 @@ without the permission — not just the happy path.
 ## Adding an operation
 
 An operation is a `TypedOperation` impl and one registry line
-(`crates/ferrum-ops/src/registry.rs`):
+(`crates/unihelm-ops/src/registry.rs`):
 
 ```rust
 #[async_trait]
@@ -134,12 +134,12 @@ mapping. What you owe on top of that:
 
 ## Adding an error code
 
-Add the variant to `ErrorCode` (`crates/ferrum-core/src/error.rs`), give it a
+Add the variant to `ErrorCode` (`crates/unihelm-core/src/error.rs`), give it a
 number inside its area's range, a slug and an HTTP status, then regenerate the
 reference:
 
 ```bash
-cargo run -p ferrum-core --bin gen-error-docs > docs/api/errors.md
+cargo run -p unihelm-core --bin gen-error-docs > docs/api/errors.md
 ```
 
 A test compares the committed file against the generated one, so the published
@@ -174,7 +174,7 @@ cd ui && npm ci && npm run typecheck && npm run test && npm run build
 
 Match the code around you. Comments explain *why* a decision was made — the
 constraint, the failure mode, the trade-off — and cite the spec section they
-implement (`spec §11.7`); `crates/ferrum-ops/src/cert.rs` is the register to
+implement (`spec §11.7`); `crates/unihelm-ops/src/cert.rs` is the register to
 imitate. Comments that restate the next line are deleted on sight.
 
 UI work ships with English and Farsi strings and working RTL, in the same

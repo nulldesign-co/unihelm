@@ -2,7 +2,7 @@
  * Address parsing for the firewall page (spec §11.9).
  *
  * This is a second copy of a rule the agent already enforces
- * (`refusal_reason` in `crates/ferrum-ops/src/fwops.rs`), and it exists for one
+ * (`refusal_reason` in `crates/unihelm-ops/src/fwops.rs`), and it exists for one
  * reason: so the ban form can say *which* rule an address breaks, in words,
  * before the round trip — rather than letting a red "conflict" toast be the
  * first thing an operator learns.

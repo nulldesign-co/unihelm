@@ -15,7 +15,7 @@ This page is the guarantee.
 `GET /api/openapi.json` carries an explicit `info.version`:
 
 ```json
-{ "openapi": "3.1.0", "info": { "title": "Ferrum Panel API", "version": "1.0.0", … } }
+{ "openapi": "3.1.0", "info": { "title": "Unihelm Panel API", "version": "1.0.0", … } }
 ```
 
 It is **semver**, and it is **not** the panel's release version. Tying the two
@@ -23,7 +23,7 @@ would mean every panel release claimed an API change, which makes the number
 useless for the one thing it is for: telling an integrator whether they have to
 read anything. A panel may ship a dozen releases without the API version moving.
 
-The constant lives in `crates/ferrum-web/src/routes/openapi.rs` (`API_VERSION`)
+The constant lives in `crates/unihelm-web/src/routes/openapi.rs` (`API_VERSION`)
 and a test asserts the document declares it, that it is well-formed semver, and
 that it has not silently become the crate version.
 
@@ -96,7 +96,7 @@ left to inference:
   it will not change without a major bump.
 - **Webhook deliveries.** The signature scheme, the header names and the
   envelope shape are documented in `docs/webhooks.md`. The `v1=` prefix on
-  `X-Ferrum-Signature` exists so that a future scheme can be *added* beside the
+  `X-Unihelm-Signature` exists so that a future scheme can be *added* beside the
   current one (`v1=…,v2=…`) in a minor release; removing `v1` would be major.
 - **Operation names.** The dotted names in `docs/operations.md` are stable. They
   appear in audit rows, task records and the CLI, and renaming one would
@@ -130,5 +130,5 @@ left to inference:
    field is marked `deprecated: true` in the OpenAPI document, so a generated
    client warns before it breaks.
 
-Ferrum is at `1.0.0`, which is a statement rather than a formality: from here,
+Unihelm is at `1.0.0`, which is a statement rather than a formality: from here,
 breaking this API costs a major version and the announcement above.

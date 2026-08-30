@@ -15,7 +15,7 @@
 import { ApiError, api, getCsrfToken, type ApiErrorBody, type TaskAccepted } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
-// Wire shapes (mirrors ferrum-ops fsops proto)
+// Wire shapes (mirrors unihelm-ops fsops proto)
 // ---------------------------------------------------------------------------
 
 export type FileKind = "file" | "dir" | "symlink" | "other";
@@ -99,7 +99,7 @@ export const MAX_EDIT_BYTES = 5 * 1024 * 1024;
 async function putJson<T>(path: string, body: unknown): Promise<T> {
   const headers = new Headers({ "content-type": "application/json" });
   const csrf = getCsrfToken();
-  if (csrf) headers.set("x-ferrum-csrf", csrf);
+  if (csrf) headers.set("x-unihelm-csrf", csrf);
 
   const response = await fetch(path, {
     method: "PUT",

@@ -1,4 +1,4 @@
-# Ferrum
+# Unihelm
 
 A multi-tenant hosting control panel that is small, hard to knock over, and does
 not compile PHP on your server.
@@ -6,7 +6,7 @@ not compile PHP on your server.
 Two Rust daemons under systemd, one SQLite file, and a React interface embedded
 in the binary. No external database, no Node.js on the server, no shell strings
 anywhere in the codebase. The full specification is
-[`FERRUM_SPEC_1.md`](FERRUM_SPEC_1.md).
+[`UNIHELM_SPEC_1.md`](UNIHELM_SPEC_1.md).
 
 ## Status
 
@@ -54,26 +54,26 @@ server. AlmaLinux has.
 
 ## Why
 
-| Problem with incumbent panels | Ferrum's answer |
+| Problem with incumbent panels | Unihelm's answer |
 |---|---|
 | The panel crashes and takes the day with it | Two small crash-only daemons, `Restart=always`, all state in SQLite. Neither daemon is in the serving path: stop both and every site keeps serving. |
 | 300–600 MB resident for a control panel | ≤ 80 MB budget for both processes combined, enforced in CI. Measured live: 18.9 MB. |
 | Compiling PHP from source on a customer's box | Install from upstream vendor repositories only, GPG-fingerprint-pinned and verified in-process. |
-| A root-owned web application | `ferrum-web` runs unprivileged. Everything privileged crosses a Unix socket into a whitelist of typed operations. |
+| A root-owned web application | `unihelm-web` runs unprivileged. Everything privileged crosses a Unix socket into a whitelist of typed operations. |
 | One admin, no resellers | Admin / reseller / customer, plans and quotas, designed in from day one. |
 
 ## Architecture
 
 ```
-  Browser ── HTTPS ──▶  ferrum-web        user: ferrum, no capabilities
+  Browser ── HTTPS ──▶  unihelm-web        user: unihelm, no capabilities
   CLI ────── UDS ────▶   • REST API + SSE
                          • sessions, RBAC, rate limiting
                          • embedded React UI
                                 │
-                                │  length-prefixed JSON over /run/ferrum/agent.sock
+                                │  length-prefixed JSON over /run/unihelm/agent.sock
                                 │  (0700, SO_PEERCRED-checked on accept)
                                 ▼
-                        ferrum-agentd     user: root
+                        unihelm-agentd     user: root
                          • operation registry — a whitelist, not a dispatcher
                          • task queue and persistent scheduler
                          • package / service / firewall backends
@@ -82,7 +82,7 @@ server. AlmaLinux has.
                         nginx · php-fpm · mariadb · postgresql
 ```
 
-`ferrum-web` faces the internet and holds nothing. It cannot restart a service,
+`unihelm-web` faces the internet and holds nothing. It cannot restart a service,
 write a config file, or read a tenant's home directory. When it needs something
 done, it names an operation and sends a frame. The agent looks the name up in a
 registry, re-derives the caller's rights from the database (ignoring whatever
@@ -95,10 +95,10 @@ The longer story, with references into the code:
 ## Security model
 
 - **A whitelist of operations.** Every privileged action is a named entry in
-  one registry (`crates/ferrum-ops/src/registry.rs`). An unknown name is an
+  one registry (`crates/unihelm-ops/src/registry.rs`). An unknown name is an
   error, not a fallback.
 - **No shell, ever.** All process execution is argv arrays through
-  `ferrum_distro::Cmd`; `Command::new` exists in exactly one file. A CI gate
+  `unihelm_distro::Cmd`; `Command::new` exists in exactly one file. A CI gate
   (`tests/gates/no-shell.sh`) proves both.
 - **Validated newtypes at every boundary.** A domain, a path, a database name
   or a PHP version is rejected at deserialization or it does not exist —
@@ -128,7 +128,7 @@ below are real measurements, with where they were taken.
 | Metric | Budget (spec §3) | Measured |
 |---|---|---|
 | Idle RSS, both daemons combined | ≤ 80 MB (target 50) | **18.9 MB** on the live AlmaLinux 9.8 server, `/proc/*/smaps_rollup` |
-| Binary size, stripped | ≤ 25 MB each | 3.8 / 9.2 / 15.8 MB (`ferrum`, `ferrum-web`, `ferrum-agentd`) with every Phase 1–3 module merged |
+| Binary size, stripped | ≤ 25 MB each | 3.8 / 9.2 / 15.8 MB (`unihelm`, `unihelm-web`, `unihelm-agentd`) with every Phase 1–3 module merged |
 | UI initial route, gzipped | ≤ 350 KB | 160 KB (its code editor is a 278 KB lazy chunk, loaded only when a file is opened) |
 | Cold start to ready | ≤ 3 s | budget defined; gate not built yet |
 | API p95, non-task endpoints | ≤ 150 ms | budget defined; gate not built yet |
@@ -140,16 +140,16 @@ path — **it does not work today**:
 
 ```bash
 # PLACEHOLDER — not live until the first release:
-curl -fsSL https://ferrum.sh/install | bash
+curl -fsSL https://unihelm.sh/install | bash
 ```
 
 ### From source (works today)
 
 You need stable Rust (`rust-toolchain.toml` pins the channel) and Node 20+ for
-the UI build. Build the UI first — `ferrum-web` embeds it at compile time:
+the UI build. Build the UI first — `unihelm-web` embeds it at compile time:
 
 ```bash
-cd ui && npm ci && npm run build && cd ..    # builds into crates/ferrum-web/ui-dist
+cd ui && npm ci && npm run build && cd ..    # builds into crates/unihelm-web/ui-dist
 cargo build --release
 ```
 
@@ -157,10 +157,10 @@ On a development machine, run the whole panel unprivileged out of a directory:
 
 ```bash
 mkdir -p /tmp/fd
-./target/release/ferrum-agentd --dev /tmp/fd &
-./target/release/ferrum user --dev /tmp/fd create-admin \
+./target/release/unihelm-agentd --dev /tmp/fd &
+./target/release/unihelm user --dev /tmp/fd create-admin \
     --username admin --email admin@example.com     # prints the password once
-./target/release/ferrum-web --dev /tmp/fd --listen 127.0.0.1:8088
+./target/release/unihelm-web --dev /tmp/fd --listen 127.0.0.1:8088
 ```
 
 Then open <http://127.0.0.1:8088>.
@@ -173,7 +173,7 @@ verified live):
 sudo installer/install.sh --from ./target/release
 ```
 
-The installer runs a preflight, creates the unprivileged `ferrum` account,
+The installer runs a preflight, creates the unprivileged `unihelm` account,
 installs the binaries and systemd units, and prints the first administrator's
 password once. It installs no stack components — nginx, PHP and databases
 arrive on demand from the panel. The full walkthrough is
@@ -198,17 +198,17 @@ says where.
 
 ```
 crates/
-  ferrum-core/     domain types, validated newtypes, RBAC, error taxonomy
-  ferrum-db/       SQLite schema, migrations, tenant-scoped repositories, sealed secrets
-  ferrum-ipc/      the framed protocol between the two daemons
-  ferrum-distro/   the only place OS differences live; pinned upstream repositories
-  ferrum-config/   templates, and the render/validate/activate/rollback engine
-  ferrum-ops/      the operation registry — every privileged action
-  ferrum-metrics/  the metrics collector
-  ferrum-web/      unprivileged HTTP server + embedded UI   (binary)
-  ferrum-agentd/   root daemon: operations, tasks, scheduler (binary)
-  ferrum-cli/      `ferrum`                                  (binary)
-ui/                React + TypeScript, built into ferrum-web
+  unihelm-core/     domain types, validated newtypes, RBAC, error taxonomy
+  unihelm-db/       SQLite schema, migrations, tenant-scoped repositories, sealed secrets
+  unihelm-ipc/      the framed protocol between the two daemons
+  unihelm-distro/   the only place OS differences live; pinned upstream repositories
+  unihelm-config/   templates, and the render/validate/activate/rollback engine
+  unihelm-ops/      the operation registry — every privileged action
+  unihelm-metrics/  the metrics collector
+  unihelm-web/      unprivileged HTTP server + embedded UI   (binary)
+  unihelm-agentd/   root daemon: operations, tasks, scheduler (binary)
+  unihelm-cli/      `unihelm`                                  (binary)
+ui/                React + TypeScript, built into unihelm-web
 installer/         preflight, install script, systemd units
 tests/gates/       the CI gates that enforce §3 budgets and §12 invariants
 docs/              operator, developer and API documentation
@@ -229,7 +229,7 @@ docs/              operator, developer and API documentation
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later). If you
-run a modified Ferrum for others over a network, they are entitled to your
+run a modified Unihelm for others over a network, they are entitled to your
 modifications' source.
 
 Built with [Claude Code](https://claude.com/claude-code). The commit history is

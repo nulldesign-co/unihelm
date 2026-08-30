@@ -1,4 +1,4 @@
-# Installing Ferrum
+# Installing Unihelm
 
 ## What you need
 
@@ -24,7 +24,7 @@ panel already installed, Apache running on port 80.
 
 ```bash
 sudo installer/install.sh                        # the latest release
-sudo FERRUM_VERSION=v0.4.1 installer/install.sh  # a pinned one
+sudo UNIHELM_VERSION=v0.4.1 installer/install.sh  # a pinned one
 ```
 
 That downloads the release built for this machine's architecture, verifies it,
@@ -37,9 +37,9 @@ The installer:
 2. downloads the tarball, `SHA256SUMS` and `SHA256SUMS.minisig`,
 3. verifies the minisign signature on `SHA256SUMS` against the key built into
    the installer, then checks the tarball against that signed file,
-4. creates the unprivileged `ferrum` account,
-5. installs three binaries into `/usr/local/ferrum/bin`,
-6. writes `/etc/ferrum/config.toml` and generates `/etc/ferrum/secret.key`,
+4. creates the unprivileged `unihelm` account,
+5. installs three binaries into `/usr/local/unihelm/bin`,
+6. writes `/etc/unihelm/config.toml` and generates `/etc/unihelm/secret.key`,
 7. installs and starts both systemd units,
 8. creates the first administrator and prints its password **once**.
 
@@ -66,14 +66,14 @@ installation steps. If you have already built:
 ```bash
 cargo build --release
 cd ui && npm ci && npm run build && cd ..
-cargo build --release -p ferrum-web    # embeds the built UI
+cargo build --release -p unihelm-web    # embeds the built UI
 
 sudo installer/install.sh --from ./target/release
 ```
 
 ### Installing from a fork
 
-`FERRUM_REPO` chooses the repository releases come from and `FERRUM_PUBKEY` the
+`UNIHELM_REPO` chooses the repository releases come from and `UNIHELM_PUBKEY` the
 minisign public key they must be signed with. Both are needed: an installer
 whose key is still the release-time placeholder refuses to download anything,
 precisely so that a fork cannot end up skipping verification by omission. See
@@ -91,48 +91,48 @@ ssh -L 8088:127.0.0.1:8088 root@your-server
 
 Then open <http://127.0.0.1:8088>.
 
-To expose it directly, set `listen` in `/etc/ferrum/config.toml` and restart
-`ferrum-web`. Leave `secure_cookies = true` and put TLS in front of it — with
+To expose it directly, set `listen` in `/etc/unihelm/config.toml` and restart
+`unihelm-web`. Leave `secure_cookies = true` and put TLS in front of it — with
 `secure_cookies` off, a session cookie can cross an unencrypted hop.
 
 ## Checking on it
 
 ```bash
-ferrum doctor          # config, database, agent, disk — exits non-zero on failure
-ferrum status          # cpu, memory, disk, uptime
-journalctl -u ferrum-agentd -u ferrum-web -f
+unihelm doctor          # config, database, agent, disk — exits non-zero on failure
+unihelm status          # cpu, memory, disk, uptime
+journalctl -u unihelm-agentd -u unihelm-web -f
 ```
 
-`ferrum doctor` is safe to run from cron: warnings (Docker not installed, a
+`unihelm doctor` is safe to run from cron: warnings (Docker not installed, a
 small disk) exit 0, and only real failures exit 1.
 
 ## If the panel is down
 
 Your sites are not. Nginx, PHP-FPM and the databases are ordinary systemd units
-with ordinary configuration files, and neither Ferrum process is in the serving
+with ordinary configuration files, and neither Unihelm process is in the serving
 path. A panel outage is an inconvenience for you, not for the people visiting
 the sites you host.
 
 ```bash
-systemctl status ferrum-agentd ferrum-web
-journalctl -u ferrum-agentd -n 100 --no-pager
-ferrum doctor
+systemctl status unihelm-agentd unihelm-web
+journalctl -u unihelm-agentd -n 100 --no-pager
+unihelm doctor
 ```
 
-The agent is the one to check first: `ferrum-web` will serve the interface and
+The agent is the one to check first: `unihelm-web` will serve the interface and
 report the agent as unreachable, so a working panel that cannot do anything
 privileged means the agent, not the web process.
 
 ## Files
 
 ```
-/usr/local/ferrum/bin/       ferrum-agentd, ferrum-web, ferrum
-/etc/ferrum/config.toml      bootstrap configuration
-/etc/ferrum/secret.key       master key for secrets at rest (0600, back this up)
-/var/lib/ferrum/panel.db     all panel state
-/var/lib/ferrum/state/       rendered configs, ACME account keys, task artefacts
-/run/ferrum/agent.sock       the privilege boundary (0700, owned by `ferrum`)
-/var/log/ferrum/             file logs (also in journald)
+/usr/local/unihelm/bin/       unihelm-agentd, unihelm-web, unihelm
+/etc/unihelm/config.toml      bootstrap configuration
+/etc/unihelm/secret.key       master key for secrets at rest (0600, back this up)
+/var/lib/unihelm/panel.db     all panel state
+/var/lib/unihelm/state/       rendered configs, ACME account keys, task artefacts
+/run/unihelm/agent.sock       the privilege boundary (0700, owned by `unihelm`)
+/var/log/unihelm/             file logs (also in journald)
 ```
 
 `secret.key` is generated once and never regenerated. Losing it means losing the
@@ -142,11 +142,11 @@ backup repository passwords. Back it up somewhere other than this server.
 ## Uninstalling
 
 ```bash
-sudo systemctl disable --now ferrum-web ferrum-agentd
-sudo rm -f /etc/systemd/system/ferrum-{web,agentd}.service
+sudo systemctl disable --now unihelm-web unihelm-agentd
+sudo rm -f /etc/systemd/system/unihelm-{web,agentd}.service
 sudo systemctl daemon-reload
-sudo rm -rf /usr/local/ferrum /usr/local/bin/ferrum
+sudo rm -rf /usr/local/unihelm /usr/local/bin/unihelm
 # Keep these until you are certain: they hold every account and setting.
-# sudo rm -rf /etc/ferrum /var/lib/ferrum /var/log/ferrum
-# sudo userdel ferrum
+# sudo rm -rf /etc/unihelm /var/lib/unihelm /var/log/unihelm
+# sudo userdel unihelm
 ```

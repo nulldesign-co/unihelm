@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-None yet. Ferrum is pre-release: there are no published versions, no binary
+None yet. Unihelm is pre-release: there are no published versions, no binary
 downloads, and no deployment we support. Until the first tagged release, the
 only supported response to a security problem is a fix on `main`.
 
@@ -27,11 +27,11 @@ fix that lands with a regression test named after the hole it closes.
 
 ## Threat model, in brief
 
-Ferrum is a control panel that runs privileged operations on a server hosting
+Unihelm is a control panel that runs privileged operations on a server hosting
 mutually untrusting tenants. The design assumes three hostile parties, in
 increasing order of access:
 
-**An attacker on the network.** Faces `ferrum-web` only: argon2id password
+**An attacker on the network.** Faces `unihelm-web` only: argon2id password
 hashing, session cookies stored as SHA-256 digests, CSRF tokens on mutations,
 rate limiting, and a default configuration that listens on loopback until the
 operator decides otherwise.
@@ -45,10 +45,10 @@ PHP on a live server: `/etc/passwd` unreadable, `/home` unlistable,
 `shell_exec` absent.
 
 **A compromised web process.** The design's central assumption is that
-`ferrum-web` — the internet-facing half — will one day be compromised, and the
+`unihelm-web` — the internet-facing half — will one day be compromised, and the
 damage must be bounded. It runs unprivileged and holds no capabilities.
 Everything privileged crosses a 0700 Unix socket (peer-credential-checked on
-accept) into `ferrum-agentd`, which treats the web process as untrusted:
+accept) into `unihelm-agentd`, which treats the web process as untrusted:
 operations must exist in a whitelist registry, the caller's rights are
 re-derived from the database rather than believed from the frame, and inputs
 must deserialize into validated newtypes. A compromised web process can ask
@@ -67,12 +67,12 @@ Two classes of attack are removed structurally rather than defended against:
   any repo file is written.
 
 Secrets at rest (ACME account keys, and every credential to come) are sealed
-with XChaCha20-Poly1305 under a master key in `/etc/ferrum/secret.key` (0600);
+with XChaCha20-Poly1305 under a master key in `/etc/unihelm/secret.key` (0600);
 the key refuses to load from a file with wider permissions.
 
 **Out of scope:** an attacker who is already root on the host, kernel
 vulnerabilities, physical access, and the security of the tenant applications
-themselves — Ferrum bounds what a hacked WordPress can reach, but cannot make
+themselves — Unihelm bounds what a hacked WordPress can reach, but cannot make
 it unhackable.
 
 A longer treatment of the boundary and its enforcement points is in

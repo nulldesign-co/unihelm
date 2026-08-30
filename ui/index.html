@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
-    <title>Ferrum</title>
+    <title>Unihelm</title>
     <!--
       Set the theme before first paint. Doing this in React would mean a flash of
       the wrong colours on every load, which is the kind of small ugliness that
@@ -13,12 +13,12 @@
     <script>
       (function () {
         try {
-          var stored = localStorage.getItem("ferrum.theme") || "system";
+          var stored = localStorage.getItem("unihelm.theme") || "system";
           var dark =
             stored === "dark" ||
             (stored === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
           document.documentElement.classList.toggle("dark", dark);
-          var lang = localStorage.getItem("ferrum.lang") || "en";
+          var lang = localStorage.getItem("unihelm.lang") || "en";
           document.documentElement.lang = lang;
           document.documentElement.dir = lang === "fa" ? "rtl" : "ltr";
         } catch (e) {}

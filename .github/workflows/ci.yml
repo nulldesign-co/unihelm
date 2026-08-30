@@ -38,7 +38,7 @@ jobs:
       # Migrations are forward-only and checked in CI (spec §4.1): a changed
       # checksum on an applied migration means somebody edited history.
       - name: Migrations apply to a fresh database
-        run: cargo test -p ferrum-db migrations
+        run: cargo test -p unihelm-db migrations
 
   gates:
     name: Gates
@@ -151,7 +151,7 @@ jobs:
         id: ui-build-cache
         uses: actions/cache@v4
         with:
-          path: crates/ferrum-web/ui-dist
+          path: crates/unihelm-web/ui-dist
           key: ui-dist-${{ runner.os }}-node22-${{ hashFiles('ui/package-lock.json', 'ui/index.html', 'ui/vite.config.ts', 'ui/tsconfig*.json', 'ui/src/**') }}
 
       - run: npm ci
@@ -176,7 +176,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ui-dist
-          path: crates/ferrum-web/ui-dist
+          path: crates/unihelm-web/ui-dist
           retention-days: 3
 
   budgets:
@@ -192,7 +192,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ui-dist
-          path: crates/ferrum-web/ui-dist
+          path: crates/unihelm-web/ui-dist
 
       - name: Release build
         run: cargo build --release
@@ -239,9 +239,9 @@ jobs:
       # image; this proves the right backends are picked before anything else
       # gets built on top of them (spec §7.2).
       - name: Distro detection and backend selection
-        run: cargo test -p ferrum-distro
+        run: cargo test -p unihelm-distro
 
       - name: Agent starts and validates its configuration
         run: |
           mkdir -p /tmp/fd
-          ./target/debug/ferrum-agentd --dev /tmp/fd --check
+          ./target/debug/unihelm-agentd --dev /tmp/fd --check

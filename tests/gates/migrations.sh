@@ -3,7 +3,7 @@
 #
 # Two invariants, and one deliberate softness between them.
 #
-#   1. **Numbering.** Every file in `crates/ferrum-db/migrations/` is
+#   1. **Numbering.** Every file in `crates/unihelm-db/migrations/` is
 #      `NNNN_name.sql` with a 4-digit prefix. Two files may never share a
 #      number: sqlx applies migrations in filename order and records them by
 #      version, so a duplicate number means one of the two silently never runs
@@ -37,7 +37,7 @@
 # Duplicates and rewritten migrations are always hard failures — neither has a
 # benign explanation.
 #
-# Set FERRUM_MIGRATIONS_STRICT=1 to turn the gap warning into a failure; the
+# Set UNIHELM_MIGRATIONS_STRICT=1 to turn the gap warning into a failure; the
 # integrator should do that once every allocated number has landed.
 #
 # Run `bash tests/gates/migrations.sh --self-test` to prove the three hard
@@ -51,7 +51,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # Not configurable: the forward-only half asks git about this exact path, so a
 # redirected directory would silently check only half of what it claims to.
 # The self-test builds whole throwaway repositories instead.
-readonly MIGRATIONS_DIR="crates/ferrum-db/migrations"
+readonly MIGRATIONS_DIR="crates/unihelm-db/migrations"
 
 failures=0
 warnings=0
@@ -78,13 +78,13 @@ note() { printf '     %-38s %s\n' "$1" "${2:-}"; }
 _fixture() {
   local dir="$1" file
   shift
-  mkdir -p "$dir/crates/ferrum-db/migrations" "$dir/tests/gates"
+  mkdir -p "$dir/crates/unihelm-db/migrations" "$dir/tests/gates"
   cp "$SELF" "$dir/tests/gates/migrations.sh"
   git -c init.defaultBranch=main init -q "$dir"
   git -C "$dir" config user.email gate@example.invalid
   git -C "$dir" config user.name 'migration gate self-test'
   for file in "$@"; do
-    printf -- '-- %s\nSELECT 1;\n' "$file" >"$dir/crates/ferrum-db/migrations/$file"
+    printf -- '-- %s\nSELECT 1;\n' "$file" >"$dir/crates/unihelm-db/migrations/$file"
     git -C "$dir" add -A
     git -C "$dir" commit -qm "add $file"
   done
@@ -130,7 +130,7 @@ self_test() {
   _case a_single_contiguous_reserved_gap_is_a_warning_not_a_failure \
     "$root/reserved" 0 'reserved range 0003-0004'
   _case strict_mode_turns_the_reserved_gap_into_a_failure \
-    "$root/reserved" 1 'FERRUM_MIGRATIONS_STRICT=1' FERRUM_MIGRATIONS_STRICT=1
+    "$root/reserved" 1 'UNIHELM_MIGRATIONS_STRICT=1' UNIHELM_MIGRATIONS_STRICT=1
 
   # Two holes is not one reserved block; it is numbering that has diverged.
   _fixture "$root/two-gaps" 0001_init.sql 0003_scheduler.sql 0005_databases.sql
@@ -140,7 +140,7 @@ self_test() {
   # sqlx records a migration by its version, so the second 0002 would never run
   # on a database that already saw the first.
   _fixture "$root/duplicate" 0002_sites.sql
-  printf -- '-- collision\n' >"$root/duplicate/crates/ferrum-db/migrations/0002_other.sql"
+  printf -- '-- collision\n' >"$root/duplicate/crates/unihelm-db/migrations/0002_other.sql"
   git -C "$root/duplicate" add -A
   git -C "$root/duplicate" commit -qm 'add a colliding number'
   _case a_duplicate_number_is_a_failure \
@@ -148,7 +148,7 @@ self_test() {
 
   _fixture "$root/edited" 0001_init.sql 0002_sites.sql
   printf -- 'ALTER TABLE sites ADD COLUMN oops TEXT;\n' \
-    >>"$root/edited/crates/ferrum-db/migrations/0002_sites.sql"
+    >>"$root/edited/crates/unihelm-db/migrations/0002_sites.sql"
   _case an_uncommitted_edit_to_an_applied_migration_is_a_failure \
     "$root/edited" 1 'migrations are forward-only'
   # And committing the edit does not launder it: the comparison is against the
@@ -165,7 +165,7 @@ self_test() {
     _case a_shallow_clone_fails_rather_than_passing_blindly \
       "$shallow" 1 'shallow clone'
     _case a_shallow_clone_can_be_waived_explicitly \
-      "$shallow" 0 'FERRUM_ALLOW_SHALLOW=1' FERRUM_ALLOW_SHALLOW=1
+      "$shallow" 0 'UNIHELM_ALLOW_SHALLOW=1' UNIHELM_ALLOW_SHALLOW=1
   else
     printf 'skip a_shallow_clone_fails_rather_than_passing_blindly: clone failed\n'
   fi
@@ -270,8 +270,8 @@ else
       ok "numbering is gapless" "0001-$(printf '%04d' "$highest")"
       ;;
     1)
-      if [ "${FERRUM_MIGRATIONS_STRICT:-0}" = "1" ]; then
-        fail "reserved range ${runs[0]} unfilled" "FERRUM_MIGRATIONS_STRICT=1"
+      if [ "${UNIHELM_MIGRATIONS_STRICT:-0}" = "1" ]; then
+        fail "reserved range ${runs[0]} unfilled" "UNIHELM_MIGRATIONS_STRICT=1"
       else
         warn "reserved range ${runs[0]} unfilled" "allocated in docs/wave1-contracts.md, not yet landed"
       fi
@@ -288,8 +288,8 @@ fi
 # committed", and would answer "unchanged" for everything — a false pass, which
 # is worse than no check. CI checks out with fetch-depth: 0 for this reason.
 if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo true)" = "true" ]; then
-  if [ "${FERRUM_ALLOW_SHALLOW:-0}" = "1" ]; then
-    warn "forward-only" "skipped: shallow clone (FERRUM_ALLOW_SHALLOW=1)"
+  if [ "${UNIHELM_ALLOW_SHALLOW:-0}" = "1" ]; then
+    warn "forward-only" "skipped: shallow clone (UNIHELM_ALLOW_SHALLOW=1)"
   else
     fail "forward-only" "shallow clone — fetch full history (fetch-depth: 0) to check this"
   fi

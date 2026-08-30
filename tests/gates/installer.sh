@@ -59,7 +59,7 @@ else
   fail "preflight exited without printing anything"
 fi
 
-if printf '%s' "$output" | grep -q "Ferrum preflight"; then
+if printf '%s' "$output" | grep -q "Unihelm preflight"; then
   ok "preflight reaches its report"
 else
   fail "preflight died before reporting: ${output:-<empty>}"
@@ -70,8 +70,8 @@ fi
 # bare "cannot create directory" — a hardening setting quietly breaking the
 # feature it was meant to protect. The split is the point: the root daemon needs
 # /home, the web process must never see it.
-agent_unit=installer/systemd/ferrum-agentd.service
-web_unit=installer/systemd/ferrum-web.service
+agent_unit=installer/systemd/unihelm-agentd.service
+web_unit=installer/systemd/unihelm-web.service
 
 if grep -qE '^ProtectHome=(yes|read-only)' "$agent_unit"; then
   fail "$agent_unit restricts /home, but creating tenant homes is its job"
@@ -176,7 +176,7 @@ else
 fi
 
 # --- 7. the release path refuses everything it cannot verify -----------------
-fixtures="$(mktemp -d "${TMPDIR:-/tmp}/ferrum-installer-gate.XXXXXX")"
+fixtures="$(mktemp -d "${TMPDIR:-/tmp}/unihelm-installer-gate.XXXXXX")"
 cleanup_fixtures() {
   rm -rf "$fixtures"
   return 0
@@ -195,7 +195,7 @@ gate_sha256() {
 # fixture and the code under test cannot drift apart.
 gate_arch="$( . installer/install.sh; release_arch )"
 gate_version="0.0.0-gate"
-gate_dir="ferrum-${gate_version}-${gate_arch}-linux"
+gate_dir="unihelm-${gate_version}-${gate_arch}-linux"
 gate_tarball="${gate_dir}.tar.gz"
 
 if [ -z "$gate_arch" ]; then
@@ -203,7 +203,7 @@ if [ -z "$gate_arch" ]; then
 else
 
 mkdir -p "$fixtures/bin" "$fixtures/payload/$gate_dir"
-for binary in ferrum-agentd ferrum-web ferrum; do
+for binary in unihelm-agentd unihelm-web unihelm; do
   printf '#!/bin/sh\nexit 0\n' >"$fixtures/payload/$gate_dir/$binary"
   chmod 0755 "$fixtures/payload/$gate_dir/$binary"
 done
@@ -271,7 +271,7 @@ tar -czf "$good/$gate_tarball" -C "$fixtures/payload" "$gate_dir"
 # A real SHA256SUMS lists every architecture, so it names tarballs this machine
 # never downloads. Feeding the whole file to `sha256sum -c` would fail on those;
 # the installer has to pick out its own line, and this fixture proves it does.
-printf '%s  ferrum-%s-otherarch-linux.tar.gz\n' \
+printf '%s  unihelm-%s-otherarch-linux.tar.gz\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   "$gate_version" >>"$good/SHA256SUMS"
 sign_sums "$good" "$fixtures/trusted.key" "$trusted_key"
@@ -287,7 +287,7 @@ sign_sums "$bad_signature" "$fixtures/attacker.key" "$attacker_key"
 
 # A correctly signed checksum file that says nothing about our tarball.
 cp "$good/$gate_tarball" "$not_listed/"
-printf '%s  ferrum-%s-otherarch-linux.tar.gz\n' \
+printf '%s  unihelm-%s-otherarch-linux.tar.gz\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   "$gate_version" >"$not_listed/SHA256SUMS"
 sign_sums "$not_listed" "$fixtures/trusted.key" "$trusted_key"
@@ -306,12 +306,12 @@ run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  wo
   # shellcheck disable=SC2030,SC2031,SC2329
   (
     export PATH="$fixtures/bin:$PATH"
-    export FERRUM_VERSION="$gate_version"
-    export FERRUM_SERVE="$serve"
+    export UNIHELM_VERSION="$gate_version"
+    export UNIHELM_SERVE="$serve"
     if [ -n "$pubkey" ]; then
-      export FERRUM_PUBKEY="$pubkey"
+      export UNIHELM_PUBKEY="$pubkey"
     else
-      unset FERRUM_PUBKEY
+      unset UNIHELM_PUBKEY
     fi
 
     # shellcheck source=../../installer/install.sh
@@ -319,8 +319,8 @@ run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  wo
 
     fetch_to() {
       local name="${1##*/}"
-      [ -f "$FERRUM_SERVE/$name" ] || return 22
-      cp "$FERRUM_SERVE/$name" "$2"
+      [ -f "$UNIHELM_SERVE/$name" ] || return 22
+      cp "$UNIHELM_SERVE/$name" "$2"
     }
 
     download_and_verify_release "$work"
@@ -329,7 +329,7 @@ run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  wo
 
 staged() { # workdir — did all three binaries get unpacked?
   local work="$1" binary
-  for binary in ferrum-agentd ferrum-web ferrum; do
+  for binary in unihelm-agentd unihelm-web unihelm; do
     find "$work" -type f -name "$binary" 2>/dev/null | grep -q . || return 1
   done
   return 0
@@ -419,11 +419,11 @@ fi  # gate_arch is known
 # it assumes a signature was really checked.
 #
 # Emptying PATH inside the subshell is how minisign is made unfindable, and
-# blanking FERRUM_FAMILY is how the package manager is taken away — both are
+# blanking UNIHELM_FAMILY is how the package manager is taken away — both are
 # deliberate, both are scoped to the subshell, and both are what SC2123/SC2030
 # would otherwise flag as an accident.
 # shellcheck disable=SC2123,SC2030
-if ( . installer/install.sh; PATH=/nonexistent; FERRUM_FAMILY=""; ensure_minisign ) >/dev/null 2>&1; then
+if ( . installer/install.sh; PATH=/nonexistent; UNIHELM_FAMILY=""; ensure_minisign ) >/dev/null 2>&1; then
   fail "ensure_minisign returned success without minisign — the release path would install an unverified binary"
 else
   ok "ensure_minisign refuses when minisign cannot be obtained"

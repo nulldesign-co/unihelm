@@ -1,0 +1,94 @@
+{# One plugin sidecar (spec §6 plugin note, §14 Phase 6). Rendered by
+   unihelm_ops::plugin.
+
+   The whole point of the sidecar model is in this file: a plugin is a separate
+   process, under its own dedicated system account, with the same hardening the
+   panel's own unihelm-web unit carries. Spec §6 says plugins must NOT run
+   in-process as root, and a unit that merely *said* User= while leaving the
+   process every capability and a writable /usr would be that sentence obeyed
+   in letter only.
+
+   Every value interpolated here has been through validation: PluginSlug for
+   the slug and account name, and an entry path that is relative, traversal-free
+   and free of anything systemd would read as syntax (space, %, quote). The
+   template only interpolates; it makes no decisions. #}
+[Unit]
+Description=Unihelm plugin {{ plugin.slug }}
+Documentation=https://github.com/farzam-seyedhashem/unihelm
+{# The plugin talks to the agent's socket, and often to the network. #}
+After=network-online.target unihelm-agentd.service
+Wants=network-online.target
+{# A plugin that crashes on start must not spin a core. StartLimit* live in
+   [Unit]: systemd moved them there in v229 and only still parses the [Service]
+   spelling with a warning `systemd-analyze verify` reports. #}
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User={{ plugin.run_user }}
+Group={{ plugin.run_user }}
+WorkingDirectory={{ plugin.install_dir }}
+ExecStart={{ plugin.exec_start }}
+{# Where the sidecar must bind its listening socket. The agent dials exactly
+   this path and nothing else, so a plugin that binds elsewhere is simply
+   unreachable rather than reachable on a path nobody vouched for. #}
+Environment=UNIHELM_PLUGIN_SOCKET={{ plugin.socket_path }}
+Environment=UNIHELM_PLUGIN_SLUG={{ plugin.slug }}
+Environment=UNIHELM_PLUGIN_API={{ plugin.api_version }}
+{# systemd creates this under /run, chowns it to User=/Group=, and removes it
+   when the unit stops — so the socket directory is writable by the plugin and
+   by nobody else, and a stale socket cannot survive a restart. #}
+RuntimeDirectory={{ plugin.runtime_dir }}
+RuntimeDirectoryMode=0750
+
+Restart=always
+RestartSec=2s
+
+{# Hardening: the same set unihelm-web carries, because the threat model is the
+   same — third-party code that should be able to do its declared job and
+   nothing else. The differences from unihelm-web are deliberate:
+     * ProtectSystem=strict plus no ReadWritePaths at all. A plugin's install
+       tree is root-owned and read-only to it; anything it needs to persist
+       goes through an extension-point call to the agent, which is the whole
+       reason the extension points exist.
+     * PrivateNetwork is NOT set: a DnsProvider or a BackupTarget plugin exists
+       to talk to a remote API. RestrictAddressFamilies keeps that to the
+       families a network client actually needs.
+     * MemoryMax bounds a leaking plugin below the panel's own budget (spec §3)
+       so third-party code cannot spend the server's memory. #}
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax={{ plugin.memory_max_mb }}M
+TasksMax=64
+
+{# Drop every capability: a plugin needs none, and saying so makes that
+   checkable by anyone reading the unit rather than trusting this comment. #}
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=unihelm-plugin-{{ plugin.slug }}
+
+[Install]
+WantedBy=multi-user.target

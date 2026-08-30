@@ -151,7 +151,7 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
       </div>
 
       {/* The advisory sentence is the server's, deliberately: the decision table
-          behind it (proxied, partial, timed out) lives in `ferrum_ops::dns` and
+          behind it (proxied, partial, timed out) lives in `unihelm_ops::dns` and
           a second copy here would be a second copy to keep in step. */}
       <p dir="auto" className="rounded-lg bg-surface-muted px-3 py-2 text-sm text-ink">
         {result.advice}

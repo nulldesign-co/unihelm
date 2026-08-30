@@ -26,7 +26,7 @@
 import { api, type SiteView, type TaskAccepted } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
-// Wire shapes (mirrors ferrum-ops `plan`)
+// Wire shapes (mirrors unihelm-ops `plan`)
 // ---------------------------------------------------------------------------
 
 export interface PlanView {

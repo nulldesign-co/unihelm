@@ -1,0 +1,61 @@
+# Outbound mail relay for {{ mail.site_domain }} (spec §11.18, relay-only).
+#
+# Read by the sendmail-compatible shim that this site's PHP `sendmail_path`
+# points at. Unihelm runs no mail server: this file is the address of somebody
+# else's submission service plus the credential to use with it.
+#
+# MODE AND OWNERSHIP MATTER. This file is 0640, owned root:{{ mail.group }}.
+# PHP's mail() runs as the site's own Linux user, so that user has to be able
+# to read the credential — that exposure is inherent to relay-only mail and is
+# why the relay credential should be a send-only one, scoped to this server and
+# rotatable without touching anything else (spec §11.18, and the note in
+# unihelm_ops::mail). No other tenant can read it.
+
+defaults
+# msmtp is told to log through syslog rather than to a file: the process runs
+# as the tenant, and a log file it could write would be a log file it could
+# forge or fill.
+syslog          on
+# A message that cannot be handed over in this long is not going to be. The
+# default is to wait forever, which turns a dead relay into a wedged PHP worker
+# and, a few requests later, into a site that does not answer at all.
+timeout         {{ mail.timeout_seconds }}
+
+account         unihelm
+host            {{ mail.host }}
+port            {{ mail.port }}
+{% if mail.tls_mode == "none" %}
+# Plaintext. Only ever defensible to a relay on localhost or a private LAN,
+# and the panel refuses to store a password alongside it.
+tls             off
+{% else %}
+tls             on
+{% if mail.tls_mode == "starttls" %}
+tls_starttls    on
+{% else %}
+# Implicit TLS (SMTPS): encrypted from the first byte, conventionally port 465.
+tls_starttls    off
+{% endif %}
+# Certificate verification stays on. A relay whose certificate does not verify
+# is a relay somebody may be in the middle of, and "it worked when I disabled
+# checking" is how a hosting provider's outbound mail ends up readable.
+tls_certcheck   on
+tls_trust_file  {{ mail.tls_trust_file }}
+{% endif %}
+{% if mail.username %}
+auth            on
+user            {{ mail.username }}
+password        {{ mail.password }}
+{% else %}
+# No credential: this relay authorises by source IP, which is how most
+# in-datacentre relays work.
+auth            off
+{% endif %}
+
+# The envelope sender, and deliberately not the message's own From: header.
+# SPF is evaluated against the envelope, so mail has to leave as an address the
+# relay is authorised for however a PHP application chose to address it. The
+# From: the recipient sees is still the application's.
+from            {{ mail.from_address }}
+
+account default : unihelm

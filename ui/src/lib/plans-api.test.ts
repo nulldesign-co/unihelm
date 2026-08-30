@@ -29,7 +29,7 @@ function site(subscriptionId: number, domain: string, status: SiteState = "activ
     domain,
     site_type: "php",
     php_version: "8.4",
-    root_dir: `/home/ft_x/${domain}`,
+    root_dir: `/home/uh_x/${domain}`,
     status,
     force_https: true,
     http3: false,
@@ -39,7 +39,7 @@ function site(subscriptionId: number, domain: string, status: SiteState = "activ
     php_ini_overrides: null,
     rate_limit_enabled: false,
     aliases: [],
-    linux_user: "ft_x",
+    linux_user: "uh_x",
     has_certificate: true,
   };
 }

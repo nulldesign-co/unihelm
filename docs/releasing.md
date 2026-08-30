@@ -1,4 +1,4 @@
-# Releasing Ferrum
+# Releasing Unihelm
 
 A release is one signed tag. Everything after that is
 [`.github/workflows/release.yml`](../.github/workflows/release.yml): it builds
@@ -7,7 +7,7 @@ the 25 MB budget, packages per-architecture tarballs, signs them with minisign,
 and leaves a **draft** release for a human to publish.
 
 Publishing stays manual on purpose. Self-update follows *published* releases and
-swaps binaries on every server that runs Ferrum (spec §5.5), so an accidental
+swaps binaries on every server that runs Unihelm (spec §5.5), so an accidental
 tag must not be able to reach them.
 
 ---
@@ -66,7 +66,7 @@ git commit -m "Release signing key"
 ```
 
 Say in the commit message, or in an announcement, what the key's ID is
-(the trailing text of the `untrusted comment:` line). People who verify Ferrum
+(the trailing text of the `untrusted comment:` line). People who verify Unihelm
 should learn the key from somewhere other than the artifact they are verifying.
 
 ---
@@ -109,8 +109,8 @@ means finding out now rather than after the tag exists.
 ### 3. Tag and push
 
 ```bash
-git commit -am "Ferrum 0.2.0"
-git tag -s v0.2.0 -m "Ferrum 0.2.0"
+git commit -am "Unihelm 0.2.0"
+git tag -s v0.2.0 -m "Unihelm 0.2.0"
 git push origin main
 git push origin v0.2.0
 ```
@@ -131,9 +131,9 @@ It runs four jobs:
 | `x86_64` / `aarch64` | the binaries build, are each under 25 MB, unpack, and report the right version on their own architecture |
 | `Sign and draft the release` | checksums, minisign signatures, signatures verify against the committed public key, draft created |
 
-The UI is built once and downloaded by both build jobs, because `ferrum-web`
-embeds `crates/ferrum-web/ui-dist` with `rust-embed` **at compile time**
-(`crates/ferrum-web/src/ui.rs`). A build job that starts without that directory
+The UI is built once and downloaded by both build jobs, because `unihelm-web`
+embeds `crates/unihelm-web/ui-dist` with `rust-embed` **at compile time**
+(`crates/unihelm-web/src/ui.rs`). A build job that starts without that directory
 populated still succeeds and still produces a running binary — one that serves
 an empty page. The workflow therefore fails outright if `ui-dist/assets` is
 missing after the download, rather than trusting it.
@@ -173,19 +173,19 @@ runner image, not across a runner image that ships a different `tar` or `gzip`.
 ## What operators do with the signature
 
 ```bash
-curl -fsSLO https://github.com/farzam/ferrum/releases/download/v0.2.0/ferrum-0.2.0-x86_64.tar.gz
-curl -fsSLO https://github.com/farzam/ferrum/releases/download/v0.2.0/ferrum-0.2.0-x86_64.tar.gz.minisig
+curl -fsSLO https://github.com/farzam-seyedhashem/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz
+curl -fsSLO https://github.com/farzam-seyedhashem/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz.minisig
 
-minisign -Vm ferrum-0.2.0-x86_64.tar.gz -P 'RW…'   # key from the repo, not the download
-tar -xzf ferrum-0.2.0-x86_64.tar.gz
-cd ferrum-0.2.0-x86_64 && sudo ./install.sh --from ./bin
+minisign -Vm unihelm-0.2.0-x86_64.tar.gz -P 'RW…'   # key from the repo, not the download
+tar -xzf unihelm-0.2.0-x86_64.tar.gz
+cd unihelm-0.2.0-x86_64 && sudo ./install.sh --from ./bin
 ```
 
 Two signature layers exist because they answer different questions:
 
 - **`SHA256SUMS.minisig`** — one signature over the checksum file. A human
   verifies it once and then `sha256sum -c SHA256SUMS` covers every artifact.
-- **`ferrum-<version>-<arch>.tar.gz.minisig`** — a signature on each tarball on
+- **`unihelm-<version>-<arch>.tar.gz.minisig`** — a signature on each tarball on
   its own. Self-update fetches one file and must be able to decide whether it is
   genuine without also fetching and parsing a checksum list (spec §5.5).
 

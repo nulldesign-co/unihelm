@@ -65,16 +65,16 @@ has "triggered on v* tags" '^ *- "v\*"'
 hasnt "not triggered by pull_request" '^ *pull_request'
 
 # --- 2. the UI, built once and handed to the compiler -----------------------
-# ferrum-web embeds crates/ferrum-web/ui-dist with rust-embed at compile time
-# (crates/ferrum-web/src/ui.rs). If the bundle is not on disk before cargo runs,
+# unihelm-web embeds crates/unihelm-web/ui-dist with rust-embed at compile time
+# (crates/unihelm-web/src/ui.rs). If the bundle is not on disk before cargo runs,
 # the binary still builds and still serves — an empty shell.
 has "UI job uses node 20"          '^ *node-version: 20$'
 has "UI installed with npm ci"     '^ *run: npm ci$'
 has "UI built with npm run build"  '^ *run: npm run build$'
 has "UI built in ui/"              '^ *working-directory: ui$'
 has "UI bundle uploaded once"      '^ *name: ui-dist$'
-has "UI downloaded into the embed folder" '^ *path: crates/ferrum-web/ui-dist$'
-has "empty ui-dist fails the build" 'test -d crates/ferrum-web/ui-dist/assets'
+has "UI downloaded into the embed folder" '^ *path: crates/unihelm-web/ui-dist$'
+has "empty ui-dist fails the build" 'test -d crates/unihelm-web/ui-dist/assets'
 
 # --- 3. both architectures --------------------------------------------------
 # Matched as matrix keys, not as bare triples: the cross-compilation fallback
@@ -100,7 +100,7 @@ else
 fi
 
 # --- 5. packaging -----------------------------------------------------------
-has "per-arch tarball named ferrum-<version>-<arch>.tar.gz" 'ferrum-\$\{VERSION\}-\$\{ARCH\}\.tar\.gz"$'
+has "per-arch tarball named unihelm-<version>-<arch>.tar.gz" 'unihelm-\$\{VERSION\}-\$\{ARCH\}\.tar\.gz"$'
 # `tar -czf` invokes gzip without -n, and gzip stamps the current time into its
 # own header even when it is reading a pipe. Everything else about the tarball
 # is pinned (--sort, --owner, --mtime), so dropping -n is the one change that
@@ -109,18 +109,18 @@ has "per-arch tarball named ferrum-<version>-<arch>.tar.gz" 'ferrum-\$\{VERSION\
 has "tarball gzip is timestamp-free"  'gzip -n'
 has "tarball file order is pinned"    'tar --sort=name'
 has "tarball mtimes are pinned"       '\-\-mtime='
-has "all three binaries packaged: agentd" '^ *install -m 0755 "target/.*/release/ferrum-agentd"'
-has "all three binaries packaged: web"    '^ *install -m 0755 "target/.*/release/ferrum-web"'
-has "all three binaries packaged: cli"    '^ *install -m 0755 "target/.*/release/ferrum"'
+has "all three binaries packaged: agentd" '^ *install -m 0755 "target/.*/release/unihelm-agentd"'
+has "all three binaries packaged: web"    '^ *install -m 0755 "target/.*/release/unihelm-web"'
+has "all three binaries packaged: cli"    '^ *install -m 0755 "target/.*/release/unihelm"'
 has "installer packaged"       '^ *install -m 0755 installer/install\.sh'
 has "preflight packaged"       '^ *install -m 0755 installer/preflight\.sh'
-has "systemd units packaged"   '^ *install -m 0644 installer/systemd/ferrum-web\.service'
+has "systemd units packaged"   '^ *install -m 0644 installer/systemd/unihelm-web\.service'
 has "config example packaged"  '^ *install -m 0644 installer/config\.toml\.example'
 
 # --- 6. signing -------------------------------------------------------------
 has "signs with minisign -S"          '^ *minisign -S -s '
 has "key comes from the repo secret"  'secrets\.MINISIGN_SECRET_KEY'
-has "SHA256SUMS produced"             '^ *sha256sum ferrum-\*\.tar\.gz'
+has "SHA256SUMS produced"             '^ *sha256sum unihelm-\*\.tar\.gz'
 has "SHA256SUMS signed"               '\-m SHA256SUMS$'
 has "each tarball signed on its own"  '\-m "\$tarball"'
 # Against the *committed* public key: a rotation done halfway — new secret in
@@ -191,7 +191,7 @@ fi
 has "creates the release with gh, not a third-party action" '^ *gh release create '
 # Draft, not published: self-update follows published releases (spec §5.5), so
 # publishing has to stay a human action. An accidental tag must not be able to
-# push a binary to every server running Ferrum.
+# push a binary to every server running Unihelm.
 has "the release is a draft"                    '^ *--draft'
 has "the tag is verified before assets attach"  '^ *--verify-tag'
 # A re-run deletes and recreates the release so assets do not pile up in two

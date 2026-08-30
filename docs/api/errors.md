@@ -2,10 +2,10 @@
 
 Every error the API returns carries a stable code and slug. Clients should branch on the **slug**; the message is free to change with translations.
 
-This file is generated from `ferrum_core::error::ErrorCode`. Regenerate it with:
+This file is generated from `unihelm_core::error::ErrorCode`. Regenerate it with:
 
 ```
-cargo run -p ferrum-core --bin gen-error-docs > docs/api/errors.md
+cargo run -p unihelm-core --bin gen-error-docs > docs/api/errors.md
 ```
 
 | Code | Slug | HTTP | Area |

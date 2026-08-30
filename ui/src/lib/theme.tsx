@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 export type Theme = "light" | "dark" | "system";
 
-const STORAGE_KEY = "ferrum.theme";
+const STORAGE_KEY = "unihelm.theme";
 
 interface ThemeContextValue {
   theme: Theme;

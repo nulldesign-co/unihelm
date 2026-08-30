@@ -6,7 +6,7 @@
  * one. **Never import this file statically.**
  *
  * Everything in here is presentation and byte-shuffling. Who may open a shell,
- * as which account, is decided in `ferrum_ops::terminal` and nowhere near the
+ * as which account, is decided in `unihelm_ops::terminal` and nowhere near the
  * browser.
  */
 

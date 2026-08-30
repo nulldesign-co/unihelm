@@ -1,0 +1,125 @@
+; PHP-FPM pool for {{ pool.site_domain }} (PHP {{ pool.php_version }}).
+;
+; One pool per site, running as the site's own Linux user. That is what makes
+; "tenant A cannot read tenant B's files" an operating-system guarantee rather
+; than a promise the panel makes about its own path handling.
+
+[{{ pool.name }}]
+
+; --- identity -------------------------------------------------------------
+user  = {{ pool.user }}
+group = {{ pool.group }}
+
+; --- socket ---------------------------------------------------------------
+; A unix socket rather than a TCP port: no port to firewall, no chance of
+; another tenant connecting to this pool, and the permissions below are the
+; access control.
+listen = {{ pool.socket }}
+listen.owner = {{ pool.socket_owner }}
+listen.group = {{ pool.socket_group }}
+; 0660 with nginx in the group: nginx can talk to this pool, nothing else can.
+listen.mode  = 0660
+listen.backlog = 511
+
+; --- process manager ------------------------------------------------------
+; `ondemand` on small servers so an idle site costs nothing, `dynamic` where
+; there is memory to keep workers warm.
+pm = {{ pool.pm }}
+pm.max_children = {{ pool.max_children }}
+{% if pool.pm == "dynamic" %}
+pm.start_servers = {{ pool.start_servers }}
+pm.min_spare_servers = {{ pool.min_spare_servers }}
+pm.max_spare_servers = {{ pool.max_spare_servers }}
+{% endif %}
+{% if pool.pm == "ondemand" %}
+pm.process_idle_timeout = {{ pool.idle_timeout }}s
+{% endif %}
+; Recycle workers periodically: the cheapest defence against a slow leak in
+; somebody's plugin becoming the server's problem.
+pm.max_requests = {{ pool.max_requests }}
+
+; --- observability --------------------------------------------------------
+; Consumed by the panel's metrics collector, and reachable only through this
+; site's own nginx location.
+pm.status_path = /_unihelm/fpm-status
+ping.path = /_unihelm/fpm-ping
+ping.response = pong
+
+access.log = {{ pool.log_dir }}/fpm-access.log
+slowlog = {{ pool.log_dir }}/fpm-slow.log
+request_slowlog_timeout = {{ pool.slowlog_timeout }}s
+; A request that runs this long is not going to finish usefully, and holding a
+; worker forever is how one bad script starves a whole site.
+request_terminate_timeout = {{ pool.terminate_timeout }}s
+
+catch_workers_output = yes
+decorate_workers_output = no
+
+; --- isolation ------------------------------------------------------------
+; `php_admin_value` cannot be overridden by ini_set() from inside a script;
+; `php_value` can. Anything that is a security boundary must be admin.
+php_admin_value[open_basedir] = {{ pool.open_basedir }}
+php_admin_value[upload_tmp_dir] = {{ pool.tmp_dir }}
+php_admin_value[sys_temp_dir] = {{ pool.tmp_dir }}
+php_admin_value[session.save_path] = {{ pool.session_dir }}
+php_admin_value[error_log] = {{ pool.log_dir }}/php-error.log
+php_admin_flag[log_errors] = on
+; Never render an error into a response: stack traces leak paths and queries.
+php_admin_flag[display_errors] = off
+php_admin_flag[display_startup_errors] = off
+php_admin_flag[expose_php] = off
+php_admin_flag[allow_url_include] = off
+php_admin_flag[allow_url_fopen] = {{ pool.allow_url_fopen }}
+
+; A conservative default that does not break WordPress, Laravel or Composer.
+; Admins can widen it per site from the panel when an application genuinely
+; needs one of these.
+php_admin_value[disable_functions] = {{ pool.disable_functions }}
+
+; --- limits ---------------------------------------------------------------
+php_admin_value[memory_limit] = {{ pool.memory_limit }}
+php_value[max_execution_time] = {{ pool.max_execution_time }}
+php_value[max_input_time] = {{ pool.max_input_time }}
+php_value[upload_max_filesize] = {{ pool.upload_max_filesize }}
+php_value[post_max_size] = {{ pool.post_max_size }}
+php_value[max_input_vars] = {{ pool.max_input_vars }}
+php_value[date.timezone] = {{ pool.timezone }}
+
+; --- opcache --------------------------------------------------------------
+php_admin_value[opcache.enable] = 1
+php_admin_value[opcache.memory_consumption] = {{ pool.opcache_memory_mb }}
+php_admin_value[opcache.interned_strings_buffer] = 16
+php_admin_value[opcache.max_accelerated_files] = {{ pool.opcache_max_files }}
+php_admin_value[opcache.validate_timestamps] = {{ pool.opcache_validate_timestamps }}
+php_admin_value[opcache.revalidate_freq] = 2
+; Per-site cache file, so one tenant's opcache cannot be read by another.
+php_admin_value[opcache.file_cache] = {{ pool.tmp_dir }}/opcache
+
+; --- outbound mail --------------------------------------------------------
+{% if pool.sendmail_path %}
+; PHP's mail() with an external relay (spec §11.18). `php_admin_value` rather
+; than `php_value`: a script that could ini_set() its way to another
+; sendmail_path could run a program of its own choosing as this tenant.
+;
+; Rendered only while a relay is configured and enabled. There is no fallback
+; line: an empty sendmail_path makes mail() run nothing and return true, so
+; every message would be reported as sent.
+php_admin_value[sendmail_path] = {{ pool.sendmail_path }}
+{% else %}
+; No relay is configured, so nothing overrides PHP's own sendmail_path and
+; mail() fails the way an unconfigured server should.
+{% endif %}
+
+; --- environment ----------------------------------------------------------
+; FPM clears the environment by default; PATH is the one thing scripts that
+; shell out reasonably expect to find.
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+env[TMPDIR] = {{ pool.tmp_dir }}
+{% for entry in pool.env %}
+env[{{ entry.key }}] = {{ entry.value }}
+{% endfor %}
+
+{% if pool.extra_ini %}
+; --- per-site overrides, from the panel ------------------------------------
+{{ pool.extra_ini }}
+{% endif %}

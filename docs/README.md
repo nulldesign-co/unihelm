@@ -1,8 +1,8 @@
-# Ferrum documentation
+# Unihelm documentation
 
 - **Operators**
   - [Installing](operator/install.md)
-  - [The `ferrum` command line](operator/cli.md) — every operation, `--json`, exit codes, completions
+  - [The `unihelm` command line](operator/cli.md) — every operation, `--json`, exit codes, completions
   - [Configuration safety](config-safety.md) — what happens when you edit a generated file
 - **Developers**
   - [Architecture](architecture.md) — the two daemons, the operation registry, the config contract
@@ -13,8 +13,8 @@
   - [Operations](operations.md) — every registered operation, its permission and its inputs
   - [Error codes](api/errors.md) — generated from the source
   - [API versioning](api-versioning.md) — what may change without a version bump, and what may not
-- **Extending Ferrum**
+- **Extending Unihelm**
   - [Webhooks](webhooks.md) — the signature scheme, the delivery guarantees and the event catalogue
   - [Plugins](plugins.md) — the sidecar contract: manifest, trust model and socket protocol
 
-The full product specification lives at [`../FERRUM_SPEC_1.md`](../FERRUM_SPEC_1.md).
+The full product specification lives at [`../UNIHELM_SPEC_1.md`](../UNIHELM_SPEC_1.md).

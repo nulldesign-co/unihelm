@@ -90,8 +90,8 @@ export const SERVICE_TARGETS = [
   "kv_store",
   "docker",
   "sshd",
-  "ferrum_web",
-  "ferrum_agentd",
+  "unihelm_web",
+  "unihelm_agentd",
 ] as const;
 
 export type RuleProblem =

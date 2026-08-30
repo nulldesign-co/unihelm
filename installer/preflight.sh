@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ferrum preflight (spec §7.1).
+# Unihelm preflight (spec §7.1).
 #
 # Refuses clearly and early rather than failing halfway through provisioning.
 # Sourced by install.sh, and runnable on its own to check a candidate server:
@@ -33,33 +33,33 @@ preflight_check_os() {
 
   # shellcheck disable=SC1091
   . /etc/os-release
-  FERRUM_OS_ID="${ID:-unknown}"
-  FERRUM_OS_VERSION="${VERSION_ID:-}"
-  FERRUM_OS_NAME="${PRETTY_NAME:-$FERRUM_OS_ID}"
+  UNIHELM_OS_ID="${ID:-unknown}"
+  UNIHELM_OS_VERSION="${VERSION_ID:-}"
+  UNIHELM_OS_NAME="${PRETTY_NAME:-$UNIHELM_OS_ID}"
   local like="${ID_LIKE:-}"
-  local major="${FERRUM_OS_VERSION%%.*}"
+  local major="${UNIHELM_OS_VERSION%%.*}"
 
-  case "$FERRUM_OS_ID" in
+  case "$UNIHELM_OS_ID" in
     debian)
-      FERRUM_FAMILY=debian
-      [ "$major" -ge 12 ] 2>/dev/null || _warn "Debian $FERRUM_OS_VERSION is older than the tested 12/13"
+      UNIHELM_FAMILY=debian
+      [ "$major" -ge 12 ] 2>/dev/null || _warn "Debian $UNIHELM_OS_VERSION is older than the tested 12/13"
       ;;
     ubuntu)
-      FERRUM_FAMILY=debian
-      case "$FERRUM_OS_VERSION" in
+      UNIHELM_FAMILY=debian
+      case "$UNIHELM_OS_VERSION" in
         22.04 | 24.04 | 26.04) ;;
-        *) _warn "Ubuntu $FERRUM_OS_VERSION is not one of the tested LTS releases" ;;
+        *) _warn "Ubuntu $UNIHELM_OS_VERSION is not one of the tested LTS releases" ;;
       esac
       ;;
     almalinux | rocky | rhel | centos)
-      FERRUM_FAMILY=rhel
-      [ "$major" -ge 9 ] 2>/dev/null || _warn "$FERRUM_OS_NAME is older than the tested 9/10"
+      UNIHELM_FAMILY=rhel
+      [ "$major" -ge 9 ] 2>/dev/null || _warn "$UNIHELM_OS_NAME is older than the tested 9/10"
       ;;
     *)
       case " $like " in
-        *" debian "* | *" ubuntu "*) FERRUM_FAMILY=debian; _warn "$FERRUM_OS_NAME is an untested Debian derivative" ;;
-        *" rhel "* | *" fedora "* | *" centos "*) FERRUM_FAMILY=rhel; _warn "$FERRUM_OS_NAME is an untested RHEL derivative" ;;
-        *) _fail "$FERRUM_OS_NAME is not supported (Debian/Ubuntu or RHEL family only)" ;;
+        *" debian "* | *" ubuntu "*) UNIHELM_FAMILY=debian; _warn "$UNIHELM_OS_NAME is an untested Debian derivative" ;;
+        *" rhel "* | *" fedora "* | *" centos "*) UNIHELM_FAMILY=rhel; _warn "$UNIHELM_OS_NAME is an untested RHEL derivative" ;;
+        *) _fail "$UNIHELM_OS_NAME is not supported (Debian/Ubuntu or RHEL family only)" ;;
       esac
       ;;
   esac
@@ -67,10 +67,10 @@ preflight_check_os() {
 }
 
 preflight_check_arch() {
-  FERRUM_ARCH="$(uname -m)"
-  case "$FERRUM_ARCH" in
+  UNIHELM_ARCH="$(uname -m)"
+  case "$UNIHELM_ARCH" in
     x86_64 | aarch64 | arm64) ;;
-    *) _fail "architecture $FERRUM_ARCH is not supported (x86_64 and aarch64 only)" ;;
+    *) _fail "architecture $UNIHELM_ARCH is not supported (x86_64 and aarch64 only)" ;;
   esac
   return 0
 }
@@ -96,7 +96,7 @@ preflight_check_memory() {
   kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   local mb=$((kb / 1024))
   if [ "$mb" -lt "$MIN_RAM_MB" ]; then
-    _fail "${mb} MB of RAM; Ferrum needs at least 1 GB"
+    _fail "${mb} MB of RAM; Unihelm needs at least 1 GB"
   elif [ "$mb" -lt 1800 ]; then
     _warn "${mb} MB of RAM — enough for the panel, tight for a full stack"
   fi
@@ -109,7 +109,7 @@ preflight_check_disk() {
   if [ -z "$mb" ]; then
     _warn "could not determine free space on /var"
   elif [ "$mb" -lt "$MIN_DISK_MB" ]; then
-    _fail "${mb} MB free on /var; Ferrum needs at least 10 GB"
+    _fail "${mb} MB free on /var; Unihelm needs at least 10 GB"
   fi
   return 0
 }
@@ -119,7 +119,7 @@ preflight_check_conflicts() {
   # loses at 3am. Say so now.
   for unit in httpd apache2 cpanel psa; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      _warn "$unit is running and will compete with the stack Ferrum manages"
+      _warn "$unit is running and will compete with the stack Unihelm manages"
     fi
   done
   for panel in /usr/local/cpanel /opt/psa /www/server/panel; do
@@ -160,9 +160,9 @@ preflight_report() {
 # Run standalone when executed rather than sourced.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   preflight_run
-  echo "Ferrum preflight"
+  echo "Unihelm preflight"
   if preflight_report; then
-    echo "  ok    ${FERRUM_OS_NAME:-this system} (${FERRUM_FAMILY:-?}, ${FERRUM_ARCH:-?}) can run Ferrum"
+    echo "  ok    ${UNIHELM_OS_NAME:-this system} (${UNIHELM_FAMILY:-?}, ${UNIHELM_ARCH:-?}) can run Unihelm"
     exit 0
   fi
   exit 1

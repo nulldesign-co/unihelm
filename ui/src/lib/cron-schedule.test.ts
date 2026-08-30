@@ -1,7 +1,7 @@
 /**
  * Behaviour tests for the client-side cron grammar (spec §11.8).
  *
- * The agent is the authority — `ferrum_ops::cron::validate_schedule` re-parses
+ * The agent is the authority — `unihelm_ops::cron::validate_schedule` re-parses
  * everything this file accepts, and `render_crontab` validates a third time on
  * the way out. What is pinned here is that the two copies do not *disagree*:
  * a schedule the agent refuses must not sail through the form and come back as
@@ -144,7 +144,7 @@ describe("the command check", () => {
     // `%` is escaped by the renderer rather than refused: `date +%F` is a
     // perfectly normal thing to schedule, and refusing it would be a rule the
     // agent never had.
-    expect(checkCommand("/usr/bin/php /home/ft_ab12cd34/cron.php")).toBeNull();
+    expect(checkCommand("/usr/bin/php /home/uh_ab12cd34/cron.php")).toBeNull();
     expect(checkCommand("/usr/bin/date +%F >> log.txt")).toBeNull();
     expect(checkCommand("  spaced.sh  ")).toBeNull();
   });

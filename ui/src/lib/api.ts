@@ -54,7 +54,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (init.body !== undefined) headers.set("content-type", "application/json");
   if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken) {
-    headers.set("x-ferrum-csrf", csrfToken);
+    headers.set("x-unihelm-csrf", csrfToken);
   }
 
   const response = await fetch(path, {
@@ -417,7 +417,7 @@ export type FirewallBackend = "firewalld" | "ufw" | "nftables" | "none";
  *
  * `missing_from_backend` — the panel promised this hole and the firewall has
  * never heard of it (somebody flushed the ruleset).
- * `unrecorded` — the firewall enforces a Ferrum-marked rule the panel has no
+ * `unrecorded` — the firewall enforces a Unihelm-marked rule the panel has no
  * row for (a restored database, or an older build).
  */
 export type RuleDrift = "missing_from_backend" | "unrecorded";
@@ -566,7 +566,7 @@ export type BackupRunStatus = "running" | "ok" | "failed";
  * A repository as the API returns it.
  *
  * Note what is missing: there is no password field and no credentials field,
- * because `ferrum_db::BackupRepo` has none. The password exists in exactly one
+ * because `unihelm_db::BackupRepo` has none. The password exists in exactly one
  * response, `RepoInitResponse`, and exactly once.
  */
 export interface BackupRepo {
@@ -878,7 +878,7 @@ export type TlsMode = "none" | "starttls" | "implicit";
 /**
  * One record the operator should publish.
  *
- * `managed` is always false and the UI says so out loud: Ferrum surfaces
+ * `managed` is always false and the UI says so out loud: Unihelm surfaces
  * SPF/DKIM/DMARC as guidance and does not publish or verify them (spec §11.18).
  * `value` is null for DKIM, because only the relay provider knows the selector
  * and the public key.

@@ -26,7 +26,7 @@ import {
  * The page has to be honest about three things, and each one is a design
  * decision rather than a label:
  *
- * 1. **Ferrum runs no mail server.** This configures somebody else's SMTP
+ * 1. **Unihelm runs no mail server.** This configures somebody else's SMTP
  *    relay and points every PHP site's `mail()` at it. There are no mailboxes
  *    to manage here and the page says so, because a "Mail" item in a hosting
  *    panel's navigation promises mailboxes to almost everybody who clicks it.

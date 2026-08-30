@@ -1,6 +1,6 @@
 # Architecture
 
-Three stories explain most of Ferrum: the two-daemon privilege boundary, the
+Three stories explain most of Unihelm: the two-daemon privilege boundary, the
 operation registry that is the only door through it, and the configuration
 contract that governs every file the panel writes. This page tells all three
 and points into the code that enforces them — the claims here are checkable.
@@ -8,14 +8,14 @@ and points into the code that enforces them — the claims here are checkable.
 ## Two processes, one hard boundary
 
 ```
-  Browser ── HTTPS ──▶  ferrum-web        user: ferrum, no capabilities
+  Browser ── HTTPS ──▶  unihelm-web        user: unihelm, no capabilities
   CLI ────── UDS ────▶   • REST API + SSE
                          • sessions, RBAC, rate limiting
                          • embedded React UI
                                 │
-                                │  length-prefixed JSON over /run/ferrum/agent.sock
+                                │  length-prefixed JSON over /run/unihelm/agent.sock
                                 ▼
-                        ferrum-agentd     user: root
+                        unihelm-agentd     user: root
                          • operation registry (a whitelist)
                          • task queue and scheduler
                          • package / service / firewall backends
@@ -24,7 +24,7 @@ and points into the code that enforces them — the claims here are checkable.
                         nginx · php-fpm · mariadb · postgres
 ```
 
-`ferrum-web` faces the internet and holds nothing. It cannot restart a service,
+`unihelm-web` faces the internet and holds nothing. It cannot restart a service,
 write a config file, or read a tenant's home directory. When it needs something
 done, it names an operation and sends a frame.
 
@@ -40,32 +40,32 @@ Every privileged action — from the UI, the CLI, or the scheduler — takes the
 same path. Each step names the code that enforces it.
 
 1. **The web process authorizes** the session against RBAC and sends a frame
-   naming an operation (`crates/ferrum-web/src/`, routes under `routes/`).
+   naming an operation (`crates/unihelm-web/src/`, routes under `routes/`).
 2. **The transport authenticates the peer**, not the payload: the socket is
    0700, and `SO_PEERCRED` is checked on accept
-   (`crates/ferrum-ipc/src/peercred.rs`, `server.rs`). A process that is not
-   the `ferrum` user does not get to speak the protocol at all.
+   (`crates/unihelm-ipc/src/peercred.rs`, `server.rs`). A process that is not
+   the `unihelm` user does not get to speak the protocol at all.
 3. **The agent looks the name up in the registry**
-   (`crates/ferrum-ops/src/registry.rs`). The registry is a whitelist, not a
+   (`crates/unihelm-ops/src/registry.rs`). The registry is a whitelist, not a
    dispatcher: an unknown name is `FER-1504`, never a fallback.
 4. **The agent re-derives the caller's rights from the database**
-   (auth validation in `crates/ferrum-ops/src/registry.rs`) and intersects
+   (auth validation in `crates/unihelm-ops/src/registry.rs`) and intersects
    them with what the frame claimed. The frame's asserted permissions are advisory downward only —
    a forged context can lose privileges, never gain them.
 5. **The input deserializes into the operation's typed struct**, where every
    field is a validated newtype or an enum
-   (`crates/ferrum-core/src/newtypes.rs`: `Domain`, `TenantPath`, `DbName`,
+   (`crates/unihelm-core/src/newtypes.rs`: `Domain`, `TenantPath`, `DbName`,
    `LinuxUser`, `PhpVersion`, …). Validation runs inside `serde`, so a hostile
    frame dies at the protocol edge, before any operation code runs.
-6. **The operation runs** — through `ferrum_distro::Cmd`
-   (`crates/ferrum-distro/src/exec.rs`), which takes argv arrays and resolves
+6. **The operation runs** — through `unihelm_distro::Cmd`
+   (`crates/unihelm-distro/src/exec.rs`), which takes argv arrays and resolves
    programs against a fixed list of trusted directories. `Command::new` exists
    in that one file, and `tests/gates/no-shell.sh` fails CI if it appears
    anywhere else, or if a shell is ever the program. There is no path from an
    API request to a shell.
-7. **The action is audited** (`crates/ferrum-db/src/audit.rs`), with secret
+7. **The action is audited** (`crates/unihelm-db/src/audit.rs`), with secret
    fields recursively redacted before the row is written. Anything slower than
-   ~300 ms runs as a Task (`crates/ferrum-agentd/src/tasks.rs`) with a
+   ~300 ms runs as a Task (`crates/unihelm-agentd/src/tasks.rs`) with a
    persistent log.
 
 An operation declares its name, its required permission and its execution mode
@@ -94,13 +94,13 @@ The registry pattern earns its structure three times over:
 
 Nothing in the serving path — nginx, php-fpm, the databases — depends on either
 daemon at runtime. They are ordinary systemd units with ordinary configuration
-files. Stop both Ferrum processes and every hosted site keeps serving.
+files. Stop both Unihelm processes and every hosted site keeps serving.
 
 That is a design constraint, not a happy accident, and it is why the panel can
 afford to be crash-only: both daemons restart unconditionally, keep no state
 that matters in memory, and reconcile whatever was in flight on the way back
 up. The scheduler is built the same way: its jobs live in SQLite
-(`crates/ferrum-db/src/scheduler.rs`), so a job that fell due while the agent
+(`crates/unihelm-db/src/scheduler.rs`), so a job that fell due while the agent
 was down runs on the way back up instead of being skipped — verified on a live
 server, where a certificate forced to twenty days remaining was renewed
 unattended, production ACME order to reloaded nginx, in seconds.
@@ -108,12 +108,12 @@ unattended, production ACME order to reloaded nginx, in seconds.
 ## The configuration contract
 
 Every file the panel writes — vhosts, FPM pools, systemd slices — goes through
-one engine (`crates/ferrum-config/src/apply.rs`), which exists to keep two
+one engine (`crates/unihelm-config/src/apply.rs`), which exists to keep two
 promises: *never reload a broken configuration* and *never clobber a human's
 edit*.
 
 - **Render** from a minijinja template with strict undefined behavior
-  (`templates.rs`, templates in `crates/ferrum-config/templates/`). A renamed
+  (`templates.rs`, templates in `crates/unihelm-config/templates/`). A renamed
   variable is a render failure, not an empty string — because `server_name ;`
   is a vhost that silently swallows every request on the server.
 - **Write atomically** in the target directory, fsynced before and after the
@@ -126,10 +126,10 @@ edit*.
 - **Roll back byte-for-byte** on any failure, including a post-check that
   fails after a reload — in which case the engine reloads back onto the old
   file.
-- **Record a revision** (`crates/ferrum-db/src/revisions.rs`); any revision
+- **Record a revision** (`crates/unihelm-db/src/revisions.rs`); any revision
   can be reactivated.
 - **Detect drift** (`managed.rs`): managed files carry a
-  `# FERRUM-MANAGED sha256:` header over their body. A human edit is reported
+  `# UNIHELM-MANAGED sha256:` header over their body. A human edit is reported
   with a diff and stops management of that file; a file the panel did not
   write is Foreign and refused outright; a forged header does not make
   somebody else's file ours.
@@ -142,7 +142,7 @@ One lesson from live verification is now part of the contract's lore: a
 renewed certificate does not change the vhost text, so the engine correctly
 skips the reload — while nginx keeps serving the old certificate from memory.
 The thing that changed was not the thing being watched. Certificate issuance
-reloads explicitly (`crates/ferrum-ops/src/cert.rs`), and the same shape has
+reloads explicitly (`crates/unihelm-ops/src/cert.rs`), and the same shape has
 been found and fixed twice since; when a change's effect lives outside the
 file, the operation owns the reload.
 
@@ -157,10 +157,10 @@ process owns sessions and audit. That is what avoids lock contention under
 load rather than hoping WAL absorbs it.
 
 Repositories are tenant-scoped by construction: they take a `TenantScope`
-(`crates/ferrum-db/src/scope.rs`), not a raw id, so an unscoped query is
+(`crates/unihelm-db/src/scope.rs`), not a raw id, so an unscoped query is
 something you must write on purpose. Secrets — the ACME account key, every
 credential to come — are sealed with XChaCha20-Poly1305 under
-`ferrum_db::MasterKey` (`secrets.rs`) before touching a row; the master key
+`unihelm_db::MasterKey` (`secrets.rs`) before touching a row; the master key
 refuses to load from a file anybody else can read, and its `Debug` impl prints
 `<redacted>`, because the way key material reaches a log is somebody adding
 `?key` to a tracing call.
@@ -179,7 +179,7 @@ the stream, never from the record.
 
 ## Where OS differences live
 
-`crates/ferrum-distro`, and nowhere else. Four traits — packages, services,
+`crates/unihelm-distro`, and nowhere else. Four traits — packages, services,
 firewall, security module — with an implementation per family. A feature
 module that knows whether it is on Debian or RHEL is a bug: unit names,
 package names and firewall syntax all resolve behind those traits.

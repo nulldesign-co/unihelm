@@ -1,0 +1,36 @@
+[package]
+name = "unihelm-agentd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "unihelm-agentd"
+path = "src/main.rs"
+
+[dependencies]
+unihelm-config = { workspace = true }
+unihelm-core = { workspace = true }
+unihelm-db = { workspace = true }
+unihelm-distro = { workspace = true }
+unihelm-ipc = { workspace = true }
+unihelm-metrics = { workspace = true }
+unihelm-ops = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+# Terminal output crosses the IPC frame base64-encoded: a shell writes bytes,
+# and a JSON string cannot carry a split UTF-8 sequence (spec 11.16).
+base64 = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Terminal session ids.
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

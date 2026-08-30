@@ -4,10 +4,10 @@ Spec §6 does not leave this open:
 
 > Do NOT let plugins run in-process as root.
 
-Everything on this page follows from that one sentence. A Ferrum plugin is **a
+Everything on this page follows from that one sentence. A Unihelm plugin is **a
 separate process**, started by the agent under a **dedicated unprivileged system
 account**, inside a systemd unit carrying the same hardening the panel's own
-`ferrum-web` unit does, speaking the panel's **existing length-prefixed JSON
+`unihelm-web` unit does, speaking the panel's **existing length-prefixed JSON
 framing** over **its own** Unix socket.
 
 There is no dynamic library, no ABI, no `dlopen`, and no code path from a plugin
@@ -38,7 +38,7 @@ and is asked for `dns.present` is refused *before a socket is opened*.
 ### What a plugin can never do
 
 **Register an operation.** The operation registry is built from a fixed list in
-Rust (`crates/ferrum-ops/src/registry.rs`). Nothing in the plugin system inserts
+Rust (`crates/unihelm-ops/src/registry.rs`). Nothing in the plugin system inserts
 into it, and that is load-bearing rather than incidental: the registry is where
 the permission check lives, so an extension point that could add an operation
 would be an extension point that could add an unchecked one. Plugins are reached
@@ -94,7 +94,7 @@ Rules the panel enforces, and why each one exists:
 - **`slug`** is `[a-z0-9]`, then up to 18 more of `[a-z0-9-]`, ending
   alphanumeric. That alphabet is the intersection of three things the slug
   becomes: a systemd unit-name component, a Unix account name
-  (`ferrum-plug-<slug>`, which must fit in 32 characters), and a path component.
+  (`unihelm-plug-<slug>`, which must fit in 32 characters), and a path component.
   No dots — a dot in a unit name changes what systemd thinks the unit *is*.
 - **`entry`** must be relative and traversal-free, and must contain no character
   systemd would read as syntax in `ExecStart=` — no space (which would split the
@@ -214,13 +214,13 @@ recycled onto files nobody meant to hand over.
 ```ini
 [Service]
 Type=simple
-User=ferrum-plug-<slug>
-WorkingDirectory=/var/lib/ferrum/plugins/<slug>
-ExecStart=/var/lib/ferrum/plugins/<slug>/<entry>
-Environment=FERRUM_PLUGIN_SOCKET=/run/ferrum/plugins/<slug>/plugin.sock
-Environment=FERRUM_PLUGIN_SLUG=<slug>
-Environment=FERRUM_PLUGIN_API=1
-RuntimeDirectory=ferrum/plugins/<slug>
+User=unihelm-plug-<slug>
+WorkingDirectory=/var/lib/unihelm/plugins/<slug>
+ExecStart=/var/lib/unihelm/plugins/<slug>/<entry>
+Environment=UNIHELM_PLUGIN_SOCKET=/run/unihelm/plugins/<slug>/plugin.sock
+Environment=UNIHELM_PLUGIN_SLUG=<slug>
+Environment=UNIHELM_PLUGIN_API=1
+RuntimeDirectory=unihelm/plugins/<slug>
 RuntimeDirectoryMode=0750
 …NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp, PrivateDevices,
    ProtectKernel*, ProtectControlGroups, ProtectClock, ProtectHostname,
@@ -237,7 +237,7 @@ families a network client actually needs.
 
 ### The socket
 
-Bind a `SOCK_STREAM` Unix socket at `$FERRUM_PLUGIN_SOCKET` and accept
+Bind a `SOCK_STREAM` Unix socket at `$UNIHELM_PLUGIN_SOCKET` and accept
 connections. `systemd` creates the parent directory, owns it to your account and
 removes it when the unit stops, so there is never a stale socket to clean up.
 The agent dials exactly that path and nothing else — a plugin that binds
@@ -246,7 +246,7 @@ elsewhere is simply unreachable.
 ### The framing
 
 The same wire format as the panel's own IPC (spec §5.3), and deliberately so —
-`crates/ferrum-ipc/src/codec.rs` is the reference implementation:
+`crates/unihelm-ipc/src/codec.rs` is the reference implementation:
 
 > **A 4-byte big-endian length, then that many bytes of UTF-8 JSON.**
 
@@ -280,7 +280,7 @@ hangs must not become a panel that hangs.
 import json, os, socket, struct
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.bind(os.environ["FERRUM_PLUGIN_SOCKET"])
+sock.bind(os.environ["UNIHELM_PLUGIN_SOCKET"])
 sock.listen(8)
 
 def read_frame(conn):

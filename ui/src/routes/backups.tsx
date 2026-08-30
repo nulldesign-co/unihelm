@@ -46,7 +46,7 @@ import { formatBytes } from "@/lib/utils";
  * again — an operation that could would turn a stolen session into every backup
  * this panel has ever taken. So the creation flow ends in a dialog that treats
  * that value as the deliverable rather than as a confirmation, and says the
- * consequence out loud: without the password **and** `/etc/ferrum/secret.key`,
+ * consequence out loud: without the password **and** `/etc/unihelm/secret.key`,
  * a panel-scope backup cannot be restored after the panel is lost.
  *
  * The rest follows the API's own scoping. Repositories, schedules and restores
@@ -516,7 +516,7 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
               id="repo-location"
               dir="ltr"
               className="font-mono"
-              placeholder={kind === "local" ? "/var/backups/ferrum" : "s3.example.com/ferrum-backups"}
+              placeholder={kind === "local" ? "/var/backups/unihelm" : "s3.example.com/unihelm-backups"}
               autoComplete="off"
               spellCheck={false}
               aria-describedby="repo-location-hint"
@@ -654,7 +654,7 @@ function PasswordDialog({
             {t("backups.passwordOnce")}
           </p>
           {/* The consequence, in the words the API states it in: without this
-              password *and* /etc/ferrum/secret.key, a panel-scope backup cannot
+              password *and* /etc/unihelm/secret.key, a panel-scope backup cannot
               be restored after the panel is lost. */}
           <p className="mt-1 text-sm text-ink">{t("backups.passwordNotice")}</p>
         </div>

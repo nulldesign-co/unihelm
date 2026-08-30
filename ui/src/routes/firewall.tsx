@@ -35,7 +35,7 @@ import { banRefusal, isCidr } from "@/lib/ip";
  * Firewall and Sentinel (spec §11.9).
  *
  * Two ideas shape this page, both taken straight from the agent module it
- * fronts (`crates/ferrum-ops/src/fwops.rs`):
+ * fronts (`crates/unihelm-ops/src/fwops.rs`):
  *
  * **The backend is the truth; the panel record is the intent.** Every read is
  * a merge of the two, and where they disagree this page says so instead of

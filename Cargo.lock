@@ -895,223 +895,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
-name = "ferrum-agentd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "clap",
- "ferrum-config",
- "ferrum-core",
- "ferrum-db",
- "ferrum-distro",
- "ferrum-ipc",
- "ferrum-metrics",
- "ferrum-ops",
- "libc",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "ferrum-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "clap_complete",
- "ferrum-core",
- "ferrum-db",
- "ferrum-distro",
- "ferrum-ipc",
- "ferrum-ops",
- "libc",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "ferrum-config"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ferrum-core",
- "ferrum-distro",
- "hex",
- "minijinja",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ferrum-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "ferrum-db"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "chacha20poly1305",
- "ferrum-core",
- "hex",
- "password-hash 0.5.0",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ferrum-distro"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "ferrum-core",
- "hex",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "sha2 0.10.9",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ferrum-ipc"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ferrum-core",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ferrum-metrics"
-version = "0.1.0"
-dependencies = [
- "ferrum-core",
- "serde",
- "serde_json",
- "sysinfo",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ferrum-ops"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "ed25519-dalek",
- "ferrum-config",
- "ferrum-core",
- "ferrum-db",
- "ferrum-distro",
- "ferrum-ipc",
- "ferrum-metrics",
- "flate2",
- "hex",
- "hickory-resolver",
- "hmac",
- "instant-acme",
- "libc",
- "rand 0.8.7",
- "rcgen",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha-crypt",
- "sha2 0.10.9",
- "sqlx",
- "tar",
- "tempfile",
- "time",
- "tokio",
- "tokio-rustls",
- "toml",
- "tracing",
- "uuid",
- "webpki-roots",
- "x509-parser",
- "zip",
- "zstd",
-]
-
-[[package]]
-name = "ferrum-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "axum-extra",
- "base64 0.22.1",
- "clap",
- "ferrum-core",
- "ferrum-db",
- "ferrum-ipc",
- "ferrum-metrics",
- "futures",
- "libc",
- "mime_guess",
- "rust-embed",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tower",
- "tower-http 0.7.0",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "uuid",
-]
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3832,6 +3615,223 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unihelm-agentd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "clap",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unihelm-config",
+ "unihelm-core",
+ "unihelm-db",
+ "unihelm-distro",
+ "unihelm-ipc",
+ "unihelm-metrics",
+ "unihelm-ops",
+ "uuid",
+]
+
+[[package]]
+name = "unihelm-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "libc",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tokio",
+ "unihelm-core",
+ "unihelm-db",
+ "unihelm-distro",
+ "unihelm-ipc",
+ "unihelm-ops",
+]
+
+[[package]]
+name = "unihelm-config"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "unihelm-core",
+ "unihelm-distro",
+]
+
+[[package]]
+name = "unihelm-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "unihelm-db"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "hex",
+ "password-hash 0.5.0",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "unihelm-core",
+ "uuid",
+]
+
+[[package]]
+name = "unihelm-distro"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "unihelm-core",
+]
+
+[[package]]
+name = "unihelm-ipc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "unihelm-core",
+ "uuid",
+]
+
+[[package]]
+name = "unihelm-metrics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "time",
+ "tokio",
+ "tracing",
+ "unihelm-core",
+]
+
+[[package]]
+name = "unihelm-ops"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "ed25519-dalek",
+ "flate2",
+ "hex",
+ "hickory-resolver",
+ "hmac",
+ "instant-acme",
+ "libc",
+ "rand 0.8.7",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha-crypt",
+ "sha2 0.10.9",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "unihelm-config",
+ "unihelm-core",
+ "unihelm-db",
+ "unihelm-distro",
+ "unihelm-ipc",
+ "unihelm-metrics",
+ "uuid",
+ "webpki-roots",
+ "x509-parser",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "unihelm-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "libc",
+ "mime_guess",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
+ "tracing-subscriber",
+ "unihelm-core",
+ "unihelm-db",
+ "unihelm-ipc",
+ "unihelm-metrics",
+ "utoipa",
+ "uuid",
+]
 
 [[package]]
 name = "universal-hash"

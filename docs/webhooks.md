@@ -1,10 +1,10 @@
 # Webhooks
 
-Ferrum will never grow a billing module. Spec §2.4 says so explicitly — *"No
+Unihelm will never grow a billing module. Spec §2.4 says so explicitly — *"No
 billing/invoicing — expose a clean API + webhooks so WHMCS/FOSSBilling can
 integrate later"* — which makes this page the other half of that sentence:
-everything somebody needs to receive Ferrum's events and be sure they came from
-Ferrum.
+everything somebody needs to receive Unihelm's events and be sure they came from
+Unihelm.
 
 This document is the contract. If you are implementing the receiving side, you
 should not have to read any Rust.
@@ -16,7 +16,7 @@ should not have to read any Rust.
 ```
 POST /api/webhooks
 {
-  "url": "https://billing.example.com/ferrum/events",
+  "url": "https://billing.example.com/unihelm/events",
   "events": ["backup.failed", "subscription.suspended"]
 }
 ```
@@ -27,7 +27,7 @@ The response carries the signing secret **exactly once**:
 {
   "webhook": { "id": 3, "url": "...", "events": [...], "active": true, ... },
   "secret": "9f2c…64 hex characters…",
-  "signature_scheme": "HMAC-SHA256 over `v1:<X-Ferrum-Timestamp>:<raw body>` …"
+  "signature_scheme": "HMAC-SHA256 over `v1:<X-Unihelm-Timestamp>:<raw body>` …"
 }
 ```
 
@@ -47,23 +47,23 @@ machine.
 ## 2. What a delivery looks like
 
 ```
-POST /ferrum/events HTTP/1.1
+POST /unihelm/events HTTP/1.1
 Content-Type: application/json
-User-Agent: ferrum-panel/0.1.0
-X-Ferrum-Event: backup.failed
-X-Ferrum-Delivery: 4821
-X-Ferrum-Timestamp: 1764250800
-X-Ferrum-Signature: v1=3f0a…64 hex characters…
+User-Agent: unihelm-panel/0.1.0
+X-Unihelm-Event: backup.failed
+X-Unihelm-Delivery: 4821
+X-Unihelm-Timestamp: 1764250800
+X-Unihelm-Signature: v1=3f0a…64 hex characters…
 
 {"event":"backup.failed","id":4821,"at":"2026-08-28T09:00:00Z","data":{ … }}
 ```
 
 | Header | Meaning |
 |---|---|
-| `X-Ferrum-Event` | The event name. Also in the body; the header is there so a proxy or a router can dispatch without parsing. |
-| `X-Ferrum-Delivery` | The delivery id. **Stable across retries** — this is your de-duplication key. |
-| `X-Ferrum-Timestamp` | Unix seconds, UTC, at the moment of *this attempt*. Covered by the signature. |
-| `X-Ferrum-Signature` | `v1=<lowercase hex HMAC-SHA256>`. |
+| `X-Unihelm-Event` | The event name. Also in the body; the header is there so a proxy or a router can dispatch without parsing. |
+| `X-Unihelm-Delivery` | The delivery id. **Stable across retries** — this is your de-duplication key. |
+| `X-Unihelm-Timestamp` | Unix seconds, UTC, at the moment of *this attempt*. Covered by the signature. |
+| `X-Unihelm-Signature` | `v1=<lowercase hex HMAC-SHA256>`. |
 
 The body is the same four fields for every event: `event`, `id`, `at` (RFC 3339,
 UTC) and `data`, whose shape depends on the event.
@@ -80,25 +80,25 @@ Three steps, in this order:
 2. **Rebuild the signed string:** the ASCII text
 
    ```
-   v1:<X-Ferrum-Timestamp>:<raw body>
+   v1:<X-Unihelm-Timestamp>:<raw body>
    ```
 
    — the literal `v1`, a colon, the timestamp header verbatim, a colon, then the
    body bytes.
 3. **Compute `HMAC-SHA256(secret, signed_string)`** and compare it, in constant
-   time, against the hex after `v1=` in `X-Ferrum-Signature`. The MAC key is the
+   time, against the hex after `v1=` in `X-Unihelm-Signature`. The MAC key is the
    secret string **exactly as the panel showed it** — ASCII bytes, not
    hex-decoded first.
 
 Then **reject anything older than your tolerance** (five minutes is the usual
-choice) by comparing `X-Ferrum-Timestamp` against your own clock. This is the
+choice) by comparing `X-Unihelm-Timestamp` against your own clock. This is the
 step that makes the timestamp worth having: without it, a captured request can
 be replayed forever. The timestamp is inside the MAC precisely so an attacker
 cannot edit it.
 
 ### Worked example
 
-These exact values are pinned by a test in `crates/ferrum-ops/src/webhook.rs`
+These exact values are pinned by a test in `crates/unihelm-ops/src/webhook.rs`
 (`the_documented_signature_vector_still_holds`), so they will not drift:
 
 ```
@@ -118,22 +118,22 @@ Python:
 import hmac, hashlib, time
 
 def verify(secret, headers, raw_body, tolerance=300):
-    ts = int(headers["X-Ferrum-Timestamp"])
+    ts = int(headers["X-Unihelm-Timestamp"])
     if abs(time.time() - ts) > tolerance:
         return False                      # replay, or a badly wrong clock
     signed = b"v1:%d:" % ts + raw_body
     expected = "v1=" + hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, headers["X-Ferrum-Signature"])
+    return hmac.compare_digest(expected, headers["X-Unihelm-Signature"])
 ```
 
 PHP:
 
 ```php
-function ferrum_verify(string $secret, array $h, string $body, int $tol = 300): bool {
-    $ts = (int) $h['X-Ferrum-Timestamp'];
+function unihelm_verify(string $secret, array $h, string $body, int $tol = 300): bool {
+    $ts = (int) $h['X-Unihelm-Timestamp'];
     if (abs(time() - $ts) > $tol) { return false; }
     $expected = 'v1=' . hash_hmac('sha256', "v1:$ts:$body", $secret);
-    return hash_equals($expected, $h['X-Ferrum-Signature']);
+    return hash_equals($expected, $h['X-Unihelm-Signature']);
 }
 ```
 
@@ -142,19 +142,19 @@ Node:
 ```js
 const crypto = require("crypto");
 function verify(secret, headers, rawBody, tolerance = 300) {
-  const ts = Number(headers["x-ferrum-timestamp"]);
+  const ts = Number(headers["x-unihelm-timestamp"]);
   if (Math.abs(Date.now() / 1000 - ts) > tolerance) return false;
   const mac = crypto.createHmac("sha256", secret)
     .update(`v1:${ts}:`).update(rawBody).digest("hex");
   return crypto.timingSafeEqual(
-    Buffer.from(`v1=${mac}`), Buffer.from(headers["x-ferrum-signature"]));
+    Buffer.from(`v1=${mac}`), Buffer.from(headers["x-unihelm-signature"]));
 }
 ```
 
 ### Why `v1=`
 
 The prefix is there from the first release so that changing the scheme later is
-additive: a future panel would send `X-Ferrum-Signature: v1=…,v2=…`, and a
+additive: a future panel would send `X-Unihelm-Signature: v1=…,v2=…`, and a
 receiver picks the version it understands and ignores the rest. A scheme with no
 version in it can only ever be replaced by a flag day.
 
@@ -164,7 +164,7 @@ version in it can only ever be replaced by a flag day.
 
 **At-least-once, never exactly-once.** A delivery is marked delivered only after
 the panel *sees* a 2xx. A response lost on the wire produces a second POST with
-the same `X-Ferrum-Delivery` id and a byte-identical body. Make your handler
+the same `X-Unihelm-Delivery` id and a byte-identical body. Make your handler
 idempotent, keyed on that id.
 
 **The payload is frozen at emit time.** A retry re-sends the bytes that were
@@ -257,6 +257,6 @@ switching on `event` can tell a drill from the real thing.
   (`audit.retention_days`, 180 days by default); pending deliveries are never
   purged.
 - **Restores.** The signing secrets are sealed with the master key in
-  `/etc/ferrum/secret.key`. A database restored without that file has hooks
+  `/etc/unihelm/secret.key`. A database restored without that file has hooks
   whose secrets cannot be opened; the delivery loop disables such a hook with a
   reason rather than POSTing anything unsigned.

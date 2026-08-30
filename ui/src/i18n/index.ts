@@ -11,7 +11,7 @@ export const LANGUAGES = [
 
 export type LanguageCode = (typeof LANGUAGES)[number]["code"];
 
-const STORAGE_KEY = "ferrum.lang";
+const STORAGE_KEY = "unihelm.lang";
 
 function initialLanguage(): string {
   const stored = localStorage.getItem(STORAGE_KEY);

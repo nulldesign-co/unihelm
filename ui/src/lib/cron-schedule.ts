@@ -1,7 +1,7 @@
 /**
  * The five-field cron grammar, mirrored from the agent (spec §11.8).
  *
- * The server is the authority and stays it: `ferrum_ops::cron::validate_schedule`
+ * The server is the authority and stays it: `unihelm_ops::cron::validate_schedule`
  * re-parses every schedule and refuses anything this file waved through. What
  * this copy buys is the round trip — a cron expression is the one setting in the
  * panel that people routinely get *silently* wrong, and "0 3 * *" (four fields,
@@ -24,7 +24,7 @@
 /** The agent's own bound, so a megabyte of commas never becomes parser work. */
 export const MAX_SCHEDULE_CHARS = 256;
 
-/** `ferrum_ops::cron::MAX_COMMAND_CHARS` — beyond it a cron daemon may truncate. */
+/** `unihelm_ops::cron::MAX_COMMAND_CHARS` — beyond it a cron daemon may truncate. */
 export const MAX_COMMAND_CHARS = 1024;
 
 /** Which field a problem is about; the UI translates it for the message. */

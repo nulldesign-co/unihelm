@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/ferrum-core",
-    "crates/ferrum-config",
-    "crates/ferrum-db",
-    "crates/ferrum-ipc",
-    "crates/ferrum-distro",
-    "crates/ferrum-ops",
-    "crates/ferrum-metrics",
-    "crates/ferrum-web",
-    "crates/ferrum-agentd",
-    "crates/ferrum-cli",
+    "crates/unihelm-core",
+    "crates/unihelm-config",
+    "crates/unihelm-db",
+    "crates/unihelm-ipc",
+    "crates/unihelm-distro",
+    "crates/unihelm-ops",
+    "crates/unihelm-metrics",
+    "crates/unihelm-web",
+    "crates/unihelm-agentd",
+    "crates/unihelm-cli",
 ]
 
 [workspace.package]
@@ -23,16 +23,16 @@ edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 authors = ["farzam"]
-repository = "https://github.com/farzam/ferrum"
+repository = "https://github.com/farzam-seyedhashem/unihelm"
 
 [workspace.dependencies]
-ferrum-config = { path = "crates/ferrum-config" }
-ferrum-core = { path = "crates/ferrum-core" }
-ferrum-db = { path = "crates/ferrum-db" }
-ferrum-ipc = { path = "crates/ferrum-ipc" }
-ferrum-distro = { path = "crates/ferrum-distro" }
-ferrum-ops = { path = "crates/ferrum-ops" }
-ferrum-metrics = { path = "crates/ferrum-metrics" }
+unihelm-config = { path = "crates/unihelm-config" }
+unihelm-core = { path = "crates/unihelm-core" }
+unihelm-db = { path = "crates/unihelm-db" }
+unihelm-ipc = { path = "crates/unihelm-ipc" }
+unihelm-distro = { path = "crates/unihelm-distro" }
+unihelm-ops = { path = "crates/unihelm-ops" }
+unihelm-metrics = { path = "crates/unihelm-metrics" }
 
 anyhow = "1"
 base64 = "0.22.1"
@@ -43,7 +43,7 @@ blake2 = "0.10.6"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 # File-manager content crosses the op JSON as base64 chunks (spec §11.7).
 # Archive formats for fs.compress / fs.extract (spec §11.7). Extraction is
-# zip-bomb and path-traversal guarded in ferrum-ops::fsops::archive.
+# zip-bomb and path-traversal guarded in unihelm-ops::fsops::archive.
 # zip is default-features = false: the defaults pull AES, bzip2, lzma, ppmd and
 # xz — attack surface and binary size for formats the file manager never emits.
 flate2 = "1.1.9"
@@ -62,7 +62,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "json", "time", "uuid"] }
 clap = { version = "4", features = ["derive", "env"] }
-# Shell completions for `ferrum completions <shell>` (spec §11.20). Generated
+# Shell completions for `unihelm completions <shell>` (spec §11.20). Generated
 # from the same clap tree the binary parses with, so they cannot drift.
 clap_complete = "4"
 async-trait = "0.1"
@@ -98,7 +98,7 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.9"
 
 # CI-enforced budgets (spec §3) depend on a small, stripped binary.
-# NOTE: panic stays `unwind` on purpose — ferrum-web wraps handlers in
+# NOTE: panic stays `unwind` on purpose — unihelm-web wraps handlers in
 # CatchPanicLayer so one bad request cannot take the panel down.
 [profile.release]
 opt-level = 3

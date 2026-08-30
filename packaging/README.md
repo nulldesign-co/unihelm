@@ -1,7 +1,7 @@
 # Packaging
 
 Signed tarballs exist. `.github/workflows/release.yml` builds
-`ferrum-<version>-{x86_64,aarch64}.tar.gz` from a `v*` tag, signs them with
+`unihelm-<version>-{x86_64,aarch64}.tar.gz` from a `v*` tag, signs them with
 minisign, and drafts a GitHub release; `docs/releasing.md` is the procedure and
 the key-handling rules. The public key is `minisign.pub` at the repository root.
 
@@ -30,16 +30,16 @@ installer half of this contract lives in `release_tarball_name`,
 A release of tag `vX.Y.Z` publishes, as GitHub release assets:
 
 ```
-ferrum-X.Y.Z-x86_64-linux.tar.gz     the three binaries, top level or one dir down
-ferrum-X.Y.Z-aarch64-linux.tar.gz
+unihelm-X.Y.Z-x86_64-linux.tar.gz     the three binaries, top level or one dir down
+unihelm-X.Y.Z-aarch64-linux.tar.gz
 SHA256SUMS                           sha256sum(1) format, one line per tarball
 SHA256SUMS.minisig                   minisign signature over SHA256SUMS
 ```
 
 Note where the `v` goes: the *tag* carries it, the *filename* does not.
 
-Each tarball contains `ferrum-agentd`, `ferrum-web` and `ferrum` — nothing else
-is looked at. `ferrum-web` must be built after `ui/` so the interface is
+Each tarball contains `unihelm-agentd`, `unihelm-web` and `unihelm` — nothing else
+is looked at. `unihelm-web` must be built after `ui/` so the interface is
 embedded in it.
 
 Only `SHA256SUMS` is signed. That is deliberate and it is the whole reason the
@@ -57,14 +57,14 @@ common shape — proves only that the file matched itself.
 2. Sign it:
 
    ```bash
-   minisign -S -s ~/.minisign/ferrum-release.key -m SHA256SUMS
+   minisign -S -s ~/.minisign/unihelm-release.key -m SHA256SUMS
    ```
 
 3. Rewrite the placeholder in the installer with the matching public key —
-   the 56-character `RW…` line from `ferrum-release.pub`, not the file:
+   the 56-character `RW…` line from `unihelm-release.pub`, not the file:
 
    ```bash
-   sed -i "s|PLACEHOLDER-REPLACE-AT-RELEASE|$(sed -n 2p ferrum-release.pub)|" \
+   sed -i "s|PLACEHOLDER-REPLACE-AT-RELEASE|$(sed -n 2p unihelm-release.pub)|" \
      installer/install.sh
    ```
 

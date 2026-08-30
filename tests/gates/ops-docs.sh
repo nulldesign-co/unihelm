@@ -6,7 +6,7 @@
 # "document as you go" (§16.10). Those are the two rules that rot first,
 # because nothing breaks when they are ignored. This gate is what breaks.
 #
-# It reads `crates/ferrum-ops/src/registry.rs`, resolves each registered type
+# It reads `crates/unihelm-ops/src/registry.rs`, resolves each registered type
 # to the `const NAME` on its `impl TypedOperation`, and requires that name to
 # appear somewhere under `docs/`. Registration is the source of truth on
 # purpose: an operation that is not registered does not exist (the registry is
@@ -31,8 +31,8 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-readonly REGISTRY="crates/ferrum-ops/src/registry.rs"
-readonly OPS_SRC="crates/ferrum-ops/src"
+readonly REGISTRY="crates/unihelm-ops/src/registry.rs"
+readonly OPS_SRC="crates/unihelm-ops/src"
 readonly DOCS_DIR="docs"
 
 # Not documentation; see the header.

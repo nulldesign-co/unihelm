@@ -1,0 +1,39 @@
+[package]
+name = "unihelm-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "unihelm-web"
+path = "src/main.rs"
+
+[dependencies]
+unihelm-core = { workspace = true }
+unihelm-db = { workspace = true }
+unihelm-ipc = { workspace = true }
+unihelm-metrics = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+# `ws` for the web terminal (spec §11.16): a PTY is bidirectional and
+# byte-oriented, which is the one thing SSE cannot carry.
+axum = { version = "0.8.9", features = ["ws"] }
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+rust-embed = "8.12.0"
+mime_guess = "2.0.5"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["trace", "compression-gzip", "limit", "set-header"] }
+async-stream = "0.3.6"
