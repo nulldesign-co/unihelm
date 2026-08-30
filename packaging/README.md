@@ -30,17 +30,28 @@ installer half of this contract lives in `release_tarball_name`,
 A release of tag `vX.Y.Z` publishes, as GitHub release assets:
 
 ```
-unihelm-X.Y.Z-x86_64-linux.tar.gz     the three binaries, top level or one dir down
-unihelm-X.Y.Z-aarch64-linux.tar.gz
-SHA256SUMS                           sha256sum(1) format, one line per tarball
-SHA256SUMS.minisig                   minisign signature over SHA256SUMS
+unihelm-X.Y.Z-x86_64.tar.gz     a complete installer: bin/, install.sh,
+unihelm-X.Y.Z-aarch64.tar.gz    preflight.sh, config.toml.example, systemd/
+SHA256SUMS                      sha256sum(1) format, one line per tarball
+SHA256SUMS.minisig              minisign signature over SHA256SUMS
 ```
+
+Each tarball unpacks to a directory of the same name as the file, minus
+`.tar.gz`.
 
 Note where the `v` goes: the *tag* carries it, the *filename* does not.
 
-Each tarball contains `unihelm-agentd`, `unihelm-web` and `unihelm` — nothing else
-is looked at. `unihelm-web` must be built after `ui/` so the interface is
-embedded in it.
+Each tarball contains `unihelm-agentd`, `unihelm-web` and `unihelm`, and
+`unihelm-web` must be built after `ui/` so the interface is embedded in it.
+
+The rest of the tarball is not padding. `curl … | sudo bash` has no files on
+disk — no `preflight.sh`, no `config.toml.example`, no unit files — and fetching
+those loose from the raw content host would put unsigned files on a server,
+which is the one thing this whole chain exists to prevent. So a piped run
+verifies this tarball and then runs the `install.sh` inside it. That makes
+`install.sh`, `preflight.sh`, `config.toml.example` and `systemd/*.service`
+part of the release contract too: drop one and the piped install stops working,
+because `locate_installer_root` refuses a tarball that is missing any of them.
 
 Only `SHA256SUMS` is signed. That is deliberate and it is the whole reason the
 chain holds: the installer verifies the signature on the checksum file first,

@@ -193,10 +193,17 @@ gate_sha256() {
 
 # Take the architecture and the artefact name from the installer itself, so the
 # fixture and the code under test cannot drift apart.
+#
+# `gate_tarball` is derived rather than spelled out, and that is not tidiness.
+# It used to be written here as unihelm-<v>-<arch>-linux.tar.gz, matching what
+# release_tarball_name built and *not* matching what release.yml publishes, so
+# the fixture and the installer agreed with each other while both disagreed with
+# the actual release. Every download would have 404ed and this gate would have
+# stayed green. Asking the installer for the name is what makes that impossible.
 gate_arch="$( . installer/install.sh; release_arch )"
 gate_version="0.0.0-gate"
-gate_dir="unihelm-${gate_version}-${gate_arch}-linux"
-gate_tarball="${gate_dir}.tar.gz"
+gate_tarball="$( . installer/install.sh; RELEASE_VERSION="$gate_version"; release_tarball_name )"
+gate_dir="${gate_tarball%.tar.gz}"
 
 if [ -z "$gate_arch" ]; then
   fail "install.sh does not recognise this machine's architecture; skipping the release fixtures"
@@ -271,7 +278,7 @@ tar -czf "$good/$gate_tarball" -C "$fixtures/payload" "$gate_dir"
 # A real SHA256SUMS lists every architecture, so it names tarballs this machine
 # never downloads. Feeding the whole file to `sha256sum -c` would fail on those;
 # the installer has to pick out its own line, and this fixture proves it does.
-printf '%s  unihelm-%s-otherarch-linux.tar.gz\n' \
+printf '%s  unihelm-%s-otherarch.tar.gz\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   "$gate_version" >>"$good/SHA256SUMS"
 sign_sums "$good" "$fixtures/trusted.key" "$trusted_key"
@@ -287,7 +294,7 @@ sign_sums "$bad_signature" "$fixtures/attacker.key" "$attacker_key"
 
 # A correctly signed checksum file that says nothing about our tarball.
 cp "$good/$gate_tarball" "$not_listed/"
-printf '%s  unihelm-%s-otherarch-linux.tar.gz\n' \
+printf '%s  unihelm-%s-otherarch.tar.gz\n' \
   "0000000000000000000000000000000000000000000000000000000000000000" \
   "$gate_version" >"$not_listed/SHA256SUMS"
 sign_sums "$not_listed" "$fixtures/trusted.key" "$trusted_key"
@@ -295,7 +302,7 @@ sign_sums "$not_listed" "$fixtures/trusted.key" "$trusted_key"
 # The download stub. `fetch_to` is the single point in install.sh where bytes
 # come off the network, so replacing it — and nothing else — runs the real
 # verification, unpacking and staging code against a local directory.
-run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  workdir
+run_release_path() { # serve-dir  public-key (empty = force the placeholder)  workdir
   local serve="$1" pubkey="$2" work="$3"
   # Every assertion below needs its own environment and its own copy of the
   # installer's globals, so each run happens in a subshell and nothing it sets
@@ -311,7 +318,12 @@ run_release_path() { # serve-dir  public-key (empty = leave the placeholder)  wo
     if [ -n "$pubkey" ]; then
       export UNIHELM_PUBKEY="$pubkey"
     else
-      unset UNIHELM_PUBKEY
+      # Injected, not inherited. install.sh used to default to the placeholder
+      # and this branch unset the variable to reach it; the real key is committed
+      # now, because the advertised `curl … | sudo bash` fetches install.sh from
+      # main and a placeholder there could verify nothing. The refusal still has
+      # to work, so the case is forced rather than relying on the default.
+      export UNIHELM_PUBKEY="PLACEHOLDER-REPLACE-AT-RELEASE"
     fi
 
     # shellcheck source=../../installer/install.sh
@@ -429,11 +441,34 @@ else
   ok "ensure_minisign refuses when minisign cannot be obtained"
 fi
 
-placeholder_hits="$(grep -c 'PLACEHOLDER-REPLACE-AT-RELEASE' installer/install.sh)"
-if [ "$placeholder_hits" -eq 1 ]; then
-  ok "the signing-key placeholder appears exactly once, so release tooling can rewrite it"
+# The committed key must be a real one. This used to assert the opposite — that
+# the placeholder appeared exactly once "so release tooling can rewrite it" — but
+# no such tooling was ever written: nothing in .github/workflows/release.yml
+# touches UNIHELM_PUBKEY. The placeholder would have shipped, and the advertised
+# install command, which fetches install.sh from main, would have refused every
+# release for want of a key it could never obtain.
+installer_key="$(sed -n 's/^UNIHELM_PUBKEY="${UNIHELM_PUBKEY:-\(.*\)}"$/\1/p' installer/install.sh)"
+case "$installer_key" in
+  PLACEHOLDER-* | "")
+    fail "installer/install.sh still carries the placeholder signing key, so a
+  piped install can verify nothing; commit the public half of the release key" ;;
+  RW*)
+    if [ "$installer_key" = "$(sed -n 2p minisign.pub)" ]; then
+      ok "the installer's signing key is the one in minisign.pub"
+    else
+      fail "installer/install.sh and minisign.pub disagree about the signing key:
+  install.sh has $installer_key, minisign.pub has $(sed -n 2p minisign.pub)" ;
+    fi ;;
+  *)
+    fail "the installer's signing key is not a minisign public key: $installer_key" ;;
+esac
+
+# ... and the refusal it replaced must still exist, for a fork that points this
+# at its own releases without setting a key.
+if grep -qE 'PLACEHOLDER-\* \| ""' installer/install.sh; then
+  ok "a placeholder or empty key is still refused outright"
 else
-  fail "the placeholder appears $placeholder_hits times; a release-time substitution would rewrite the check along with the key"
+  fail "nothing refuses a placeholder or empty signing key any more"
 fi
 
 if grep -qE -- '--(skip|no|without)-(verify|verification|signature|checksum|minisign)' installer/install.sh; then
@@ -460,6 +495,115 @@ if ( . installer/install.sh; parse_args; [ -z "${SOURCE_DIR:-}" ] && [ "${FROM_S
   ok "with no arguments the installer takes the release path"
 else
   fail "the default is no longer the release path"
+fi
+
+# --- 9. the install line the README advertises ------------------------------
+# `curl … | sudo bash` hands bash a stream, not a file, so BASH_SOURCE is empty
+# and there is no directory beside the script holding preflight.sh, the units or
+# config.toml.example. The script used to die under `set -u` computing `$here`,
+# with the operator seeing "BASH_SOURCE[0]: unbound variable" from the flagship
+# install command.
+#
+# The obvious repair is worse than the bug: writing `${BASH_SOURCE[0]:-}` and
+# leaving the dispatch alone makes a piped run compare "" against "bash",
+# conclude it was sourced, and exit 0 having installed nothing at all. So both
+# halves are asserted here — it must run, and it must run the right thing. None
+# of these reach the network.
+piped_help="$(cat installer/install.sh | bash -s -- --help 2>&1 || true)"
+if printf '%s' "$piped_help" | grep -q 'Usage: install.sh'; then
+  ok "piped into bash, the installer reaches its own argument parsing"
+else
+  fail "piped into bash the installer never got started: ${piped_help:-<nothing at all>}"
+fi
+if printf '%s' "$piped_help" | grep -qE 'unbound variable|null directory'; then
+  fail "the piped installer still dies on BASH_SOURCE: $piped_help"
+else
+  ok "piped into bash, nothing dies on BASH_SOURCE"
+fi
+
+# The piped path must reach the network only through the verified download. A
+# mutation that replaced `download_and_verify_release` in the bootstrap with
+# plain fetches of the same files from raw.githubusercontent.com passed every
+# other check in this file: the install still worked, and nothing it ran had a
+# signature. So the shape of the bootstrap is asserted directly.
+bootstrap_body="$(awk '/^bootstrap_from_release\(\)/,/^}/' installer/install.sh)"
+if printf '%s' "$bootstrap_body" | grep -q 'download_and_verify_release'; then
+  ok "the piped bootstrap goes through the verified download"
+else
+  fail "bootstrap_from_release never calls download_and_verify_release — a piped
+  install would run code whose signature was never checked"
+fi
+
+# ... and it must fetch nothing else. Every other retrieval in that function is
+# a way to obtain an unsigned file.
+# Command position only, and outside quotes. The function's own error messages
+# quote the advertised `curl ... | sudo bash` line back at the operator inside a
+# multi-line `die "..."`, so matching a line at a time reads documentation as
+# behaviour. Blank out anything inside a double-quoted string first.
+bootstrap_fetches="$(printf '%s' "$bootstrap_body" | awk '
+  {
+    line = $0; out = ""; i = 1
+    while (i <= length(line)) {
+      c = substr(line, i, 1)
+      if (c == "\\") { i += 2; continue }
+      if (c == "\"") { inq = !inq; i++; continue }
+      if (!inq) out = out c
+      i++
+    }
+    print out
+  }' | grep -nE "^[[:space:]]*(curl|wget|fetch_to|fetch_stdout)([[:space:]]|$)" || true)"
+if [ -n "$bootstrap_fetches" ]; then
+  fail "bootstrap_from_release fetches something outside the verified tarball:
+  $bootstrap_fetches"
+else
+  ok "the piped bootstrap fetches nothing but the release it verifies"
+fi
+
+# The hand-over must run the installer out of the extraction directory, not a
+# path that could name anything else on the machine.
+if printf '%s' "$bootstrap_body" | grep -q '"\$root/install.sh"'; then
+  ok "the hand-over runs the installer found inside the verified tarball"
+else
+  fail "the hand-over does not run \$root/install.sh; what does it run?"
+fi
+
+# A candidate root must be a real directory. `-d` follows symlinks, so an
+# archive member that is a link would point the hand-over at bytes that were
+# never in the signed tarball.
+if grep -q 'real_dir "\$candidate"' installer/install.sh &&
+   grep -qE '^real_dir\(\).*\{|\[ ! -L' installer/install.sh; then
+  ok "extraction roots are rejected when they are symlinks"
+else
+  fail "locate_binaries/locate_installer_root accept a symlinked candidate:
+  a signed tarball carrying a link could redirect what gets run and installed"
+fi
+
+# Silence is the failure mode worth naming: a piped run that neither installs
+# nor explains itself looks like success to every caller.
+piped_bare="$(cat installer/install.sh | bash 2>&1 || true)"
+if [ -n "$piped_bare" ]; then
+  ok "a piped run with no arguments says something"
+else
+  fail "a piped run with no arguments printed nothing — it decided it was sourced and gave up"
+fi
+
+# --from-source needs a source tree and --from needs a directory; a pipe has
+# neither. Both must refuse in words, and must do it before any request.
+piped_src="$(cat installer/install.sh | bash -s -- --from-source 2>&1 || true)"
+if printf '%s' "$piped_src" | grep -q 'git clone'; then
+  ok "piped --from-source refuses with the clone command that would work"
+else
+  fail "piped --from-source did not explain itself: ${piped_src:-<nothing>}"
+fi
+
+# The bootstrap hands over to the installer inside the verified tarball. If that
+# child ever came back round to the bootstrap it would fork-bomb the machine,
+# so the guard that makes that one error line is worth an assertion of its own.
+piped_loop="$(cat installer/install.sh | UNIHELM_BOOTSTRAPPED=1 bash 2>&1 || true)"
+if printf '%s' "$piped_loop" | grep -q 'refusing to loop'; then
+  ok "the bootstrap refuses to re-enter itself"
+else
+  fail "a re-entered bootstrap was not refused: ${piped_loop:-<nothing>}"
 fi
 
 echo

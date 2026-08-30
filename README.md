@@ -139,11 +139,14 @@ below are real measurements, with where they were taken.
 curl -fsSL https://raw.githubusercontent.com/farzam-seyedhashem/unihelm/main/installer/install.sh | sudo bash
 ```
 
-The installer downloads the latest release's tarball for your architecture,
-verifies its minisign signature against the key committed to this repository,
-and refuses to install anything it cannot verify. To read it before running it —
-which you should, for any script piped to a shell — it is
-[`installer/install.sh`](installer/install.sh).
+That script is a bootstrap and nothing else: it downloads the latest release's
+tarball for your architecture, checks its minisign signature against the key
+committed here, and refuses to go on if it cannot. Everything that then runs and
+gets installed comes out of that verified tarball — including the installer
+itself, which is why reading
+[`installer/install.sh`](installer/install.sh) shows you what fetches the release
+rather than what the release does. The installer inside the tarball is the same
+file at the tag you install.
 
 Pin a version with `UNIHELM_VERSION=v0.1.0`, or point the installer at a fork
 with `UNIHELM_REPO=owner/name`.

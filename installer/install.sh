@@ -74,7 +74,7 @@ UNIHELM_REPO="${UNIHELM_REPO:-farzam-seyedhashem/unihelm}"
 # anything at all. Setting UNIHELM_PUBKEY in the environment points this
 # installer at a fork's own key; note what that cannot do — there is no value
 # of it, including the empty string, that skips verification.
-UNIHELM_PUBKEY="${UNIHELM_PUBKEY:-PLACEHOLDER-REPLACE-AT-RELEASE}"
+UNIHELM_PUBKEY="${UNIHELM_PUBKEY:-RWSj0olr2XQ6OU9F7XmaNUTsVQMelXpx6b4mK/NZ22cxRB75xdu/RGQs}"
 
 readonly BIN_DIR=/usr/local/unihelm/bin
 readonly CONFIG_DIR=/etc/unihelm
@@ -94,7 +94,25 @@ RELEASE_VERSION="${UNIHELM_VERSION:-}"
 STAGED_BIN_DIR=""
 WORKDIR=""
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where this script is, and whether it is anywhere at all.
+#
+# preflight.sh, config.toml.example and the two systemd units are read relative
+# to this file, so `here` has to exist before any of them can be. Run from a
+# clone or from an unpacked release tarball it is this script's own directory.
+# Piped into bash — `curl … | sudo bash`, the line the README advertises — there
+# is no file on disk at all: BASH_SOURCE is empty, none of those companion files
+# came with us, and no ordering trick conjures them. That is a mode, not an
+# error; `bootstrap_from_release` at the bottom of this file is what it means.
+#
+# The `:-` is load-bearing: without it `set -u` kills the script on this line,
+# which is exactly the bug this handles.
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  piped=0
+else
+  here=""
+  piped=1
+fi
 
 # --- output helpers --------------------------------------------------------
 step() { printf '\033[1m==>\033[0m %s\n' "$*"; }
@@ -222,11 +240,15 @@ resolve_version() {
   return 0
 }
 
-# Release artefacts are named unihelm-<version>-<arch>-linux.tar.gz, with the
-# leading `v` of the tag dropped. packaging/README.md is the other half of this
-# contract; changing one without the other breaks every install.
+# Release artefacts are named unihelm-<version>-<arch>.tar.gz, with the leading
+# `v` of the tag dropped, and each one unpacks to a directory of the same name.
+# .github/workflows/release.yml is the other half of this contract — it is what
+# actually publishes the assets — and packaging/README.md documents it; changing
+# one without the others breaks every install. This said `-linux` until the
+# piped install was fixed, which nothing had noticed because no release had been
+# cut yet: every download would have 404ed.
 release_tarball_name() {
-  printf 'unihelm-%s-%s-linux.tar.gz\n' "${RELEASE_VERSION#v}" "$(release_arch)"
+  printf 'unihelm-%s-%s.tar.gz\n' "${RELEASE_VERSION#v}" "$(release_arch)"
 }
 
 release_base_url() {
@@ -283,7 +305,26 @@ ensure_minisign() {
   fi
 
   step "Installing minisign to verify the download"
-  case "${UNIHELM_FAMILY:-}" in
+
+  # Normally preflight has already named the family. In the piped bootstrap it
+  # has not, and cannot: preflight.sh travels inside the tarball minisign is
+  # here to verify. The only question this function actually asks is which
+  # package manager exists, and that one is answerable without preflight.
+  #
+  # Note what the fallback cannot do. It cannot create a path that continues
+  # without minisign — the check at the end of this function is the same check
+  # it always was, and on a box with neither apt-get nor dnf `family` stays
+  # empty and we still refuse.
+  local family="${UNIHELM_FAMILY:-}"
+  if [ -z "$family" ]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      family=debian
+    elif command -v dnf >/dev/null 2>&1; then
+      family=rhel
+    fi
+  fi
+
+  case "$family" in
     debian)
       DEBIAN_FRONTEND=noninteractive apt-get update -qq ||
         warn "apt-get update failed; trying the install anyway"
@@ -373,10 +414,18 @@ unpack_release() { # tarball dest
 
 # We never install "whatever was in the archive": we look for the three names
 # we expect, at the top level or one directory down, and copy only those.
+# A candidate must be a real directory inside the extraction root, not a symlink
+# to one. `-d` follows links: an archive member that is a symlink would let a
+# tarball point the installer at bytes that were never in the archive and never
+# signed, while the run says everything came from a verified tarball.
+real_dir() { # path -> true when it is a directory and not a symlink
+  [ -d "$1" ] && [ ! -L "$1" ]
+}
+
 locate_binaries() { # unpacked-dir -> prints the directory holding all three
   local root="$1" candidate binary complete
   for candidate in "$root" "$root"/*/ "$root"/*/bin; do
-    [ -d "$candidate" ] || continue
+    real_dir "$candidate" || continue
     complete=1
     for binary in "${BINARIES[@]}"; do
       [ -f "$candidate/$binary" ] || complete=0
@@ -426,9 +475,116 @@ download_and_verify_release() { # workdir; sets STAGED_BIN_DIR
   return 0
 }
 
+# --- the piped install -----------------------------------------------------
+# `curl -fsSL …/install.sh | sudo bash` delivers one file and nothing else: no
+# preflight.sh, no config.toml.example, no systemd units — the four files this
+# installer reads from its own directory. Fetching those loose from the raw
+# content host would put four unsigned files on somebody's server, which is the
+# one thing the release path exists to prevent.
+#
+# The release tarball already holds every one of them, beside the binaries and
+# beside a copy of this same script (see .github/workflows/release.yml). So a
+# piped run has exactly one job: verify that tarball with the code above —
+# minisign signature first, then the checksum that signature vouches for — and
+# hand the install over to the install.sh that came out of it. From that point
+# on every byte executed or installed is covered by the release signature, which
+# is strictly more than the file-executed path can say about its own companions.
+#
+# The companion half of locate_binaries, and for the same reason: take the files
+# we expect from where we expect them, never "whatever was in the archive". A
+# directory only counts as an installer if it has all four things install.sh
+# reads by relative path, so a tarball missing one says so here rather than
+# three functions later as `install: cannot stat`.
+locate_installer_root() { # unpacked-dir -> prints the directory holding install.sh
+  local root="$1" candidate file complete
+  for candidate in "$root" "$root"/*/; do
+    real_dir "$candidate" || continue
+    complete=1
+    for file in install.sh preflight.sh config.toml.example \
+      systemd/unihelm-agentd.service systemd/unihelm-web.service; do
+      [ -f "$candidate/$file" ] || complete=0
+    done
+    if [ "$complete" -eq 1 ]; then
+      ( cd "$candidate" && pwd )
+      return 0
+    fi
+  done
+  return 1
+}
+
+bootstrap_from_release() {
+  local root
+
+  # Belt and braces. The real guarantee is structural — the installer we hand
+  # over to is run from a file, so it has a BASH_SOURCE and takes the executed
+  # branch, and it is given --from so it never downloads anything. This turns
+  # any future mistake into one error line instead of a fork bomb.
+  [ -z "${UNIHELM_BOOTSTRAPPED:-}" ] ||
+    die "the installer re-entered its own bootstrap; refusing to loop"
+
+  # Before a byte is fetched: --help must print, an unknown option must stop,
+  # and --version must be honoured, since it decides which tarball we download.
+  parse_args "$@"
+
+  # An argument error is an argument error whoever you are, so this comes before
+  # the root check.
+  if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$SOURCE_DIR" ]; then
+    die "--from and --from-source install from files on this machine, and a piped
+    install has none: this script arrived on stdin with no directory of its own.
+    Clone the repository and run the installer out of it:
+      git clone https://github.com/$UNIHELM_REPO
+      sudo unihelm/installer/install.sh --from-source"
+  fi
+
+  # preflight's own root check is inside the tarball we have not got yet, and
+  # what follows writes to /tmp as root and may install a package.
+  [ "$(id -u)" -eq 0 ] ||
+    die "this installs system services and must run as root:
+    curl -fsSL https://raw.githubusercontent.com/$UNIHELM_REPO/main/installer/install.sh | sudo bash"
+
+  trap cleanup EXIT
+  WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/unihelm-install.XXXXXX")"
+
+  # Dies unless the signature and the checksum both verify. Nothing below this
+  # line runs otherwise, which is the whole point of putting it above the
+  # hand-over.
+  download_and_verify_release "$WORKDIR"
+
+  root="$(locate_installer_root "$WORKDIR/unpacked")" ||
+    die "the verified $RELEASE_VERSION tarball carries no installer — no install.sh,
+    preflight.sh, config.toml.example and systemd units together in one place.
+    Download it from $(release_base_url), unpack it, and run ./install.sh --from ./bin,
+    or pin a release that has one with UNIHELM_VERSION."
+
+  step "Handing over to the installer from the verified release"
+  info "everything from here comes out of a tarball whose signature verified"
+
+  # A child rather than `exec`: the EXIT trap above is what removes $WORKDIR,
+  # and exec would drop it and leave a 0700 directory holding a tarball in /tmp.
+  # `set -e` still propagates a failing install.
+  #
+  # </dev/null because bash reads a piped script as it runs it — without the
+  # redirect the child would inherit the unread tail of this very script as its
+  # standard input. Nothing on the install path reads stdin (`user create-admin`
+  # only does under --password-stdin, which the installer never passes), so
+  # /dev/null costs nothing.
+  #
+  # `bash "$root/install.sh"`, not `"$root/install.sh"`: /tmp is mounted noexec
+  # on plenty of hardened servers, and this way that fails nothing and tempts
+  # nobody into a chmod workaround.
+  UNIHELM_BOOTSTRAPPED=1 "${BASH:-bash}" "$root/install.sh" \
+    --from "$STAGED_BIN_DIR" "$@" </dev/null
+  return 0
+}
+
 # --- source build ----------------------------------------------------------
 build_from_source() {
   local root
+  # Unreachable from a pipe — the bootstrap refuses --from-source before it gets
+  # here — but an empty `here` would make this `cd /..`, and silently building
+  # the root directory is not a failure mode worth leaving open.
+  [ -n "$here" ] ||
+    die "--from-source needs the Unihelm source tree, and this script has no directory of its own"
   root="$(cd "$here/.." && pwd)"
   [ -f "$root/Cargo.toml" ] ||
     die "--from-source needs the Unihelm source tree, and $root has no Cargo.toml"
@@ -633,13 +789,34 @@ main() {
   print_summary
 }
 
-# shellcheck source-path=SCRIPTDIR
-# shellcheck source=installer/preflight.sh
-. "$here/preflight.sh"
+if [ "$piped" -eq 0 ]; then
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=installer/preflight.sh
+  . "$here/preflight.sh"
+fi
 
-# Run only when executed. Sourcing gives you the functions and no side effects,
-# which is how the CI gate drives the verification path without installing
-# anything.
-if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+# --- how this file was started ---------------------------------------------
+# Three ways, and they have to be told apart, because two facts distinguish them
+# and the old test here only looked at one:
+#
+#   executed  ./install.sh, bash install.sh   BASH_SOURCE[0] is set and is $0
+#   piped     curl … | sudo bash              BASH_SOURCE is empty, $0 is "bash"
+#   sourced   . installer/install.sh          BASH_SOURCE[0] is set, $0 is not it
+#
+# "Empty" is the piped signal, and it is captured at the top of the file where
+# it has to be captured anyway to keep `set -u` from killing us. Testing it
+# *first* is what matters: the obvious repair — writing `${BASH_SOURCE[0]:-}`
+# and leaving the comparison alone — collapses piped into sourced, so the
+# advertised install line would exit 0 having done absolutely nothing. Silence
+# is a worse failure than the crash it replaces.
+#
+# The piped branch never falls through to main: it verifies a release and runs
+# the installer out of it, in a child process that is executed from a file and
+# therefore takes the first branch.
+if [ "$piped" -eq 1 ]; then
+  bootstrap_from_release "$@"
+elif [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  # Executed. Sourcing gives you the functions and no side effects, which is how
+  # the CI gate drives the verification path without installing anything.
   main "$@"
 fi
