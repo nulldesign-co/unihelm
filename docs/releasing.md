@@ -147,8 +147,9 @@ Check before you do:
 - both tarballs are attached, plus `SHA256SUMS`, `SHA256SUMS.minisig`, and a
   `.minisig` per tarball,
 - the public key quoted in the notes is the one you expect,
-- the glibc floor in the notes is one your supported distributions meet
-  (see the caveat below).
+- the glibc floor in the notes reads 2.34 — the build asserts this rather than
+  leaving it to your eye (see below), so a number above it means the release
+  never got here.
 
 ### Re-running a release
 
@@ -231,27 +232,46 @@ otherwise is worse than admitting it.
 
 ---
 
-## Known gap: the glibc floor
+## The glibc floor
 
-The build runs on `ubuntu-24.04`, which links against glibc 2.39. Spec §7.1 also
-promises Debian 12 (glibc 2.36) and AlmaLinux 9 (glibc 2.34), and a binary built
-against a newer glibc does not run on an older one — it dies at startup with
-`version 'GLIBC_2.38' not found`.
+A binary linked against glibc runs only where glibc is at least as new as the
+one it was built against. Get this wrong and there is no graceful degradation:
+the dynamic linker resolves versioned symbols before `main()` runs, so the
+binary dies at startup with `version 'GLIBC_2.38' not found`.
 
-The workflow does not hide this: each build job computes the highest `GLIBC_`
-symbol version its binaries need and puts it in the release notes, so the
-requirement is stated rather than discovered. But until the build moves, the
-tarballs are for glibc ≥ 2.39 distributions.
+v0.1.0 got it wrong. It was built on `ubuntu-24.04` (glibc 2.39) while spec §7.1
+promises AlmaLinux 9 (2.34) and Debian 12 (2.36). The workflow recorded the real
+floor in the release notes and shipped anyway, on the reasoning that a stated
+requirement beats a surprise. It did not — operators met it as a crash on the
+first `systemctl start`, after a download, a signature check and an install that
+had all worked perfectly.
 
-Two ways to close it, when someone picks it up:
+Both halves of that are now fixed in `.github/workflows/release.yml`:
 
-- **Build in an older container** — run the cargo step inside `almalinux:9`
-  (or `debian:12`), which is the oldest glibc in the support matrix. Keeps
-  dynamic linking, needs a container step per architecture.
-- **Build `*-unknown-linux-musl`** — statically linked, runs on anything.
-  Costs binary size and swaps in musl's allocator, so re-measure against the
-  25 MB budget and the RSS budget (spec §3) before committing to it.
+- **The `build` job runs inside an `almalinux:9` container** — the oldest glibc
+  in the support matrix, and the same image `ci.yml`'s install matrix already
+  builds in. The tag is a multi-architecture index, so one line covers x86_64 on
+  `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`: both native, no qemu and no
+  cross toolchain. Linking stays dynamic glibc, so binary sizes and the RSS
+  budget (spec §3) remain comparable with every earlier measurement.
+- **The floor is asserted, not recorded.** The step reads the highest `GLIBC_`
+  symbol back out of the ELF that is about to be signed and fails the job if it
+  exceeds `MAX_GLIBC` (2.34), naming the distribution that would break. It also
+  rejects any `NEEDED` shared library outside a base install, since a correct
+  glibc floor means nothing if a build script quietly added `libstdc++` or a
+  system OpenSSL. Because the job builds in the container, the existing
+  "tarball unpacks and its binaries report the release version" step is now the
+  end-to-end proof: the packaged binaries execute on glibc 2.34 before anything
+  is signed.
 
-Until then, `installer/preflight.sh` reports the OS but does not check glibc, and
-building from source (`cargo build --release`) is the supported path on the older
-distributions.
+`MAX_GLIBC` is the promise in spec §7.1, in one place. If a future dependency
+pushes the floor above it, the release fails — that is the point. The fix is to
+build older, or to drop the distribution from §7.1 and raise `MAX_GLIBC` in the
+same commit. It is not to raise the number to whatever turns the build green.
+
+`tests/gates/release.sh` pins all of this (§3b), so the container and the
+assertion cannot be removed together and leave the gate passing — which is
+exactly how the original gap survived.
+
+`installer/preflight.sh` still reports the OS without checking glibc, and now
+correctly does not need to.

@@ -147,6 +147,28 @@ jobs:
     name: ${{ matrix.arch }} (${{ matrix.target }})
     needs: [version, ui]
     runs-on: ${{ matrix.runner }}
+    # Compiled inside the OLDEST glibc this project promises, not the newest the
+    # runner happens to carry. A glibc-linked binary runs only where glibc is at
+    # least as new as the builder's, so building on the runner's own userland
+    # (ubuntu-24.04, glibc 2.39) shipped v0.1.0 tarballs that installed
+    # perfectly — download, signature check, account, binaries, config — and
+    # then died on the first `systemctl start` with
+    # "version `GLIBC_2.38' not found". almalinux:9 is the floor of the support
+    # matrix (spec §7.1, glibc 2.34); Debian 12 (2.36) and everything newer are
+    # covered by the same build.
+    #
+    # The tag is a multi-architecture index, so this one line gives an x86_64
+    # container on ubuntu-24.04 and an aarch64 one on ubuntu-24.04-arm: native
+    # on both, no qemu and no cross toolchain. Pin it by *index* digest
+    # (almalinux:9@sha256:...) if you want byte-reproducible rebuilds; a
+    # per-architecture manifest digest would resolve on one runner and fail on
+    # the other.
+    #
+    # This is the same image ci.yml's install matrix already builds this
+    # workspace in, so the release now compiles where the project claims to run
+    # instead of where the runner happens to be.
+    container:
+      image: almalinux:9
     strategy:
       fail-fast: false
       matrix:
@@ -168,9 +190,16 @@ jobs:
           #     CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           # Everything downstream (`--target`, the budget check, packaging) is
           # already written against `matrix.target`, so nothing else moves.
-          # The catch worth knowing before you switch: Ubuntu's cross gcc links
-          # against the *host* runner's glibc headers for the target, so the
-          # glibc floor recorded below can shift between native and cross builds.
+          #
+          # The catch worth knowing before you switch: a cross toolchain links
+          # against its own target sysroot, so Ubuntu's `gcc-aarch64-linux-gnu`
+          # would put the glibc floor straight back where the container above
+          # was introduced to move it from — and the floor assertion below would
+          # (correctly) fail the release rather than let it ship. Under the
+          # container the cheaper fallback is to keep this image and run its
+          # aarch64 variant on the x86_64 runner through
+          # docker/setup-qemu-action: slow under fat LTO, but the floor stays
+          # 2.34.
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
@@ -178,6 +207,36 @@ jobs:
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     steps:
+      # Runs before checkout on purpose: actions/checkout only *clones* when git
+      # is present and otherwise falls back to a source tarball with no .git,
+      # and the packaging step below reads the commit date out of git for the
+      # tarball's pinned mtimes.
+      #
+      # --allowerasing: the AlmaLinux images ship `curl-minimal`, which conflicts
+      # with `curl`, and dnf refuses the swap without being told it may remove
+      # the incumbent. Without it the job dies at "cannot install the best
+      # candidate for the job" before compiling anything — the same wall
+      # ci.yml's install matrix documents hitting on this exact image.
+      #
+      # gcc/gcc-c++/make build the vendored C in the tree (aws-lc-sys, ring,
+      # libsqlite3-sys, zstd-sys); binutils carries the objdump the floor
+      # assertion runs and gawk the awk it parses with; tar/gzip build the
+      # release tarball and back actions/cache, and zstd lets actions/cache take
+      # its fast path. Named explicitly rather than assumed from the base image,
+      # since what a distribution considers "already there" is not a promise.
+      - name: Toolchain the build needs inside the container
+        run: |
+          set -euo pipefail
+          dnf install -y --allowerasing --setopt=install_weak_deps=False \
+            curl ca-certificates git gcc gcc-c++ make binutils gawk \
+            tar gzip zstd findutils
+          echo "container: $(cat /etc/almalinux-release), $(ldd --version | head -1)"
+          # Container jobs run as root against a workspace git did not create,
+          # which is the shape git refuses as "dubious ownership". checkout sets
+          # this itself, but the packaging step's `git log` is load-bearing
+          # enough to not depend on that.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
@@ -186,9 +245,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Keyed apart from any cache written outside this container: the same
+      # target triple compiled against a different libc must never restore into
+      # this build.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-el9-${{ matrix.target }}
 
       # Overwrites the placeholder crates/unihelm-web/ui-dist/index.html that is
       # checked in only so rust-embed always has a folder to read.
@@ -226,17 +288,69 @@ jobs:
         run: bash tests/gates/budgets.sh binaries
 
       # A glibc-linked binary runs on a distribution only if that distribution's
-      # glibc is at least as new as the builder's. ubuntu-24.04 ships 2.39, while
-      # spec §7.1 also promises AlmaLinux 9 (2.34) and Debian 12 (2.36). This
-      # step does not fail the build — it records the real floor so the release
-      # notes state it instead of leaving operators to discover it as a
-      # "version `GLIBC_2.38' not found" crash on first start.
-      - name: Record the glibc floor these binaries need
+      # glibc is at least as new as the one it was linked against. The container
+      # this job builds in is chosen so that floor lands on 2.34; this step is
+      # what makes that a checked fact rather than an intention, by reading the
+      # floor back out of the ELF that is about to be signed.
+      #
+      # It used to only *record* the floor, on the reasoning that a stated
+      # requirement beats a surprise. It did not: v0.1.0 was built on the
+      # runner's glibc 2.39, the note said so, and operators still met it as
+      # "version `GLIBC_2.38' not found" on the first `systemctl start` after an
+      # install that had otherwise gone perfectly. So the number is now a gate.
+      # A release whose binaries cannot start on the oldest distribution the
+      # project promises fails here, before anything is signed.
+      #
+      # MAX_GLIBC is AlmaLinux 9 (spec §7.1). Debian 12's 2.36 and Ubuntu
+      # 24.04's 2.39 are newer, so one number covers the whole matrix. Raising
+      # it is not a fix for a red build — it is dropping a distribution from
+      # spec §7.1, and belongs in the same commit as that decision.
+      - name: The glibc floor is no newer than the oldest distro we support
+        env:
+          # The oldest glibc in the support matrix, and the only place the
+          # number lives.
+          MAX_GLIBC: "2.34"
+          OLDEST_DISTRO: "AlmaLinux 9"
         run: |
           set -euo pipefail
           bindir="target/${{ matrix.target }}/release"
+          # `|| true` so the guard below is reachable: grep exits 1 when it
+          # matches nothing, pipefail propagates that, and a failing command
+          # substitution in an assignment trips `set -e` on this very line,
+          # killing the step before it can say which files it actually read.
           floor=$(objdump -T "$bindir"/unihelm-agentd "$bindir"/unihelm-web "$bindir"/unihelm |
-            grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V -u | tail -1)
+            grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V -u | tail -1 || true)
+          # An empty floor would compare as "older than anything" and pass, so a
+          # bad path or a stripped-away .gnu.version_r must be its own failure.
+          [ -n "$floor" ] ||
+            { echo "::error::found no versioned glibc symbols in $bindir — objdump read the wrong files" >&2; exit 1; }
+
+          # `sort -V` and not a string compare: 2.9 is older than 2.34, and
+          # lexically it is not.
+          if [ "$(printf '%s\n%s\n' "$floor" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "::error::these ${{ matrix.arch }} binaries need glibc ${floor}, but ${OLDEST_DISTRO} (glibc ${MAX_GLIBC}) is in the support matrix (spec §7.1) and ships ${MAX_GLIBC} — it would fail to start there with \"version \`GLIBC_${floor}' not found\". Build in an older container, or drop ${OLDEST_DISTRO} from spec §7.1 and raise MAX_GLIBC in the same commit. Find the culprit with: objdump -T $bindir/unihelm-agentd | grep GLIBC_${floor}" >&2
+            exit 1
+          fi
+
+          # The glibc version is only half of it. A build that quietly picked up
+          # some other shared library — libstdc++ from a C++ build script, a
+          # system OpenSSL — starts fine here and still fails on a server that
+          # does not have the package.
+          # `bad=$(...)` rather than a `while read` loop, because the loop would
+          # run in a pipeline subshell where `exit 1` ends the subshell and not
+          # the step.
+          for binary in unihelm-agentd unihelm-web unihelm; do
+            bad=$(objdump -p "$bindir/$binary" | awk '$1 == "NEEDED" {print $2}' |
+              grep -Ev '^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|ld-linux-.*\.so\..*)$' || true)
+            if [ -n "$bad" ]; then
+              echo "::error::$binary links $(echo "$bad" | tr '\n' ' ')— not part of a base install, so the tarball would need a package the operator does not have" >&2
+              exit 1
+            fi
+          done
+
+          # Same filename and format as before: the packaging step copies this
+          # into dist/ and the `release` job globs dist/glibc-*.txt into the
+          # notes' Requirements section.
           echo "${{ matrix.arch }}: glibc >= ${floor}" | tee "$RUNNER_TEMP/glibc-${{ matrix.arch }}.txt"
           echo "- \`${{ matrix.arch }}\` requires glibc >= ${floor}" >>"$GITHUB_STEP_SUMMARY"
 
@@ -317,9 +431,14 @@ jobs:
           ls -l "$RUNNER_TEMP/dist"
 
       # Sanity: the thing we are about to sign actually unpacks, contains what
-      # install.sh reaches for, and runs on this architecture. `--version` also
-      # settles the question the Cargo.toml check could only ask indirectly — the
-      # binaries report the version on the tin, not one the tag disagrees with.
+      # install.sh reaches for, and runs on this architecture. Since the job
+      # builds inside almalinux:9, that last part is now the end-to-end proof of
+      # the floor above: these are the packaged binaries, executing on the
+      # oldest glibc spec §7.1 promises, before anything is signed. `--version`
+      # is a sufficient probe for that, because the failure it guards against
+      # happens at load time, before main() runs at all. And it settles the
+      # question the Cargo.toml check could only ask indirectly — the binaries
+      # report the version on the tin, not one the tag disagrees with.
       - name: The tarball unpacks and its binaries report the release version
         env:
           VERSION: ${{ needs.version.outputs.version }}

@@ -16,8 +16,10 @@ Still to come here:
   compile on a customer's server.
 
 `installer/install.sh --from ./target/release` still installs from a local
-build, which is what you want on a distribution older than the one the release
-tarballs are linked against (see the glibc note in `docs/releasing.md`).
+build, which is what you want when testing a change before it is tagged. It is
+no longer needed to work around the glibc floor: the release tarballs are built
+inside `almalinux:9`, the oldest glibc in the support matrix, and the build
+asserts it (see the glibc section in `docs/releasing.md`).
 
 ## The release contract
 

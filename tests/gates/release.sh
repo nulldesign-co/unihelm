@@ -101,6 +101,24 @@ has "aarch64 runner" '^ *runner: ubuntu-24\.04-arm$'
 # to live in a comment — it is instructions for a human, not a step.
 prose "cross-compilation fallback documented" 'gcc-aarch64-linux-gnu'
 
+# --- 3b. the glibc floor ----------------------------------------------------
+# The bug this section exists for: v0.1.0 was built on the runner's own
+# ubuntu-24.04 userland (glibc 2.39) and every AlmaLinux 9 install died on
+# `systemctl start` with "version `GLIBC_2.38' not found" — after a download,
+# a signature check and an install that had all worked. A glibc-linked binary
+# runs only where glibc is at least as new as the builder's.
+#
+# Two halves, and the gate wants both, because either alone silently stops
+# working: the build happens inside the oldest distribution in the support
+# matrix, and the produced binaries are *checked* against that promise rather
+# than merely annotated with it. Recording the floor was the old behaviour and
+# is exactly what let the release ship.
+has "built on the oldest supported glibc"  '^ *image: almalinux:9$'
+has "the floor is the oldest supported distro" '^ *MAX_GLIBC: "2\.34"$'
+# Declaring the number is not checking it. This pins the comparison itself, so
+# the limit cannot decay back into a note printed next to a passing build.
+has "the floor is asserted, not just recorded" '\$MAX_GLIBC.*sort -V'
+
 # --- 4. the size budget, before anything is signed --------------------------
 # Reused from tests/gates/budgets.sh so the 25 MB number lives in one place.
 has "binary size budget checked" 'run: bash tests/gates/budgets\.sh binaries$'
