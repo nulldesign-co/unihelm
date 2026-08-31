@@ -19,9 +19,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { Table, Td, Th } from "@/components/ui/table";
 import { ApiError } from "@/lib/api";
 import {
   confirmsName,
@@ -65,29 +70,30 @@ export function DatabasesPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("databases.title")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("databases.subtitle")}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => setCreatingUser(true)}>
-            <UserPlus className="h-4 w-4" aria-hidden />
-            {t("databases.newUser")}
-          </Button>
-          <Button variant="primary" onClick={() => setCreatingDb(true)}>
-            <Plus className="h-4 w-4" aria-hidden />
-            {t("databases.newDatabase")}
-          </Button>
-        </div>
-      </header>
+      <PageHeader
+        title={t("databases.title")}
+        description={t("databases.subtitle")}
+        actions={
+          <>
+            <Button variant="outline" onClick={() => setCreatingUser(true)}>
+              <UserPlus className="h-4 w-4" aria-hidden />
+              {t("databases.newUser")}
+            </Button>
+            <Button variant="primary" onClick={() => setCreatingDb(true)}>
+              <Plus className="h-4 w-4" aria-hidden />
+              {t("databases.newDatabase")}
+            </Button>
+          </>
+        }
+      />
 
       {list.error ? <ErrorNote error={list.error} /> : null}
 
       {list.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <>
+          <ListSkeleton rows={3} />
+          <ListSkeleton rows={3} />
+        </>
       ) : (
         <>
           <DatabaseList
@@ -143,17 +149,6 @@ function EngineBadge({ engine }: { engine: DbEngine }) {
   );
 }
 
-function SubscriptionBadge({ id }: { id: number }) {
-  const { t } = useTranslation();
-  return (
-    <Badge tone="neutral">
-      <span>{t("databases.subscription")}</span>
-      {/* The number stays LTR even on a Farsi page. */}
-      <span dir="ltr">{id}</span>
-    </Badge>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Databases
 // ---------------------------------------------------------------------------
@@ -170,48 +165,99 @@ function DatabaseList({
   const { t } = useTranslation();
 
   return (
-    <Card>
-      <CardHeader
-        title={t("databases.databasesTitle")}
-        description={t("databases.databasesHint")}
-      />
-      <CardBody className="pt-0">
-        {databases.length === 0 ? (
-          <div className="py-10 text-center">
-            <Database className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("databases.noDatabases")}</p>
-            <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">
-              {t("databases.noDatabasesHint")}
-            </p>
-            <Button variant="primary" className="mt-4" onClick={onCreate}>
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-sm font-semibold text-ink">{t("databases.databasesTitle")}</h2>
+        <p className="mt-0.5 text-sm text-ink-muted">{t("databases.databasesHint")}</p>
+      </div>
+      {databases.length === 0 ? (
+        <EmptyState
+          icon={<Database aria-hidden />}
+          title={t("databases.noDatabases")}
+          hint={t("databases.noDatabasesHint")}
+          action={
+            <Button variant="primary" onClick={onCreate}>
               <Plus className="h-4 w-4" aria-hidden />
               {t("databases.newDatabase")}
             </Button>
-          </div>
-        ) : (
-          <ul className="divide-y divide-border">
+          }
+        />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>{t("databases.name")}</Th>
+              <Th>{t("databases.engineLabel")}</Th>
+              <Th>{t("databases.subscription")}</Th>
+              <Th className="w-px">
+                <span className="sr-only">{t("files.actions")}</span>
+              </Th>
+            </tr>
+          </thead>
+          <tbody>
             {databases.map((row) => (
-              <li key={row.id} className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
-                <EngineBadge engine={row.engine} />
-                <span dir="ltr" className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
-                  {row.name}
-                </span>
-                <SubscriptionBadge id={row.subscription_id} />
-                <GrantButton database={row} users={users} />
-                <DropDatabaseButton database={row} />
-              </li>
+              <tr key={row.id} className="transition-colors hover:bg-surface-muted/60">
+                <Td className="w-full font-mono text-xs">{row.name}</Td>
+                <Td className="whitespace-nowrap">
+                  <EngineBadge engine={row.engine} />
+                </Td>
+                <Td className="whitespace-nowrap tabular-nums">{row.subscription_id}</Td>
+                <Td className="py-2 text-end">
+                  <DatabaseRowActions database={row} users={users} />
+                </Td>
+              </tr>
             ))}
-          </ul>
-        )}
-      </CardBody>
-    </Card>
+          </tbody>
+        </Table>
+      )}
+    </section>
   );
 }
 
-function GrantButton({ database, users }: { database: DatabaseRow; users: DbUserRow[] }) {
+function DatabaseRowActions({ database, users }: { database: DatabaseRow; users: DbUserRow[] }) {
+  const { t } = useTranslation();
+  const [dialog, setDialog] = useState<"grant" | "drop" | null>(null);
+
+  return (
+    <>
+      <Menu label={t("files.actions")}>
+        <MenuItem icon={<Link2 />} onClick={() => setDialog("grant")}>
+          {t("databases.grant")}
+        </MenuItem>
+        <MenuSeparator />
+        <MenuItem danger icon={<Trash2 />} onClick={() => setDialog("drop")}>
+          {t("databases.drop")}
+        </MenuItem>
+      </Menu>
+
+      <GrantDialog
+        database={database}
+        users={users}
+        open={dialog === "grant"}
+        onClose={() => setDialog(null)}
+      />
+      <DropDatabaseDialog
+        database={database}
+        open={dialog === "drop"}
+        onClose={() => setDialog(null)}
+      />
+    </>
+  );
+}
+
+function GrantDialog({
+  database,
+  users,
+  open,
+  onClose,
+}: {
+  database: DatabaseRow;
+  users: DbUserRow[];
+  open: boolean;
+  onClose: () => void;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
   const [username, setUsername] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -223,7 +269,7 @@ function GrantButton({ database, users }: { database: DatabaseRow; users: DbUser
   const grant = useMutation({
     mutationFn: () => databasesApi.grant(database.name, username),
     onSuccess: () => {
-      setOpen(false);
+      onClose();
       setUsername("");
       void queryClient.invalidateQueries({ queryKey: ["databases"] });
     },
@@ -231,65 +277,64 @@ function GrantButton({ database, users }: { database: DatabaseRow; users: DbUser
   });
 
   return (
-    <>
-      <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
-        <Link2 className="h-3.5 w-3.5" aria-hidden />
-        {t("databases.grant")}
-      </Button>
-
-      <Dialog
-        open={open}
-        onClose={() => setOpen(false)}
-        title={t("databases.grantTitle", { name: database.name })}
-        description={t("databases.grantHint")}
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setOpen(false)}>
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="primary"
-              disabled={username === "" || grant.isPending}
-              onClick={() => {
-                setError(null);
-                grant.mutate();
-              }}
-            >
-              {grant.isPending ? <Spinner /> : null}
-              {t("databases.grant")}
-            </Button>
-          </>
-        }
-      >
-        {candidates.length === 0 ? (
-          <p className="text-sm text-ink-muted">{t("databases.grantNoUsers")}</p>
-        ) : (
-          <Field label={t("databases.user")} htmlFor="grant-user">
-            <Select
-              id="grant-user"
-              dir="ltr"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-            >
-              <option value="">{t("databases.choose")}</option>
-              {candidates.map((user) => (
-                <option key={user.id} value={user.username}>
-                  {user.username}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        )}
-        {error ? <ErrorNote error={error} /> : null}
-      </Dialog>
-    </>
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("databases.grantTitle", { name: database.name })}
+      description={t("databases.grantHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            variant="primary"
+            disabled={username === "" || grant.isPending}
+            onClick={() => {
+              setError(null);
+              grant.mutate();
+            }}
+          >
+            {grant.isPending ? <Spinner /> : null}
+            {t("databases.grant")}
+          </Button>
+        </>
+      }
+    >
+      {candidates.length === 0 ? (
+        <p className="text-sm text-ink-muted">{t("databases.grantNoUsers")}</p>
+      ) : (
+        <Field label={t("databases.user")} htmlFor="grant-user">
+          <Select
+            id="grant-user"
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+          >
+            <option value="">{t("databases.choose")}</option>
+            {candidates.map((user) => (
+              <option key={user.id} value={user.username}>
+                {user.username}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      )}
+      {error ? <ErrorNote error={error} /> : null}
+    </Dialog>
   );
 }
 
-function DropDatabaseButton({ database }: { database: DatabaseRow }) {
+function DropDatabaseDialog({
+  database,
+  open,
+  onClose,
+}: {
+  database: DatabaseRow;
+  open: boolean;
+  onClose: () => void;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
   const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -301,7 +346,7 @@ function DropDatabaseButton({ database }: { database: DatabaseRow }) {
     // check into a no-op.
     mutationFn: () => databasesApi.drop(database.id, typed.trim()),
     onSuccess: () => {
-      setOpen(false);
+      onClose();
       setTyped("");
       void queryClient.invalidateQueries({ queryKey: ["databases"] });
     },
@@ -309,57 +354,49 @@ function DropDatabaseButton({ database }: { database: DatabaseRow }) {
   });
 
   return (
-    <>
-      <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("databases.drop")}
-      </Button>
-
-      <Dialog
-        open={open}
-        onClose={() => setOpen(false)}
-        title={t("databases.dropTitle", { name: database.name })}
-        description={t("databases.dropHint")}
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setOpen(false)}>
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="danger"
-              disabled={!armed || drop.isPending}
-              onClick={() => {
-                setError(null);
-                drop.mutate();
-              }}
-            >
-              {drop.isPending ? <Spinner /> : null}
-              {t("databases.dropConfirm")}
-            </Button>
-          </>
-        }
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("databases.dropTitle", { name: database.name })}
+      description={t("databases.dropHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            variant="danger"
+            disabled={!armed || drop.isPending}
+            onClick={() => {
+              setError(null);
+              drop.mutate();
+            }}
+          >
+            {drop.isPending ? <Spinner /> : null}
+            {t("databases.dropConfirm")}
+          </Button>
+        </>
+      }
+    >
+      <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        {t("databases.dropWarning")}
+      </p>
+      <Field
+        label={t("databases.typeName")}
+        htmlFor={`drop-db-${database.id}`}
+        error={typed.length > 0 && !armed ? t("databases.typeNameMismatch") : undefined}
       >
-        <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {t("databases.dropWarning")}
-        </p>
-        <Field
-          label={t("databases.typeName")}
-          htmlFor={`drop-db-${database.id}`}
-          error={typed.length > 0 && !armed ? t("databases.typeNameMismatch") : undefined}
-        >
-          <Input
-            id={`drop-db-${database.id}`}
-            dir="ltr"
-            autoComplete="off"
-            autoFocus
-            placeholder={database.name}
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-          />
-        </Field>
-        {error ? <ErrorNote error={error} /> : null}
-      </Dialog>
-    </>
+        <Input
+          id={`drop-db-${database.id}`}
+          autoComplete="off"
+          autoFocus
+          placeholder={database.name}
+          value={typed}
+          onChange={(event) => setTyped(event.target.value)}
+        />
+      </Field>
+      {error ? <ErrorNote error={error} /> : null}
+    </Dialog>
   );
 }
 
@@ -379,42 +416,56 @@ function UserList({
   const { t } = useTranslation();
 
   return (
-    <Card>
-      <CardHeader title={t("databases.usersTitle")} description={t("databases.usersHint")} />
-      <CardBody className="pt-0">
-        {users.length === 0 ? (
-          <div className="py-10 text-center">
-            <KeyRound className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("databases.noUsers")}</p>
-            <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">
-              {t("databases.noUsersHint")}
-            </p>
-            <Button variant="outline" className="mt-4" onClick={onCreate}>
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-sm font-semibold text-ink">{t("databases.usersTitle")}</h2>
+        <p className="mt-0.5 text-sm text-ink-muted">{t("databases.usersHint")}</p>
+      </div>
+      {users.length === 0 ? (
+        <EmptyState
+          icon={<KeyRound aria-hidden />}
+          title={t("databases.noUsers")}
+          hint={t("databases.noUsersHint")}
+          action={
+            <Button variant="outline" onClick={onCreate}>
               <UserPlus className="h-4 w-4" aria-hidden />
               {t("databases.newUser")}
             </Button>
-          </div>
-        ) : (
-          <ul className="divide-y divide-border">
+          }
+        />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>{t("databases.username")}</Th>
+              <Th>{t("databases.engineLabel")}</Th>
+              <Th>{t("databases.subscription")}</Th>
+              <Th className="w-px">
+                <span className="sr-only">{t("files.actions")}</span>
+              </Th>
+            </tr>
+          </thead>
+          <tbody>
             {users.map((user) => (
-              <li key={user.id} className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
-                <EngineBadge engine={user.engine} />
-                <span dir="ltr" className="min-w-0 flex-1 truncate font-mono text-sm text-ink">
-                  {user.username}
-                </span>
-                <SubscriptionBadge id={user.subscription_id} />
-                <ResetPasswordButton user={user} onSecret={onSecret} />
-                <DropUserButton user={user} />
-              </li>
+              <tr key={user.id} className="transition-colors hover:bg-surface-muted/60">
+                <Td className="w-full font-mono text-xs">{user.username}</Td>
+                <Td className="whitespace-nowrap">
+                  <EngineBadge engine={user.engine} />
+                </Td>
+                <Td className="whitespace-nowrap tabular-nums">{user.subscription_id}</Td>
+                <Td className="py-2 text-end">
+                  <UserRowActions user={user} onSecret={onSecret} />
+                </Td>
+              </tr>
             ))}
-          </ul>
-        )}
-      </CardBody>
-    </Card>
+          </tbody>
+        </Table>
+      )}
+    </section>
   );
 }
 
-function ResetPasswordButton({
+function UserRowActions({
   user,
   onSecret,
 }: {
@@ -422,62 +473,98 @@ function ResetPasswordButton({
   onSecret: (secret: DbUserSecret) => void;
 }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
+  const [dialog, setDialog] = useState<"reset" | "drop" | null>(null);
+
+  return (
+    <>
+      <Menu label={t("files.actions")}>
+        <MenuItem icon={<RotateCw />} onClick={() => setDialog("reset")}>
+          {t("databases.resetPassword")}
+        </MenuItem>
+        <MenuSeparator />
+        <MenuItem danger icon={<Trash2 />} onClick={() => setDialog("drop")}>
+          {t("databases.dropUser")}
+        </MenuItem>
+      </Menu>
+
+      <ResetPasswordDialog
+        user={user}
+        onSecret={onSecret}
+        open={dialog === "reset"}
+        onClose={() => setDialog(null)}
+      />
+      <DropUserDialog user={user} open={dialog === "drop"} onClose={() => setDialog(null)} />
+    </>
+  );
+}
+
+function ResetPasswordDialog({
+  user,
+  onSecret,
+  open,
+  onClose,
+}: {
+  user: DbUserRow;
+  onSecret: (secret: DbUserSecret) => void;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
 
   const reset = useMutation({
     mutationFn: () => databasesApi.resetPassword(user.username),
     onSuccess: (secret) => {
-      setOpen(false);
+      onClose();
       onSecret(secret);
     },
     onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
   });
 
   return (
-    <>
-      <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
-        <RotateCw className="h-3.5 w-3.5" aria-hidden />
-        {t("databases.resetPassword")}
-      </Button>
-
-      <Dialog
-        open={open}
-        onClose={() => setOpen(false)}
-        title={t("databases.resetTitle", { name: user.username })}
-        description={t("databases.resetHint")}
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setOpen(false)}>
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="danger"
-              disabled={reset.isPending}
-              onClick={() => {
-                setError(null);
-                reset.mutate();
-              }}
-            >
-              {reset.isPending ? <Spinner /> : null}
-              {t("databases.resetConfirm")}
-            </Button>
-          </>
-        }
-      >
-        {/* The old password stops working the moment this succeeds; anything
-            still connecting with it breaks until it is updated. */}
-        <p className="text-sm text-ink-muted">{t("databases.resetBreaks")}</p>
-        {error ? <ErrorNote error={error} /> : null}
-      </Dialog>
-    </>
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("databases.resetTitle", { name: user.username })}
+      description={t("databases.resetHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            variant="danger"
+            disabled={reset.isPending}
+            onClick={() => {
+              setError(null);
+              reset.mutate();
+            }}
+          >
+            {reset.isPending ? <Spinner /> : null}
+            {t("databases.resetConfirm")}
+          </Button>
+        </>
+      }
+    >
+      {/* The old password stops working the moment this succeeds; anything
+          still connecting with it breaks until it is updated. */}
+      <p className="text-sm text-ink-muted">{t("databases.resetBreaks")}</p>
+      {error ? <ErrorNote error={error} /> : null}
+    </Dialog>
   );
 }
 
-function DropUserButton({ user }: { user: DbUserRow }) {
+function DropUserDialog({
+  user,
+  open,
+  onClose,
+}: {
+  user: DbUserRow;
+  open: boolean;
+  onClose: () => void;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
   const [typed, setTyped] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -486,7 +573,7 @@ function DropUserButton({ user }: { user: DbUserRow }) {
   const drop = useMutation({
     mutationFn: () => databasesApi.dropUser(user.username),
     onSuccess: () => {
-      setOpen(false);
+      onClose();
       setTyped("");
       void queryClient.invalidateQueries({ queryKey: ["databases"] });
     },
@@ -494,60 +581,52 @@ function DropUserButton({ user }: { user: DbUserRow }) {
   });
 
   return (
-    <>
-      <Button variant="ghost" size="sm" onClick={() => setOpen(true)}>
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("databases.dropUser")}
-      </Button>
-
-      <Dialog
-        open={open}
-        onClose={() => setOpen(false)}
-        title={t("databases.dropUserTitle", { name: user.username })}
-        description={t("databases.dropUserHint")}
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setOpen(false)}>
-              {t("common.cancel")}
-            </Button>
-            <Button
-              variant="danger"
-              disabled={!armed || drop.isPending}
-              onClick={() => {
-                setError(null);
-                drop.mutate();
-              }}
-            >
-              {drop.isPending ? <Spinner /> : null}
-              {t("databases.dropUserConfirm")}
-            </Button>
-          </>
-        }
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("databases.dropUserTitle", { name: user.username })}
+      description={t("databases.dropUserHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            variant="danger"
+            disabled={!armed || drop.isPending}
+            onClick={() => {
+              setError(null);
+              drop.mutate();
+            }}
+          >
+            {drop.isPending ? <Spinner /> : null}
+            {t("databases.dropUserConfirm")}
+          </Button>
+        </>
+      }
+    >
+      {/* The user's databases survive; what dies is every application that
+          was connecting as this account. Say which, so the operator can
+          decide before rather than discover after. */}
+      <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        {t("databases.dropUserWarning")}
+      </p>
+      <Field
+        label={t("databases.typeUsername")}
+        htmlFor={`drop-user-${user.id}`}
+        error={typed.length > 0 && !armed ? t("databases.typeUsernameMismatch") : undefined}
       >
-        {/* The user's databases survive; what dies is every application that
-            was connecting as this account. Say which, so the operator can
-            decide before rather than discover after. */}
-        <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {t("databases.dropUserWarning")}
-        </p>
-        <Field
-          label={t("databases.typeUsername")}
-          htmlFor={`drop-user-${user.id}`}
-          error={typed.length > 0 && !armed ? t("databases.typeUsernameMismatch") : undefined}
-        >
-          <Input
-            id={`drop-user-${user.id}`}
-            dir="ltr"
-            autoComplete="off"
-            autoFocus
-            placeholder={user.username}
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-          />
-        </Field>
-        {error ? <ErrorNote error={error} /> : null}
-      </Dialog>
-    </>
+        <Input
+          id={`drop-user-${user.id}`}
+          autoComplete="off"
+          autoFocus
+          placeholder={user.username}
+          value={typed}
+          onChange={(event) => setTyped(event.target.value)}
+        />
+      </Field>
+      {error ? <ErrorNote error={error} /> : null}
+    </Dialog>
   );
 }
 
@@ -586,12 +665,12 @@ function PasswordOnceDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 pt-[8vh] backdrop-blur-[1px]"
+      className="fixed inset-0 z-50 flex animate-fade-in items-start justify-center overflow-y-auto bg-black/60 p-4 pt-[8vh] backdrop-blur-[2px]"
       role="alertdialog"
       aria-modal="true"
       aria-label={t("databases.secretTitle")}
     >
-      <div className="w-full max-w-lg rounded-card border border-warning/40 bg-surface shadow-2xl">
+      <div className="w-full max-w-lg animate-pop-in rounded-card border border-warning/40 bg-surface shadow-pop">
         <header className="flex items-start gap-3 border-b border-border px-5 py-4">
           <TriangleAlert className="mt-0.5 h-5 w-5 shrink-0 text-warning" aria-hidden />
           <div>
@@ -611,10 +690,7 @@ function PasswordOnceDialog({
             {/* Selectable text, not a masked field: if the clipboard is
                 unavailable (no secure context, a browser that refuses the
                 permission) the operator must still be able to select it. */}
-            <code
-              dir="ltr"
-              className="min-w-0 flex-1 overflow-x-auto rounded-lg border border-border-strong bg-canvas px-3 py-2 font-mono text-sm break-all text-ink select-all"
-            >
+            <code className="min-w-0 flex-1 overflow-x-auto rounded-lg border border-border-strong bg-canvas px-3 py-2 font-mono text-sm break-all text-ink select-all">
               {secret.password}
             </code>
             <Button
@@ -645,21 +721,17 @@ function PasswordOnceDialog({
 
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-ink-muted">
             <dt>{t("databases.user")}</dt>
-            <dd dir="ltr" className="font-mono text-ink">
-              {secret.username}
-            </dd>
+            <dd className="font-mono text-ink">{secret.username}</dd>
             <dt>{t("databases.engineLabel")}</dt>
             <dd className="text-ink">{t(`databases.engine.${secret.engine}`)}</dd>
             <dt>{t("databases.host")}</dt>
-            <dd dir="ltr" className="font-mono text-ink">
-              localhost
-            </dd>
+            <dd className="font-mono text-ink">localhost</dd>
           </dl>
 
           <p className="text-xs text-ink-subtle">{t("databases.secretRecovery")}</p>
         </div>
 
-        <footer className="flex justify-end border-t border-border px-5 py-3.5">
+        <footer className="flex justify-end rounded-b-card border-t border-border bg-surface-muted/50 px-5 py-3.5">
           <Button variant="primary" onClick={onAcknowledge} autoFocus>
             {t("databases.secretAcknowledge")}
           </Button>
@@ -697,7 +769,6 @@ function SubscriptionField({
       >
         <Input
           id={id}
-          dir="ltr"
           inputMode="numeric"
           // A datalist rather than a select: the panel has no endpoint that
           // lists subscriptions, so these are only the ids already on screen —
@@ -809,7 +880,6 @@ function CreateDatabaseDialog({
       >
         <Input
           id="db-name"
-          dir="ltr"
           autoFocus
           placeholder="shop_main"
           aria-invalid={Boolean(problem)}
@@ -855,7 +925,6 @@ function CreateDatabaseDialog({
       <Field label={t("databases.ownerOptional")} htmlFor="db-owner">
         <Select
           id="db-owner"
-          dir="ltr"
           value={owner}
           onChange={(event) => setOwner(event.target.value)}
           aria-describedby="db-owner-hint"
@@ -961,7 +1030,6 @@ function CreateUserDialog({
       >
         <Input
           id="db-username"
-          dir="ltr"
           autoFocus
           placeholder="shop_app"
           aria-invalid={Boolean(problem)}
@@ -1084,13 +1152,13 @@ function AdminerCard() {
               {status.data?.php_version ? (
                 <Badge tone="neutral">
                   <span>PHP</span>
-                  <span dir="ltr">{status.data.php_version}</span>
+                  <span className="font-mono">{status.data.php_version}</span>
                 </Badge>
               ) : null}
               {status.data ? (
                 <Badge tone="neutral">
                   <span>Adminer</span>
-                  <span dir="ltr">{status.data.adminer_version}</span>
+                  <span className="font-mono">{status.data.adminer_version}</span>
                 </Badge>
               ) : null}
             </div>
@@ -1111,10 +1179,7 @@ function AdminerCard() {
                     {t("databases.adminerTunnelStep")}
                   </p>
                   <div className="flex items-stretch gap-2">
-                    <code
-                      dir="ltr"
-                      className="min-w-0 flex-1 overflow-x-auto rounded-md border border-border-strong bg-surface px-2.5 py-2 font-mono text-xs whitespace-pre text-ink select-all"
-                    >
+                    <code className="min-w-0 flex-1 overflow-x-auto rounded-md border border-border-strong bg-surface px-2.5 py-2 font-mono text-xs whitespace-pre text-ink select-all">
                       {tunnel}
                     </code>
                     <Button
@@ -1134,7 +1199,7 @@ function AdminerCard() {
                   </div>
                   <p className="mt-2 text-xs text-ink-muted">
                     {t("databases.adminerThenOpen")}{" "}
-                    <span dir="ltr" className="font-mono text-ink">
+                    <span className="font-mono text-xs text-ink">
                       {status.data?.url ?? `http://127.0.0.1:${port}/`}
                     </span>
                   </p>

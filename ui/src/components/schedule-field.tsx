@@ -85,16 +85,15 @@ export function ScheduleField({
   const preview = problem ? null : textOf(value);
 
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2">
       <label htmlFor={id} className="block text-sm font-medium text-ink">
         {label}
       </label>
 
-      {/* A cron expression is machine text: LTR and monospaced whatever the
-          page direction is, or the five fields stop lining up. */}
+      {/* A cron expression is machine text: monospaced so the five fields
+          line up under the legend below. */}
       <Input
         id={id}
-        dir="ltr"
         className="font-mono"
         placeholder="*/15 * * * *"
         autoComplete="off"
@@ -110,7 +109,7 @@ export function ScheduleField({
         }}
       />
 
-      <p id={`${id}-legend`} dir="ltr" className="font-mono text-[11px] text-ink-subtle">
+      <p id={`${id}-legend`} className="font-mono text-[11px] text-ink-subtle">
         {t("cron.legend")}
       </p>
 
@@ -127,9 +126,7 @@ export function ScheduleField({
         ) : preview ? (
           <>
             <CalendarClock className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
-            {/* `dir="auto"` because the sentence is Persian on a Persian page
-                but carries Latin times and day numbers inside it. */}
-            <span dir="auto">{t("cron.runs", { description: preview })}</span>
+            <span>{t("cron.runs", { description: preview })}</span>
           </>
         ) : null}
       </p>
@@ -139,13 +136,12 @@ export function ScheduleField({
           <li key={preset}>
             <button
               type="button"
-              dir="ltr"
               onClick={() => onChange(preset)}
               title={textOf(preset) ?? preset}
               className={cn(
-                "rounded-full border border-border px-2.5 py-0.5 font-mono text-[11px] text-ink-muted",
-                "hover:border-border-strong hover:text-ink",
-                value.trim() === preset && "border-accent text-accent",
+                "rounded-full border border-border px-2.5 py-0.5 font-mono text-[11px] text-ink-muted transition-colors",
+                "hover:border-border-strong hover:bg-surface-muted hover:text-ink",
+                value.trim() === preset && "border-accent bg-accent-soft text-accent",
               )}
             >
               {preset}
@@ -162,9 +158,5 @@ export function ScheduleText({ schedule, className }: { schedule: string; classN
   const textOf = useScheduleText();
   const text = textOf(schedule);
   if (!text) return null;
-  return (
-    <span dir="auto" className={className}>
-      {text}
-    </span>
-  );
+  return <span className={className}>{text}</span>;
 }

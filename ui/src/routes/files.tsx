@@ -29,7 +29,10 @@ import { TrashView } from "@/components/files/trash-view";
 import { UploadPanel, filesFromDrop, useUploader } from "@/components/files/upload";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { ApiError } from "@/lib/api";
@@ -236,33 +239,29 @@ export function FilesPage() {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">
-            {inTrash ? t("files.trash") : t("files.title")}
-          </h1>
-          <p className="mt-1 text-sm text-ink-muted">
-            {inTrash ? t("files.trashSubtitle") : t("files.subtitle")}
-          </p>
-        </div>
-        {inTrash ? (
-          <Button
-            variant="outline"
-            onClick={() => void navigate({ to: "/files", search: { path } })}
-          >
-            <ArrowLeft className="h-4 w-4 rtl:rotate-180" />
-            {t("files.backToFiles")}
-          </Button>
-        ) : (
-          <Button
-            variant="outline"
-            onClick={() => void navigate({ to: "/files", search: { path, view: "trash" } })}
-          >
-            <Trash2 className="h-4 w-4" />
-            {t("files.trash")}
-          </Button>
-        )}
-      </header>
+      <PageHeader
+        title={inTrash ? t("files.trash") : t("files.title")}
+        description={inTrash ? t("files.trashSubtitle") : t("files.subtitle")}
+        actions={
+          inTrash ? (
+            <Button
+              variant="outline"
+              onClick={() => void navigate({ to: "/files", search: { path } })}
+            >
+              <ArrowLeft className="h-4 w-4" aria-hidden />
+              {t("files.backToFiles")}
+            </Button>
+          ) : (
+            <Button
+              variant="outline"
+              onClick={() => void navigate({ to: "/files", search: { path, view: "trash" } })}
+            >
+              <Trash2 className="h-4 w-4" aria-hidden />
+              {t("files.trash")}
+            </Button>
+          )
+        }
+      />
 
       {banner ? (
         <p
@@ -301,11 +300,11 @@ export function FilesPage() {
                 className="h-8 w-48 text-sm"
               />
               <Button variant="outline" size="sm" onClick={() => setDialog({ type: "mkdir" })}>
-                <FolderPlus className="h-3.5 w-3.5" />
+                <FolderPlus className="h-3.5 w-3.5" aria-hidden />
                 {t("files.newFolder")}
               </Button>
               <Button variant="primary" size="sm" onClick={() => pickerRef.current?.click()}>
-                <UploadIcon className="h-3.5 w-3.5" />
+                <UploadIcon className="h-3.5 w-3.5" aria-hidden />
                 {t("files.upload")}
               </Button>
               <input
@@ -322,8 +321,8 @@ export function FilesPage() {
           </div>
 
           {selectedEntries.length > 0 ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-surface-muted px-3 py-2">
-              <span className="text-sm text-ink-muted">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-accent-soft/50 px-3 py-2">
+              <span className="text-sm font-medium text-accent">
                 {t("files.selected", { count: selectedEntries.length })}
               </span>
               <span className="ms-auto flex flex-wrap items-center gap-2">
@@ -332,7 +331,7 @@ export function FilesPage() {
                   size="sm"
                   onClick={() => setDialog({ type: "copy", entries: selectedEntries })}
                 >
-                  <CopyIcon className="h-3.5 w-3.5" />
+                  <CopyIcon className="h-3.5 w-3.5" aria-hidden />
                   {t("files.copy")}
                 </Button>
                 <Button
@@ -340,7 +339,7 @@ export function FilesPage() {
                   size="sm"
                   onClick={() => setDialog({ type: "compress", entries: selectedEntries })}
                 >
-                  <Archive className="h-3.5 w-3.5" />
+                  <Archive className="h-3.5 w-3.5" aria-hidden />
                   {t("files.compress")}
                 </Button>
                 <Button
@@ -348,16 +347,16 @@ export function FilesPage() {
                   size="sm"
                   onClick={() => setDialog({ type: "delete", entries: selectedEntries })}
                 >
-                  <Trash2 className="h-3.5 w-3.5" />
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
                   {t("files.delete")}
                 </Button>
               </span>
             </div>
           ) : null}
 
-          <Card className={cn("relative", dragOver && "outline-2 outline-dashed outline-accent")}>
+          <div className="relative">
             {dragOver ? (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card bg-accent-soft/80 text-sm font-medium text-accent">
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card border-2 border-dashed border-accent bg-accent-soft/80 text-sm font-medium text-accent">
                 {t("files.dropHere")}
               </div>
             ) : null}
@@ -377,33 +376,39 @@ export function FilesPage() {
                 }}
               />
             ) : listing.isPending ? (
-              <CardBody className="flex justify-center py-20 text-ink-muted">
-                <Spinner className="h-6 w-6" />
-              </CardBody>
+              <ListSkeleton rows={6} />
             ) : listing.isError ? (
-              <CardBody className="py-16 text-center">
-                <p role="alert" className="text-sm text-danger">
-                  {listing.error instanceof ApiError
-                    ? listing.error.message
-                    : String(listing.error)}
-                </p>
-                <div className="mt-4 flex justify-center gap-2">
-                  <Button variant="outline" size="sm" onClick={() => void listing.refetch()}>
-                    {t("common.retry")}
-                  </Button>
-                  {path !== "" ? (
-                    <Button variant="ghost" size="sm" onClick={() => goTo("")}>
-                      {t("files.home")}
+              <Card>
+                <CardBody className="py-16 text-center">
+                  <p role="alert" className="text-sm text-danger">
+                    {listing.error instanceof ApiError
+                      ? listing.error.message
+                      : String(listing.error)}
+                  </p>
+                  <div className="mt-4 flex justify-center gap-2">
+                    <Button variant="outline" size="sm" onClick={() => void listing.refetch()}>
+                      {t("common.retry")}
                     </Button>
-                  ) : null}
-                </div>
-              </CardBody>
+                    {path !== "" ? (
+                      <Button variant="ghost" size="sm" onClick={() => goTo("")}>
+                        {t("files.home")}
+                      </Button>
+                    ) : null}
+                  </div>
+                </CardBody>
+              </Card>
             ) : entries.length === 0 ? (
-              <CardBody className="py-20 text-center">
-                <FolderOpen className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-                <p className="text-sm font-medium text-ink">{t("files.empty")}</p>
-                <p className="mt-1 text-sm text-ink-muted">{t("files.emptyHint")}</p>
-              </CardBody>
+              <EmptyState
+                icon={<FolderOpen aria-hidden />}
+                title={t("files.empty")}
+                hint={t("files.emptyHint")}
+                action={
+                  <Button variant="primary" size="sm" onClick={() => pickerRef.current?.click()}>
+                    <UploadIcon className="h-3.5 w-3.5" aria-hidden />
+                    {t("files.upload")}
+                  </Button>
+                }
+              />
             ) : (
               <FileTable
                 entries={entries}
@@ -414,7 +419,7 @@ export function FilesPage() {
                 onAction={onRowAction}
               />
             )}
-          </Card>
+          </div>
 
           <div className="flex items-center justify-between gap-4">
             <Switch
@@ -423,7 +428,7 @@ export function FilesPage() {
               label={t("files.showHidden")}
             />
             {!searchActive && entries.length > 0 ? (
-              <p className="text-xs text-ink-subtle">
+              <p className="text-xs tabular-nums text-ink-subtle">
                 {t("files.itemCount", { count: entries.length })}
               </p>
             ) : null}
@@ -507,55 +512,61 @@ function SearchResults({
 
   if (results.isPending) {
     return (
-      <CardBody className="flex items-center justify-center gap-3 py-16 text-sm text-ink-muted">
-        <Spinner className="h-5 w-5" />
-        {t("files.searching")}
-      </CardBody>
+      <Card>
+        <CardBody className="flex items-center justify-center gap-3 py-16 text-sm text-ink-muted">
+          <Spinner className="h-5 w-5" />
+          {t("files.searching")}
+        </CardBody>
+      </Card>
     );
   }
   if (results.isError) {
     return (
-      <CardBody className="py-16 text-center">
-        <p role="alert" className="text-sm text-danger">
-          {results.error instanceof ApiError ? results.error.message : String(results.error)}
-        </p>
-      </CardBody>
+      <Card>
+        <CardBody className="py-16 text-center">
+          <p role="alert" className="text-sm text-danger">
+            {results.error instanceof ApiError ? results.error.message : String(results.error)}
+          </p>
+        </CardBody>
+      </Card>
     );
   }
 
   const entries = results.data?.entries ?? [];
   if (entries.length === 0) {
     return (
-      <CardBody className="py-16 text-center text-sm text-ink-muted">
-        {t("files.searchNoResults", { query })}
-      </CardBody>
+      <Card>
+        <CardBody className="py-16 text-center text-sm text-ink-muted">
+          {t("files.searchNoResults", { query })}
+        </CardBody>
+      </Card>
     );
   }
 
   return (
-    <CardBody className="pt-3">
-      <p className="mb-2 text-xs text-ink-muted">
-        {t("files.searchResults", { count: entries.length })}
-        {results.data?.truncated ? ` ${t("files.searchTruncated")}` : ""}
-      </p>
-      <ul className="divide-y divide-border">
-        {entries.map((entry) => (
-          <li key={entry.path}>
-            <button
-              type="button"
-              onClick={() => (entry.kind === "file" ? onOpenFile(entry) : onOpenDir(entry))}
-              className="flex w-full items-center gap-3 px-1 py-2 text-start hover:bg-surface-muted"
-            >
-              <span dir="auto" className="shrink-0 text-sm font-medium text-ink">
-                {entry.name}
-              </span>
-              <span dir="ltr" className="min-w-0 flex-1 truncate text-start font-mono text-xs text-ink-subtle">
-                {entry.path}
-              </span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </CardBody>
+    <Card>
+      <CardBody className="pt-3">
+        <p className="mb-2 text-xs text-ink-muted">
+          {t("files.searchResults", { count: entries.length })}
+          {results.data?.truncated ? ` ${t("files.searchTruncated")}` : ""}
+        </p>
+        <ul className="divide-y divide-border">
+          {entries.map((entry) => (
+            <li key={entry.path}>
+              <button
+                type="button"
+                onClick={() => (entry.kind === "file" ? onOpenFile(entry) : onOpenDir(entry))}
+                className="flex w-full items-center gap-3 rounded-md px-1 py-2 text-start transition-colors hover:bg-surface-muted"
+              >
+                <span className="shrink-0 text-sm font-medium text-ink">{entry.name}</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-subtle">
+                  {entry.path}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </CardBody>
+    </Card>
   );
 }

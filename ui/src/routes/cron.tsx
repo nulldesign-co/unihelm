@@ -6,11 +6,15 @@ import { useTranslation } from "react-i18next";
 import { ScheduleField, ScheduleText, useScheduleProblem } from "@/components/schedule-field";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { Table, Td, Th } from "@/components/ui/table";
 import { ApiError, endpoints, type CronJob, type CronSetRequest } from "@/lib/api";
 import { checkCommand } from "@/lib/cron-schedule";
 
@@ -40,37 +44,53 @@ export function CronPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("cron.title")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("cron.subtitle")}</p>
-        </div>
-        <Button variant="primary" onClick={() => setEditing("new")}>
-          <Plus className="h-4 w-4" />
-          {t("cron.create")}
-        </Button>
-      </header>
+      <PageHeader
+        title={t("cron.title")}
+        description={t("cron.subtitle")}
+        actions={
+          <Button variant="primary" onClick={() => setEditing("new")}>
+            <Plus className="h-4 w-4" aria-hidden />
+            {t("cron.create")}
+          </Button>
+        }
+      />
 
       {cron.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <ListSkeleton />
       ) : cron.error ? (
         <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
           {cron.error instanceof ApiError ? cron.error.message : String(cron.error)}
         </p>
       ) : jobs.length === 0 ? (
-        <EmptyState onCreate={() => setEditing("new")} />
+        <EmptyState
+          icon={<Clock aria-hidden />}
+          title={t("cron.empty")}
+          hint={t("cron.emptyHint")}
+          action={
+            <Button variant="primary" onClick={() => setEditing("new")}>
+              <Plus className="h-4 w-4" aria-hidden />
+              {t("cron.create")}
+            </Button>
+          }
+        />
       ) : (
         <>
-          <ul className="space-y-3">
-            {jobs.map((job) => (
-              <li key={job.id}>
-                <JobRow job={job} onEdit={() => setEditing(job)} />
-              </li>
-            ))}
-          </ul>
-          <p className="text-xs text-ink-subtle">
+          <Table>
+            <thead>
+              <tr>
+                <Th>{t("cron.schedule")}</Th>
+                <Th>{t("cron.command")}</Th>
+                <Th>{t("backups.status")}</Th>
+                <Th className="text-end">{t("files.actions")}</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.map((job) => (
+                <JobRow key={job.id} job={job} onEdit={() => setEditing(job)} />
+              ))}
+            </tbody>
+          </Table>
+          <p className="text-xs text-ink-subtle tabular-nums">
             {t("cron.limit", {
               used: jobs.length,
               max: cron.data?.max_jobs_per_subscription ?? 0,
@@ -86,23 +106,6 @@ export function CronPage() {
         onClose={() => setEditing(null)}
       />
     </div>
-  );
-}
-
-function EmptyState({ onCreate }: { onCreate: () => void }) {
-  const { t } = useTranslation();
-  return (
-    <Card>
-      <CardBody className="py-16 text-center">
-        <Clock className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-        <p className="text-sm font-medium text-ink">{t("cron.empty")}</p>
-        <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">{t("cron.emptyHint")}</p>
-        <Button variant="primary" className="mt-4" onClick={onCreate}>
-          <Plus className="h-4 w-4" />
-          {t("cron.create")}
-        </Button>
-      </CardBody>
-    </Card>
   );
 }
 
@@ -139,91 +142,101 @@ function JobRow({ job, onEdit }: { job: CronJob; onEdit: () => void }) {
   // A job whose crontab could not be installed is not running, whatever its
   // `enabled` flag says — so that, and not the flag, decides the badge.
   const broken = job.last_error !== null;
+  // The extra row below carries the install failure and any mutation error;
+  // when it is shown, the main row's bottom border moves down to it.
+  const detail = broken || error !== null;
 
   return (
-    <Card>
-      <CardBody className="pt-5">
-        <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
-          <Badge tone={broken ? "danger" : job.enabled ? "success" : "neutral"}>
+    <>
+      <tr className="transition-colors hover:bg-surface-muted/60">
+        <Td className={detail ? "border-b-0" : undefined}>
+          <div className="font-mono text-xs font-medium whitespace-nowrap text-ink">
+            {job.schedule}
+          </div>
+          <ScheduleText schedule={job.schedule} className="mt-1 block text-xs text-ink-muted" />
+        </Td>
+        <Td className={detail ? "border-b-0" : undefined}>
+          <span className="block max-w-md truncate font-mono text-xs text-ink-muted" title={job.command}>
+            {job.command}
+          </span>
+        </Td>
+        <Td className={detail ? "border-b-0" : undefined}>
+          <Badge dot tone={broken ? "danger" : job.enabled ? "success" : "neutral"}>
             {broken
               ? t("cron.notRunning")
               : job.enabled
                 ? t("cron.scheduled")
                 : t("cron.disabledBadge")}
           </Badge>
-
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
-              <span dir="ltr" className="font-mono text-sm font-medium text-ink">
-                {job.schedule}
-              </span>
-              <ScheduleText schedule={job.schedule} className="text-xs text-ink-muted" />
-            </div>
-            <p dir="ltr" className="mt-1 truncate font-mono text-xs text-ink-subtle" title={job.command}>
-              {job.command}
-            </p>
-          </div>
-
-          <div className="flex items-center gap-1">
+        </Td>
+        <Td className={detail ? "border-b-0" : undefined}>
+          <div className="flex items-center justify-end gap-2">
             <Switch
               checked={job.enabled}
               disabled={toggle.isPending}
               onChange={(next) => toggle.mutate(next)}
               label={job.enabled ? t("cron.enabled") : t("cron.disabledBadge")}
             />
-            <Button variant="ghost" size="sm" onClick={onEdit}>
-              <Pencil className="h-3.5 w-3.5" aria-hidden />
-              {t("cron.edit")}
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
-              <Trash2 className="h-3.5 w-3.5" aria-hidden />
-              {t("cron.delete")}
-            </Button>
+            <Menu label={t("files.actions")}>
+              <MenuItem icon={<Pencil />} onClick={onEdit}>
+                {t("cron.edit")}
+              </MenuItem>
+              <MenuSeparator />
+              <MenuItem danger icon={<Trash2 />} onClick={() => setConfirming(true)}>
+                {t("cron.delete")}
+              </MenuItem>
+            </Menu>
           </div>
-        </div>
 
-        {job.last_error ? (
-          <div className="mt-3 rounded-lg bg-danger-soft px-3 py-2.5">
-            <p className="flex items-center gap-1.5 text-sm font-medium text-danger">
-              <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
-              {t("cron.lastError")}
+          <Dialog
+            open={confirming}
+            onClose={() => setConfirming(false)}
+            title={t("cron.deleteTitle")}
+            description={t("cron.deleteHint")}
+            footer={
+              <>
+                <Button variant="ghost" onClick={() => setConfirming(false)}>
+                  {t("common.cancel")}
+                </Button>
+                <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
+                  {remove.isPending ? <Spinner /> : null}
+                  {t("cron.deleteConfirm")}
+                </Button>
+              </>
+            }
+          >
+            <p className="rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-muted">
+              {job.schedule} {job.command}
             </p>
-            <p dir="ltr" className="mt-1 font-mono text-xs break-words text-danger">
-              {job.last_error}
-            </p>
-            <p className="mt-1.5 text-xs text-ink-muted">{t("cron.lastErrorHint")}</p>
-          </div>
-        ) : null}
+          </Dialog>
+        </Td>
+      </tr>
 
-        {error ? (
-          <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
-        ) : null}
-
-        <Dialog
-          open={confirming}
-          onClose={() => setConfirming(false)}
-          title={t("cron.deleteTitle")}
-          description={t("cron.deleteHint")}
-          footer={
-            <>
-              <Button variant="ghost" onClick={() => setConfirming(false)}>
-                {t("common.cancel")}
-              </Button>
-              <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-                {remove.isPending ? <Spinner /> : null}
-                {t("cron.deleteConfirm")}
-              </Button>
-            </>
-          }
-        >
-          <p dir="ltr" className="rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-muted">
-            {job.schedule} {job.command}
-          </p>
-        </Dialog>
-      </CardBody>
-    </Card>
+      {detail ? (
+        <tr>
+          <Td colSpan={4} className="pt-0">
+            {job.last_error ? (
+              <div className="rounded-lg bg-danger-soft px-3 py-2.5">
+                <p className="flex items-center gap-1.5 text-sm font-medium text-danger">
+                  <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+                  {t("cron.lastError")}
+                </p>
+                <p className="mt-1 font-mono text-xs break-words text-danger">{job.last_error}</p>
+                <p className="mt-1.5 text-xs text-ink-muted">{t("cron.lastErrorHint")}</p>
+              </div>
+            ) : null}
+            {error ? (
+              <p
+                role="alert"
+                className={`rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger ${job.last_error ? "mt-2" : ""}`}
+              >
+                {error}
+              </p>
+            ) : null}
+          </Td>
+        </tr>
+      ) : null}
+    </>
   );
 }
 
@@ -344,7 +357,6 @@ function JobDialog({
         >
           <Input
             id="cron-command"
-            dir="ltr"
             className="font-mono"
             placeholder="/usr/bin/php ~/cron.php"
             autoComplete="off"
@@ -368,7 +380,6 @@ function JobDialog({
             >
               <Input
                 id="cron-subscription"
-                dir="ltr"
                 inputMode="numeric"
                 placeholder={t("cron.subscriptionPlaceholder")}
                 aria-describedby="cron-subscription-hint"

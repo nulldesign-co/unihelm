@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { Ban, CheckCircle2, Clock, XCircle } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -32,6 +33,23 @@ const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "wa
 const isSettled = (status: TaskStatus | undefined) =>
   status !== undefined && status !== "queued" && status !== "running";
 
+/** The status at a glance — an icon in the status's colour, never colour alone. */
+function StatusIcon({ status }: { status: TaskStatus | undefined }) {
+  switch (status) {
+    case undefined:
+    case "running":
+      return <Spinner className="h-3.5 w-3.5 text-accent" />;
+    case "queued":
+      return <Clock className="h-3.5 w-3.5 text-ink-muted" aria-hidden />;
+    case "ok":
+      return <CheckCircle2 className="h-3.5 w-3.5 text-success" aria-hidden />;
+    case "failed":
+      return <XCircle className="h-3.5 w-3.5 text-danger" aria-hidden />;
+    case "cancelled":
+      return <Ban className="h-3.5 w-3.5 text-warning" aria-hidden />;
+  }
+}
+
 /** Poll one task until it stops moving. */
 function useTask(taskId: string, onSettled?: (status: TaskStatus) => void) {
   const task = useQuery({
@@ -63,17 +81,18 @@ export function TaskNotice({
   const task = useTask(taskId, onSettled);
 
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-surface-muted px-3 py-2 text-sm">
-      {isSettled(task?.status) ? null : <Spinner className="h-3.5 w-3.5" />}
+    <div className="mt-3 flex animate-slide-up flex-wrap items-center gap-2 rounded-card border border-border bg-surface px-3 py-2 text-sm shadow-pop">
+      <StatusIcon status={task?.status} />
       <span className="text-ink-muted">
-        {t("tasks.title")}{" "}
-        <span dir="ltr" className="font-mono text-xs">
-          {taskId.slice(0, 8)}
-        </span>
+        {t("tasks.title")} <span className="font-mono text-xs">{taskId.slice(0, 8)}</span>
       </span>
-      {task ? <Badge tone={TONE[task.status]}>{t(`tasks.status.${task.status}`)}</Badge> : null}
+      {task ? (
+        <Badge tone={TONE[task.status]} dot={task.status === "running"}>
+          {t(`tasks.status.${task.status}`)}
+        </Badge>
+      ) : null}
       {task?.status === "failed" && task.error_detail ? (
-        <span role="alert" dir="auto" className="basis-full text-danger">
+        <span role="alert" className="basis-full text-danger">
           {task.error_detail}
         </span>
       ) : null}
@@ -125,13 +144,11 @@ export function TaskLogPanel({
   return (
     <div className="mt-3 rounded-lg border border-border bg-canvas">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-        {isSettled(task?.status) ? null : <Spinner className="h-3.5 w-3.5" />}
+        <StatusIcon status={task?.status} />
         <span className="text-xs font-medium text-ink-muted">{t("tasks.logs")}</span>
-        <span dir="ltr" className="font-mono text-[11px] text-ink-subtle">
-          {taskId.slice(0, 8)}
-        </span>
+        <span className="font-mono text-xs text-ink-subtle">{taskId.slice(0, 8)}</span>
         {task ? (
-          <Badge tone={TONE[task.status]} className="ms-auto">
+          <Badge tone={TONE[task.status]} dot={task.status === "running"} className="ms-auto">
             {t(`tasks.status.${task.status}`)}
           </Badge>
         ) : null}
@@ -142,9 +159,8 @@ export function TaskLogPanel({
           <p className="text-ink-subtle">{t("tasks.noLogs")}</p>
         ) : (
           lines.map((line) => (
-            // restic's output is machine text: LTR even on an RTL page, and
             // `break-all` keeps a long path inside the box.
-            <div key={line.seq} dir="ltr" className="whitespace-pre-wrap break-all text-ink-muted">
+            <div key={line.seq} className="whitespace-pre-wrap break-all text-ink-muted">
               {line.line}
             </div>
           ))
@@ -153,8 +169,8 @@ export function TaskLogPanel({
       </div>
 
       {task?.status === "failed" && task.error_detail ? (
-        <p role="alert" dir="auto" className="border-t border-border px-3 py-2 text-sm text-danger">
-          {task.error_code ? <span className="font-mono">{task.error_code} </span> : null}
+        <p role="alert" className="border-t border-border px-3 py-2 text-sm text-danger">
+          {task.error_code ? <span className="font-mono text-xs">{task.error_code} </span> : null}
           {task.error_detail}
         </p>
       ) : null}

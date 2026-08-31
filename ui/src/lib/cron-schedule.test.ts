@@ -12,7 +12,6 @@
 import { describe, expect, it } from "vitest";
 
 import { en } from "../i18n/en";
-import { fa } from "../i18n/fa";
 import {
   PHRASE_KEYS,
   PROBLEM_KEYS,
@@ -250,25 +249,20 @@ describe("the preview's translations", () => {
     expect(formatSchedule("nonsense", echo, "en")).toBeNull();
   });
 
-  it("has an English and a Persian string for every phrase it can emit", () => {
+  it("has a string for every phrase it can emit", () => {
     // The failure this prevents is the ordinary one: a new phrase key added to
-    // the describer, an English string written for it, and a Persian page that
-    // silently falls back to English prose (spec §4.2).
+    // the describer with no string written for it, shipping as a raw key.
     for (const key of PHRASE_KEYS) {
       expect(en.cron.preview, `en: ${key}`).toHaveProperty(key);
-      expect(fa.cron.preview, `fa: ${key}`).toHaveProperty(key);
     }
     for (const key of PROBLEM_KEYS) {
       expect(en.cron.problem, `en: ${key}`).toHaveProperty(key);
-      expect(fa.cron.problem, `fa: ${key}`).toHaveProperty(key);
     }
     for (const day of [0, 1, 2, 3, 4, 5, 6]) {
       expect(en.cron.weekday, `en weekday ${day}`).toHaveProperty(String(day));
-      expect(fa.cron.weekday, `fa weekday ${day}`).toHaveProperty(String(day));
     }
     for (let month = 1; month <= 12; month += 1) {
       expect(en.cron.month, `en month ${month}`).toHaveProperty(String(month));
-      expect(fa.cron.month, `fa month ${month}`).toHaveProperty(String(month));
     }
   });
 });

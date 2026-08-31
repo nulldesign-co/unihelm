@@ -24,7 +24,7 @@ Every architectural decision in this spec traces back to a concrete failure of a
 | High memory usage (Python stack, 300–600 MB) | aaPanel | Rust; hard CI-enforced budget: **web + agent combined ≤ 80 MB RSS idle** (§3) |
 | Compiles PHP/Nginx from source → slow installs, breaks on updates | aaPanel | Install ONLY from official upstream repos (Sury/Ondřej, Remi, nginx.org, MariaDB, PGDG, NodeSource) — never compile from source |
 | Heavy monolith, everything preinstalled, needs 1 GB+ for the panel alone | cPanel | Base install = the panel binary and nothing else; every stack component is installed on demand from the Stack Manager |
-| Ancient UI, jQuery-era UX | cPanel | React 18 + TypeScript + Tailwind + shadcn/ui, dark mode, realtime (SSE), RTL + fa/en i18n from day one |
+| Ancient UI, jQuery-era UX | cPanel | React 18 + TypeScript + Tailwind + shadcn/ui, dark mode, realtime (SSE), English-only UI (strings centralised behind i18next) |
 | Panel edits break user's manual config edits | all | Managed-block config strategy + drift detection + validate-before-reload + auto-rollback (§10.4) |
 | Panel is a root-owned web app = giant attack surface | most | Privilege separation: unprivileged web process, root agent behind a typed Unix-socket RPC with a fixed operation whitelist — no shell-string execution anywhere (§5) |
 | Locked to one OS family | cPanel (RHEL-ish), CloudPanel (Debian family) | First-class Debian family AND RHEL family via a distro abstraction layer (§7) |
@@ -111,7 +111,7 @@ Rules that guard the budgets:
 
 ### 4.2 Frontend
 
-React 18 + TypeScript (strict) + Vite + TailwindCSS + **shadcn/ui** components; TanStack Router + TanStack Query; `react-hook-form` + `zod`; `i18next` with **English + Farsi (full RTL)** shipped from day one; dark/light/system theme; xterm.js for web terminal; Monaco editor (lazy-loaded chunk, allowed to exceed initial bundle budget as an async route) for file/config editing; charts with `recharts` (or lightweight `uPlot` for dense metric charts).
+React 18 + TypeScript (strict) + Vite + TailwindCSS + **shadcn/ui** components; TanStack Router + TanStack Query; `react-hook-form` + `zod`; `i18next` with **English only** (strings centralised, a second language stays an import away); dark/light/system theme; xterm.js for web terminal; Monaco editor (lazy-loaded chunk, allowed to exceed initial bundle budget as an async route) for file/config editing; charts with `recharts` (or lightweight `uPlot` for dense metric charts).
 
 Design direction: clean admin aesthetic in the family of Vercel/Linear dashboards — generous whitespace, 8px grid, one accent color, semantic status colors, keyboard palette (⌘K) for navigation, empty states that teach. No skeuomorphic server icons, no 2010 gradients.
 
@@ -489,7 +489,7 @@ These are gates, not guidelines — CI and code review enforce them.
 > Guiding rule: **reach a real, deployable single-server PHP host as early as possible (end of Phase 2)**, then widen. Never let the tree get so big it can't run.
 
 ### Phase 0 — Foundations & skeleton (the walking skeleton)
-Repo/workspace layout (§15), the two daemons booting under systemd, `unihelm-ipc` with 2–3 trivial ops (ping, `svc.status`, `metrics.snapshot`), SQLite + first migrations, auth (login, argon2, sessions, one admin user via installer), RBAC scaffolding, the operation-registry pattern + the CI gates (no-`sh -c`, RSS budget, binary size), `unihelm-distro` traits with Apt+Dnf+Systemd implemented, base installer script + preflight, embedded React shell with login + empty dashboard + task drawer + i18n(en/fa)/RTL/theming wired. **Exit:** you can log in on Debian 13 and AlmaLinux 10 and see live server metrics; CI enforces budgets.
+Repo/workspace layout (§15), the two daemons booting under systemd, `unihelm-ipc` with 2–3 trivial ops (ping, `svc.status`, `metrics.snapshot`), SQLite + first migrations, auth (login, argon2, sessions, one admin user via installer), RBAC scaffolding, the operation-registry pattern + the CI gates (no-`sh -c`, RSS budget, binary size), `unihelm-distro` traits with Apt+Dnf+Systemd implemented, base installer script + preflight, embedded React shell with login + empty dashboard + task drawer + i18n(en)/theming wired. **Exit:** you can log in on Debian 13 and AlmaLinux 10 and see live server metrics; CI enforces budgets.
 
 ### Phase 1 — Web serving core
 Nginx backend + vhost renderer + config-management contract (§10.4), PHP module (install versions from Sury/Remi, FPM pools per site), site CRUD (php/static types), file manager, SSL via instant-acme (HTTP-01), basic per-site settings & logs. **Exit:** create a PHP site with SSL and serve real traffic, entirely from the UI, on both distro families.
@@ -549,7 +549,7 @@ Testing expectations: unit tests in every crate; `unihelm-ops` gets a mock distr
 6. **Distro differences live ONLY in `unihelm-distro`.** Modules must be OS-agnostic. Test on both families (SELinux enforcing on RHEL) before calling a feature done.
 7. **Every mutation:** typed input → validate → task/log → audit → reversible where possible. Every API error: stable code.
 8. **Ask before inventing scope.** If a requirement here is ambiguous, prefer the smallest thing that satisfies the phase exit criteria and leave a `// TODO(scope):` note rather than gold-plating. The enemy is bloat.
-9. **i18n/RTL and accessibility are not afterthoughts** — new UI ships with en+fa strings and keyboard access.
+9. **i18n hygiene and accessibility are not afterthoughts** — new UI keeps every string behind `t()` in `en.ts` and ships with keyboard access.
 10. **Document as you go** in `docs/` and keep the OpenAPI spec + error-code list current in the same PR as the code.
 
 ## 17. Open questions to resolve with farzam (before/near the relevant phase)

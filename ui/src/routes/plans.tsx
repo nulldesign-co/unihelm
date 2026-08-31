@@ -2,13 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Ban,
   Globe,
-  Layers,
   Pencil,
   Plus,
   Trash2,
   TriangleAlert,
   Undo2,
   Users,
+  Wallet,
 } from "lucide-react";
 import { forwardRef, useState, type TextareaHTMLAttributes } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,10 +17,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { Table, Td, Th } from "@/components/ui/table";
 import { ApiError, endpoints } from "@/lib/api";
 import {
   limitProblem,
@@ -56,33 +60,35 @@ export function PlansPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("plans.title")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("plans.subtitle")}</p>
-        </div>
-        <Button variant="primary" onClick={() => setCreating(true)}>
-          <Plus className="h-4 w-4" aria-hidden />
-          {t("plans.newPlan")}
-        </Button>
-      </header>
+      <PageHeader
+        title={t("plans.title")}
+        description={t("plans.subtitle")}
+        actions={
+          <Button variant="primary" onClick={() => setCreating(true)}>
+            <Plus className="h-4 w-4" aria-hidden />
+            {t("plans.newPlan")}
+          </Button>
+        }
+      />
 
       {plans.error ? <ErrorNote error={plans.error} /> : null}
 
       {plans.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <ListSkeleton rows={3} />
       ) : (plans.data?.plans.length ?? 0) === 0 ? (
-        <EmptyPlans onCreate={() => setCreating(true)} />
+        <EmptyState
+          icon={<Wallet aria-hidden />}
+          title={t("plans.empty")}
+          hint={t("plans.emptyHint")}
+          action={
+            <Button variant="primary" onClick={() => setCreating(true)}>
+              <Plus className="h-4 w-4" aria-hidden />
+              {t("plans.newPlan")}
+            </Button>
+          }
+        />
       ) : (
-        <ul className="grid gap-3 sm:grid-cols-2">
-          {plans.data!.plans.map((plan) => (
-            <li key={plan.id}>
-              <PlanCard plan={plan} />
-            </li>
-          ))}
-        </ul>
+        <PlansTable plans={plans.data!.plans} />
       )}
 
       <SubscriptionsCard plans={plans.data?.plans ?? []} />
@@ -100,28 +106,34 @@ function ErrorNote({ error }: { error: unknown }) {
   );
 }
 
-function EmptyPlans({ onCreate }: { onCreate: () => void }) {
-  const { t } = useTranslation();
-  return (
-    <Card>
-      <CardBody className="py-16 text-center">
-        <Layers className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-        <p className="text-sm font-medium text-ink">{t("plans.empty")}</p>
-        <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">{t("plans.emptyHint")}</p>
-        <Button variant="primary" className="mt-4" onClick={onCreate}>
-          <Plus className="h-4 w-4" aria-hidden />
-          {t("plans.newPlan")}
-        </Button>
-      </CardBody>
-    </Card>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Plans
 // ---------------------------------------------------------------------------
 
-function PlanCard({ plan }: { plan: PlanView }) {
+function PlansTable({ plans }: { plans: PlanView[] }) {
+  const { t } = useTranslation();
+  return (
+    <Table>
+      <thead>
+        <tr>
+          <Th>{t("plans.name")}</Th>
+          <Th className="text-end">{t("plans.maxSites")}</Th>
+          <Th className="text-end">{t("plans.maxDbs")}</Th>
+          <Th className="text-end">{t("plans.storage")}</Th>
+          <Th>{t("plans.features")}</Th>
+          <Th />
+        </tr>
+      </thead>
+      <tbody>
+        {plans.map((plan) => (
+          <PlanRow key={plan.id} plan={plan} />
+        ))}
+      </tbody>
+    </Table>
+  );
+}
+
+function PlanRow({ plan }: { plan: PlanView }) {
   const { t, i18n } = useTranslation();
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -131,74 +143,62 @@ function PlanCard({ plan }: { plan: PlanView }) {
   const inUse = plan.subscriptions > 0;
 
   return (
-    <Card className="h-full">
-      <CardHeader
-        title={
-          <span className="flex items-center gap-2">
-            <span className="truncate">{plan.name}</span>
-            <Badge tone={plan.owner_user_id === null ? "accent" : "neutral"}>
-              {plan.owner_user_id === null ? t("plans.global") : t("plans.owned")}
-            </Badge>
-          </span>
-        }
-        description={t("plans.subscriptionsOn", { count: plan.subscriptions })}
-      />
-      <CardBody className="space-y-3 pt-0">
-        <dl className="grid grid-cols-3 gap-2 text-center">
-          <Limit label={t("plans.maxSites")} value={String(plan.max_sites)} />
-          <Limit label={t("plans.maxDbs")} value={String(plan.max_dbs)} />
-          <Limit
-            label={t("plans.storage")}
-            value={formatBytes(plan.storage_mb * 1024 * 1024, i18n.language)}
-          />
-        </dl>
-
+    <tr className="transition-colors hover:bg-surface-muted/60">
+      <Td>
+        <div className="flex items-center gap-2">
+          <span className="truncate text-sm font-medium text-ink">{plan.name}</span>
+          <Badge tone={plan.owner_user_id === null ? "accent" : "neutral"}>
+            {plan.owner_user_id === null ? t("plans.global") : t("plans.owned")}
+          </Badge>
+        </div>
+        <p className="mt-0.5 text-xs text-ink-muted">
+          {t("plans.subscriptionsOn", { count: plan.subscriptions })}
+        </p>
+      </Td>
+      <Td className="text-end text-sm tabular-nums">{plan.max_sites}</Td>
+      <Td className="text-end text-sm tabular-nums">{plan.max_dbs}</Td>
+      <Td className="text-end text-sm whitespace-nowrap tabular-nums">
+        {formatBytes(plan.storage_mb * 1024 * 1024, i18n.language)}
+      </Td>
+      <Td>
         <ul className="flex flex-wrap gap-1.5">
           <Flag on={plan.can_ssh} label={t("plans.canSsh")} />
           <Flag on={plan.can_cron} label={t("plans.canCron")} />
           <Flag on={plan.can_node_apps} label={t("plans.canNodeApps")} />
         </ul>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
-            <Pencil className="h-3.5 w-3.5" aria-hidden />
-            {t("plans.edit")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={inUse}
-            // The reason sits beside the button as visible text rather than in
-            // a `title`: a tooltip is invisible on a touch screen, and a title
-            // on a button that already has a label muddies its accessible name.
-            aria-describedby={inUse ? `plan-${plan.id}-blocked` : undefined}
-            onClick={() => setDeleting(true)}
-          >
-            <Trash2 className="h-3.5 w-3.5" aria-hidden />
-            {t("plans.delete")}
-          </Button>
+      </Td>
+      <Td className="text-end">
+        <div className="flex flex-col items-end gap-1">
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
+              <Pencil className="h-3.5 w-3.5" aria-hidden />
+              {t("plans.edit")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={inUse}
+              // The reason sits beside the button as visible text rather than in
+              // a `title`: a tooltip is invisible on a touch screen, and a title
+              // on a button that already has a label muddies its accessible name.
+              aria-describedby={inUse ? `plan-${plan.id}-blocked` : undefined}
+              onClick={() => setDeleting(true)}
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden />
+              {t("plans.delete")}
+            </Button>
+          </div>
           {inUse ? (
             <span id={`plan-${plan.id}-blocked`} className="text-xs text-ink-subtle">
               {t("plans.deleteBlocked")}
             </span>
           ) : null}
         </div>
-      </CardBody>
 
-      <PlanFormDialog open={editing} onClose={() => setEditing(false)} plan={plan} />
-      <DeletePlanDialog open={deleting} onClose={() => setDeleting(false)} plan={plan} />
-    </Card>
-  );
-}
-
-function Limit({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg bg-surface-muted px-2 py-2">
-      <dt className="text-xs text-ink-muted">{label}</dt>
-      <dd dir="ltr" className="mt-0.5 text-sm font-semibold text-ink">
-        {value}
-      </dd>
-    </div>
+        <PlanFormDialog open={editing} onClose={() => setEditing(false)} plan={plan} />
+        <DeletePlanDialog open={deleting} onClose={() => setDeleting(false)} plan={plan} />
+      </Td>
+    </tr>
   );
 }
 
@@ -434,7 +434,6 @@ function LimitField({
     >
       <Input
         id={id}
-        dir="ltr"
         inputMode="numeric"
         aria-invalid={Boolean(problem)}
         value={value}
@@ -536,17 +535,24 @@ function SubscriptionsCard({ plans }: { plans: PlanView[] }) {
         {sites.error ? <ErrorNote error={sites.error} /> : null}
 
         {sites.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner className="h-5 w-5" />
+          <div role="status" aria-live="polite" className="divide-y divide-border">
+            {Array.from({ length: 3 }, (_, i) => (
+              <div key={i} className="flex items-center gap-3 py-3">
+                <Skeleton className="h-6 w-28 rounded-full" />
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <Skeleton className="h-3.5 w-1/2" />
+                  <Skeleton className="h-3 w-1/4" />
+                </div>
+                <Skeleton className="h-8 w-40 rounded-lg" />
+              </div>
+            ))}
           </div>
         ) : subscriptions.length === 0 ? (
-          <div className="py-10 text-center">
-            <Users className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("plans.noSubscriptions")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("plans.noSubscriptionsHint")}
-            </p>
-          </div>
+          <EmptyState
+            icon={<Users aria-hidden />}
+            title={t("plans.noSubscriptions")}
+            hint={t("plans.noSubscriptionsHint")}
+          />
         ) : (
           <ul className="divide-y divide-border">
             {subscriptions.map((subscription) => (
@@ -595,20 +601,20 @@ function SubscriptionRow({
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
       <Badge tone="neutral">
         <span>{t("plans.subscriptionShort")}</span>
-        <span dir="ltr">{subscription.id}</span>
+        <span className="tabular-nums">{subscription.id}</span>
       </Badge>
 
       <div className="min-w-0 flex-1">
-        <p dir="ltr" className="truncate text-sm text-ink">
+        <p className="truncate font-mono text-xs text-ink">
           {all.length === 0 ? "—" : all.join(", ")}
         </p>
-        <p className="text-xs text-ink-subtle">
+        <p className="mt-0.5 text-xs text-ink-subtle">
           {t("plans.liveCount", { count: subscription.liveDomains.length })}
         </p>
       </div>
 
       {last ? (
-        <Badge tone={last === "suspended" ? "danger" : "success"}>
+        <Badge tone={last === "suspended" ? "danger" : "success"} dot>
           {t(`plans.justAction.${last}`)}
         </Badge>
       ) : null}
@@ -777,7 +783,6 @@ function AssignByIdDialog({
       >
         <Input
           id="assign-subscription"
-          dir="ltr"
           inputMode="numeric"
           autoFocus
           aria-invalid={idInvalid}
@@ -816,8 +821,8 @@ const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLText
     <textarea
       ref={ref}
       className={cn(
-        "w-full rounded-lg border border-border-strong bg-surface px-3 py-2 text-sm text-ink",
-        "placeholder:text-ink-subtle",
+        "w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-ink shadow-card",
+        "transition-colors placeholder:text-ink-subtle hover:border-border-strong",
         "focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent",
         "aria-[invalid=true]:border-danger",
         className,
@@ -906,7 +911,7 @@ function SuspendDialog({
         {subscription.liveDomains.length === 0 ? null : (
           <ul className="mt-1 ps-6">
             {subscription.liveDomains.map((domain) => (
-              <li key={domain} dir="ltr" className="truncate font-mono text-xs">
+              <li key={domain} className="truncate font-mono text-xs">
                 {domain}
               </li>
             ))}

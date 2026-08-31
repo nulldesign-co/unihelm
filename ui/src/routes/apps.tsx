@@ -6,10 +6,14 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import {
   ApiError,
@@ -59,31 +63,41 @@ export function AppsPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("apps.title")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("apps.subtitle")}</p>
-        </div>
-        <Button variant="primary" onClick={() => setCreating(true)}>
-          <Plus className="h-4 w-4" />
-          {t("apps.create")}
-        </Button>
-      </header>
+      <PageHeader
+        title={t("apps.title")}
+        description={t("apps.subtitle")}
+        actions={
+          <Button variant="primary" onClick={() => setCreating(true)}>
+            <Plus className="h-4 w-4" aria-hidden />
+            {t("apps.create")}
+          </Button>
+        }
+      />
 
       {apps.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <ListSkeleton />
       ) : (apps.data?.apps.length ?? 0) === 0 ? (
-        <EmptyState onCreate={() => setCreating(true)} />
+        <EmptyState
+          icon={<Boxes aria-hidden />}
+          title={t("apps.empty")}
+          hint={t("apps.emptyHint")}
+          action={
+            <Button variant="primary" onClick={() => setCreating(true)}>
+              <Plus className="h-4 w-4" aria-hidden />
+              {t("apps.create")}
+            </Button>
+          }
+        />
       ) : (
-        <ul className="space-y-3">
-          {apps.data!.apps.map((app) => (
-            <li key={app.id}>
-              <AppRow app={app} />
-            </li>
-          ))}
-        </ul>
+        <Card>
+          <ul className="divide-y divide-border">
+            {apps.data!.apps.map((app) => (
+              <li key={app.id}>
+                <AppRow app={app} />
+              </li>
+            ))}
+          </ul>
+        </Card>
       )}
 
       <CreateAppDialog open={creating} onClose={() => setCreating(false)} />
@@ -91,71 +105,48 @@ export function AppsPage() {
   );
 }
 
-function EmptyState({ onCreate }: { onCreate: () => void }) {
-  const { t } = useTranslation();
-  return (
-    <Card>
-      <CardBody className="py-16 text-center">
-        <Boxes className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-        <p className="text-sm font-medium text-ink">{t("apps.empty")}</p>
-        <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">{t("apps.emptyHint")}</p>
-        <Button variant="primary" className="mt-4" onClick={onCreate}>
-          <Plus className="h-4 w-4" />
-          {t("apps.create")}
-        </Button>
-      </CardBody>
-    </Card>
-  );
-}
-
 function AppRow({ app }: { app: AppView }) {
   const { t, i18n } = useTranslation();
 
   return (
-    <Card>
-      <CardBody className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-5">
-        <Badge tone={TONE[app.state]} dot={app.state === "activating" || app.state === "deactivating"}>
-          {/* systemd's states are already named on the dashboard; one vocabulary
-              for "running" across the panel beats two that nearly agree. */}
-          {t(`service.${app.state}`)}
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-4">
+      <Badge tone={TONE[app.state]} dot={app.state === "activating" || app.state === "deactivating"}>
+        {/* systemd's states are already named on the dashboard; one vocabulary
+            for "running" across the panel beats two that nearly agree. */}
+        {t(`service.${app.state}`)}
+      </Badge>
+
+      <div className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-ink">{app.name}</span>
+        <p className="truncate font-mono text-xs text-ink-subtle">{app.entry}</p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        {/* The label and the number are separate children so the badge's own
+            gap spaces them. */}
+        <Badge tone="neutral">
+          <span>{t("apps.port")}</span>
+          <span className="tabular-nums">{app.port}</span>
         </Badge>
 
-        <div className="min-w-0 flex-1">
-          <span dir="ltr" className="block truncate font-medium text-ink">
-            {app.name}
-          </span>
-          <p dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
-            {app.entry}
-          </p>
-        </div>
+        {/* Production is the default and the boring case; the other two are
+            worth flagging, because a hosted app in `development` leaks stack
+            traces to the internet. */}
+        {app.node_env === "production" ? null : (
+          <Badge tone="warning">{t(`apps.envName.${app.node_env}`)}</Badge>
+        )}
 
-        <div className="flex flex-wrap items-center gap-2">
-          {/* The label and the number are separate children so the badge's own
-              gap spaces them — and so the number stays LTR on an RTL page. */}
-          <Badge tone="neutral">
-            <span>{t("apps.port")}</span>
-            <span dir="ltr">{app.port}</span>
-          </Badge>
+        {app.memory_bytes === undefined ? null : (
+          <Badge tone="neutral">{formatBytes(app.memory_bytes, i18n.language)}</Badge>
+        )}
 
-          {/* Production is the default and the boring case; the other two are
-              worth flagging, because a hosted app in `development` leaks stack
-              traces to the internet. */}
-          {app.node_env === "production" ? null : (
-            <Badge tone="warning">{t(`apps.envName.${app.node_env}`)}</Badge>
-          )}
+        <Badge tone={app.site_id === null ? "neutral" : "accent"}>
+          {app.site_id === null ? t("apps.notPublished") : t("apps.published")}
+        </Badge>
 
-          {app.memory_bytes === undefined ? null : (
-            <Badge tone="neutral">{formatBytes(app.memory_bytes, i18n.language)}</Badge>
-          )}
-
-          <Badge tone={app.site_id === null ? "neutral" : "accent"}>
-            {app.site_id === null ? t("apps.notPublished") : t("apps.published")}
-          </Badge>
-
-          <AppActions app={app} />
-        </div>
-      </CardBody>
-    </Card>
+        <AppActions app={app} />
+      </div>
+    </div>
   );
 }
 
@@ -200,10 +191,11 @@ function AppActions({ app }: { app: AppView }) {
         {t("apps.restart")}
       </Button>
 
-      <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("apps.delete")}
-      </Button>
+      <Menu label={t("nav.menu")}>
+        <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
+          {t("apps.delete")}
+        </MenuItem>
+      </Menu>
 
       <LogsDialog app={app} open={showLogs} onClose={() => setShowLogs(false)} />
 
@@ -260,6 +252,7 @@ function LogsDialog({
     <Dialog
       open={open}
       onClose={onClose}
+      wide
       title={t("apps.logsTitle", { name: app.name })}
       description={t("apps.logsHint", { count: DEFAULT_LOG_LINES })}
       footer={
@@ -274,13 +267,16 @@ function LogsDialog({
         </>
       }
     >
-      <p dir="ltr" className="mb-2 truncate font-mono text-xs text-ink-subtle">
+      <p className="mb-2 truncate font-mono text-xs text-ink-subtle">
         {logs.data?.unit ?? app.unit}
       </p>
 
       {logs.isPending ? (
-        <div className="flex justify-center py-10 text-ink-muted">
-          <Spinner className="h-5 w-5" />
+        <div className="space-y-2 rounded-lg border border-border bg-canvas p-3">
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-5/6" />
+          <Skeleton className="h-3 w-2/3" />
+          <Skeleton className="h-3 w-3/4" />
         </div>
       ) : logs.error ? (
         <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
@@ -292,13 +288,9 @@ function LogsDialog({
             <p className="text-ink-subtle">{t("apps.logsEmpty")}</p>
           ) : (
             logs.data!.lines.map((line, index) => (
-              // Journal output is machine text: it stays LTR even on an RTL
-              // page, and `break-all` keeps a long stack trace inside the box.
-              <div
-                key={`${index}-${line}`}
-                dir="ltr"
-                className="whitespace-pre-wrap break-all text-ink-muted"
-              >
+              // Journal output is machine text; `break-all` keeps a long stack
+              // trace inside the box.
+              <div key={`${index}-${line}`} className="whitespace-pre-wrap break-all text-ink-muted">
                 {line}
               </div>
             ))
@@ -412,7 +404,6 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         <Field label={t("apps.name")} htmlFor="app-name" error={errors.name?.message}>
           <Input
             id="app-name"
-            dir="ltr"
             placeholder="blog"
             autoFocus
             aria-invalid={Boolean(errors.name)}
@@ -431,7 +422,6 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         <Field label={t("apps.entry")} htmlFor="app-entry" error={errors.entry?.message}>
           <Input
             id="app-entry"
-            dir="ltr"
             placeholder="apps/blog/server.js"
             aria-describedby="app-entry-hint"
             aria-invalid={Boolean(errors.entry)}
@@ -456,7 +446,6 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         <Field label={t("apps.memory")} htmlFor="app-memory" error={errors.memory_mb?.message}>
           <Input
             id="app-memory"
-            dir="ltr"
             inputMode="numeric"
             placeholder="512"
             aria-describedby="app-memory-hint"
@@ -477,7 +466,6 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         >
           <Input
             id="app-proxy-domain"
-            dir="ltr"
             placeholder="blog.example.com"
             aria-describedby="app-proxy-hint"
             {...register("proxy_domain", {
@@ -502,15 +490,13 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
             {env.fields.map((field, index) => (
               <li key={field.id} className="flex items-center gap-2">
                 <Input
-                  dir="ltr"
-                  className="flex-1"
+                  className="flex-1 font-mono text-xs"
                   aria-label={t("apps.envKey")}
                   placeholder="DATABASE_URL"
                   {...register(`env.${index}.key` as const)}
                 />
                 <Input
-                  dir="ltr"
-                  className="flex-1"
+                  className="flex-1 font-mono text-xs"
                   aria-label={t("apps.envValue")}
                   {...register(`env.${index}.value` as const)}
                 />

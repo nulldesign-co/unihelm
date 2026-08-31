@@ -44,7 +44,7 @@ export function Switch({
         <span
           className={cn(
             "h-4 w-4 rounded-full bg-white shadow transition-transform",
-            checked ? "translate-x-4 rtl:-translate-x-4" : "translate-x-0",
+            checked ? "translate-x-4" : "translate-x-0",
           )}
         />
       </span>

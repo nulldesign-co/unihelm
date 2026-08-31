@@ -10,6 +10,12 @@ export const en = {
     search: "Search",
     none: "—",
     unknown: "Unknown",
+    noResults: "No results",
+    role: {
+      admin: "Administrator",
+      reseller: "Reseller",
+      customer: "Customer",
+    },
   },
   login: {
     title: "Sign in",
@@ -23,6 +29,8 @@ export const en = {
     genericError: "Could not sign in. Check the details and try again.",
     rateLimited: "Too many attempts. Wait a few minutes before trying again.",
     support: "Need help?",
+    showPassword: "Show password",
+    hidePassword: "Hide password",
   },
   nav: {
     dashboard: "Dashboard",
@@ -42,6 +50,11 @@ export const en = {
     tasks: "Tasks",
     terminal: "Terminal",
     commandPalette: "Command palette",
+    menu: "Menu",
+    groupHosting: "Hosting",
+    groupOperations: "Operations",
+    groupSecurity: "Security",
+    groupAdmin: "Administration",
     theme: "Theme",
     language: "Language",
     themeLight: "Light",
@@ -938,6 +951,7 @@ export const en = {
         "One certificate covers both example.com and *.example.com. A wildcard matches exactly one label, so a wildcard-only certificate would leave the bare domain broken — which is the most common wildcard mistake there is.",
       issue: "Get wildcard certificate",
       noSites: "No sites yet.",
+    },
   },
   firewall: {
     title: "Firewall",
@@ -1066,7 +1080,6 @@ export const en = {
       save: "Save Sentinel settings",
       saved: "Saved",
     },
-  },
   },
   alerts: {
     title: "Alerts",

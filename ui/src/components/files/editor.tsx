@@ -2,6 +2,7 @@ import { Save, X } from "lucide-react";
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ApiError } from "@/lib/api";
@@ -132,21 +133,19 @@ export function FileEditorOverlay({
       className="fixed inset-0 z-50 flex flex-col bg-canvas"
     >
       <header className="flex items-center gap-3 border-b border-border bg-surface px-4 py-2.5">
-        <p dir="ltr" className="min-w-0 flex-1 truncate text-start font-mono text-sm text-ink">
-          {entry.path}
-        </p>
+        <p className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{entry.path}</p>
         {dirty ? (
-          <span className="rounded-full bg-warning-soft px-2 py-0.5 text-xs text-warning">
+          <Badge tone="warning" dot>
             {t("files.unsaved")}
-          </span>
+          </Badge>
         ) : savedFlash ? (
-          <span role="status" className="rounded-full bg-success-soft px-2 py-0.5 text-xs text-success">
+          <Badge role="status" tone="success" dot>
             {t("files.saved")}
-          </span>
+          </Badge>
         ) : null}
         {phase.kind === "ready" ? (
           <Button variant="primary" size="sm" onClick={save} disabled={saving || !dirty}>
-            {saving ? <Spinner /> : <Save className="h-3.5 w-3.5" />}
+            {saving ? <Spinner /> : <Save className="h-3.5 w-3.5" aria-hidden />}
             {t("files.save")}
           </Button>
         ) : null}

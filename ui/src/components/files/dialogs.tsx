@@ -102,7 +102,6 @@ export function MkdirDialog({
         <Field label={t("files.folderName")} htmlFor="mkdir-name">
           <Input
             id="mkdir-name"
-            dir="auto"
             autoFocus
             value={name}
             onChange={(event) => setName(event.target.value)}
@@ -177,7 +176,6 @@ export function RenameDialog({
         <Field label={t("files.newName")} htmlFor="rename-name">
           <Input
             id="rename-name"
-            dir="auto"
             autoFocus
             value={name}
             onChange={(event) => setName(event.target.value)}
@@ -249,7 +247,7 @@ export function CopyDialog({
       <Field label={t("files.copyDest")} htmlFor="copy-dest">
         <Input
           id="copy-dest"
-          dir="ltr"
+          className="font-mono"
           autoFocus
           value={dest}
           placeholder={t("files.home")}
@@ -308,7 +306,7 @@ export function DeleteDialog({
         </>
       }
     >
-      <ul className="max-h-40 space-y-1 overflow-y-auto font-mono text-xs text-ink-muted" dir="ltr">
+      <ul className="max-h-40 space-y-1 overflow-y-auto font-mono text-xs text-ink-muted">
         {entries.map((entry) => (
           <li key={entry.path} className="truncate">
             {entry.path}
@@ -377,7 +375,7 @@ export function ChmodDialog({
         </>
       }
     >
-      <div dir="ltr" className="grid grid-cols-4 gap-x-4 gap-y-2 text-sm">
+      <div className="grid grid-cols-4 gap-x-4 gap-y-2 text-sm">
         <span />
         {WHAT.map((what) => (
           <span key={what} className="text-center text-xs font-medium text-ink-muted">
@@ -410,7 +408,6 @@ export function ChmodDialog({
         <Field label={t("files.octal")} htmlFor="chmod-octal" error={mode === null ? t("files.octalInvalid") : undefined}>
           <Input
             id="chmod-octal"
-            dir="ltr"
             className="w-28 font-mono"
             value={octal}
             aria-invalid={mode === null}
@@ -497,7 +494,7 @@ export function CompressDialog({
           <Field label={t("files.archiveName")} htmlFor="compress-name">
             <Input
               id="compress-name"
-              dir="ltr"
+              className="font-mono"
               autoFocus
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -520,7 +517,7 @@ export function CompressDialog({
           </Field>
         </div>
       </div>
-      <p dir="ltr" className="font-mono text-xs text-ink-subtle">
+      <p className="font-mono text-xs text-ink-subtle">
         {joinPath(dir, `${name.trim() || "…"}.${ext}`)}
       </p>
       <ErrorNote error={error} />
@@ -578,7 +575,7 @@ export function ExtractDialog({
       <Field label={t("files.extractDest")} htmlFor="extract-dest">
         <Input
           id="extract-dest"
-          dir="ltr"
+          className="font-mono"
           autoFocus
           value={dest}
           placeholder={t("files.home")}
@@ -642,7 +639,6 @@ export function PurgeDialog({
       >
         <Input
           id="purge-days"
-          dir="ltr"
           inputMode="numeric"
           className="w-28"
           value={days}

@@ -7,6 +7,7 @@ import {
   Cpu,
   HardDrive,
   MemoryStick,
+  Server,
   ShieldCheck,
   Slash,
   Timer,
@@ -16,8 +17,10 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Meter } from "@/components/ui/meter";
-import { Spinner } from "@/components/ui/spinner";
+import { PageHeader } from "@/components/ui/page-header";
+import { ListSkeleton, Skeleton, StatSkeleton } from "@/components/ui/skeleton";
 import { endpoints, type ServiceStatus, type SystemInfo, type UnitState } from "@/lib/api";
 import { useSession } from "@/lib/session";
 import { formatBytes, formatPercent, formatUptime } from "@/lib/utils";
@@ -51,8 +54,10 @@ export function DashboardPage() {
 
   if (overview.isPending) {
     return (
-      <div className="flex items-center justify-center py-24 text-ink-muted">
-        <Spinner className="h-6 w-6" />
+      <div className="space-y-6">
+        <PageHeader title={t("dashboard.title")} description={t("dashboard.subtitle")} />
+        <StatSkeleton />
+        <ListSkeleton />
       </div>
     );
   }
@@ -63,24 +68,19 @@ export function DashboardPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("dashboard.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("dashboard.subtitle")}</p>
-      </header>
+      <PageHeader title={t("dashboard.title")} description={t("dashboard.subtitle")} />
 
       {data && !data.agent_online ? (
         <div
           role="alert"
-          className="flex gap-3 rounded-card border border-warning/30 bg-warning-soft px-4 py-3"
+          className="flex gap-3 rounded-lg border border-warning/30 bg-warning-soft px-4 py-3"
         >
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
           <div>
             <p className="text-sm font-medium text-ink">{t("dashboard.agentOffline")}</p>
             <p className="mt-0.5 text-sm text-ink-muted">{t("dashboard.agentOfflineHint")}</p>
             {data.agent_error ? (
-              <p dir="ltr" className="mt-1 font-mono text-xs text-ink-subtle">
-                {data.agent_error}
-              </p>
+              <p className="mt-1 font-mono text-xs text-ink-subtle">{data.agent_error}</p>
             ) : null}
           </div>
         </div>
@@ -123,9 +123,7 @@ export function DashboardPage() {
                   return (
                     <div key={disk.mount}>
                       <div className="mb-1.5 flex items-baseline justify-between gap-3 text-sm">
-                        <span dir="ltr" className="truncate font-mono text-xs text-ink">
-                          {disk.mount}
-                        </span>
+                        <span className="truncate font-mono text-xs text-ink">{disk.mount}</span>
                         <span className="shrink-0 text-ink-muted">
                           {formatBytes(disk.used_bytes, locale)} /{" "}
                           {formatBytes(disk.total_bytes, locale)}
@@ -148,11 +146,21 @@ export function DashboardPage() {
           <CardHeader title={t("dashboard.services")} />
           <CardBody>
             {services.isPending ? (
-              <div className="flex justify-center py-8 text-ink-muted">
-                <Spinner />
+              <div role="status" aria-live="polite" className="space-y-4 py-1">
+                {Array.from({ length: 4 }, (_, i) => (
+                  <div key={i} className="flex items-center gap-3">
+                    <Skeleton className="h-6 w-20 rounded-full" />
+                    <Skeleton className="h-3.5 w-1/3" />
+                    <Skeleton className="ms-auto h-3 w-14" />
+                  </div>
+                ))}
               </div>
             ) : (services.data?.services.length ?? 0) === 0 ? (
-              <Empty title={t("dashboard.noServices")} hint={t("dashboard.installHint")} />
+              <EmptyState
+                icon={<Server aria-hidden />}
+                title={t("dashboard.noServices")}
+                hint={t("dashboard.installHint")}
+              />
             ) : (
               <ul className="divide-y divide-border">
                 {services.data!.services.map((service) => (
@@ -318,17 +326,15 @@ function SecurityTile({
       <span className="flex items-center gap-2 text-ink-muted">
         {icon}
         <span className="text-xs font-medium tracking-wide uppercase">{label}</span>
-        {/* A chevron rather than a mirrored arrow: the icon is rotated by the
-            RTL rule below so it always points the way the reader travels. */}
         <ChevronRight
-          className="ms-auto h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100 rtl:rotate-180"
+          className="ms-auto h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100"
           aria-hidden
         />
       </span>
-      <span dir="auto" className="text-xl font-semibold tracking-tight text-ink tabular-nums">
-        {value}
-      </span>
-      {badge}
+      <span className="text-xl font-semibold tracking-tight text-ink tabular-nums">{value}</span>
+      {/* `self-start`: a flex column stretches children, and a stretched pill
+          reads as a bar. */}
+      {badge ? <span className="self-start">{badge}</span> : null}
     </Link>
   );
 }
@@ -407,7 +413,7 @@ function PanelFootprint({ total }: { total: number | null }) {
 function ServiceRow({ service }: { service: ServiceStatus }) {
   const { t, i18n } = useTranslation();
   return (
-    <li className="flex items-center gap-3 py-2.5 first:pt-0 last:pb-0">
+    <li className="-mx-2 flex items-center gap-3 rounded-lg px-2 py-2.5 transition-colors hover:bg-surface-muted/60">
       <Badge tone={SERVICE_TONE[service.state]} dot>
         {t(`service.${service.state}`)}
       </Badge>
@@ -425,18 +431,7 @@ function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
       <dt className="text-ink-muted">{label}</dt>
-      <dd dir="ltr" className="truncate text-end font-mono text-xs text-ink">
-        {value}
-      </dd>
-    </div>
-  );
-}
-
-function Empty({ title, hint }: { title: string; hint: string }) {
-  return (
-    <div className="py-10 text-center">
-      <p className="text-sm font-medium text-ink">{title}</p>
-      <p className="mt-1 text-sm text-ink-muted">{hint}</p>
+      <dd className="truncate text-end font-mono text-xs text-ink">{value}</dd>
     </div>
   );
 }
