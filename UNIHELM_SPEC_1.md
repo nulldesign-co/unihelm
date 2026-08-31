@@ -195,6 +195,7 @@ Keep `unihelm-ipc` transport-abstract (`trait FrameTransport`), so a later `mTLS
 - `unihelm-web` unit hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `CapabilityBoundingSet=`, RW only its state dirs.
 - Crash-only design: no in-memory state that matters; task queue, sessions, scheduler state all in SQLite; on restart, interrupted tasks are re-queued or marked failed-with-reason.
 - SQLite in WAL + `synchronous=NORMAL`, single-writer discipline (agentd owns writes to task/metric tables; web owns sessions) to avoid lock contention.
+- **agentd owns the schema.** It is the only process that applies migrations, under an exclusive `flock` on `<database>-migrate.lock` held across check-and-apply. `unihelm-web` and the CLI open the database read-only with respect to the schema: they verify it and refuse to start against one they do not recognise, rather than rewriting a root-owned schema from an unprivileged process. The lock is what makes this true where systemd's ordering does not reach — `--dev`, containers, and a CLI command run while the agent is restarting.
 - Self-monitoring: agentd watches web (and vice versa via socket ping); a `unihelm doctor` CLI command prints a full health report (units, sockets, db integrity, disk space, cert expiries).
 - **Update safety:** self-update downloads the new binary, verifies ed25519 signature (`minisign` format), swaps atomically, restarts one daemon at a time, auto-rolls back if the new version fails its health check within 60 s.
 

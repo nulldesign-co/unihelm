@@ -1063,13 +1063,15 @@ mod tests {
         // file *is a database with our rows in it*, not merely that it exists.
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("panel.db");
-        let db = Db::open(&live).await.unwrap();
+        let db = Db::open_and_migrate(&live).await.unwrap();
         db.create_backup_repo(repo("nightly")).await.unwrap();
 
         let snapshot = dir.path().join("snapshot.db");
         db.vacuum_into(&snapshot).await.unwrap();
         assert!(snapshot.is_file());
 
+        // The read-only door on purpose: a restored snapshot must open
+        // without anybody migrating it.
         let restored = Db::open(&snapshot).await.unwrap();
         let repos = restored.backup_repos().await.unwrap();
         assert_eq!(repos.len(), 1);
@@ -1099,7 +1101,9 @@ mod tests {
         // SQLite's own refusal, kept rather than worked around: a file already
         // sitting at the destination means something else is using that path.
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("panel.db")).await.unwrap();
+        let db = Db::open_and_migrate(dir.path().join("panel.db"))
+            .await
+            .unwrap();
         let occupied = dir.path().join("taken.db");
         std::fs::write(&occupied, b"not ours").unwrap();
         assert!(db.vacuum_into(&occupied).await.is_err());
@@ -1111,7 +1115,9 @@ mod tests {
         // were interpolated, this would run `VACUUM` against a nonsense target
         // and then try to execute a second statement.
         let dir = tempfile::tempdir().unwrap();
-        let db = Db::open(dir.path().join("panel.db")).await.unwrap();
+        let db = Db::open_and_migrate(dir.path().join("panel.db"))
+            .await
+            .unwrap();
         let hostile = dir.path().join("x'; DROP TABLE backup_repos; --");
         // May or may not succeed depending on the filesystem; what must hold
         // is that the table is still there afterwards.

@@ -2,7 +2,12 @@
 Description=Unihelm panel web server
 Documentation=https://github.com/farzam-seyedhashem/unihelm
 After=network-online.target unihelm-agentd.service
-Wants=network-online.target
+# `After=` alone only orders the two when both are already being started, so
+# `systemctl start unihelm-web` on its own would start the web process against a
+# database no agent has created — and unihelm-web does not migrate. `Wants=`
+# pulls the agent in; `Requires=` would also stop web whenever the agent stops,
+# which this unit deliberately survives.
+Wants=network-online.target unihelm-agentd.service
 
 [Service]
 Type=notify

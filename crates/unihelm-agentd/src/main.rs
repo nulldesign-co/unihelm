@@ -142,7 +142,12 @@ async fn run(args: Args, config: UnihelmConfig) -> Result<()> {
         Err(e) => return Err(e).context("this system is not supported"),
     };
 
-    let db = Db::open(&config.panel.database)
+    // The agent owns the schema (spec §5.1, §5.5), and is the only production
+    // process that migrates. It does so under an exclusive lock, and it does so
+    // *before* it binds the socket below — which is what makes the installer's
+    // wait for /run/unihelm/agent.sock a wait for "the schema is ready", relied
+    // on by `unihelm user create-admin` and by unihelm-web.
+    let db = Db::open_and_migrate(&config.panel.database)
         .await
         .with_context(|| format!("could not open {}", config.panel.database.display()))?;
 
@@ -321,7 +326,10 @@ fn grant_db_access(config: &UnihelmConfig) -> Result<()> {
     };
 
     let base = &config.panel.database;
-    for suffix in ["", "-wal", "-shm"] {
+    // The schema lock holds no data, but handing it over with the rest means the
+    // web process owns it outright after the first agent start, rather than
+    // depending on a root-created file happening to be readable.
+    for suffix in ["", "-wal", "-shm", unihelm_db::migrate_lock::LOCK_SUFFIX] {
         let path = if suffix.is_empty() {
             base.clone()
         } else {

@@ -875,11 +875,17 @@ struct TempSnapshot(PathBuf);
 
 impl Drop for TempSnapshot {
     fn drop(&mut self) {
-        if self.0.exists()
-            && let Err(e) = std::fs::remove_file(&self.0)
-        {
-            tracing::warn!(path = %self.0.display(), error = %e,
-                "could not remove the temporary database snapshot");
+        // The snapshot and everything opening it leaves behind. Reading a
+        // database now creates a `-migrate.lock` sidecar beside it, so removing
+        // only the `.db` leaves a stray zero-byte file in the work directory
+        // every time a backup runs.
+        for path in [self.0.clone(), unihelm_db::schema_lock_path(&self.0)] {
+            if path.exists()
+                && let Err(e) = std::fs::remove_file(&path)
+            {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "could not remove a temporary database snapshot file");
+            }
         }
     }
 }
@@ -2689,7 +2695,9 @@ mod tests {
         use unihelm_core::{Email, Username};
         use unihelm_db::users::NewUser;
 
-        let db = unihelm_db::Db::open(db_dir.join("panel.db")).await.unwrap();
+        let db = unihelm_db::Db::open_and_migrate(db_dir.join("panel.db"))
+            .await
+            .unwrap();
         let mk = |name: &'static str, role: Role| NewUser {
             role,
             email: Email::parse(&format!("{name}@example.com")).unwrap(),

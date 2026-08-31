@@ -77,12 +77,29 @@ pub struct Session {
     follow: bool,
 }
 
+/// Open the panel database for a CLI command.
+///
+/// The read-only door: `unihelm-agentd` owns the schema (spec §5.1, §5.5), so no
+/// CLI command migrates. A person typed this and is waiting, so an unready
+/// schema is reported now rather than waited on — `unihelm-web` waits instead,
+/// because there systemd is the one waiting.
+pub(crate) async fn open_panel_db(config: &UnihelmConfig) -> Result<Db> {
+    match Db::open(&config.panel.database).await {
+        Ok(db) => Ok(db),
+        Err(
+            e @ (unihelm_db::DbError::NotInitialised { .. }
+            | unihelm_db::DbError::SchemaNotReady { .. }),
+        ) => Err(anyhow::anyhow!("{e}")),
+        Err(e) => {
+            Err(e).with_context(|| format!("could not open {}", config.panel.database.display()))
+        }
+    }
+}
+
 impl Session {
     /// Open the database only.
     pub async fn local(config: &UnihelmConfig, json: bool, follow: bool) -> Result<Self> {
-        let db = Db::open(&config.panel.database)
-            .await
-            .with_context(|| format!("could not open {}", config.panel.database.display()))?;
+        let db = open_panel_db(config).await?;
         let auth = admin_auth(&db).await?;
         Ok(Self {
             client: None,

@@ -29,13 +29,18 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use unihelm_core::config::{LogFormat, UnihelmConfig, paths};
 use unihelm_core::notify;
-use unihelm_db::Db;
+use unihelm_db::{Db, DbError};
 
 use crate::state::AppState;
 
 /// Request bodies larger than this are refused before they are buffered. File
 /// uploads get their own chunked path when the file manager lands (spec §11.7).
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// How long to wait for the agent to create and migrate the panel database.
+/// Long enough to cover a cold start on a small VPS, short enough to stay
+/// well inside systemd's 90s default `TimeoutStartSec`.
+const SCHEMA_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Parser, Debug)]
 #[command(name = "unihelm-web", version, about = "Unihelm panel web server")]
@@ -92,9 +97,37 @@ async fn main() -> Result<()> {
         );
     }
 
-    let db = Db::open(&config.panel.database)
-        .await
-        .with_context(|| format!("could not open {}", config.panel.database.display()))?;
+    // The watchdog is armed before the database wait, not after. `WatchdogSec=30`
+    // in unihelm-web.service is measured from process start, not from READY=1,
+    // so a wait with the heartbeat still below it would get this process killed
+    // on exactly the machine the wait exists to serve.
+    let watchdog = spawn_watchdog();
+
+    // `unihelm-agentd` owns the schema (spec §5.1, §5.5). This half used to
+    // migrate on open, which meant both daemons ran sqlx's migrator
+    // concurrently — and sqlx has no cross-process lock on SQLite, so whichever
+    // process lost reported `table users already exists` and refused to start.
+    //
+    // In dev there may be no agent at all, so a dev instance is an owner and
+    // migrates for itself; the exclusive lock is what makes that safe.
+    let db = if args.dev.is_some() {
+        Db::open_and_migrate(&config.panel.database).await
+    } else {
+        // Waiting rather than failing fast: with Restart=always/RestartSec=2 and
+        // StartLimitBurst=10, failing fast would put this unit permanently in
+        // `failed` about twenty seconds into a slow agent start.
+        Db::open_waiting(&config.panel.database, SCHEMA_WAIT).await
+    };
+    let db = match db {
+        Ok(db) => db,
+        Err(e @ (DbError::NotInitialised { .. } | DbError::SchemaNotReady { .. })) => {
+            anyhow::bail!("{e}\nunihelm-agentd applies migrations; unihelm-web does not.")
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not open {}", config.panel.database.display()));
+        }
+    };
 
     if !db.has_any_user().await? {
         tracing::warn!(
@@ -123,7 +156,6 @@ async fn main() -> Result<()> {
 
     notify::ready();
     notify::status(&format!("listening on {addr}"));
-    let watchdog = spawn_watchdog();
 
     axum::serve(
         listener,

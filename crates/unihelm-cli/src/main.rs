@@ -33,8 +33,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use unihelm_core::config::UnihelmConfig;
 use unihelm_core::{Email, Role, TenantScope, Username};
-use unihelm_db::Db;
 use unihelm_db::users::NewUser;
+use unihelm_db::{Db, DbError, SchemaState};
 use unihelm_distro::{Distro, SupportStatus};
 use unihelm_ipc::IpcClient;
 
@@ -308,39 +308,74 @@ fn check_system(report: &mut Report) {
     }
 }
 
+/// `doctor` reports; it never applies and it never blocks.
+///
+/// This used to call `Db::open`, which migrated — so the command an operator
+/// runs *because* something looks wrong was itself a migrator, racing the agent
+/// and, on a machine where the agent had never run, conjuring a fully migrated
+/// database owned by whoever typed it and then reporting it healthy.
 async fn check_database(config: &UnihelmConfig, report: &mut Report) {
     let path = &config.panel.database;
-    if !path.exists() {
-        report.fail("database", format!("{} does not exist yet", path.display()));
-        return;
-    }
 
-    match Db::open(path).await {
-        Ok(db) => {
-            match db.integrity_check().await {
-                Ok(result) if result == "ok" => {
-                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    report.ok(
-                        "database",
-                        format!("{} ({})", path.display(), human_bytes(size)),
-                    );
-                }
-                Ok(result) => report.fail("database", format!("integrity check: {result}")),
-                Err(e) => report.fail("database", format!("integrity check failed: {e}")),
-            }
-
-            match db.has_any_user().await {
-                Ok(true) => report.ok("accounts", "at least one account exists"),
-                Ok(false) => report.warn(
-                    "accounts",
-                    "no accounts yet — run `unihelm user create-admin`",
+    let (db, state) = match Db::open_unchecked(path).await {
+        Ok(pair) => pair,
+        Err(DbError::NotInitialised { .. }) => {
+            // The "the agent has never run" case, and a legitimate failure on a
+            // box that is supposed to be installed.
+            report.fail(
+                "database",
+                format!(
+                    "{} does not exist yet — unihelm-agentd creates it on first start; \
+                     check: systemctl status unihelm-agentd",
+                    path.display()
                 ),
-                Err(e) => report.fail("accounts", e.to_string()),
-            }
-            db.close().await;
+            );
+            return;
         }
-        Err(e) => report.fail("database", format!("{}: {e}", path.display())),
+        Err(e) => {
+            report.fail("database", format!("{}: {e}", path.display()));
+            return;
+        }
+    };
+
+    match &state {
+        SchemaState::Ready { version } => {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            report.ok(
+                "schema",
+                format!("{version:04} applied ({})", human_bytes(size)),
+            );
+        }
+        // A mixed-version box mid-upgrade: worth saying, not worth failing over.
+        SchemaState::Ahead { .. } => report.warn("schema", state.to_string()),
+        // Every one of these already names the command that fixes it.
+        _ => report.fail("schema", state.to_string()),
     }
+
+    // A page-level check, meaningful whatever the schema version — except after
+    // a checksum divergence, where the finding above is the whole story.
+    if !matches!(state, SchemaState::Diverged { .. }) {
+        match db.integrity_check().await {
+            Ok(result) if result == "ok" => report.ok("database", path.display().to_string()),
+            Ok(result) => report.fail("database", format!("integrity check: {result}")),
+            Err(e) => report.fail("database", format!("integrity check failed: {e}")),
+        }
+    }
+
+    // Only where a `users` table is guaranteed to exist. On Empty/Behind the raw
+    // sqlx "no such table" would be noise on top of a finding already made
+    // properly above.
+    if matches!(state, SchemaState::Ready { .. } | SchemaState::Ahead { .. }) {
+        match db.has_any_user().await {
+            Ok(true) => report.ok("accounts", "at least one account exists"),
+            Ok(false) => report.warn(
+                "accounts",
+                "no accounts yet — run `unihelm user create-admin`",
+            ),
+            Err(e) => report.fail("accounts", e.to_string()),
+        }
+    }
+    db.close().await;
 }
 
 async fn check_agent(config: &UnihelmConfig, report: &mut Report) {
@@ -433,9 +468,7 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
-    let db = Db::open(&config.panel.database)
-        .await
-        .with_context(|| format!("could not open {}", config.panel.database.display()))?;
+    let db = crate::session::open_panel_db(config).await?;
 
     match cmd {
         UserCommand::CreateAdmin {

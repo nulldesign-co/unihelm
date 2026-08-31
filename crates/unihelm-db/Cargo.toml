@@ -14,6 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# flock(2) for the schema lock. Already a workspace dependency and already in
+# this crate's link graph via libsqlite3-sys, so nothing new arrives.
+libc = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
