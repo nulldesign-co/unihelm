@@ -15,8 +15,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -52,10 +55,7 @@ export function AlertsPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("alerts.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("alerts.subtitle")}</p>
-      </header>
+      <PageHeader title={t("alerts.title")} description={t("alerts.subtitle")} />
 
       <RulesCard />
       <HistoryCard />
@@ -66,6 +66,24 @@ export function AlertsPage() {
 
 function errorText(error: unknown): string {
   return error instanceof ApiError ? error.message : String(error);
+}
+
+/** Ghost rows shaped like the list they stand in for, inside a card body. */
+function RowsSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div role="status" aria-live="polite" className="space-y-4">
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className="flex items-center gap-3">
+          <Skeleton className="h-6 w-16 rounded-full" />
+          <div className="min-w-0 flex-1 space-y-1.5">
+            <Skeleton className="h-3.5 w-1/3" />
+            <Skeleton className="h-3 w-1/2" />
+          </div>
+          <Skeleton className="h-8 w-16 rounded-lg" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -156,21 +174,23 @@ function RulesCard() {
       />
       <CardBody>
         {rules.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner />
-          </div>
+          <RowsSkeleton />
         ) : rules.error ? (
           <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
             {errorText(rules.error)}
           </p>
         ) : rules.data!.rules.length === 0 ? (
-          <div className="py-10 text-center">
-            <BellRing className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("alerts.rules.empty")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("alerts.rules.emptyHint")}
-            </p>
-          </div>
+          <EmptyState
+            icon={<BellRing aria-hidden />}
+            title={t("alerts.rules.empty")}
+            hint={t("alerts.rules.emptyHint")}
+            action={
+              <Button variant="primary" size="sm" onClick={() => setEditing("new")}>
+                <Plus className="h-3.5 w-3.5" aria-hidden />
+                {t("alerts.rules.add")}
+              </Button>
+            }
+          />
         ) : (
           <ul className="divide-y divide-border">
             {rules.data!.rules.map((rule) => (
@@ -242,7 +262,7 @@ function RuleRow({
 
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-ink">{t(`alerts.kind.${rule.kind}`)}</p>
-        <p dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
+        <p className="truncate font-mono text-xs text-ink-subtle">
           {rule.target ?? t("alerts.rules.everySubject")}
         </p>
       </div>
@@ -250,7 +270,7 @@ function RuleRow({
       {rule.kind === "service_down" ? null : (
         <Badge tone="neutral">
           <span>{t("alerts.rules.threshold")}</span>
-          <span dir="ltr">
+          <span className="tabular-nums">
             {number.format(rule.threshold)}
             {t(`alerts.unit.${rule.kind}`)}
           </span>
@@ -258,7 +278,7 @@ function RuleRow({
       )}
 
       {open.length > 0 ? (
-        <p className="w-full text-xs text-danger" dir="auto">
+        <p className="w-full text-xs text-danger">
           {open.map((event) => event.message).join(" · ")}
         </p>
       ) : null}
@@ -393,7 +413,7 @@ function RuleDialog({
         ) : (
           <Input
             id="alert-target"
-            dir="ltr"
+            className="font-mono"
             disabled={rule !== null}
             placeholder={kind === "disk_pct" ? "/" : kind === "cert_expiry_days" ? "example.com" : ""}
             value={target}
@@ -424,7 +444,6 @@ function RuleDialog({
         >
           <Input
             id="alert-threshold"
-            dir="ltr"
             inputMode="decimal"
             value={threshold}
             aria-invalid={problem?.startsWith("threshold") ?? false}
@@ -539,21 +558,17 @@ function HistoryCard() {
       />
       <CardBody>
         {events.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner />
-          </div>
+          <RowsSkeleton />
         ) : events.error ? (
           <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
             {errorText(events.error)}
           </p>
         ) : spans.length === 0 ? (
-          <div className="py-10 text-center">
-            <ShieldCheck className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("alerts.history.empty")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("alerts.history.emptyHint")}
-            </p>
-          </div>
+          <EmptyState
+            icon={<ShieldCheck aria-hidden />}
+            title={t("alerts.history.empty")}
+            hint={t("alerts.history.emptyHint")}
+          />
         ) : (
           <ul className="divide-y divide-border">
             {spans.map((span) => (
@@ -580,9 +595,7 @@ function SpanRow({ span, dateFormat }: { span: EventSpan; dateFormat: Intl.DateT
       </span>
 
       <div className="min-w-0 flex-1">
-        <p dir="auto" className="text-sm text-ink">
-          {span.event.message}
-        </p>
+        <p className="text-sm text-ink">{span.event.message}</p>
         {/* The span itself: when it started, when it ended (or that it has
             not), and how long that was. This line is the whole reason the
             history is not a list of notifications. */}
@@ -604,9 +617,7 @@ function SpanRow({ span, dateFormat }: { span: EventSpan; dateFormat: Intl.DateT
         <Badge tone={span.open ? "danger" : "success"} dot={span.open}>
           {span.open ? t("alerts.history.open") : t("alerts.history.resolved")}
         </Badge>
-        <span dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
-          {span.event.subject}
-        </span>
+        <span className="truncate font-mono text-xs text-ink-subtle">{span.event.subject}</span>
       </div>
     </li>
   );
@@ -697,21 +708,23 @@ function ChannelsCard() {
       />
       <CardBody>
         {channels.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner />
-          </div>
+          <RowsSkeleton />
         ) : channels.error ? (
           <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
             {errorText(channels.error)}
           </p>
         ) : channels.data!.channels.length === 0 ? (
-          <div className="py-10 text-center">
-            <Send className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("alerts.channels.empty")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("alerts.channels.emptyHint")}
-            </p>
-          </div>
+          <EmptyState
+            icon={<Send aria-hidden />}
+            title={t("alerts.channels.empty")}
+            hint={t("alerts.channels.emptyHint")}
+            action={
+              <Button variant="primary" size="sm" onClick={() => setEditing("new")}>
+                <Plus className="h-3.5 w-3.5" aria-hidden />
+                {t("alerts.channels.add")}
+              </Button>
+            }
+          />
         ) : (
           <ul className="divide-y divide-border">
             {channels.data!.channels.map((channel) => (
@@ -765,9 +778,7 @@ function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () =>
       </Badge>
 
       <div className="min-w-0 flex-1">
-        <p dir="auto" className="truncate text-sm font-medium text-ink">
-          {channel.label}
-        </p>
+        <p className="truncate text-sm font-medium text-ink">{channel.label}</p>
         <p className="truncate text-xs text-ink-subtle">{t(`alerts.channelKind.${channel.kind}`)}</p>
       </div>
 
@@ -784,7 +795,12 @@ function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () =>
         {t("alerts.channels.edit")}
       </Button>
 
-      <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="text-danger hover:bg-danger-soft hover:text-danger"
+        onClick={() => setConfirming(true)}
+      >
         <Trash2 className="h-3.5 w-3.5" aria-hidden />
         {t("alerts.channels.delete")}
       </Button>
@@ -912,7 +928,6 @@ function ChannelDialog({
       >
         <Input
           id="channel-label"
-          dir="auto"
           placeholder={t("alerts.channels.labelPlaceholder")}
           value={form.label}
           autoFocus
@@ -928,7 +943,7 @@ function ChannelDialog({
         >
           <Input
             id="channel-url"
-            dir="ltr"
+            className="font-mono"
             type="url"
             // The stored value is unreachable by design, so the placeholder
             // states that rather than sitting empty and looking like loss.
@@ -943,7 +958,7 @@ function ChannelDialog({
           <Field label={t("alerts.channels.botToken")} htmlFor="channel-token">
             <Input
               id="channel-token"
-              dir="ltr"
+              className="font-mono"
               // Not `type="password"`: nothing is ever pre-filled here, so the
               // dots would only stop the operator checking their own paste.
               placeholder={channel ? t("alerts.channels.keepStored") : "123456:ABC-DEF…"}
@@ -963,7 +978,7 @@ function ChannelDialog({
           >
             <Input
               id="channel-chat"
-              dir="ltr"
+              className="font-mono"
               placeholder={channel ? t("alerts.channels.keepStored") : "-1001234567890"}
               value={form.chatId}
               onChange={(event) => patch({ chatId: event.target.value })}

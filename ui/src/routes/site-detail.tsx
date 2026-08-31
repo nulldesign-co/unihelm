@@ -1,14 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, getRouteApi, useNavigate } from "@tanstack/react-router";
-import {
-  ArrowLeft,
-  ExternalLink,
-  FileDiff,
-  Lock,
-  LockOpen,
-  RefreshCw,
-  Wrench,
-} from "lucide-react";
+import { getRouteApi, useNavigate } from "@tanstack/react-router";
+import { ExternalLink, FileDiff, Lock, LockOpen, RefreshCw, Wrench } from "lucide-react";
 import { forwardRef, useEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -17,7 +9,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Field, Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -115,11 +109,7 @@ export function SiteDetailPage() {
   });
 
   if (sites.isPending) {
-    return (
-      <div className="flex justify-center py-24 text-ink-muted">
-        <Spinner className="h-6 w-6" />
-      </div>
-    );
+    return <PageSkeleton />;
   }
 
   const site = sites.data?.sites.find((s) => s.id === id) as SiteDetail | undefined;
@@ -127,21 +117,45 @@ export function SiteDetailPage() {
   if (!site) {
     return (
       <div className="space-y-6">
-        <BackLink />
-        <Card>
-          <CardBody className="py-16 text-center">
-            <p className="text-sm font-medium text-ink">{t("siteDetail.notFound")}</p>
-            <p className="mt-1 text-sm text-ink-muted">{t("siteDetail.notFoundHint")}</p>
-          </CardBody>
-        </Card>
+        <PageHeader
+          back={{ to: "/sites", label: t("nav.sites") }}
+          title={t("siteDetail.notFound")}
+          description={t("siteDetail.notFoundHint")}
+        />
       </div>
     );
   }
 
   return (
     <div className="space-y-6">
-      <BackLink />
-      <OverviewHeader site={site} />
+      <PageHeader
+        back={{ to: "/sites", label: t("nav.sites") }}
+        title={site.domain}
+        actions={
+          <>
+            <Badge tone={STATE_TONE[site.status]} dot={site.status === "provisioning"}>
+              {t(`sites.state.${site.status}`)}
+            </Badge>
+            {site.maintenance_mode ? (
+              <Badge tone="warning">
+                <Wrench className="h-3 w-3" aria-hidden />
+                {t("sites.maintenance")}
+              </Badge>
+            ) : null}
+            <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
+            <a
+              href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="inline-flex items-center gap-1.5 text-sm text-ink-muted transition-colors hover:text-accent"
+            >
+              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+              {t("siteDetail.openSite")}
+            </a>
+          </>
+        }
+      />
+      <OverviewCard site={site} />
       <div className="grid gap-6 lg:grid-cols-2">
         <CertificateCard site={site} />
         <AliasesCard site={site} />
@@ -153,16 +167,45 @@ export function SiteDetailPage() {
   );
 }
 
-function BackLink() {
-  const { t } = useTranslation();
+/** Ghost layout matching the loaded page, so nothing jumps when data lands. */
+function PageSkeleton() {
   return (
-    <Link
-      to="/sites"
-      className="inline-flex items-center gap-1.5 text-sm text-ink-muted hover:text-ink"
-    >
-      <ArrowLeft className="h-4 w-4 rtl:rotate-180" aria-hidden />
-      {t("siteDetail.back")}
-    </Link>
+    <div role="status" aria-live="polite" className="space-y-6">
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-20" />
+        <Skeleton className="h-7 w-64" />
+      </div>
+      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-5">
+          {Array.from({ length: 5 }, (_, i) => (
+            <div key={i} className="space-y-1.5">
+              <Skeleton className="h-3 w-16" />
+              <Skeleton className="h-4 w-24" />
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-2">
+        {Array.from({ length: 2 }, (_, i) => (
+          <div key={i} className="rounded-card border border-border bg-surface p-5 shadow-card">
+            <Skeleton className="mb-4 h-4 w-32" />
+            <div className="space-y-3">
+              <Skeleton className="h-4 w-2/3" />
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-4 w-3/5" />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+        <Skeleton className="mb-4 h-4 w-24" />
+        <div className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
+          {Array.from({ length: 4 }, (_, i) => (
+            <Skeleton key={i} className="h-9 w-full" />
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -170,59 +213,39 @@ function BackLink() {
 // Overview
 // ---------------------------------------------------------------------------
 
-function OverviewHeader({ site }: { site: SiteDetail }) {
+function OverviewCard({ site }: { site: SiteDetail }) {
   const { t, i18n } = useTranslation();
 
   return (
-    <header className="space-y-4">
-      <div className="flex flex-wrap items-center gap-3">
-        <h1 dir="ltr" className="text-2xl font-semibold tracking-tight text-ink">
-          {site.domain}
-        </h1>
-        <Badge tone={STATE_TONE[site.status]} dot={site.status === "provisioning"}>
-          {t(`sites.state.${site.status}`)}
-        </Badge>
-        {site.maintenance_mode ? (
-          <Badge tone="warning">
-            <Wrench className="h-3 w-3" aria-hidden />
-            {t("sites.maintenance")}
-          </Badge>
-        ) : null}
-        <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
-        <a
-          href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
-          target="_blank"
-          rel="noreferrer noopener"
-          className="inline-flex items-center gap-1 text-sm text-ink-muted hover:text-accent"
-        >
-          <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-          {t("siteDetail.openSite")}
-        </a>
-      </div>
-
-      <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3 lg:grid-cols-5">
-        {site.php_version ? (
-          <MetaItem label={t("siteDetail.phpVersion")} value={`PHP ${site.php_version}`} mono />
-        ) : null}
-        <MetaItem label={t("siteDetail.linuxUser")} value={site.linux_user} mono />
-        <MetaItem label={t("siteDetail.rootDir")} value={site.root_dir} mono />
-        <MetaItem
-          label={t("siteDetail.created")}
-          value={formatDate(site.created_at, i18n.language)}
-        />
-        <MetaItem label={t("siteDetail.wwwPolicy")} value={t(`siteDetail.www.${site.www_policy}`)} />
-        {site.site_type === "proxy" && site.proxy_port !== null ? (
-          <MetaItem label={t("siteDetail.proxyPort")} value={String(site.proxy_port)} mono />
-        ) : null}
-        {site.site_type === "redirect" && site.redirect_target ? (
+    <Card>
+      <CardBody className="pt-5">
+        <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3 lg:grid-cols-5">
+          {site.php_version ? (
+            <MetaItem label={t("siteDetail.phpVersion")} value={`PHP ${site.php_version}`} mono />
+          ) : null}
+          <MetaItem label={t("siteDetail.linuxUser")} value={site.linux_user} mono />
+          <MetaItem label={t("siteDetail.rootDir")} value={site.root_dir} mono />
           <MetaItem
-            label={`${t("siteDetail.redirectTarget")} (${t("siteDetail.redirectCode", { code: site.redirect_code })})`}
-            value={site.redirect_target}
-            mono
+            label={t("siteDetail.created")}
+            value={formatDate(site.created_at, i18n.language)}
           />
-        ) : null}
-      </dl>
-    </header>
+          <MetaItem
+            label={t("siteDetail.wwwPolicy")}
+            value={t(`siteDetail.www.${site.www_policy}`)}
+          />
+          {site.site_type === "proxy" && site.proxy_port !== null ? (
+            <MetaItem label={t("siteDetail.proxyPort")} value={String(site.proxy_port)} mono />
+          ) : null}
+          {site.site_type === "redirect" && site.redirect_target ? (
+            <MetaItem
+              label={`${t("siteDetail.redirectTarget")} (${t("siteDetail.redirectCode", { code: site.redirect_code })})`}
+              value={site.redirect_target}
+              mono
+            />
+          ) : null}
+        </dl>
+      </CardBody>
+    </Card>
   );
 }
 
@@ -231,7 +254,6 @@ function MetaItem({ label, value, mono }: { label: string; value: string; mono?:
     <div className="min-w-0">
       <dt className="text-xs text-ink-subtle">{label}</dt>
       <dd
-        dir={mono ? "ltr" : undefined}
         className={cn("mt-0.5 truncate text-ink", mono && "font-mono text-xs leading-5")}
         title={value}
       >
@@ -241,11 +263,9 @@ function MetaItem({ label, value, mono }: { label: string; value: string; mono?:
   );
 }
 
-/** Dates in the reader's calendar, digits kept Latin like every other number here. */
 function formatDate(iso: string, language: string): string {
   try {
-    const locale = language === "fa" ? "fa-IR-u-nu-latn" : language;
-    return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(iso));
+    return new Intl.DateTimeFormat(language, { dateStyle: "medium" }).format(new Date(iso));
   } catch {
     return iso;
   }
@@ -300,14 +320,11 @@ function TaskNotice({
         <Spinner className="h-3.5 w-3.5" />
       ) : null}
       <span className="text-ink-muted">
-        {t("siteDetail.task")}{" "}
-        <span dir="ltr" className="font-mono text-xs">
-          {taskId.slice(0, 8)}
-        </span>
+        {t("siteDetail.task")} <span className="font-mono text-xs">{taskId.slice(0, 8)}</span>
       </span>
       {task.data ? <Badge tone={tone[task.data.status]}>{t(`tasks.status.${task.data.status}`)}</Badge> : null}
       {task.data?.status === "failed" && task.data.error_detail ? (
-        <span role="alert" dir="auto" className="basis-full text-danger">
+        <span role="alert" className="basis-full text-danger">
           {task.data.error_detail}
         </span>
       ) : null}
@@ -366,8 +383,17 @@ function CertificateCard({ site }: { site: SiteDetail }) {
       />
       <CardBody>
         {certs.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
+          <div
+            role="status"
+            aria-live="polite"
+            className="grid grid-cols-2 gap-x-6 gap-y-3 py-0.5"
+          >
+            {Array.from({ length: 4 }, (_, i) => (
+              <div key={i} className="space-y-1.5">
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-4 w-28" />
+              </div>
+            ))}
           </div>
         ) : cert ? (
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
@@ -397,7 +423,7 @@ function CertificateCard({ site }: { site: SiteDetail }) {
             {cert.last_error ? (
               <div className="col-span-2 min-w-0">
                 <dt className="text-xs text-ink-subtle">{t("siteDetail.lastError")}</dt>
-                <dd dir="ltr" className="mt-0.5 rounded-lg bg-danger-soft px-3 py-2 font-mono text-xs text-danger">
+                <dd className="mt-0.5 rounded-lg bg-danger-soft px-3 py-2 font-mono text-xs text-danger">
                   {cert.last_error}
                 </dd>
               </div>
@@ -464,9 +490,7 @@ function AliasesCard({ site }: { site: SiteDetail }) {
             {site.aliases.map((alias) => (
               <li key={alias}>
                 <Badge tone="neutral">
-                  <span dir="ltr" className="font-mono text-xs">
-                    {alias}
-                  </span>
+                  <span className="font-mono text-xs">{alias}</span>
                 </Badge>
               </li>
             ))}
@@ -671,7 +695,7 @@ function SettingsCard({ site }: { site: SiteDetail }) {
             >
               <Input
                 id="client_max_body_size"
-                dir="ltr"
+                className="font-mono text-xs"
                 placeholder="64m"
                 aria-invalid={bodySizeInvalid}
                 value={value("client_max_body_size")}
@@ -724,7 +748,6 @@ function SettingsCard({ site }: { site: SiteDetail }) {
           <Field label={t("siteDetail.nginxSnippet")} htmlFor="custom_nginx_snippet">
             <Textarea
               id="custom_nginx_snippet"
-              dir="ltr"
               rows={5}
               spellCheck={false}
               placeholder="location /downloads/ { autoindex on; }"
@@ -740,7 +763,6 @@ function SettingsCard({ site }: { site: SiteDetail }) {
             <Field label={t("siteDetail.phpIni")} htmlFor="php_ini_overrides">
               <Textarea
                 id="php_ini_overrides"
-                dir="ltr"
                 rows={4}
                 spellCheck={false}
                 placeholder={"memory_limit = 256M\nmax_execution_time = 120"}
@@ -786,10 +808,7 @@ function SettingsCard({ site }: { site: SiteDetail }) {
   );
 }
 
-/**
- * A start-side accent bar on fields that differ from what the server has.
- * Logical properties (`border-s`, `ps`) keep it on the correct side in RTL.
- */
+/** A start-side accent bar on fields that differ from what the server has. */
 function DirtyMark({ dirty, children }: { dirty: boolean; children: React.ReactNode }) {
   return (
     <div
@@ -872,8 +891,12 @@ function DriftCard({ siteId }: { siteId: number }) {
       />
       <CardBody>
         {drift.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
+          <div role="status" aria-live="polite" className="space-y-3 py-0.5">
+            <div className="flex items-center gap-2">
+              <Skeleton className="h-6 w-24 rounded-full" />
+              <Skeleton className="h-3.5 w-48" />
+            </div>
+            <Skeleton className="h-4 w-2/3" />
           </div>
         ) : drift.isError ? (
           <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
@@ -883,9 +906,7 @@ function DriftCard({ siteId }: { siteId: number }) {
           <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
               <Badge tone={tone[key]}>{t(`siteDetail.driftState.${key}`)}</Badge>
-              <span dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
-                {drift.data.path}
-              </span>
+              <span className="truncate font-mono text-xs text-ink-subtle">{drift.data.path}</span>
             </div>
             <p className="text-sm text-ink-muted">{t(`siteDetail.drift${capitalize(key)}`)}</p>
             {key === "drifted" && drift.data.diff.length > 0 ? (
@@ -906,12 +927,9 @@ function DiffView({ diff }: { diff: DriftResponse["diff"] }) {
   const { t } = useTranslation();
   return (
     <div>
-      <p className="mb-1 text-xs text-ink-subtle" dir="auto">
-        {t("siteDetail.diffLegend")}
-      </p>
-      {/* Config text is LTR whatever the UI language; the container scrolls so
-          long nginx lines never force the page sideways. */}
-      <div dir="ltr" className="max-h-96 overflow-auto rounded-lg border border-border bg-surface-muted">
+      <p className="mb-1 text-xs text-ink-subtle">{t("siteDetail.diffLegend")}</p>
+      {/* The container scrolls so long nginx lines never force the page sideways. */}
+      <div className="max-h-96 overflow-auto rounded-lg border border-border bg-surface-muted">
         <table className="w-full border-collapse font-mono text-xs leading-5">
           <tbody>
             {diff.map((line, index) => (
@@ -1010,7 +1028,7 @@ function DangerZone({ site }: { site: SiteDetail }) {
         >
           <Input
             id="confirm_domain"
-            dir="ltr"
+            className="font-mono text-xs"
             autoFocus
             placeholder={site.domain}
             autoComplete="off"

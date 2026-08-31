@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Globe, KeyRound, Search, ShieldCheck } from "lucide-react";
+import { Globe, KeyRound, Network, Search, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -7,9 +7,13 @@ import { TaskNotice } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { Table, Td, Th } from "@/components/ui/table";
 import {
   ApiError,
   endpoints,
@@ -45,10 +49,7 @@ export function DnsPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("dns.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("dns.subtitle")}</p>
-      </header>
+      <PageHeader title={t("dns.title")} description={t("dns.subtitle")} />
 
       <DomainChecker />
       {canManageProvider ? <ProviderCard /> : null}
@@ -97,7 +98,6 @@ function DomainChecker() {
             <Field label={t("dns.check.domain")} htmlFor="dns-domain">
               <Input
                 id="dns-domain"
-                dir="ltr"
                 placeholder="example.com"
                 autoComplete="off"
                 spellCheck={false}
@@ -118,6 +118,12 @@ function DomainChecker() {
           </p>
         ) : check.data ? (
           <CheckResult result={check.data} />
+        ) : check.isFetching ? (
+          <div role="status" aria-live="polite" className="space-y-3">
+            <Skeleton className="h-6 w-48 rounded-full" />
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-24 w-full" />
+          </div>
         ) : (
           <p className="text-sm text-ink-muted">{t("dns.check.idle")}</p>
         )}
@@ -145,38 +151,32 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
         <Badge tone={verdict.tone} dot>
           {verdict.label}
         </Badge>
-        <span dir="ltr" className="font-mono text-sm text-ink">
-          {result.domain}
-        </span>
+        <span className="font-mono text-xs text-ink">{result.domain}</span>
       </div>
 
       {/* The advisory sentence is the server's, deliberately: the decision table
           behind it (proxied, partial, timed out) lives in `unihelm_ops::dns` and
           a second copy here would be a second copy to keep in step. */}
-      <p dir="auto" className="rounded-lg bg-surface-muted px-3 py-2 text-sm text-ink">
-        {result.advice}
-      </p>
+      <p className="rounded-lg bg-surface-muted px-3 py-2 text-sm text-ink">{result.advice}</p>
 
       {result.proxied_hint ? (
         <p className="text-xs text-ink-muted">{t("dns.check.proxiedHint")}</p>
       ) : null}
 
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-lg text-start text-sm">
-          <thead>
-            <tr className="border-b border-border text-xs text-ink-subtle">
-              <th className="py-2 pe-3 text-start font-medium">{t("dns.check.name")}</th>
-              <th className="py-2 pe-3 text-start font-medium">A</th>
-              <th className="py-2 pe-3 text-start font-medium">AAAA</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {result.records.map((record) => (
-              <RecordRow key={record.name} record={record} serverAddresses={result.server_addresses} />
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table className="min-w-lg" containerClassName="shadow-none">
+        <thead>
+          <tr>
+            <Th>{t("dns.check.name")}</Th>
+            <Th>A</Th>
+            <Th>AAAA</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {result.records.map((record) => (
+            <RecordRow key={record.name} record={record} serverAddresses={result.server_addresses} />
+          ))}
+        </tbody>
+      </Table>
 
       <div>
         <p className="text-xs text-ink-subtle">{t("dns.check.serverAddresses")}</p>
@@ -187,9 +187,7 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
             result.server_addresses.map((address) => (
               <li key={address}>
                 <Badge tone="neutral">
-                  <span dir="ltr" className="font-mono">
-                    {address}
-                  </span>
+                  <span className="font-mono">{address}</span>
                 </Badge>
               </li>
             ))
@@ -220,9 +218,7 @@ function RecordRow({
             {/* Marking the addresses that are this server's is the whole
                 comparison; a bare list makes the reader do it by eye. */}
             <Badge tone={here.has(value) ? "success" : "neutral"}>
-              <span dir="ltr" className="font-mono">
-                {value}
-              </span>
+              <span className="font-mono">{value}</span>
             </Badge>
           </li>
         ))}
@@ -230,22 +226,18 @@ function RecordRow({
     );
 
   return (
-    <tr className="align-top">
-      <td dir="ltr" className="py-2 pe-3 font-mono text-xs text-ink">
-        {record.name}
-      </td>
-      <td className="py-2 pe-3">{cell(record.a)}</td>
-      <td className="py-2 pe-3">
+    <tr className="transition-colors hover:bg-surface-muted/60">
+      <Td className="align-top font-mono text-xs">{record.name}</Td>
+      <Td className="align-top">{cell(record.a)}</Td>
+      <Td className="align-top">
         {record.error ? (
           // NXDOMAIN and "the resolver timed out" are different problems with
           // different fixes, and an empty list says neither.
-          <span dir="ltr" className="font-mono text-xs text-warning">
-            {record.error}
-          </span>
+          <span className="font-mono text-xs text-warning">{record.error}</span>
         ) : (
           cell(record.aaaa)
         )}
-      </td>
+      </Td>
     </tr>
   );
 }
@@ -302,7 +294,6 @@ function ProviderCard() {
           <Field label={t("dns.provider.label")} htmlFor="dns-label">
             <Input
               id="dns-label"
-              dir="ltr"
               placeholder="cloudflare-main"
               autoComplete="off"
               aria-describedby="dns-label-hint"
@@ -317,7 +308,6 @@ function ProviderCard() {
           <Field label={t("dns.provider.token")} htmlFor="dns-token">
             <Input
               id="dns-token"
-              dir="ltr"
               type="password"
               className="font-mono"
               // A credential field the browser offers to fill from a saved
@@ -355,9 +345,7 @@ function ProviderCard() {
               {saved.zones.map((zone) => (
                 <li key={zone}>
                   <Badge tone="neutral">
-                    <span dir="ltr" className="font-mono">
-                      {zone}
-                    </span>
+                    <span className="font-mono">{zone}</span>
                   </Badge>
                 </li>
               ))}
@@ -397,11 +385,20 @@ function WildcardCard() {
         />
 
         {sites.isPending ? (
-          <div className="flex justify-center py-8 text-ink-muted">
-            <Spinner />
+          <div role="status" aria-live="polite" className="divide-y divide-border">
+            {Array.from({ length: 3 }, (_, i) => (
+              <div key={i} className="flex items-center gap-3 py-3">
+                <Skeleton className="h-4 w-4 rounded" />
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  <Skeleton className="h-3.5 w-1/3" />
+                  <Skeleton className="h-3 w-1/4" />
+                </div>
+                <Skeleton className="h-8 w-36 rounded-lg" />
+              </div>
+            ))}
           </div>
         ) : (sites.data?.sites.length ?? 0) === 0 ? (
-          <p className="text-sm text-ink-muted">{t("dns.wildcard.noSites")}</p>
+          <EmptyState icon={<Network aria-hidden />} title={t("dns.wildcard.noSites")} />
         ) : (
           <ul className="divide-y divide-border">
             {sites.data!.sites.map((site) => (
@@ -435,12 +432,10 @@ function WildcardRow({ site, staging }: { site: SiteView; staging: boolean }) {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <Globe className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
         <div className="min-w-0 flex-1">
-          <span dir="ltr" className="block truncate font-medium text-ink">
+          <span className="block truncate font-mono text-xs font-medium text-ink">
             {site.domain}
           </span>
-          <span dir="ltr" className="block truncate font-mono text-xs text-ink-subtle">
-            *.{site.domain}
-          </span>
+          <span className="block truncate font-mono text-xs text-ink-subtle">*.{site.domain}</span>
         </div>
         <Button
           variant="outline"

@@ -7,9 +7,11 @@ import { TaskRow } from "@/components/task-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { endpoints, type TaskQuery, type TaskStatus } from "@/lib/api";
 import { useEventStream } from "@/lib/events";
 
@@ -61,28 +63,33 @@ export function TasksPage() {
     setPage(0);
   };
 
+  const clearFilters = () => {
+    setFilters({});
+    setPage(0);
+  };
+
   const list = tasks.data?.tasks ?? [];
   const hasFilters = Object.values(filters).some((v) => v !== undefined && v !== "");
 
   return (
     <div className="space-y-6">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("tasks.pageTitle")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("tasks.pageSubtitle")}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          {tasks.data && tasks.data.active > 0 ? (
-            <Badge tone="accent" dot>
-              {t("tasks.active", { count: tasks.data.active })}
-            </Badge>
-          ) : null}
-          <Button variant="secondary" onClick={refresh}>
-            <RotateCw className="h-4 w-4" />
-            {t("tasks.refresh")}
-          </Button>
-        </div>
-      </header>
+      <PageHeader
+        title={t("tasks.pageTitle")}
+        description={t("tasks.pageSubtitle")}
+        actions={
+          <>
+            {tasks.data && tasks.data.active > 0 ? (
+              <Badge tone="accent" dot>
+                {t("tasks.active", { count: tasks.data.active })}
+              </Badge>
+            ) : null}
+            <Button variant="secondary" onClick={refresh}>
+              <RotateCw className="h-4 w-4" aria-hidden />
+              {t("tasks.refresh")}
+            </Button>
+          </>
+        }
+      />
 
       {lagged ? (
         <p className="rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">
@@ -91,7 +98,7 @@ export function TasksPage() {
       ) : null}
 
       <Card>
-        <CardBody className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <CardBody className="grid gap-3 pt-5 sm:grid-cols-2 lg:grid-cols-4">
           <label className="space-y-1.5">
             <span className="block text-xs font-medium text-ink-muted">{t("tasks.filterOp")}</span>
             <Select
@@ -146,13 +153,7 @@ export function TasksPage() {
 
           {hasFilters ? (
             <div className="sm:col-span-2 lg:col-span-4">
-              <Button
-                variant="ghost"
-                onClick={() => {
-                  setFilters({});
-                  setPage(0);
-                }}
-              >
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
                 {t("tasks.filterClear")}
               </Button>
             </div>
@@ -160,37 +161,36 @@ export function TasksPage() {
         </CardBody>
       </Card>
 
-      <Card>
-        <CardBody className="p-0">
-          {tasks.isPending ? (
-            <div className="flex justify-center py-20 text-ink-muted">
-              <Spinner className="h-6 w-6" />
-            </div>
-          ) : list.length === 0 ? (
-            <div className="px-5 py-20 text-center">
-              <ListChecks className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-              <p className="text-sm font-medium text-ink">
-                {hasFilters ? t("tasks.noMatches") : t("tasks.empty")}
-              </p>
-              <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">
-                {hasFilters ? t("tasks.noMatchesHint") : t("tasks.emptyHint")}
-              </p>
-            </div>
-          ) : (
-            <ul className="divide-y divide-border">
-              {list.map((task) => (
-                <TaskRow
-                  key={task.id}
-                  task={task}
-                  expanded={expanded === task.id}
-                  onToggle={() => setExpanded(expanded === task.id ? null : task.id)}
-                  showActions
-                />
-              ))}
-            </ul>
-          )}
-        </CardBody>
-      </Card>
+      {tasks.isPending ? (
+        <ListSkeleton rows={8} />
+      ) : list.length === 0 ? (
+        <EmptyState
+          icon={<ListChecks aria-hidden />}
+          title={hasFilters ? t("tasks.noMatches") : t("tasks.empty")}
+          hint={hasFilters ? t("tasks.noMatchesHint") : t("tasks.emptyHint")}
+          action={
+            hasFilters ? (
+              <Button variant="secondary" onClick={clearFilters}>
+                {t("tasks.filterClear")}
+              </Button>
+            ) : undefined
+          }
+        />
+      ) : (
+        <Card className="overflow-hidden">
+          <ul className="divide-y divide-border">
+            {list.map((task) => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                expanded={expanded === task.id}
+                onToggle={() => setExpanded(expanded === task.id ? null : task.id)}
+                showActions
+              />
+            ))}
+          </ul>
+        </Card>
+      )}
 
       <nav className="flex items-center justify-between" aria-label={t("tasks.pagination")}>
         <Button variant="secondary" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>

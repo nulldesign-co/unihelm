@@ -7,8 +7,11 @@ import { TaskNotice } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -51,19 +54,14 @@ export function MailPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("mail.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("mail.subtitle")}</p>
-      </header>
+      <PageHeader title={t("mail.title")} description={t("mail.subtitle")} />
 
       <p className="rounded-lg bg-surface-muted px-3 py-2.5 text-sm text-ink-muted">
         {t("mail.scopeNote")}
       </p>
 
       {relay.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <MailSkeleton />
       ) : relay.error ? (
         <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
           {relay.error instanceof ApiError ? relay.error.message : String(relay.error)}
@@ -78,6 +76,32 @@ export function MailPage() {
           <DnsCard dns={relay.data!.dns} />
         </>
       )}
+    </div>
+  );
+}
+
+/** Ghosts shaped like the relay form and the DNS card, so nothing jumps. */
+function MailSkeleton() {
+  return (
+    <div role="status" aria-live="polite" className="space-y-6">
+      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="mt-2 h-3.5 w-72 max-w-full" />
+        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+          <Skeleton className="h-9" />
+          <Skeleton className="h-9" />
+          <Skeleton className="h-9" />
+          <Skeleton className="h-9" />
+        </div>
+        <Skeleton className="mt-6 h-9 w-32" />
+      </div>
+      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+        <Skeleton className="h-4 w-40" />
+        <div className="mt-4 space-y-3">
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+        </div>
+      </div>
     </div>
   );
 }
@@ -179,7 +203,7 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
         description={t("mail.relay.hint")}
         action={
           relay.configured ? (
-            <Badge tone={relay.enabled ? "success" : "neutral"}>
+            <Badge tone={relay.enabled ? "success" : "neutral"} dot>
               {relay.enabled ? t("mail.relay.on") : t("mail.relay.off")}
             </Badge>
           ) : null
@@ -198,7 +222,6 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
             <Field label={t("mail.relay.host")} htmlFor="mail-host">
               <Input
                 id="mail-host"
-                dir="ltr"
                 autoComplete="off"
                 placeholder="smtp.example.net"
                 value={host}
@@ -208,8 +231,8 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
             <Field label={t("mail.relay.port")} htmlFor="mail-port">
               <Input
                 id="mail-port"
-                dir="ltr"
                 inputMode="numeric"
+                className="tabular-nums"
                 value={port}
                 onChange={(e) => setPort(e.target.value)}
               />
@@ -237,7 +260,6 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
             <Field label={t("mail.relay.username")} htmlFor="mail-user">
               <Input
                 id="mail-user"
-                dir="ltr"
                 autoComplete="off"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
@@ -247,7 +269,6 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
               <Input
                 id="mail-pass"
                 type="password"
-                dir="ltr"
                 autoComplete="new-password"
                 placeholder={relay.has_password ? t("mail.relay.passwordStored") : ""}
                 value={password}
@@ -267,7 +288,6 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
             <Field label={t("mail.relay.fromAddress")} htmlFor="mail-from">
               <Input
                 id="mail-from"
-                dir="ltr"
                 autoComplete="off"
                 placeholder="noreply@example.com"
                 value={fromAddress}
@@ -365,7 +385,6 @@ function TestCard() {
             <Field label={t("mail.test.to")} htmlFor="mail-test-to">
               <Input
                 id="mail-test-to"
-                dir="ltr"
                 autoComplete="off"
                 placeholder={t("mail.test.toPlaceholder")}
                 value={to}
@@ -413,9 +432,9 @@ function TestReport({ report }: { report: MailTestReport }) {
         </Badge>
       </div>
 
-      {/* The relay's own words, verbatim and LTR: paraphrasing an SMTP reply
-          throws away the only precise thing in the response. */}
-      <p dir="ltr" className="mt-2 font-mono text-xs break-words text-ink">
+      {/* The relay's own words, verbatim: paraphrasing an SMTP reply throws
+          away the only precise thing in the response. */}
+      <p className="mt-2 font-mono text-xs break-words text-ink">
         {report.detail}
       </p>
       <p className="mt-1.5 text-xs text-ink-muted">{t(`mail.stageHint.${report.stage}`)}</p>
@@ -431,8 +450,7 @@ function TestReport({ report }: { report: MailTestReport }) {
                 // The transcript is an ordered log with repeated lines; the
                 // index is genuinely its identity here.
                 key={index}
-                dir="ltr"
-                className="font-mono text-[11px] break-all whitespace-pre-wrap text-ink-muted"
+                className="font-mono text-xs break-all whitespace-pre-wrap text-ink-muted"
               >
                 {line}
               </div>
@@ -457,11 +475,18 @@ function DnsCard({ dns }: { dns: { records: MailDnsRecord[]; advice: string } })
       <CardBody>
         <p className="mb-3 text-sm text-ink-muted">{dns.advice}</p>
         {dns.records.length === 0 ? (
-          <p className="text-sm text-ink-subtle">{t("mail.dns.none")}</p>
+          <EmptyState
+            icon={<Mail aria-hidden />}
+            title={t("mail.dns.none")}
+            className="py-10"
+          />
         ) : (
-          <ul className="space-y-3">
+          <ul className="divide-y divide-border">
             {dns.records.map((record) => (
-              <li key={`${record.record_type}-${record.name}`}>
+              <li
+                key={`${record.record_type}-${record.name}`}
+                className="py-4 first:pt-0 last:pb-0"
+              >
                 <RecordRow record={record} />
               </li>
             ))}
@@ -490,10 +515,10 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
   };
 
   return (
-    <div className="rounded-lg border border-border p-3">
+    <div>
       <div className="flex flex-wrap items-center gap-2">
         <Badge tone="accent">{record.record_type}</Badge>
-        <span dir="ltr" className="font-mono text-xs break-all text-ink">
+        <span className="font-mono text-xs break-all text-ink">
           {record.name}
         </span>
         {/* Stated on every row, not once at the top: this is the difference
@@ -505,10 +530,7 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
 
       {record.value ? (
         <div className="mt-2 flex items-start gap-2">
-          <code
-            dir="ltr"
-            className="flex-1 rounded bg-surface-muted px-2 py-1.5 font-mono text-xs break-all text-ink"
-          >
+          <code className="flex-1 rounded-lg bg-surface-muted px-2 py-1.5 font-mono text-xs break-all text-ink">
             {record.value}
           </code>
           <Button variant="ghost" size="sm" onClick={() => void copy()}>
@@ -517,7 +539,7 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
           </Button>
         </div>
       ) : (
-        <p className="mt-2 rounded bg-surface-muted px-2 py-1.5 text-xs text-ink-muted">
+        <p className="mt-2 rounded-lg bg-surface-muted px-2 py-1.5 text-xs text-ink-muted">
           {t("mail.dns.noValue")}
         </p>
       )}

@@ -19,7 +19,7 @@ crates/
   unihelm-web/      unprivileged HTTP server + embedded UI   (binary)
   unihelm-agentd/   root daemon: operations, tasks, scheduler (binary)
   unihelm-cli/      the `unihelm` CLI                          (binary)
-ui/                React 18 + TypeScript + Vite + Tailwind, en+fa with full RTL
+ui/                React 18 + TypeScript + Vite + Tailwind, English-only i18n
 installer/         preflight, install script, systemd units
 packaging/         .deb / .rpm build (not yet implemented)
 tests/gates/       the CI gates described below
@@ -177,8 +177,9 @@ constraint, the failure mode, the trade-off — and cite the spec section they
 implement (`spec §11.7`); `crates/unihelm-ops/src/cert.rs` is the register to
 imitate. Comments that restate the next line are deleted on sight.
 
-UI work ships with English and Farsi strings and working RTL, in the same
-change — i18n is not a follow-up. Keyboard access likewise.
+UI strings live behind `t()` in `ui/src/i18n/en.ts`, never inline in JSX —
+the panel ships English-only, but copy stays in one reviewable file. Keyboard
+access ships in the same change; it is not a follow-up.
 
 ## Scope discipline
 

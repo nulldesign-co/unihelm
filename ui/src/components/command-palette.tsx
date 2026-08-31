@@ -1,3 +1,4 @@
+import { Search, SearchX, type LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -7,6 +8,7 @@ export interface Command {
   id: string;
   label: string;
   hint?: string;
+  icon?: LucideIcon;
   run: () => void;
 }
 
@@ -65,61 +67,82 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 pt-[12vh] backdrop-blur-[1px]"
+      className="fixed inset-0 z-50 flex animate-fade-in items-start justify-center bg-black/40 pt-[12vh] backdrop-blur-[2px]"
       onClick={() => onOpenChange(false)}
       role="dialog"
       aria-modal="true"
       aria-label={t("nav.commandPalette")}
     >
       <div
-        className="w-full max-w-lg overflow-hidden rounded-card border border-border bg-surface shadow-2xl"
+        className="w-full max-w-lg animate-pop-in overflow-hidden rounded-card border border-border bg-surface shadow-pop"
         onClick={(event) => event.stopPropagation()}
       >
-        <input
-          autoFocus
-          value={query}
-          onChange={(event) => {
-            setQuery(event.target.value);
-            setActive(0);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "ArrowDown") {
-              event.preventDefault();
-              setActive((i) => Math.min(i + 1, matches.length - 1));
-            } else if (event.key === "ArrowUp") {
-              event.preventDefault();
-              setActive((i) => Math.max(i - 1, 0));
-            } else if (event.key === "Enter") {
-              event.preventDefault();
-              choose(active);
-            }
-          }}
-          placeholder={t("common.search")}
-          aria-label={t("common.search")}
-          className="w-full border-b border-border bg-transparent px-4 py-3.5 text-sm text-ink outline-none placeholder:text-ink-subtle"
-        />
+        <div className="flex items-center gap-2.5 border-b border-border px-4">
+          <Search className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setActive(0);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setActive((i) => Math.min(i + 1, matches.length - 1));
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setActive((i) => Math.max(i - 1, 0));
+              } else if (event.key === "Enter") {
+                event.preventDefault();
+                choose(active);
+              }
+            }}
+            placeholder={t("common.search")}
+            aria-label={t("common.search")}
+            className="w-full bg-transparent py-3.5 text-sm text-ink outline-none placeholder:text-ink-subtle"
+          />
+          <kbd className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-ink-subtle">
+            esc
+          </kbd>
+        </div>
 
-        <ul className="max-h-80 overflow-y-auto py-1.5">
-          {matches.map((command, index) => (
-            <li key={command.id}>
-              <button
-                onMouseEnter={() => setActive(index)}
-                onClick={() => choose(index)}
-                className={cn(
-                  "flex w-full items-center justify-between gap-3 px-4 py-2 text-start text-sm",
-                  index === active ? "bg-accent-soft text-accent" : "text-ink hover:bg-surface-muted",
-                )}
-              >
-                <span>{command.label}</span>
-                {command.hint ? (
-                  <kbd className="rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-ink-subtle">
-                    {command.hint}
-                  </kbd>
-                ) : null}
-              </button>
-            </li>
-          ))}
-        </ul>
+        {matches.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 py-10 text-ink-muted">
+            <SearchX className="h-5 w-5 text-ink-subtle" aria-hidden />
+            <p className="text-sm">{t("common.noResults")}</p>
+          </div>
+        ) : (
+          <ul className="max-h-80 overflow-y-auto p-1.5">
+            {matches.map((command, index) => (
+              <li key={command.id}>
+                <button
+                  onMouseEnter={() => setActive(index)}
+                  onClick={() => choose(index)}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-start text-sm transition-colors",
+                    index === active ? "bg-accent-soft text-accent" : "text-ink",
+                  )}
+                >
+                  {command.icon ? (
+                    <command.icon
+                      className={cn("h-4 w-4 shrink-0", index === active ? "" : "text-ink-subtle")}
+                      aria-hidden
+                    />
+                  ) : (
+                    <span className="w-4 shrink-0" aria-hidden />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">{command.label}</span>
+                  {command.hint ? (
+                    <kbd className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-ink-subtle">
+                      {command.hint}
+                    </kbd>
+                  ) : null}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

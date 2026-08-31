@@ -16,10 +16,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { Table, Td, Th } from "@/components/ui/table";
 import {
   ApiError,
   endpoints,
@@ -60,15 +65,14 @@ export function FirewallPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("firewall.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("firewall.subtitle")}</p>
-      </header>
+      <PageHeader title={t("firewall.title")} description={t("firewall.subtitle")} />
 
       {firewall.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <>
+          <Skeleton className="h-24 w-full rounded-card" />
+          <ListSkeleton rows={3} />
+          <ListSkeleton rows={3} />
+        </>
       ) : firewall.error ? (
         <LoadError error={firewall.error} />
       ) : (
@@ -101,7 +105,12 @@ function LoadError({ error }: { error: unknown }) {
   return (
     <Card>
       <CardBody className="py-12 text-center">
-        <ShieldAlert className="mx-auto mb-3 h-8 w-8 text-danger" aria-hidden />
+        <div
+          className="mx-auto mb-4 grid h-11 w-11 place-items-center rounded-full bg-danger-soft text-danger"
+          aria-hidden
+        >
+          <ShieldAlert className="h-5 w-5" />
+        </div>
         <p className="text-sm font-medium text-ink">
           {missing ? t("firewall.apiMissing") : t("firewall.loadFailed")}
         </p>
@@ -114,6 +123,27 @@ function LoadError({ error }: { error: unknown }) {
         </p>
       </CardBody>
     </Card>
+  );
+}
+
+/** The shared header of a table section: what it lists, and how to add to it. */
+function SectionHeader({
+  title,
+  description,
+  actions,
+}: {
+  title: string;
+  description: string;
+  actions?: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+      <div className="min-w-0">
+        <h2 className="text-sm font-semibold text-ink">{title}</h2>
+        <p className="mt-0.5 text-sm text-ink-muted">{description}</p>
+      </div>
+      {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
+    </div>
   );
 }
 
@@ -131,7 +161,8 @@ function BackendCard({ data }: { data: FirewallResponse }) {
     return (
       <Notice
         tone="danger"
-        icon={<ShieldOff className="h-5 w-5" aria-hidden />}
+        icon={<ShieldOff aria-hidden />}
+        badge={t("dashboard.firewallUnprotected")}
         title={t("firewall.noneTitle")}
         body={t("firewall.noneBody")}
         hint={t("firewall.noneHint")}
@@ -143,7 +174,8 @@ function BackendCard({ data }: { data: FirewallResponse }) {
     return (
       <Notice
         tone="warning"
-        icon={<AlertTriangle className="h-5 w-5" aria-hidden />}
+        icon={<AlertTriangle aria-hidden />}
+        badge={t("dashboard.firewallInactive")}
         title={t("firewall.inactiveTitle", { backend: backendName })}
         body={t("firewall.inactiveBody")}
       />
@@ -153,7 +185,8 @@ function BackendCard({ data }: { data: FirewallResponse }) {
   return (
     <Notice
       tone="success"
-      icon={<ShieldCheck className="h-5 w-5" aria-hidden />}
+      icon={<ShieldCheck aria-hidden />}
+      badge={t("dashboard.firewallActive")}
       title={t("firewall.activeTitle", { backend: backendName })}
       body={t("firewall.activeBody", { count: data.rules.filter((r) => r.in_backend).length })}
     />
@@ -163,36 +196,49 @@ function BackendCard({ data }: { data: FirewallResponse }) {
 function Notice({
   tone,
   icon,
+  badge,
   title,
   body,
   hint,
 }: {
   tone: "danger" | "warning" | "success";
   icon: React.ReactNode;
+  /** The one-word state, next to the sentence — colour is never the only signal. */
+  badge: string;
   title: string;
   body: string;
   hint?: string;
 }) {
-  const styles = {
-    danger: "border-danger/30 bg-danger-soft text-danger",
-    warning: "border-warning/30 bg-warning-soft text-warning",
-    success: "border-success/30 bg-success-soft text-success",
+  const ring = {
+    danger: "bg-danger-soft text-danger",
+    warning: "bg-warning-soft text-warning",
+    success: "bg-success-soft text-success",
   } as const;
 
   return (
-    <div
+    <Card
       // `role="status"` rather than `alert` for the healthy case would need two
       // components; a firewall banner is always worth announcing.
       role="status"
-      className={`flex gap-3 rounded-card border px-4 py-3 ${styles[tone]}`}
+      className="flex items-start gap-4 px-5 py-4"
     >
-      <span className="mt-0.5 shrink-0">{icon}</span>
+      <span
+        className={`grid h-10 w-10 shrink-0 place-items-center rounded-full ${ring[tone]} [&>svg]:h-5 [&>svg]:w-5`}
+        aria-hidden
+      >
+        {icon}
+      </span>
       <div className="min-w-0">
-        <p className="text-sm font-medium text-ink">{title}</p>
-        <p className="mt-0.5 text-sm text-ink-muted">{body}</p>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <p className="text-sm font-semibold text-ink">{title}</p>
+          <Badge tone={tone} dot>
+            {badge}
+          </Badge>
+        </div>
+        <p className="mt-1 text-sm text-ink-muted">{body}</p>
         {hint ? <p className="mt-1 text-sm text-ink-muted">{hint}</p> : null}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -218,12 +264,12 @@ function RulesCard({ data }: { data: FirewallResponse }) {
   const drifted = unmanaged ? 0 : data.rules.filter((rule) => rule.drift !== null).length;
 
   return (
-    <Card>
-      <CardHeader
+    <section className="space-y-3">
+      <SectionHeader
         title={t("firewall.rules.title")}
         description={t("firewall.rules.hint")}
-        action={
-          <div className="flex items-center gap-2">
+        actions={
+          <>
             {drifted > 0 ? (
               <Badge tone="warning" dot>
                 {t("firewall.rules.drifted", { count: drifted })}
@@ -239,60 +285,48 @@ function RulesCard({ data }: { data: FirewallResponse }) {
               <Plus className="h-3.5 w-3.5" aria-hidden />
               {t("firewall.rules.open")}
             </Button>
-          </div>
+          </>
         }
       />
-      <CardBody>
-        {/* The `none` case gets its own body rather than an empty table.
-            An empty table means "nothing is open"; this host has nothing
-            *closed*, which is the opposite claim. */}
-        {unmanaged ? (
-          <div className="py-10 text-center">
-            <ShieldOff className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-            <p className="text-sm font-medium text-ink">{t("firewall.rules.unmanaged")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("firewall.rules.unmanagedHint")}
-            </p>
-          </div>
-        ) : data.rules.length === 0 ? (
-          <div className="py-10 text-center">
-            <p className="text-sm font-medium text-ink">{t("firewall.rules.empty")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("firewall.rules.emptyHint")}
-            </p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[620px] border-collapse text-sm">
-              <thead>
-                <tr className="border-b border-border text-xs text-ink-muted">
-                  <th className="w-24 px-2 py-2 text-start font-medium">
-                    {t("firewall.rules.port")}
-                  </th>
-                  <th className="w-40 px-2 py-2 text-start font-medium">
-                    {t("firewall.rules.source")}
-                  </th>
-                  <th className="px-2 py-2 text-start font-medium">
-                    {t("firewall.rules.comment")}
-                  </th>
-                  <th className="w-56 px-2 py-2 text-start font-medium">
-                    {t("firewall.rules.state")}
-                  </th>
-                  <th className="w-28 px-2 py-2" />
-                </tr>
-              </thead>
-              <tbody>
-                {data.rules.map((rule) => (
-                  <RuleRow key={`${rule.port}/${rule.proto}/${rule.source ?? ""}`} rule={rule} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </CardBody>
+
+      {/* The `none` case gets its own body rather than an empty table.
+          An empty table means "nothing is open"; this host has nothing
+          *closed*, which is the opposite claim. */}
+      {unmanaged ? (
+        <EmptyState
+          icon={<ShieldOff aria-hidden />}
+          title={t("firewall.rules.unmanaged")}
+          hint={t("firewall.rules.unmanagedHint")}
+        />
+      ) : data.rules.length === 0 ? (
+        <EmptyState
+          icon={<Plus aria-hidden />}
+          title={t("firewall.rules.empty")}
+          hint={t("firewall.rules.emptyHint")}
+        />
+      ) : (
+        <Table className="min-w-[640px]">
+          <thead>
+            <tr>
+              <Th className="w-24">{t("firewall.rules.port")}</Th>
+              <Th className="w-40">{t("firewall.rules.source")}</Th>
+              <Th>{t("firewall.rules.comment")}</Th>
+              <Th className="w-56">{t("firewall.rules.state")}</Th>
+              <Th className="w-12">
+                <span className="sr-only">{t("firewall.rules.close")}</span>
+              </Th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.rules.map((rule) => (
+              <RuleRow key={`${rule.port}/${rule.proto}/${rule.source ?? ""}`} rule={rule} />
+            ))}
+          </tbody>
+        </Table>
+      )}
 
       <OpenPortDialog open={opening} onClose={() => setOpening(false)} />
-    </Card>
+    </section>
   );
 }
 
@@ -313,40 +347,37 @@ function RuleRow({ rule }: { rule: FirewallRule }) {
   });
 
   return (
-    <tr className="border-b border-border last:border-b-0 hover:bg-surface-muted">
-      <td dir="ltr" className="px-2 py-2 text-start font-mono text-xs text-ink">
+    <tr className="transition-colors hover:bg-surface-muted/60">
+      <Td className="font-mono text-xs">
         {rule.port}/{rule.proto}
-      </td>
-      <td dir="ltr" className="max-w-0 px-2 py-2 text-start">
+      </Td>
+      <Td className="max-w-0">
         <span className="block truncate font-mono text-xs text-ink-muted">
           {rule.source ?? t("firewall.rules.anywhere")}
         </span>
-      </td>
-      <td className="max-w-0 px-2 py-2">
-        <span dir="auto" className="block truncate text-ink-muted">
-          {rule.comment || "—"}
-        </span>
-      </td>
-      <td className="px-2 py-2">
+      </Td>
+      <Td className="max-w-0">
+        <span className="block truncate text-ink-muted">{rule.comment || t("common.none")}</span>
+      </Td>
+      <Td>
         <RuleState rule={rule} />
         {error ? (
           <p role="alert" className="mt-1 text-xs text-danger">
             {error}
           </p>
         ) : null}
-      </td>
-      <td className="px-2 py-2 text-end">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => close.mutate()}
-          disabled={close.isPending}
-          aria-label={t("firewall.rules.closeLabel", { port: rule.port, proto: rule.proto })}
-        >
-          {close.isPending ? <Spinner /> : <X className="h-3.5 w-3.5" aria-hidden />}
-          {t("firewall.rules.close")}
-        </Button>
-      </td>
+      </Td>
+      <Td className="text-end">
+        {close.isPending ? (
+          <Spinner className="text-ink-muted" />
+        ) : (
+          <Menu label={t("firewall.rules.closeLabel", { port: rule.port, proto: rule.proto })}>
+            <MenuItem danger icon={<X />} onClick={() => close.mutate()}>
+              {t("firewall.rules.close")}
+            </MenuItem>
+          </Menu>
+        )}
+      </Td>
     </tr>
   );
 }
@@ -460,7 +491,7 @@ function OpenPortDialog({ open, onClose }: { open: boolean; onClose: () => void 
             }}
           >
             {t(`firewall.presets.${preset.key}`)}
-            <span dir="ltr" className="font-mono text-xs text-ink-subtle">
+            <span className="font-mono text-xs text-ink-subtle">
               {preset.port}/{preset.proto}
             </span>
           </Button>
@@ -474,7 +505,7 @@ function OpenPortDialog({ open, onClose }: { open: boolean; onClose: () => void 
       >
         <Input
           id="fw-port"
-          dir="ltr"
+          className="font-mono"
           inputMode="numeric"
           placeholder="8080"
           value={port}
@@ -501,7 +532,7 @@ function OpenPortDialog({ open, onClose }: { open: boolean; onClose: () => void 
       >
         <Input
           id="fw-source"
-          dir="ltr"
+          className="font-mono"
           placeholder="203.0.113.0/24"
           value={source}
           aria-describedby="fw-source-hint"
@@ -516,7 +547,6 @@ function OpenPortDialog({ open, onClose }: { open: boolean; onClose: () => void 
       <Field label={t("firewall.rules.comment")} htmlFor="fw-comment">
         <Input
           id="fw-comment"
-          dir="auto"
           value={comment}
           onChange={(event) => setComment(event.target.value)}
         />
@@ -555,11 +585,11 @@ function BansCard({ backend, yourIp }: { backend: FirewallBackend; yourIp: strin
   const unrecorded = bans.data?.unrecorded ?? [];
 
   return (
-    <Card>
-      <CardHeader
+    <section className="space-y-3">
+      <SectionHeader
         title={t("firewall.bans.title")}
         description={t("firewall.bans.hint")}
-        action={
+        actions={
           <Button
             variant="primary"
             size="sm"
@@ -572,77 +602,67 @@ function BansCard({ backend, yourIp }: { backend: FirewallBackend; yourIp: strin
           </Button>
         }
       />
-      <CardBody className="space-y-4">
-        {bans.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner />
-          </div>
-        ) : bans.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {isRouteMissing(bans.error)
-              ? t("firewall.apiMissing")
-              : bans.error instanceof ApiError
-                ? bans.error.message
-                : String(bans.error)}
-          </p>
-        ) : rows.length === 0 ? (
-          <div className="py-10 text-center">
-            <p className="text-sm font-medium text-ink">{t("firewall.bans.empty")}</p>
-            <p className="mx-auto mt-1 max-w-md text-sm text-ink-muted">
-              {t("firewall.bans.emptyHint")}
-            </p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[640px] border-collapse text-sm">
-              <thead>
-                <tr className="border-b border-border text-xs text-ink-muted">
-                  <th className="w-40 px-2 py-2 text-start font-medium">{t("firewall.bans.ip")}</th>
-                  <th className="px-2 py-2 text-start font-medium">{t("firewall.bans.reason")}</th>
-                  <th className="w-44 px-2 py-2 text-start font-medium">
-                    {t("firewall.bans.expires")}
-                  </th>
-                  <th className="w-44 px-2 py-2 text-start font-medium">
-                    {t("firewall.bans.state")}
-                  </th>
-                  <th className="w-28 px-2 py-2" />
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((ban) => (
-                  <BanRow key={ban.id} ban={ban} dateFormat={dateFormat} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
 
-        {/* Addresses the kernel is dropping that the panel never recorded.
-            Listed separately because this is how an operator finds out why a
-            customer cannot reach a box they were never banned from. */}
-        {unrecorded.length > 0 ? (
-          <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2.5">
-            <p className="text-sm font-medium text-ink">
-              {t("firewall.bans.unrecorded", { count: unrecorded.length })}
-            </p>
-            <p className="mt-0.5 text-xs text-ink-muted">{t("firewall.bans.unrecordedHint")}</p>
-            <ul className="mt-2 flex flex-wrap gap-1.5">
-              {unrecorded.map((ip) => (
-                <li key={ip}>
-                  <Badge tone="neutral">
-                    <span dir="ltr" className="font-mono">
-                      {ip}
-                    </span>
-                  </Badge>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-      </CardBody>
+      {bans.isPending ? (
+        <ListSkeleton rows={3} />
+      ) : bans.error ? (
+        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          {isRouteMissing(bans.error)
+            ? t("firewall.apiMissing")
+            : bans.error instanceof ApiError
+              ? bans.error.message
+              : String(bans.error)}
+        </p>
+      ) : rows.length === 0 ? (
+        <EmptyState
+          icon={<Ban aria-hidden />}
+          title={t("firewall.bans.empty")}
+          hint={t("firewall.bans.emptyHint")}
+        />
+      ) : (
+        <Table className="min-w-[680px]">
+          <thead>
+            <tr>
+              <Th className="w-40">{t("firewall.bans.ip")}</Th>
+              <Th>{t("firewall.bans.reason")}</Th>
+              <Th className="w-44">{t("firewall.bans.expires")}</Th>
+              <Th className="w-44">{t("firewall.bans.state")}</Th>
+              <Th className="w-12">
+                <span className="sr-only">{t("firewall.bans.unban")}</span>
+              </Th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((ban) => (
+              <BanRow key={ban.id} ban={ban} dateFormat={dateFormat} />
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {/* Addresses the kernel is dropping that the panel never recorded.
+          Listed separately because this is how an operator finds out why a
+          customer cannot reach a box they were never banned from. */}
+      {unrecorded.length > 0 ? (
+        <div className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2.5">
+          <p className="text-sm font-medium text-ink">
+            {t("firewall.bans.unrecorded", { count: unrecorded.length })}
+          </p>
+          <p className="mt-0.5 text-xs text-ink-muted">{t("firewall.bans.unrecordedHint")}</p>
+          <ul className="mt-2 flex flex-wrap gap-1.5">
+            {unrecorded.map((ip) => (
+              <li key={ip}>
+                <Badge tone="neutral">
+                  <span className="font-mono">{ip}</span>
+                </Badge>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       <BanDialog open={banning} onClose={() => setBanning(false)} yourIp={yourIp} />
-    </Card>
+    </section>
   );
 }
 
@@ -659,23 +679,19 @@ function BanRow({ ban, dateFormat }: { ban: BanRecord; dateFormat: Intl.DateTime
   });
 
   return (
-    <tr className="border-b border-border last:border-b-0 hover:bg-surface-muted">
-      <td dir="ltr" className="px-2 py-2 text-start font-mono text-xs text-ink">
-        {ban.ip}
-      </td>
-      <td className="max-w-0 px-2 py-2">
-        <span dir="auto" className="block truncate text-ink-muted">
-          {ban.reason}
-        </span>
-      </td>
-      <td className="whitespace-nowrap px-2 py-2 text-ink-muted">
+    <tr className="transition-colors hover:bg-surface-muted/60">
+      <Td className="font-mono text-xs">{ban.ip}</Td>
+      <Td className="max-w-0">
+        <span className="block truncate text-ink-muted">{ban.reason}</span>
+      </Td>
+      <Td className="whitespace-nowrap text-ink-muted">
         {lifted
           ? t("firewall.bans.liftedAt", { at: dateFormat.format(new Date(ban.lifted_at!)) })
           : ban.expires_at === null
             ? t("firewall.bans.permanent")
             : dateFormat.format(new Date(ban.expires_at))}
-      </td>
-      <td className="px-2 py-2">
+      </Td>
+      <Td>
         {/* Three states, not two: a lifted ban, a ban the kernel is holding,
             and a ban the panel believes in that the backend has lost. The last
             one is the ban-list half of the same drift the rule table reports. */}
@@ -698,21 +714,18 @@ function BanRow({ ban, dateFormat }: { ban: BanRecord; dateFormat: Intl.DateTime
             {error}
           </p>
         ) : null}
-      </td>
-      <td className="px-2 py-2 text-end">
-        {lifted ? null : (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => unban.mutate()}
-            disabled={unban.isPending}
-            aria-label={t("firewall.bans.unbanLabel", { ip: ban.ip })}
-          >
-            {unban.isPending ? <Spinner /> : <Trash2 className="h-3.5 w-3.5" aria-hidden />}
-            {t("firewall.bans.unban")}
-          </Button>
+      </Td>
+      <Td className="text-end">
+        {lifted ? null : unban.isPending ? (
+          <Spinner className="text-ink-muted" />
+        ) : (
+          <Menu label={t("firewall.bans.unbanLabel", { ip: ban.ip })}>
+            <MenuItem danger icon={<Trash2 />} onClick={() => unban.mutate()}>
+              {t("firewall.bans.unban")}
+            </MenuItem>
+          </Menu>
         )}
-      </td>
+      </Td>
     </tr>
   );
 }
@@ -785,7 +798,7 @@ function BanDialog({
       <Field label={t("firewall.bans.ip")} htmlFor="fw-ban-ip">
         <Input
           id="fw-ban-ip"
-          dir="ltr"
+          className="font-mono"
           placeholder="203.0.113.42"
           value={ip}
           autoFocus
@@ -820,7 +833,6 @@ function BanDialog({
       >
         <Input
           id="fw-ban-minutes"
-          dir="ltr"
           inputMode="numeric"
           placeholder="60"
           value={minutes}
@@ -836,7 +848,6 @@ function BanDialog({
       <Field label={t("firewall.bans.reason")} htmlFor="fw-ban-reason">
         <Input
           id="fw-ban-reason"
-          dir="auto"
           value={reason}
           onChange={(event) => setReason(event.target.value)}
         />
@@ -897,8 +908,14 @@ function SentinelCard({ backend }: { backend: FirewallBackend }) {
       <CardHeader title={t("firewall.sentinel.title")} description={t("firewall.sentinel.hint")} />
       <CardBody>
         {sentinel.isPending ? (
-          <div className="flex justify-center py-10 text-ink-muted">
-            <Spinner />
+          <div role="status" aria-live="polite" className="space-y-4">
+            <Skeleton className="h-5 w-72 max-w-full" />
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+              <Skeleton className="h-16 w-full" />
+            </div>
+            <Skeleton className="h-9 w-24 rounded-lg" />
           </div>
         ) : sentinel.error ? (
           <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
@@ -991,7 +1008,6 @@ function SentinelForm({
         >
           <Input
             id="sentinel-threshold"
-            dir="ltr"
             inputMode="numeric"
             value={shown(draft.ssh_threshold)}
             aria-invalid={has("ssh_threshold")}
@@ -1006,7 +1022,6 @@ function SentinelForm({
         >
           <Input
             id="sentinel-window"
-            dir="ltr"
             inputMode="numeric"
             value={shown(draft.window_minutes)}
             aria-invalid={has("window_minutes")}
@@ -1020,7 +1035,6 @@ function SentinelForm({
         >
           <Input
             id="sentinel-ban-minutes"
-            dir="ltr"
             inputMode="numeric"
             value={shown(draft.ban_minutes)}
             aria-invalid={has("ban_minutes")}
@@ -1045,9 +1059,7 @@ function SentinelForm({
             {draft.allowlist.map((item) => (
               <li key={item}>
                 <Badge tone={isCidr(item) ? "accent" : "danger"}>
-                  <span dir="ltr" className="font-mono">
-                    {item}
-                  </span>
+                  <span className="font-mono">{item}</span>
                   <button
                     type="button"
                     className="ms-0.5 rounded-full hover:text-ink"
@@ -1066,8 +1078,7 @@ function SentinelForm({
 
         <div className="flex items-start gap-2">
           <Input
-            dir="ltr"
-            className="max-w-xs"
+            className="max-w-xs font-mono"
             placeholder="203.0.113.0/24"
             value={entry}
             aria-label={t("firewall.sentinel.allowlistAdd")}

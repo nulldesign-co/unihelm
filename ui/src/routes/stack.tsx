@@ -5,8 +5,11 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { Card, CardBody } from "@/components/ui/card";
+import { PageHeader } from "@/components/ui/page-header";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
+import { Table, Td } from "@/components/ui/table";
 import {
   ApiError,
   EOL_PHP_VERSIONS,
@@ -65,8 +68,9 @@ export function StackPage() {
 
   if (stack.isPending) {
     return (
-      <div className="flex justify-center py-24 text-ink-muted">
-        <Spinner className="h-6 w-6" />
+      <div className="space-y-6">
+        <PageHeader title={t("stack.title")} description={t("stack.subtitle")} />
+        <ListSkeleton rows={4} />
       </div>
     );
   }
@@ -83,53 +87,57 @@ export function StackPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("stack.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("stack.subtitle")}</p>
-      </header>
+      <PageHeader title={t("stack.title")} description={t("stack.subtitle")} />
 
       {error ? (
-        <p role="alert" className="rounded-card bg-danger-soft px-4 py-3 text-sm text-danger">
+        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
           {error}
         </p>
       ) : null}
 
-      <Card>
-        <CardHeader title={t("stack.webServer")} description={t("stack.webServerHint")} />
-        <CardBody>
-          {nginx ? (
-            <ComponentRow
-              component={nginx}
-              busy={busy}
-              onInstall={() => install.mutate(request(nginx.slug))}
-              onRemove={() => remove.mutate(request(nginx.slug))}
-            />
-          ) : null}
-        </CardBody>
-      </Card>
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">{t("stack.webServer")}</h2>
+          <p className="mt-0.5 text-sm text-ink-muted">{t("stack.webServerHint")}</p>
+        </div>
+        <Table>
+          <tbody>
+            {nginx ? (
+              <ComponentRow
+                component={nginx}
+                busy={busy}
+                onInstall={() => install.mutate(request(nginx.slug))}
+                onRemove={() => remove.mutate(request(nginx.slug))}
+              />
+            ) : null}
+          </tbody>
+        </Table>
+      </section>
 
-      <Card>
-        <CardHeader title={t("stack.php")} description={t("stack.phpHint")} />
-        <CardBody>
-          <ul className="divide-y divide-border">
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">{t("stack.php")}</h2>
+          <p className="mt-0.5 text-sm text-ink-muted">{t("stack.phpHint")}</p>
+        </div>
+        <Table>
+          <tbody>
             {PHP_VERSIONS.map((version) => {
               const component = php.find((c) => c.slug === `php${version}`);
               if (!component) return null;
               return (
-                <li key={version}>
-                  <ComponentRow
-                    component={component}
-                    eol={EOL_PHP_VERSIONS.has(version)}
-                    busy={busy}
-                    onInstall={() => install.mutate(request(component.slug))}
-                    onRemove={() => remove.mutate(request(component.slug))}
-                  />
-                </li>
+                <ComponentRow
+                  key={version}
+                  component={component}
+                  eol={EOL_PHP_VERSIONS.has(version)}
+                  busy={busy}
+                  onInstall={() => install.mutate(request(component.slug))}
+                  onRemove={() => remove.mutate(request(component.slug))}
+                />
               );
             })}
-          </ul>
-        </CardBody>
-      </Card>
+          </tbody>
+        </Table>
+      </section>
 
       {(stack.data?.unverified_pins.length ?? 0) > 0 ? (
         <Card className="border-warning/30">
@@ -138,7 +146,7 @@ export function StackPage() {
             <div>
               <p className="text-sm font-medium text-ink">{t("stack.pinsTitle")}</p>
               <p className="mt-0.5 text-sm text-ink-muted">{t("stack.pinsHint")}</p>
-              <p dir="ltr" className="mt-1.5 font-mono text-xs text-ink-subtle">
+              <p className="mt-1.5 font-mono text-xs text-ink-subtle">
                 {stack.data!.unverified_pins.join(", ")}
               </p>
             </div>
@@ -171,49 +179,49 @@ function ComponentRow({
   const disagrees = installed && !component.unit_active;
 
   return (
-    <div className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
-      <Badge tone={TONE[component.status]} dot={inFlight}>
-        {t(`stack.state.${component.status}`)}
-      </Badge>
-
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm text-ink">
+    <tr className="transition-colors hover:bg-surface-muted/60">
+      <Td>
+        <p className="text-sm font-medium text-ink">
           {component.display_name}
           {eol ? (
-            <span className="ms-2 text-xs text-warning">{t("stack.eol")}</span>
+            <span className="ms-2 text-xs font-normal text-warning">{t("stack.eol")}</span>
           ) : null}
         </p>
-        {component.installed_version ? (
-          <p dir="ltr" className="font-mono text-xs text-ink-subtle">
-            {component.installed_version}
-          </p>
-        ) : null}
         {component.last_error ? (
-          <p dir="ltr" className="mt-0.5 font-mono text-xs text-danger">
+          <p className="mt-0.5 max-w-md font-mono text-xs break-words text-danger">
             {component.last_error}
           </p>
         ) : null}
         {disagrees ? (
           <p className="mt-0.5 text-xs text-warning">{t("stack.notRunning")}</p>
         ) : null}
-      </div>
-
-      {installed ? (
-        <Button variant="ghost" size="sm" disabled={busy || inFlight} onClick={onRemove}>
-          <Trash2 className="h-3.5 w-3.5" />
-          {t("stack.remove")}
-        </Button>
-      ) : (
-        <Button
-          variant={component.status === "failed" ? "outline" : "primary"}
-          size="sm"
-          disabled={busy || inFlight}
-          onClick={onInstall}
-        >
-          {inFlight ? <Spinner /> : <Download className="h-3.5 w-3.5" />}
-          {component.status === "failed" ? t("common.retry") : t("stack.install")}
-        </Button>
-      )}
-    </div>
+      </Td>
+      <Td className="font-mono text-xs text-ink-subtle">
+        {component.installed_version ? component.installed_version : t("common.none")}
+      </Td>
+      <Td>
+        <Badge tone={TONE[component.status]} dot>
+          {t(`stack.state.${component.status}`)}
+        </Badge>
+      </Td>
+      <Td className="text-end whitespace-nowrap">
+        {installed ? (
+          <Button variant="ghost" size="sm" disabled={busy || inFlight} onClick={onRemove}>
+            <Trash2 className="h-3.5 w-3.5" aria-hidden />
+            {t("stack.remove")}
+          </Button>
+        ) : (
+          <Button
+            variant={component.status === "failed" ? "outline" : "primary"}
+            size="sm"
+            disabled={busy || inFlight}
+            onClick={onInstall}
+          >
+            {inFlight ? <Spinner /> : <Download className="h-3.5 w-3.5" aria-hidden />}
+            {component.status === "failed" ? t("common.retry") : t("stack.install")}
+          </Button>
+        )}
+      </Td>
+    </tr>
   );
 }

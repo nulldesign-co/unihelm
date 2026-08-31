@@ -1,16 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { ExternalLink, Globe, Lock, LockOpen, Plus, Wrench } from "lucide-react";
+import { ExternalLink, Globe, Lock, LockOpen, Play, Plus, Trash2, Wrench } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -44,52 +48,43 @@ export function SitesPage() {
 
   return (
     <div className="space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("sites.title")}</h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("sites.subtitle")}</p>
-        </div>
-        <Button variant="primary" onClick={() => setCreating(true)}>
-          <Plus className="h-4 w-4" />
-          {t("sites.create")}
-        </Button>
-      </header>
+      <PageHeader
+        title={t("sites.title")}
+        description={t("sites.subtitle")}
+        actions={
+          <Button variant="primary" onClick={() => setCreating(true)}>
+            <Plus className="h-4 w-4" aria-hidden />
+            {t("sites.create")}
+          </Button>
+        }
+      />
 
       {sites.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <ListSkeleton />
       ) : (sites.data?.sites.length ?? 0) === 0 ? (
-        <EmptyState onCreate={() => setCreating(true)} />
+        <EmptyState
+          icon={<Globe aria-hidden />}
+          title={t("sites.empty")}
+          hint={t("sites.emptyHint")}
+          action={
+            <Button variant="primary" onClick={() => setCreating(true)}>
+              <Plus className="h-4 w-4" aria-hidden />
+              {t("sites.create")}
+            </Button>
+          }
+        />
       ) : (
-        <ul className="space-y-3">
-          {sites.data!.sites.map((site) => (
-            <li key={site.id}>
-              <SiteRow site={site} />
-            </li>
-          ))}
-        </ul>
+        <Card>
+          <ul className="divide-y divide-border">
+            {sites.data!.sites.map((site) => (
+              <SiteRow key={site.id} site={site} />
+            ))}
+          </ul>
+        </Card>
       )}
 
       <CreateSiteDialog open={creating} onClose={() => setCreating(false)} />
     </div>
-  );
-}
-
-function EmptyState({ onCreate }: { onCreate: () => void }) {
-  const { t } = useTranslation();
-  return (
-    <Card>
-      <CardBody className="py-16 text-center">
-        <Globe className="mx-auto mb-3 h-8 w-8 text-ink-subtle" aria-hidden />
-        <p className="text-sm font-medium text-ink">{t("sites.empty")}</p>
-        <p className="mx-auto mt-1 max-w-sm text-sm text-ink-muted">{t("sites.emptyHint")}</p>
-        <Button variant="primary" className="mt-4" onClick={onCreate}>
-          <Plus className="h-4 w-4" />
-          {t("sites.create")}
-        </Button>
-      </CardBody>
-    </Card>
   );
 }
 
@@ -102,76 +97,69 @@ function SiteRow({ site }: { site: SiteView }) {
   const certTone = days === undefined ? "neutral" : days <= 7 ? "danger" : days <= 21 ? "warning" : "success";
 
   return (
-    <Card>
-      <CardBody className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-5">
-        <Badge tone={TONE[site.status]} dot={site.status === "provisioning"}>
-          {t(`sites.state.${site.status}`)}
+    <li className="flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-4 transition-colors first:rounded-t-card last:rounded-b-card hover:bg-surface-muted/40">
+      <Badge tone={TONE[site.status]} dot={site.status === "provisioning"}>
+        {t(`sites.state.${site.status}`)}
+      </Badge>
+
+      <div className="min-w-0 flex-1">
+        {/* The domain goes to the detail page; the little arrow opens the
+            live site. Managing a site is what this list is for — visiting it
+            is the secondary act. */}
+        <span className="flex items-center gap-1.5">
+          <Link
+            to="/sites/$siteId"
+            params={{ siteId: String(site.id) }}
+            className="truncate font-mono text-sm font-medium text-ink transition-colors hover:text-accent"
+          >
+            {site.domain}
+          </Link>
+          <a
+            href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="shrink-0 text-ink-subtle transition-colors hover:text-accent"
+            aria-label={site.domain}
+          >
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+          </a>
+        </span>
+        <p className="truncate font-mono text-xs text-ink-subtle">{site.root_dir}</p>
+        {site.aliases.length > 0 ? (
+          <p className="mt-0.5 truncate font-mono text-xs text-ink-muted">{site.aliases.join(", ")}</p>
+        ) : null}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        {site.maintenance_mode ? (
+          <Badge tone="warning">
+            <Wrench className="h-3 w-3" aria-hidden />
+            {t("sites.maintenance")}
+          </Badge>
+        ) : null}
+
+        {site.php_version ? (
+          <Badge tone={EOL_PHP_VERSIONS.has(site.php_version) ? "warning" : "neutral"}>
+            PHP {site.php_version}
+          </Badge>
+        ) : (
+          <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
+        )}
+
+        <Badge tone={certTone}>
+          {site.has_certificate ? (
+            <Lock className="h-3 w-3" aria-hidden />
+          ) : (
+            <LockOpen className="h-3 w-3" aria-hidden />
+          )}
+          {site.has_certificate
+            ? t("sites.certDays", { count: days ?? 0 })
+            : t("sites.noCert")}
         </Badge>
 
-        <div className="min-w-0 flex-1">
-          {/* The domain goes to the detail page; the little arrow opens the
-              live site. Managing a site is what this list is for — visiting it
-              is the secondary act. */}
-          <span className="flex items-center gap-1.5">
-            <Link
-              to="/sites/$siteId"
-              params={{ siteId: String(site.id) }}
-              dir="ltr"
-              className="truncate font-medium text-ink hover:text-accent"
-            >
-              {site.domain}
-            </Link>
-            <a
-              href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="shrink-0 text-ink-subtle hover:text-accent"
-              aria-label={site.domain}
-            >
-              <ExternalLink className="h-3.5 w-3.5" aria-hidden />
-            </a>
-          </span>
-          <p dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
-            {site.root_dir}
-          </p>
-          {site.aliases.length > 0 ? (
-            <p dir="ltr" className="mt-0.5 truncate text-xs text-ink-muted">
-              {site.aliases.join(", ")}
-            </p>
-          ) : null}
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {site.maintenance_mode ? (
-            <Badge tone="warning">
-              <Wrench className="h-3 w-3" aria-hidden />
-              {t("sites.maintenance")}
-            </Badge>
-          ) : null}
-
-          {site.php_version ? (
-            <Badge tone={EOL_PHP_VERSIONS.has(site.php_version) ? "warning" : "neutral"}>
-              PHP {site.php_version}
-            </Badge>
-          ) : (
-            <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
-          )}
-
-          <Badge tone={certTone}>
-            {site.has_certificate ? (
-              <Lock className="h-3 w-3" aria-hidden />
-            ) : (
-              <LockOpen className="h-3 w-3" aria-hidden />
-            )}
-            {site.has_certificate
-              ? t("sites.certDays", { count: days ?? 0 })
-              : t("sites.noCert")}
-          </Badge>
-
-          <SiteActions site={site} />
-        </div>
-      </CardBody>
-    </Card>
+        <SiteActions site={site} />
+      </div>
+    </li>
   );
 }
 
@@ -215,22 +203,24 @@ function SiteActions({ site }: { site: SiteView }) {
           disabled={issueCert.isPending}
           title={t("sites.issueCertHint")}
         >
-          {issueCert.isPending ? <Spinner /> : <Lock className="h-3.5 w-3.5" />}
+          {issueCert.isPending ? <Spinner /> : <Lock className="h-3.5 w-3.5" aria-hidden />}
           {t("sites.issueCert")}
         </Button>
       ) : null}
 
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => toggleMaintenance.mutate()}
-        disabled={toggleMaintenance.isPending}
-      >
-        {site.maintenance_mode ? t("sites.resume") : t("sites.pause")}
-      </Button>
-      <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
-        {t("sites.delete")}
-      </Button>
+      <Menu label={t("files.actions")}>
+        <MenuItem
+          icon={site.maintenance_mode ? <Play aria-hidden /> : <Wrench aria-hidden />}
+          onClick={() => toggleMaintenance.mutate()}
+          disabled={toggleMaintenance.isPending}
+        >
+          {site.maintenance_mode ? t("sites.resume") : t("sites.pause")}
+        </MenuItem>
+        <MenuSeparator />
+        <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
+          {t("sites.delete")}
+        </MenuItem>
+      </Menu>
 
       <Dialog
         open={confirming}
@@ -344,6 +334,7 @@ function CreateSiteDialog({ open, onClose }: { open: boolean; onClose: () => voi
       }
     >
       <form
+        className="space-y-1"
         onSubmit={(event) => {
           event.preventDefault();
           void submit();
@@ -352,7 +343,6 @@ function CreateSiteDialog({ open, onClose }: { open: boolean; onClose: () => voi
         <Field label={t("sites.domain")} htmlFor="domain" error={errors.domain?.message}>
           <Input
             id="domain"
-            dir="ltr"
             placeholder="example.com"
             autoFocus
             aria-invalid={Boolean(errors.domain)}
@@ -406,7 +396,6 @@ function CreateSiteDialog({ open, onClose }: { open: boolean; onClose: () => voi
           <Field label={t("sites.proxyPort")} htmlFor="proxy_port" error={errors.proxy_port?.message}>
             <Input
               id="proxy_port"
-              dir="ltr"
               inputMode="numeric"
               placeholder="3000"
               {...register("proxy_port", {
@@ -426,7 +415,6 @@ function CreateSiteDialog({ open, onClose }: { open: boolean; onClose: () => voi
           >
             <Input
               id="redirect_target"
-              dir="ltr"
               placeholder="new.example.com"
               {...register("redirect_target", { required: t("sites.redirectRequired") })}
             />

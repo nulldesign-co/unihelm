@@ -4,13 +4,12 @@ import {
   Copy,
   Database,
   HardDrive,
-  History,
   KeyRound,
   Play,
   Plus,
   Trash2,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ScheduleField, ScheduleText } from "@/components/schedule-field";
@@ -19,10 +18,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem } from "@/components/ui/menu";
+import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
+import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { Table, Td, Th } from "@/components/ui/table";
 import {
   ApiError,
   endpoints,
@@ -63,16 +67,37 @@ export function BackupsPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("backups.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("backups.subtitle")}</p>
-      </header>
+      <PageHeader title={t("backups.title")} description={t("backups.subtitle")} />
 
       <RunNowCard isAdmin={isAdmin} />
       {isAdmin ? <RepositoriesCard /> : null}
       <SchedulesCard isAdmin={isAdmin} />
       <RunsCard />
       <SnapshotsCard isAdmin={isAdmin} />
+    </div>
+  );
+}
+
+/**
+ * The header of a table section. Tables carry their own card shell, so these
+ * sections cannot use `CardHeader` — this mirrors its type scale instead.
+ */
+function SectionHeader({
+  title,
+  description,
+  action,
+}: {
+  title: ReactNode;
+  description?: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+      <div className="min-w-0">
+        <h2 className="text-sm font-semibold text-ink">{title}</h2>
+        {description ? <p className="mt-0.5 text-sm text-ink-muted">{description}</p> : null}
+      </div>
+      {action ? <div className="shrink-0">{action}</div> : null}
     </div>
   );
 }
@@ -174,7 +199,6 @@ function TargetFields({
           <Field label={t("backups.subscription")} htmlFor={`${idPrefix}-subscription`}>
             <Input
               id={`${idPrefix}-subscription`}
-              dir="ltr"
               inputMode="numeric"
               placeholder="1"
               aria-describedby={`${idPrefix}-subscription-hint`}
@@ -230,8 +254,18 @@ function RunNowCard({ isAdmin }: { isAdmin: boolean }) {
       <CardHeader title={t("backups.runNow")} description={t("backups.runNowHint")} />
       <CardBody className="space-y-3">
         {isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
+          <div role="status" aria-live="polite" className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+              <div className="space-y-1.5">
+                <Skeleton className="h-4 w-24" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+            </div>
+            <Skeleton className="h-9 w-36" />
           </div>
         ) : options.length === 0 ? (
           <p className="text-sm text-ink-muted">
@@ -294,8 +328,8 @@ function RepositoriesCard() {
   const repos = useQuery({ queryKey: ["backup-repos"], queryFn: endpoints.backupRepos });
 
   return (
-    <Card>
-      <CardHeader
+    <section className="space-y-3">
+      <SectionHeader
         title={t("backups.repositories")}
         description={t("backups.repositoriesHint")}
         action={
@@ -305,30 +339,35 @@ function RepositoriesCard() {
           </Button>
         }
       />
-      <CardBody>
-        {repos.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
-          </div>
-        ) : repos.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {repos.error instanceof ApiError ? repos.error.message : String(repos.error)}
-          </p>
-        ) : (repos.data?.repos.length ?? 0) === 0 ? (
-          <p className="text-sm text-ink-muted">{t("backups.noRepos")}</p>
-        ) : (
-          <ul className="divide-y divide-border">
+
+      {repos.isPending ? (
+        <ListSkeleton rows={3} />
+      ) : repos.error ? (
+        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          {repos.error instanceof ApiError ? repos.error.message : String(repos.error)}
+        </p>
+      ) : (repos.data?.repos.length ?? 0) === 0 ? (
+        <EmptyState icon={<Archive aria-hidden />} title={t("backups.noRepos")} />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>{t("backups.label")}</Th>
+              <Th>{t("backups.kindLabel")}</Th>
+              <Th />
+              <Th />
+            </tr>
+          </thead>
+          <tbody>
             {repos.data!.repos.map((repo) => (
-              <li key={repo.id}>
-                <RepoRow repo={repo} />
-              </li>
+              <RepoRow key={repo.id} repo={repo} />
             ))}
-          </ul>
-        )}
-      </CardBody>
+          </tbody>
+        </Table>
+      )}
 
       <CreateRepoDialog open={creating} onClose={() => setCreating(false)} />
-    </Card>
+    </section>
   );
 }
 
@@ -348,56 +387,67 @@ function RepoRow({ repo }: { repo: BackupRepo }) {
   });
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
-      {repo.kind === "s3" ? (
-        <Database className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
-      ) : (
-        <HardDrive className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
-      )}
+    <>
+      <tr className="transition-colors hover:bg-surface-muted/60">
+        <Td>
+          <div className="flex min-w-0 items-center gap-3">
+            {repo.kind === "s3" ? (
+              <Database className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
+            ) : (
+              <HardDrive className="h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
+            )}
+            <div className="min-w-0">
+              <span className="block max-w-xs truncate font-medium text-ink">{repo.label}</span>
+              <span className="block max-w-xs truncate font-mono text-xs text-ink-subtle">
+                {repo.path_or_url}
+              </span>
+            </div>
+          </div>
+        </Td>
+        <Td>
+          <Badge tone="neutral">{t(`backups.kind.${repo.kind}`)}</Badge>
+        </Td>
+        <Td>
+          {repo.has_credentials ? <Badge tone="accent">{t("backups.hasCredentials")}</Badge> : null}
+        </Td>
+        <Td className="w-px text-end">
+          <Menu label={t("backups.forget")}>
+            <MenuItem danger icon={<Trash2 />} onClick={() => setConfirming(true)}>
+              {t("backups.forget")}
+            </MenuItem>
+          </Menu>
 
-      <div className="min-w-0 flex-1">
-        <span dir="ltr" className="block truncate font-medium text-ink">
-          {repo.label}
-        </span>
-        <span dir="ltr" className="block truncate font-mono text-xs text-ink-subtle">
-          {repo.path_or_url}
-        </span>
-      </div>
-
-      <Badge tone="neutral">{t(`backups.kind.${repo.kind}`)}</Badge>
-      {repo.has_credentials ? <Badge tone="accent">{t("backups.hasCredentials")}</Badge> : null}
-
-      <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("backups.forget")}
-      </Button>
-
+          <Dialog
+            open={confirming}
+            onClose={() => setConfirming(false)}
+            title={t("backups.forgetTitle", { label: repo.label })}
+            description={t("backups.forgetHint")}
+            footer={
+              <>
+                <Button variant="ghost" onClick={() => setConfirming(false)}>
+                  {t("common.cancel")}
+                </Button>
+                <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
+                  {remove.isPending ? <Spinner /> : null}
+                  {t("backups.forgetConfirm")}
+                </Button>
+              </>
+            }
+          >
+            <p className="text-sm text-ink-muted">{t("backups.forgetKeepsData")}</p>
+          </Dialog>
+        </Td>
+      </tr>
       {error ? (
-        <p role="alert" className="basis-full rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {error}
-        </p>
+        <tr>
+          <Td colSpan={4}>
+            <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+              {error}
+            </p>
+          </Td>
+        </tr>
       ) : null}
-
-      <Dialog
-        open={confirming}
-        onClose={() => setConfirming(false)}
-        title={t("backups.forgetTitle", { label: repo.label })}
-        description={t("backups.forgetHint")}
-        footer={
-          <>
-            <Button variant="ghost" onClick={() => setConfirming(false)}>
-              {t("common.cancel")}
-            </Button>
-            <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-              {remove.isPending ? <Spinner /> : null}
-              {t("backups.forgetConfirm")}
-            </Button>
-          </>
-        }
-      >
-        <p className="text-sm text-ink-muted">{t("backups.forgetKeepsData")}</p>
-      </Dialog>
-    </div>
+    </>
   );
 }
 
@@ -500,7 +550,6 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
           <Field label={t("backups.label")} htmlFor="repo-label">
             <Input
               id="repo-label"
-              dir="ltr"
               placeholder="nightly-offsite"
               autoComplete="off"
               value={label}
@@ -514,7 +563,6 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
           >
             <Input
               id="repo-location"
-              dir="ltr"
               className="font-mono"
               placeholder={kind === "local" ? "/var/backups/unihelm" : "s3.example.com/unihelm-backups"}
               autoComplete="off"
@@ -533,7 +581,6 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
               <Field label={t("backups.accessKeyId")} htmlFor="repo-access-key">
                 <Input
                   id="repo-access-key"
-                  dir="ltr"
                   className="font-mono"
                   placeholder="AKIAEXAMPLE"
                   autoComplete="off"
@@ -545,7 +592,6 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
               <Field label={t("backups.secretAccessKey")} htmlFor="repo-secret-key">
                 <Input
                   id="repo-secret-key"
-                  dir="ltr"
                   type="password"
                   className="font-mono"
                   autoComplete="off"
@@ -562,7 +608,6 @@ function CreateRepoDialog({ open, onClose }: { open: boolean; onClose: () => voi
               <Field label={t("backups.region")} htmlFor="repo-region">
                 <Input
                   id="repo-region"
-                  dir="ltr"
                   placeholder="us-east-1"
                   autoComplete="off"
                   value={region}
@@ -662,10 +707,7 @@ function PasswordDialog({
         <div>
           <p className="text-xs text-ink-subtle">{t("backups.password")}</p>
           <div className="mt-1 flex items-center gap-2">
-            <code
-              dir="ltr"
-              className="min-w-0 flex-1 rounded-lg border border-border bg-canvas px-3 py-2 font-mono text-sm break-all text-ink select-all"
-            >
+            <code className="min-w-0 flex-1 rounded-lg border border-border bg-canvas px-3 py-2 font-mono text-sm break-all text-ink select-all">
               {result.password}
             </code>
             <Button variant="outline" size="sm" onClick={() => void copy()}>
@@ -680,10 +722,7 @@ function PasswordDialog({
 
         <div>
           <p className="text-xs text-ink-subtle">{t("backups.resticRepository")}</p>
-          <code
-            dir="ltr"
-            className="mt-1 block rounded-lg border border-border bg-canvas px-3 py-2 font-mono text-xs break-all text-ink-muted"
-          >
+          <code className="mt-1 block rounded-lg border border-border bg-canvas px-3 py-2 font-mono text-xs break-all text-ink-muted">
             {result.repository}
           </code>
           <p className="mt-1 text-xs text-ink-muted">{t("backups.resticRepositoryHint")}</p>
@@ -710,8 +749,8 @@ function SchedulesCard({ isAdmin }: { isAdmin: boolean }) {
   const schedules = useQuery({ queryKey: ["backup-schedules"], queryFn: endpoints.backupSchedules });
 
   return (
-    <Card>
-      <CardHeader
+    <section className="space-y-3">
+      <SectionHeader
         title={t("backups.schedules")}
         description={t("backups.schedulesHint")}
         action={
@@ -723,60 +762,74 @@ function SchedulesCard({ isAdmin }: { isAdmin: boolean }) {
           ) : null
         }
       />
-      <CardBody>
-        {schedules.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
-          </div>
-        ) : (schedules.data?.schedules.length ?? 0) === 0 ? (
-          <p className="text-sm text-ink-muted">{t("backups.noSchedules")}</p>
-        ) : (
-          <ul className="divide-y divide-border">
+
+      {schedules.isPending ? (
+        <ListSkeleton rows={3} />
+      ) : (schedules.data?.schedules.length ?? 0) === 0 ? (
+        <EmptyState icon={<Archive aria-hidden />} title={t("backups.noSchedules")} />
+      ) : (
+        <Table className="min-w-2xl">
+          <thead>
+            <tr>
+              <Th>{t("backups.status")}</Th>
+              <Th>{t("backups.when")}</Th>
+              <Th>{t("backups.scope")}</Th>
+              {/* The retention policy is what decides how far back a restore
+                  can go, so it belongs on the row and not behind an edit
+                  dialog. */}
+              <Th>{t("backups.retention")}</Th>
+              <Th>{t("backups.repository")}</Th>
+              {isAdmin ? <Th /> : null}
+            </tr>
+          </thead>
+          <tbody>
             {schedules.data!.schedules.map((schedule) => (
-              <li key={schedule.id} className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
-                <Badge tone={schedule.enabled ? "success" : "neutral"}>
-                  {schedule.enabled ? t("backups.enabled") : t("backups.disabled")}
-                </Badge>
-
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-baseline gap-x-2.5">
-                    <span dir="ltr" className="font-mono text-sm text-ink">
-                      {schedule.cron}
-                    </span>
-                    <ScheduleText schedule={schedule.cron} className="text-xs text-ink-muted" />
-                  </div>
-                  <p className="mt-0.5 text-xs text-ink-subtle">
-                    {t(`backups.scope${schedule.scope === "panel" ? "Panel" : "Subscription"}`)}
-                    {schedule.subscription_id === null ? "" : ` · #${schedule.subscription_id}`}
-                    {" · "}
-                    {/* The retention policy is what decides how far back a
-                        restore can go, so it belongs on the row and not behind
-                        an edit dialog. */}
-                    {t("backups.retentionSummary", {
-                      daily: schedule.keep_daily,
-                      weekly: schedule.keep_weekly,
-                      monthly: schedule.keep_monthly,
-                    })}
-                  </p>
-                </div>
-
-                <Badge tone="neutral">
-                  <span dir="ltr">#{schedule.repo_id}</span>
-                </Badge>
-
-                {isAdmin ? <DeleteScheduleButton id={schedule.id} /> : null}
-              </li>
+              <tr key={schedule.id} className="transition-colors hover:bg-surface-muted/60">
+                <Td>
+                  <Badge tone={schedule.enabled ? "success" : "neutral"}>
+                    {schedule.enabled ? t("backups.enabled") : t("backups.disabled")}
+                  </Badge>
+                </Td>
+                <Td>
+                  <span className="block font-mono text-xs text-ink">{schedule.cron}</span>
+                  <ScheduleText
+                    schedule={schedule.cron}
+                    className="mt-0.5 block text-xs text-ink-muted"
+                  />
+                </Td>
+                <Td className="text-ink-muted">
+                  {t(`backups.scope${schedule.scope === "panel" ? "Panel" : "Subscription"}`)}
+                  {schedule.subscription_id === null ? "" : ` #${schedule.subscription_id}`}
+                </Td>
+                <Td className="text-xs text-ink-muted">
+                  {t("backups.retentionSummary", {
+                    daily: schedule.keep_daily,
+                    weekly: schedule.keep_weekly,
+                    monthly: schedule.keep_monthly,
+                  })}
+                </Td>
+                <Td>
+                  <Badge tone="neutral">
+                    <span className="font-mono">#{schedule.repo_id}</span>
+                  </Badge>
+                </Td>
+                {isAdmin ? (
+                  <Td className="w-px text-end">
+                    <DeleteScheduleButton id={schedule.id} />
+                  </Td>
+                ) : null}
+              </tr>
             ))}
-          </ul>
-        )}
-      </CardBody>
+          </tbody>
+        </Table>
+      )}
 
       {/* Mounted only for an administrator: the dialog reads the repository
           list to fill its picker, and that endpoint answers a customer 403. */}
       {isAdmin ? (
         <CreateScheduleDialog open={creating} onClose={() => setCreating(false)} />
       ) : null}
-    </Card>
+    </section>
   );
 }
 
@@ -797,10 +850,11 @@ function DeleteScheduleButton({ id }: { id: number }) {
 
   return (
     <>
-      <Button variant="ghost" size="sm" onClick={() => setConfirming(true)}>
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("backups.deleteSchedule")}
-      </Button>
+      <Menu label={t("backups.deleteSchedule")}>
+        <MenuItem danger icon={<Trash2 />} onClick={() => setConfirming(true)}>
+          {t("backups.deleteSchedule")}
+        </MenuItem>
+      </Menu>
       <Dialog
         open={confirming}
         onClose={() => setConfirming(false)}
@@ -938,7 +992,6 @@ function CreateScheduleDialog({ open, onClose }: { open: boolean; onClose: () =>
                 </label>
                 <Input
                   id={id}
-                  dir="ltr"
                   inputMode="numeric"
                   className="mt-1"
                   value={value}
@@ -988,40 +1041,32 @@ function RunsCard() {
   });
 
   return (
-    <Card>
-      <CardHeader title={t("backups.history")} description={t("backups.historyHint")} />
-      <CardBody>
-        {runs.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
-          </div>
-        ) : (runs.data?.runs.length ?? 0) === 0 ? (
-          <div className="py-6 text-center">
-            <History className="mx-auto mb-2 h-7 w-7 text-ink-subtle" aria-hidden />
-            <p className="text-sm text-ink-muted">{t("backups.noRuns")}</p>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-2xl text-start text-sm">
-              <thead>
-                <tr className="border-b border-border text-xs text-ink-subtle">
-                  <th className="py-2 pe-3 text-start font-medium">{t("backups.status")}</th>
-                  <th className="py-2 pe-3 text-start font-medium">{t("backups.started")}</th>
-                  <th className="py-2 pe-3 text-start font-medium">{t("backups.scope")}</th>
-                  <th className="py-2 pe-3 text-start font-medium">{t("backups.size")}</th>
-                  <th className="py-2 pe-3 text-start font-medium">{t("backups.snapshot")}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {runs.data!.runs.map((run) => (
-                  <RunRow key={run.id} run={run} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </CardBody>
-    </Card>
+    <section className="space-y-3">
+      <SectionHeader title={t("backups.history")} description={t("backups.historyHint")} />
+
+      {runs.isPending ? (
+        <ListSkeleton rows={4} />
+      ) : (runs.data?.runs.length ?? 0) === 0 ? (
+        <EmptyState icon={<Archive aria-hidden />} title={t("backups.noRuns")} />
+      ) : (
+        <Table className="min-w-2xl">
+          <thead>
+            <tr>
+              <Th>{t("backups.status")}</Th>
+              <Th>{t("backups.started")}</Th>
+              <Th>{t("backups.scope")}</Th>
+              <Th>{t("backups.size")}</Th>
+              <Th>{t("backups.snapshot")}</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.data!.runs.map((run) => (
+              <RunRow key={run.id} run={run} />
+            ))}
+          </tbody>
+        </Table>
+      )}
+    </section>
   );
 }
 
@@ -1030,36 +1075,36 @@ function RunRow({ run }: { run: BackupRun }) {
 
   return (
     <>
-      <tr className="align-top">
-        <td className="py-2 pe-3">
+      <tr className="transition-colors hover:bg-surface-muted/60">
+        <Td>
           <Badge tone={RUN_TONE[run.status]} dot={run.status === "running"}>
             {t(`backups.runStatus.${run.status}`)}
           </Badge>
-        </td>
-        <td className="py-2 pe-3 text-ink-muted">
+        </Td>
+        <Td className="text-ink-muted">
           <time dateTime={run.started_at}>{formatDateTime(run.started_at, i18n.language)}</time>
-        </td>
-        <td className="py-2 pe-3 text-ink-muted">
+        </Td>
+        <Td className="text-ink-muted">
           {t(`backups.scope${run.scope === "panel" ? "Panel" : "Subscription"}`)}
           {run.subscription_id === null ? "" : ` #${run.subscription_id}`}
-        </td>
-        <td dir="ltr" className="py-2 pe-3 text-ink-muted">
+        </Td>
+        <Td className="text-ink-muted tabular-nums">
           {run.bytes === null ? t("common.none") : formatBytes(run.bytes, i18n.language)}
-        </td>
-        <td dir="ltr" className="py-2 pe-3 font-mono text-xs text-ink-muted">
+        </Td>
+        <Td className="font-mono text-xs text-ink-muted">
           {run.snapshot_id === null ? t("common.none") : run.snapshot_id.slice(0, 8)}
-        </td>
+        </Td>
       </tr>
       {run.error ? (
         // A history that recorded only successes could not answer "when did
         // this stop working", which is the question a backup history exists to
         // answer — so the failure text gets a full row rather than a tooltip.
         <tr>
-          <td colSpan={5} className="pb-2">
-            <p dir="ltr" className="rounded-lg bg-danger-soft px-3 py-2 font-mono text-xs break-words text-danger">
+          <Td colSpan={5}>
+            <p className="rounded-lg bg-danger-soft px-3 py-2 font-mono text-xs break-words text-danger">
               {run.error}
             </p>
-          </td>
+          </Td>
         </tr>
       ) : null}
     </>
@@ -1068,10 +1113,7 @@ function RunRow({ run }: { run: BackupRun }) {
 
 function formatDateTime(iso: string, language: string): string {
   try {
-    // Latin digits on the Persian page: an operator correlating this with a log
-    // line is comparing timestamps, not reading prose.
-    const locale = language === "fa" ? "fa-IR-u-nu-latn" : language;
-    return new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(
+    return new Intl.DateTimeFormat(language, { dateStyle: "short", timeStyle: "short" }).format(
       new Date(iso),
     );
   } catch {
@@ -1101,97 +1143,106 @@ function SnapshotsCard({ isAdmin }: { isAdmin: boolean }) {
   });
 
   return (
-    <Card>
-      <CardHeader title={t("backups.snapshots")} description={t("backups.snapshotsHint")} />
-      <CardBody className="space-y-3">
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label={t("backups.repository")} htmlFor="snapshot-repo">
-            <Select
-              id="snapshot-repo"
-              value={repoId}
-              onChange={(event) => setRepoId(event.target.value)}
-            >
-              <option value="">{t("backups.chooseRepository")}</option>
-              {options.map((option) => (
-                <option key={option.id} value={String(option.id)}>
-                  {option.label}
-                </option>
-              ))}
-            </Select>
-          </Field>
+    <section className="space-y-3">
+      <SectionHeader title={t("backups.snapshots")} description={t("backups.snapshotsHint")} />
 
-          <div>
-            <Field label={t("backups.subscriptionFilter")} htmlFor="snapshot-subscription">
-              <Input
-                id="snapshot-subscription"
-                dir="ltr"
-                inputMode="numeric"
-                placeholder={t("backups.subscriptionFilterPlaceholder")}
-                aria-describedby="snapshot-subscription-hint"
-                value={subscription}
-                onChange={(event) => setSubscription(event.target.value)}
-              />
-            </Field>
-            <p id="snapshot-subscription-hint" className="-mt-2 text-xs text-ink-muted">
-              {t("backups.subscriptionFilterHint")}
-            </p>
-          </div>
-        </div>
-
-        {repoId === "" ? (
-          <p className="text-sm text-ink-muted">{t("backups.chooseRepositoryFirst")}</p>
-        ) : snapshots.isPending ? (
-          <div className="flex justify-center py-6 text-ink-muted">
-            <Spinner />
-          </div>
-        ) : snapshots.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {snapshots.error instanceof ApiError
-              ? snapshots.error.message
-              : String(snapshots.error)}
-          </p>
-        ) : snapshots.data!.snapshots.length === 0 ? (
-          <p className="text-sm text-ink-muted">{t("backups.noSnapshots")}</p>
-        ) : (
-          <ul className="divide-y divide-border">
-            {snapshots.data!.snapshots.map((snapshot) => (
-              <li key={snapshot.id} className="flex flex-wrap items-start gap-x-3 gap-y-2 py-3">
-                <Archive className="mt-0.5 h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-baseline gap-x-2.5">
-                    <span dir="ltr" className="font-mono text-sm text-ink">
-                      {snapshot.short_id || snapshot.id.slice(0, 8)}
-                    </span>
-                    <span className="text-xs text-ink-muted">
-                      {formatDateTime(snapshot.time, i18n.language)}
-                    </span>
-                  </div>
-                  <p dir="ltr" className="truncate font-mono text-xs text-ink-subtle">
-                    {snapshot.paths.join(" ")}
-                  </p>
-                  {snapshot.tags.length > 0 ? (
-                    <ul className="mt-1 flex flex-wrap gap-1">
-                      {snapshot.tags.map((tag) => (
-                        <li key={tag}>
-                          <Badge tone="neutral">
-                            <span dir="ltr" className="font-mono">
-                              {tag}
-                            </span>
-                          </Badge>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </div>
-                {isAdmin ? (
-                  <RestoreButton repoId={Number(repoId)} snapshotId={snapshot.id} />
-                ) : null}
-              </li>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label={t("backups.repository")} htmlFor="snapshot-repo">
+          <Select
+            id="snapshot-repo"
+            value={repoId}
+            onChange={(event) => setRepoId(event.target.value)}
+          >
+            <option value="">{t("backups.chooseRepository")}</option>
+            {options.map((option) => (
+              <option key={option.id} value={String(option.id)}>
+                {option.label}
+              </option>
             ))}
-          </ul>
-        )}
-      </CardBody>
-    </Card>
+          </Select>
+        </Field>
+
+        <div>
+          <Field label={t("backups.subscriptionFilter")} htmlFor="snapshot-subscription">
+            <Input
+              id="snapshot-subscription"
+              inputMode="numeric"
+              placeholder={t("backups.subscriptionFilterPlaceholder")}
+              aria-describedby="snapshot-subscription-hint"
+              value={subscription}
+              onChange={(event) => setSubscription(event.target.value)}
+            />
+          </Field>
+          <p id="snapshot-subscription-hint" className="-mt-2 text-xs text-ink-muted">
+            {t("backups.subscriptionFilterHint")}
+          </p>
+        </div>
+      </div>
+
+      {repoId === "" ? (
+        <p className="text-sm text-ink-muted">{t("backups.chooseRepositoryFirst")}</p>
+      ) : snapshots.isPending ? (
+        <ListSkeleton rows={3} />
+      ) : snapshots.error ? (
+        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          {snapshots.error instanceof ApiError
+            ? snapshots.error.message
+            : String(snapshots.error)}
+        </p>
+      ) : snapshots.data!.snapshots.length === 0 ? (
+        <EmptyState icon={<Archive aria-hidden />} title={t("backups.noSnapshots")} />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>{t("backups.snapshot")}</Th>
+              <Th>{t("backups.started")}</Th>
+              {isAdmin ? <Th /> : null}
+            </tr>
+          </thead>
+          <tbody>
+            {snapshots.data!.snapshots.map((snapshot) => (
+              <tr key={snapshot.id} className="transition-colors hover:bg-surface-muted/60">
+                <Td>
+                  <div className="flex min-w-0 items-start gap-3">
+                    <Archive className="mt-0.5 h-4 w-4 shrink-0 text-ink-subtle" aria-hidden />
+                    <div className="min-w-0">
+                      <span className="block font-mono text-sm text-ink">
+                        {snapshot.short_id || snapshot.id.slice(0, 8)}
+                      </span>
+                      <span className="block max-w-md truncate font-mono text-xs text-ink-subtle">
+                        {snapshot.paths.join(" ")}
+                      </span>
+                      {snapshot.tags.length > 0 ? (
+                        <ul className="mt-1 flex flex-wrap gap-1">
+                          {snapshot.tags.map((tag) => (
+                            <li key={tag}>
+                              <Badge tone="neutral">
+                                <span className="font-mono">{tag}</span>
+                              </Badge>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </div>
+                  </div>
+                </Td>
+                <Td className="text-ink-muted">
+                  <time dateTime={snapshot.time}>
+                    {formatDateTime(snapshot.time, i18n.language)}
+                  </time>
+                </Td>
+                {isAdmin ? (
+                  <Td className="text-end align-top">
+                    <RestoreButton repoId={Number(repoId)} snapshotId={snapshot.id} />
+                  </Td>
+                ) : null}
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+    </section>
   );
 }
 
@@ -1212,13 +1263,13 @@ function RestoreButton({ repoId, snapshotId }: { repoId: number; snapshotId: str
   });
 
   return (
-    <div className="basis-full sm:basis-auto">
+    <div>
       <Button variant="outline" size="sm" onClick={() => setConfirming(true)}>
         {t("backups.restore")}
       </Button>
 
       {error ? (
-        <p role="alert" className="mt-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <p role="alert" className="mt-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger text-start">
           {error}
         </p>
       ) : null}
@@ -1244,7 +1295,7 @@ function RestoreButton({ repoId, snapshotId }: { repoId: number; snapshotId: str
         {/* Restoring in place is deliberately not implemented: the files land in
             a fresh 0700 staging directory and the finished task says where. */}
         <p className="text-sm text-ink-muted">{t("backups.restoreStaging")}</p>
-        <code dir="ltr" className="mt-2 block font-mono text-xs text-ink-subtle">
+        <code className="mt-2 block font-mono text-xs text-ink-subtle text-start">
           {snapshotId}
         </code>
       </Dialog>

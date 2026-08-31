@@ -1,14 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, RotateCcw, X, XCircle } from "lucide-react";
+import { ListChecks, RotateCcw, X, XCircle } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, endpoints, type Task, type TaskStatus } from "@/lib/api";
 import { useEventStream } from "@/lib/events";
-import { cn } from "@/lib/utils";
 
 export const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
   queued: "neutral",
@@ -58,15 +59,15 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
   const list = tasks.data?.tasks ?? [];
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end" role="dialog" aria-modal="true" aria-label={t("tasks.title")}>
+    <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-label={t("tasks.title")}>
       <button
-        className="absolute inset-0 bg-black/30 backdrop-blur-[1px]"
+        className="absolute inset-0 animate-fade-in bg-black/40"
         onClick={onClose}
         aria-label={t("common.close")}
         tabIndex={-1}
       />
 
-      <aside className="relative flex h-full w-full max-w-lg flex-col border-s border-border bg-surface shadow-xl">
+      <aside className="fixed inset-y-0 end-0 flex w-96 max-w-[90vw] animate-slide-in-end flex-col border-s border-border bg-surface shadow-pop">
         <header className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <div className="flex items-center gap-2.5">
             <h2 className="text-sm font-semibold text-ink">{t("tasks.title")}</h2>
@@ -77,10 +78,14 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
             ) : null}
           </div>
           <div className="flex items-center gap-1">
-            <Link to="/tasks" onClick={onClose} className="text-xs font-medium text-accent hover:underline">
+            <Link
+              to="/tasks"
+              onClick={onClose}
+              className="text-xs font-medium text-accent transition-colors hover:underline"
+            >
               {t("tasks.viewAll")}
             </Link>
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label={t("common.close")}>
+            <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label={t("common.close")}>
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -94,14 +99,22 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
 
         <div className="flex-1 overflow-y-auto">
           {tasks.isPending ? (
-            <div className="flex items-center justify-center py-16 text-ink-muted">
-              <Loader2 className="h-5 w-5 animate-spin" />
+            <div role="status" aria-live="polite" className="divide-y divide-border">
+              {Array.from({ length: 6 }, (_, i) => (
+                <div key={i} className="flex items-center gap-3 px-5 py-3.5">
+                  <Skeleton className="h-6 w-16 rounded-full" />
+                  <Skeleton className="h-3.5 flex-1" />
+                  <Skeleton className="h-3 w-10" />
+                </div>
+              ))}
             </div>
           ) : list.length === 0 ? (
-            <div className="px-5 py-16 text-center">
-              <p className="text-sm font-medium text-ink">{t("tasks.empty")}</p>
-              <p className="mt-1 text-sm text-ink-muted">{t("tasks.emptyHint")}</p>
-            </div>
+            <EmptyState
+              className="m-5"
+              icon={<ListChecks aria-hidden />}
+              title={t("tasks.empty")}
+              hint={t("tasks.emptyHint")}
+            />
           ) : (
             <ul className="divide-y divide-border">
               {list.map((task) => (
@@ -145,15 +158,12 @@ export function TaskRow({
       <button
         onClick={onToggle}
         aria-expanded={expanded}
-        className="flex w-full items-center gap-3 px-5 py-3 text-start hover:bg-surface-muted"
+        className="flex w-full items-center gap-3 px-5 py-3 text-start transition-colors hover:bg-surface-muted"
       >
         <Badge tone={TONE[task.status]} dot={task.status === "running"}>
           {t(`tasks.status.${task.status}`)}
         </Badge>
-        {/* An op name is machine text: LTR even when the panel is mirrored. */}
-        <span dir="ltr" className="min-w-0 flex-1 truncate font-mono text-xs text-ink">
-          {task.op}
-        </span>
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{task.op}</span>
         <time className="shrink-0 text-xs text-ink-subtle" dateTime={task.created_at}>
           {new Date(task.created_at).toLocaleTimeString(i18n.language)}
         </time>
@@ -221,18 +231,27 @@ export function TaskActions({ task }: { task: Task }) {
   return (
     <div className="flex flex-wrap items-center gap-2 px-5 pb-3">
       {canCancel ? (
-        <Button variant="ghost" onClick={() => cancel.mutate()} disabled={cancel.isPending}>
-          <XCircle className="h-4 w-4" />
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => cancel.mutate()}
+          disabled={cancel.isPending}
+        >
+          <XCircle className="h-3.5 w-3.5" aria-hidden />
           {t("tasks.cancel")}
         </Button>
       ) : null}
       {finished ? (
-        <Button variant="ghost" onClick={() => retry.mutate()} disabled={retry.isPending}>
-          <RotateCcw className="h-4 w-4" />
+        <Button variant="ghost" size="sm" onClick={() => retry.mutate()} disabled={retry.isPending}>
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden />
           {t("tasks.retry")}
         </Button>
       ) : null}
-      {error ? <span className="text-xs text-danger">{error}</span> : null}
+      {error ? (
+        <span role="alert" className="text-xs text-danger">
+          {error}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -259,13 +278,12 @@ export function TaskLogs({ taskId, live }: { taskId: string; live: boolean }) {
       <p className="border-b border-border px-3 py-1.5 text-xs font-medium text-ink-muted">
         {t("tasks.logs")}
       </p>
-      <div className={cn("max-h-64 overflow-y-auto p-3 font-mono text-xs leading-relaxed")}>
+      <div className="max-h-64 overflow-y-auto p-3 font-mono text-xs leading-relaxed">
         {lines.length === 0 ? (
           <p className="text-ink-subtle">{t("tasks.noLogs")}</p>
         ) : (
           lines.map((line) => (
-            // Log output is machine text: keep it LTR even in an RTL layout.
-            <div key={line.seq} dir="ltr" className="whitespace-pre-wrap break-all text-ink-muted">
+            <div key={line.seq} className="whitespace-pre-wrap break-all text-ink-muted">
               {line.line}
             </div>
           ))

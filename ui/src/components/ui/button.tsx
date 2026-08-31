@@ -4,15 +4,15 @@ import { forwardRef, type ButtonHTMLAttributes } from "react";
 import { cn } from "@/lib/utils";
 
 const button = cva(
-  "inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-colors " +
+  "inline-flex shrink-0 items-center justify-center gap-2 rounded-lg font-medium transition-colors " +
     "disabled:pointer-events-none disabled:opacity-50 select-none",
   {
     variants: {
       variant: {
-        primary: "bg-accent text-on-accent hover:bg-accent-hover",
-        secondary: "bg-surface-muted text-ink hover:bg-border",
+        primary: "bg-accent text-on-accent shadow-card hover:bg-accent-hover",
+        secondary: "border border-border bg-surface text-ink shadow-card hover:bg-surface-muted",
         ghost: "text-ink-muted hover:bg-surface-muted hover:text-ink",
-        danger: "bg-danger text-white hover:opacity-90",
+        danger: "bg-danger text-white shadow-card hover:opacity-90",
         outline: "border border-border-strong text-ink hover:bg-surface-muted",
       },
       size: {
@@ -20,6 +20,7 @@ const button = cva(
         md: "h-9 px-4 text-sm",
         lg: "h-11 px-5 text-base",
         icon: "h-9 w-9",
+        "icon-sm": "h-8 w-8",
       },
     },
     defaultVariants: { variant: "secondary", size: "md" },

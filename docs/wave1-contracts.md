@@ -99,7 +99,7 @@ HTTP routes: prefix by area — `/api/files/*`, `/api/databases/*`,
 - Firewall backends: `crates/unihelm-distro/src/fw.rs` (firewalld/ufw/nft +
   Unmanaged), already implemented — use `ctx.distro().fw`.
 - UI: React 18 + TS + Vite + Tailwind v4 + TanStack Router/Query, pages in
-  `ui/src/routes/`, API client in `ui/src/lib/api.ts`, i18n en+fa (RTL). The
+  `ui/src/routes/`, API client in `ui/src/lib/api.ts`, i18n English-only. The
   gzipped initial JS budget is 350 KB — anything heavy (an editor, a chart lib)
   must be a lazily imported chunk. For node_modules run `npm ci` in `ui/`.
 - Phase 2 external facts (repo pins, argv sequences, distro paths for MariaDB,

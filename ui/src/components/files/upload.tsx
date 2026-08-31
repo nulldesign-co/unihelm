@@ -237,7 +237,7 @@ export function UploadPanel({
   return (
     <section
       aria-label={t("files.uploads")}
-      className="fixed bottom-4 end-4 z-40 w-80 max-w-[calc(100vw-2rem)] rounded-card border border-border bg-surface shadow-2xl"
+      className="fixed bottom-4 end-4 z-40 w-80 max-w-[calc(100vw-2rem)] animate-slide-up rounded-card border border-border bg-surface shadow-pop"
     >
       <header className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <h2 className="text-sm font-semibold text-ink">{t("files.uploads")}</h2>
@@ -251,9 +251,7 @@ export function UploadPanel({
         {items.map((item) => (
           <li key={item.id}>
             <div className="flex items-center gap-2">
-              <span dir="auto" className="min-w-0 flex-1 truncate text-sm text-ink">
-                {item.name}
-              </span>
+              <span className="min-w-0 flex-1 truncate text-sm text-ink">{item.name}</span>
               {item.status === "uploading" ? <Spinner className="h-3.5 w-3.5" /> : null}
               {item.status === "error" || item.status === "cancelled" ? (
                 <Button
@@ -302,7 +300,7 @@ export function UploadPanel({
                 }}
               />
             </div>
-            <p dir="ltr" className="mt-1 text-start text-xs text-ink-muted">
+            <p className="mt-1 text-xs tabular-nums text-ink-muted">
               {item.status === "error" ? (
                 <span className="text-danger">{item.error ?? t("files.uploadFailed")}</span>
               ) : item.status === "cancelled" ? (
