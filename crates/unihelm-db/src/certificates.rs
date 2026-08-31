@@ -590,7 +590,19 @@ mod tests {
         let active = db.active_certificate_for_site(site).await.unwrap().unwrap();
         assert_eq!(active.id, cert.id);
         assert_eq!(active.status, CertStatus::Active);
-        assert_eq!(active.days_remaining(), Some(89));
+        // Within a day, not exactly 89. `days_remaining` is
+        // `(not_after - now()).whole_days()`, and the fixture set `not_after` to
+        // `now() + 89 days` a moment earlier — so if the clock crosses a second
+        // between the two calls the difference is 88 days 23:59:59 and
+        // `whole_days()` truncates to 88. The test then failed for the passage of
+        // time rather than for anything about certificates.
+        let days = active
+            .days_remaining()
+            .expect("an active certificate expires");
+        assert!(
+            (days - 89).abs() <= 1,
+            "89 days out, give or take the second the clock crossed: got {days}"
+        );
         assert!(!active.due_for_renewal(), "89 days out is not due");
     }
 

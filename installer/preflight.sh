@@ -14,9 +14,15 @@ readonly MIN_DISK_MB=10240
 
 preflight_problems=()
 preflight_warnings=()
+preflight_notes=()
 
 _fail() { preflight_problems+=("$1"); }
 _warn() { preflight_warnings+=("$1"); }
+# What was measured, whether or not it was a problem. The report used to print
+# only failures, so a healthy server produced silence — and the documented use
+# of "run this to size up a machine before you commit to it" told you nothing
+# on the machines where the answer was good news.
+_note() { preflight_notes+=("$1"); }
 
 preflight_check_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -95,6 +101,7 @@ preflight_check_memory() {
   local kb
   kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   local mb=$((kb / 1024))
+  _note "RAM: ${mb} MB"
   if [ "$mb" -lt "$MIN_RAM_MB" ]; then
     _fail "${mb} MB of RAM; Unihelm needs at least 1 GB"
   elif [ "$mb" -lt 1800 ]; then
@@ -106,6 +113,7 @@ preflight_check_memory() {
 preflight_check_disk() {
   local mb
   mb="$(df -Pm /var 2>/dev/null | awk 'NR==2 {print $4}')"
+  [ -n "$mb" ] && _note "free on /var: ${mb} MB"
   if [ -z "$mb" ]; then
     _warn "could not determine free space on /var"
   elif [ "$mb" -lt "$MIN_DISK_MB" ]; then
@@ -117,7 +125,11 @@ preflight_check_disk() {
 preflight_check_conflicts() {
   # Another panel owning nginx or the same ports turns into a fight the user
   # loses at 3am. Say so now.
-  for unit in httpd apache2 cpanel psa; do
+  # nginx is in this list even though Unihelm manages nginx itself: an nginx that
+  # is already running was configured by somebody else, holds 80 and 443, and its
+  # vhosts are not ones the panel wrote. Finding it after the install, when the
+  # first site fails to bind, is the expensive way to learn this.
+  for unit in nginx httpd apache2 cpanel psa; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
       _warn "$unit is running and will compete with the stack Unihelm manages"
     fi
@@ -147,7 +159,10 @@ preflight_run() {
 }
 
 preflight_report() {
-  local w p
+  local n w p
+  for n in ${preflight_notes+"${preflight_notes[@]}"}; do
+    printf '  \033[2m....\033[0m  %s\n' "$n" >&2
+  done
   for w in ${preflight_warnings+"${preflight_warnings[@]}"}; do
     printf '  \033[33mwarn\033[0m  %s\n' "$w" >&2
   done

@@ -593,13 +593,26 @@ build_from_source() {
 
   # unihelm-web embeds the built interface, so the UI has to exist before the
   # Rust build rather than after it.
-  if [ -f "$root/ui/package-lock.json" ]; then
-    if command -v npm >/dev/null 2>&1; then
-      step "Building the interface"
+  # A missing package manager is fatal here, not a warning. `unihelm-web` embeds
+  # whatever is in ui-dist at compile time, so building without one produces a
+  # binary that starts, serves, and answers every request with a blank page —
+  # an install that looks like it worked and is discovered broken in a browser.
+  # Better to stop now, while the operator is still watching the terminal.
+  if [ -f "$root/ui/package-lock.json" ] || [ -f "$root/ui/pnpm-lock.yaml" ]; then
+    step "Building the interface"
+    if [ -f "$root/ui/pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then
+      ( cd "$root/ui" && pnpm install --frozen-lockfile && pnpm run build )
+    elif [ -f "$root/ui/package-lock.json" ] && command -v npm >/dev/null 2>&1; then
       ( cd "$root/ui" && npm ci && npm run build )
     else
-      warn "npm is not installed; unihelm-web will be built without its interface"
+      die "the interface cannot be built: no package manager for the lockfile in
+  $root/ui. Install Node 20+ with npm (or pnpm, for a pnpm-lock.yaml) and run
+  this again. Building without it would produce a panel that serves a blank
+  page, so this stops rather than going on."
     fi
+    # A lockfile and a package manager are not proof the build produced anything.
+    [ -s "$root/crates/unihelm-web/ui-dist/index.html" ] ||
+      die "the interface build left no index.html in crates/unihelm-web/ui-dist"
   fi
 
   step "Building Unihelm (this takes a while)"
@@ -723,10 +736,21 @@ create_first_admin() {
     ADMIN_EMAIL="admin@$(hostname -f 2>/dev/null || hostname)"
   fi
 
-  if "$BIN_DIR/unihelm" user list 2>/dev/null | grep -q admin; then
+  # `create-admin` already refuses when any account exists, and says so — it is
+  # the only thing that can decide this correctly, because it asks the database.
+  # This used to guard it with `user list | grep -q admin`, which matched any
+  # substring: an account named `sysadmin`, or an address like
+  # `notadmin@example.com`, read as "an administrator exists" and the real one
+  # was never created, leaving an install nobody could log in to. Let the binary
+  # answer, and treat its refusal as the "already done" case it is.
+  if "$BIN_DIR/unihelm" user create-admin \
+       --username "$ADMIN_USER" --email "$ADMIN_EMAIL" 2>"$WORKDIR/create-admin.err"; then
+    :
+  elif grep -q "an account already exists" "$WORKDIR/create-admin.err"; then
     info "an account already exists; skipping"
   else
-    "$BIN_DIR/unihelm" user create-admin --username "$ADMIN_USER" --email "$ADMIN_EMAIL"
+    cat "$WORKDIR/create-admin.err" >&2
+    die "could not create the first administrator"
   fi
   return 0
 }

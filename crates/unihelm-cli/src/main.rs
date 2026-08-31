@@ -76,8 +76,19 @@ async fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Command::Completions { shell } => {
-            completions::generate(*shell, &mut std::io::stdout());
-            return Ok(0);
+            // Rendered to a buffer first. `clap_complete::generate` panics if the
+            // writer errors, and piping to `head` — which is what anyone does to
+            // look at a completion script — closes stdout early and makes it
+            // error. A broken pipe is the reader saying it has enough, not a
+            // failure of this program, so exit quietly like every other Unix tool.
+            let mut script: Vec<u8> = Vec::new();
+            completions::generate(*shell, &mut script);
+            use std::io::Write as _;
+            return match std::io::stdout().write_all(&script) {
+                Ok(()) => Ok(0),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+                Err(e) => Err(e.into()),
+            };
         }
         Command::Task(cmd) => {
             // Reading tasks must work when the agent is down — that is exactly
