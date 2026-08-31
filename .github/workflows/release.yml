@@ -469,12 +469,69 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # --- 2b. the binaries actually start on the distributions we promise -------
+  # v0.1.0 shipped binaries that could not start on AlmaLinux 9 or Debian 12:
+  # they were built on Ubuntu 24.04 and needed glibc 2.39. Nothing caught it,
+  # because the install matrix in ci.yml builds each distribution FROM SOURCE —
+  # it never ran a released binary anywhere. This does, on both families, before
+  # the signing key is touched.
+  #
+  # x86_64 only: the arm images of some of these do not exist, and this proves a
+  # property of the glibc the binaries were linked against, which is the same on
+  # both architectures because both are built in the same container.
+  distros:
+    name: Runs on ${{ matrix.image }}
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          # RHEL family. Rocky and Oracle are the derivatives people actually
+          # run; CentOS Stream is upstream of the next RHEL, so it fails here
+          # first if a future glibc drops something.
+          - almalinux:9
+          - almalinux:10
+          - rockylinux:9
+          - oraclelinux:9
+          - quay.io/centos/centos:stream9
+          # Debian family, including the oldest LTS the panel claims.
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-x86_64
+          path: dist
+
+      - name: Unpack and run all three binaries
+        run: |
+          set -euo pipefail
+          tar -xzf dist/unihelm-${{ needs.version.outputs.version }}-x86_64.tar.gz
+          root="unihelm-${{ needs.version.outputs.version }}-x86_64"
+          docker run --rm -v "$PWD/$root:/u:ro" ${{ matrix.image }} sh -euc '
+            echo "== $(. /etc/os-release && echo "$PRETTY_NAME") =="
+            ldd --version | head -1
+            for b in unihelm unihelm-web unihelm-agentd; do
+              # --version is enough: the dynamic loader resolves every versioned
+              # symbol before main() runs, so a glibc that is too old fails here
+              # exactly as it would on first boot — which is where operators met
+              # it in 0.1.0.
+              out=$(/u/bin/$b --version) || {
+                echo "::error::$b does not start on this distribution" >&2
+                exit 1
+              }
+              echo "  $out"
+            done'
+
   # --- 3. checksums, signatures, draft release ------------------------------
   # One job holds the signing key, and it runs only after every architecture has
   # built and passed its budget — so a key is never used on a half-built release.
   release:
     name: Sign and draft the release
-    needs: [version, build]
+    needs: [version, build, distros]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

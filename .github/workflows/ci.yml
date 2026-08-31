@@ -212,11 +212,18 @@ jobs:
         # Both families, both currently-supported majors (spec §7.1). Adding a
         # distribution should mean adding a line here and nothing else.
         image:
+          # Both families, and the derivatives people actually run rather than
+          # one representative each: the panel dispatches on ID_LIKE, so a
+          # derivative that names itself differently takes the same code path
+          # only if that path is exercised.
           - debian:13
           - debian:12
           - ubuntu:24.04
+          - ubuntu:22.04
           - almalinux:10
           - almalinux:9
+          - rockylinux:9
+          - oraclelinux:9
     container:
       image: ${{ matrix.image }}
     steps:
