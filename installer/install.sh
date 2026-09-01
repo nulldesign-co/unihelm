@@ -689,10 +689,72 @@ create_layout() {
   return 0
 }
 
+# Bring an existing config up to the current defaults, and nothing more.
+#
+# An upgrade leaves config.toml alone, which is right — it is the operator's
+# file. But it meant 0.1.9, whose entire point is that the panel is reachable on
+# the server you installed it on, changed nothing at all for anybody who had
+# already installed. The default only reached new machines.
+#
+# So exactly one value is migrated, and only when it still holds the string this
+# installer itself shipped as the default. A value nobody ever chose is not a
+# preference to preserve; anything else is, and is left untouched.
+migrate_config() {
+  local cfg="$CONFIG_DIR/config.toml"
+  local listen_now tls_now
+  listen_now="$(awk -F'"' '/^listen = /{print $2; exit}' "$cfg")"
+  tls_now="$(awk -F'"' '/^tls = /{print $2; exit}' "$cfg")"
+
+  # Already says what it wants.
+  [ -n "$tls_now" ] && return 0
+
+  # A panel vhost means somebody ran `unihelm cert panel`: nginx is terminating
+  # TLS and proxying plain HTTP to the panel. Turning the panel's own TLS on
+  # under that would answer their domain with a 502, so record what is already
+  # true and change nothing else.
+  if [ -f /etc/nginx/unihelm.d/01-panel.conf ]; then
+    printf '\n# Added on upgrade: nginx is terminating TLS in front of the panel.\ntls = "off"\n' >>"$cfg"
+    info "nginx fronts the panel here; recorded tls = \"off\" and left the rest alone"
+    return 0
+  fi
+
+  case "$listen_now" in
+    "127.0.0.1:8088")
+      # The shipped default, never edited. Move it to the current one.
+      sed -i 's|^listen = .*|listen = "0.0.0.0:8088"|' "$cfg"
+      printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+      info "moved the panel from loopback to 0.0.0.0:8088 with its own certificate"
+      info "set listen back to 127.0.0.1:8088 in $cfg if you would rather it were not reachable"
+      ;;
+    "")
+      # No listen line at all; the panel is on its default, which is now
+      # all-interfaces, so it needs the certificate that makes that safe.
+      printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+      ;;
+    *)
+      # A listen address somebody chose. Leave it, and pick the tls value that
+      # keeps this machine behaving exactly as it does today.
+      case "$listen_now" in
+        127.0.0.1:* | "[::1]:"* | localhost:*)
+          printf '\n# Added on upgrade, preserving this installs behaviour.\ntls = "off"\n' >>"$cfg"
+          ;;
+        *)
+          # Public and, until now, plain HTTP — which is the configuration where
+          # the session cookie is Secure and the login could never stick.
+          printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+          info "the panel is on a public address; enabled its own TLS so logins work"
+          ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
 write_configuration() {
   step "Writing configuration"
   if [ -f "$CONFIG_DIR/config.toml" ]; then
     info "$CONFIG_DIR/config.toml exists; leaving it alone"
+    migrate_config
   else
     install -m 0644 "$here/config.toml.example" "$CONFIG_DIR/config.toml"
     if [ -n "$LISTEN" ]; then
