@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BellRing,
   CheckCircle2,
+  Pencil,
   Plus,
   Send,
   ShieldCheck,
@@ -13,15 +14,18 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { staggerStyle } from "@/lib/motion";
 import {
   ApiError,
   endpoints,
@@ -68,16 +72,29 @@ function errorText(error: unknown): string {
   return error instanceof ApiError ? error.message : String(error);
 }
 
-/** Ghost rows shaped like the list they stand in for, inside a card body. */
+/**
+ * Ghost rows shaped like the list they stand in for, inside a card body.
+ *
+ * `ListSkeleton` brings its own card shell and all three of these lists already
+ * sit in one, so this is its inner markup and nothing else: same uneven widths,
+ * same staggered arrival, so the page has one ghost shape rather than two.
+ */
 function RowsSkeleton({ rows = 3 }: { rows?: number }) {
   return (
     <div role="status" aria-live="polite" className="space-y-4">
       {Array.from({ length: rows }, (_, i) => (
-        <div key={i} className="flex items-center gap-3">
+        <div
+          key={i}
+          className="flex animate-rise-in items-center gap-3 stagger"
+          style={staggerStyle(i)}
+        >
           <Skeleton className="h-6 w-16 rounded-full" />
           <div className="min-w-0 flex-1 space-y-1.5">
-            <Skeleton className="h-3.5 w-1/3" />
-            <Skeleton className="h-3 w-1/2" />
+            {/* Uneven widths: real rows are not all the same length, and a
+                perfectly regular skeleton reads as a loading graphic rather
+                than as the shape of the content. */}
+            <Skeleton className={i % 2 === 0 ? "h-3.5 w-1/3" : "h-3.5 w-2/5"} />
+            <Skeleton className={i % 3 === 0 ? "h-3 w-1/2" : "h-3 w-2/5"} />
           </div>
           <Skeleton className="h-8 w-16 rounded-lg" />
         </div>
@@ -85,6 +102,17 @@ function RowsSkeleton({ rows = 3 }: { rows?: number }) {
     </div>
   );
 }
+
+/**
+ * A row in one of this page's three lists.
+ *
+ * These lists are `<ul>`s rather than tables, so they cannot use the shared
+ * `<Tr>`; this is the same tint at the same opacity, pulled out past the card's
+ * padding so the highlight reads as the whole row rather than as its text.
+ */
+const ROW =
+  "-mx-2 flex animate-rise-in rounded-lg px-2 py-3 stagger transition-colors duration-150 " +
+  "first:pt-0 last:pb-0 hover:bg-surface-muted/60";
 
 // ---------------------------------------------------------------------------
 // rules
@@ -176,9 +204,7 @@ function RulesCard() {
         {rules.isPending ? (
           <RowsSkeleton />
         ) : rules.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {errorText(rules.error)}
-          </p>
+          <Callout tone="danger">{errorText(rules.error)}</Callout>
         ) : rules.data!.rules.length === 0 ? (
           <EmptyState
             icon={<BellRing aria-hidden />}
@@ -193,10 +219,11 @@ function RulesCard() {
           />
         ) : (
           <ul className="divide-y divide-border">
-            {rules.data!.rules.map((rule) => (
+            {rules.data!.rules.map((rule, index) => (
               <RuleRow
                 key={rule.id}
                 rule={rule}
+                index={index}
                 open={openByRule.get(rule.id) ?? []}
                 onEdit={() => setEditing(rule)}
               />
@@ -218,10 +245,12 @@ function RulesCard() {
 
 function RuleRow({
   rule,
+  index,
   open,
   onEdit,
 }: {
   rule: AlertRule;
+  index: number;
   open: AlertEvent[];
   onEdit: () => void;
 }) {
@@ -247,7 +276,7 @@ function RuleRow({
   const number = new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 });
 
   return (
-    <li className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3 first:pt-0 last:pb-0">
+    <li className={`${ROW} flex-wrap items-center gap-x-3 gap-y-2`} style={staggerStyle(index)}>
       {open.length > 0 ? (
         <Badge tone="danger" dot>
           {t("alerts.rules.firing")}
@@ -267,37 +296,49 @@ function RuleRow({
         </p>
       </div>
 
-      {rule.kind === "service_down" ? null : (
-        <Badge tone="neutral">
-          <span>{t("alerts.rules.threshold")}</span>
-          <span className="tabular-nums">
-            {number.format(rule.threshold)}
-            {t(`alerts.unit.${rule.kind}`)}
-          </span>
-        </Badge>
-      )}
+      {/* Threshold, arming switch and edit travel as one block: on a phone they
+          wrap together under the rule's name instead of stacking three deep. */}
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
+        {rule.kind === "service_down" ? null : (
+          <Badge tone="neutral">
+            <span>{t("alerts.rules.threshold")}</span>
+            <span className="tnum">
+              {number.format(rule.threshold)}
+              {t(`alerts.unit.${rule.kind}`)}
+            </span>
+          </Badge>
+        )}
+
+        {/* A slot the spinner can appear in without widening the row, and the
+            switch's label stays "Enabled" for the same reason: which way it is
+            set is the badge's job. */}
+        <span className="grid h-4 w-4 shrink-0 place-items-center">
+          {toggle.isPending ? <Spinner className="h-3.5 w-3.5 text-ink-subtle" /> : null}
+        </span>
+
+        <Switch
+          checked={rule.enabled}
+          onChange={(enabled) => toggle.mutate(enabled)}
+          disabled={toggle.isPending}
+          label={t("alerts.rules.enabled")}
+        />
+
+        <Button variant="ghost" size="sm" onClick={onEdit}>
+          <Pencil className="h-3.5 w-3.5" aria-hidden />
+          {t("alerts.rules.edit")}
+        </Button>
+      </div>
 
       {open.length > 0 ? (
-        <p className="w-full text-xs text-danger">
+        <p className="w-full text-xs text-danger tnum">
           {open.map((event) => event.message).join(" · ")}
         </p>
       ) : null}
 
-      <Switch
-        checked={rule.enabled}
-        onChange={(enabled) => toggle.mutate(enabled)}
-        disabled={toggle.isPending}
-        label={t("alerts.rules.enabled")}
-      />
-
-      <Button variant="ghost" size="sm" onClick={onEdit}>
-        {t("alerts.rules.edit")}
-      </Button>
-
       {error ? (
-        <p role="alert" className="w-full text-xs text-danger">
+        <Callout tone="danger" className="w-full">
           {error}
-        </p>
+        </Callout>
       ) : null}
     </li>
   );
@@ -355,9 +396,9 @@ function RuleDialog({
           <Button
             variant="primary"
             onClick={() => save.mutate()}
-            disabled={save.isPending || problem !== null}
+            loading={save.isPending}
+            disabled={problem !== null}
           >
-            {save.isPending ? <Spinner /> : null}
             {t("alerts.rules.save")}
           </Button>
         </>
@@ -444,6 +485,7 @@ function RuleDialog({
         >
           <Input
             id="alert-threshold"
+            className="tnum"
             inputMode="decimal"
             value={threshold}
             aria-invalid={problem?.startsWith("threshold") ?? false}
@@ -460,9 +502,9 @@ function RuleDialog({
       />
 
       {error ? (
-        <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger" className="mt-3">
           {error}
-        </p>
+        </Callout>
       ) : null}
     </Dialog>
   );
@@ -546,7 +588,7 @@ function HistoryCard() {
         description={t("alerts.history.hint")}
         action={
           ongoing > 0 ? (
-            <Badge tone="danger" dot>
+            <Badge tone="danger" dot className="tnum">
               {t("alerts.history.ongoing", { count: ongoing })}
             </Badge>
           ) : (
@@ -560,9 +602,7 @@ function HistoryCard() {
         {events.isPending ? (
           <RowsSkeleton />
         ) : events.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {errorText(events.error)}
-          </p>
+          <Callout tone="danger">{errorText(events.error)}</Callout>
         ) : spans.length === 0 ? (
           <EmptyState
             icon={<ShieldCheck aria-hidden />}
@@ -571,8 +611,13 @@ function HistoryCard() {
           />
         ) : (
           <ul className="divide-y divide-border">
-            {spans.map((span) => (
-              <SpanRow key={span.event.id} span={span} dateFormat={dateFormat} />
+            {spans.map((span, index) => (
+              <SpanRow
+                key={span.event.id}
+                span={span}
+                index={index}
+                dateFormat={dateFormat}
+              />
             ))}
           </ul>
         )}
@@ -581,11 +626,19 @@ function HistoryCard() {
   );
 }
 
-function SpanRow({ span, dateFormat }: { span: EventSpan; dateFormat: Intl.DateTimeFormat }) {
+function SpanRow({
+  span,
+  index,
+  dateFormat,
+}: {
+  span: EventSpan;
+  index: number;
+  dateFormat: Intl.DateTimeFormat;
+}) {
   const { t } = useTranslation();
 
   return (
-    <li className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
+    <li className={`${ROW} items-start gap-3`} style={staggerStyle(index)}>
       <span className="mt-0.5 shrink-0">
         {span.open ? (
           <TriangleAlert className="h-4 w-4 text-danger" aria-hidden />
@@ -598,8 +651,10 @@ function SpanRow({ span, dateFormat }: { span: EventSpan; dateFormat: Intl.DateT
         <p className="text-sm text-ink">{span.event.message}</p>
         {/* The span itself: when it started, when it ended (or that it has
             not), and how long that was. This line is the whole reason the
-            history is not a list of notifications. */}
-        <p className="mt-0.5 text-xs text-ink-muted">
+            history is not a list of notifications. Tabular figures because an
+            open span's duration is recomputed on every 30s refetch, and
+            proportional digits would reflow the sentence each time. */}
+        <p className="mt-0.5 text-xs text-ink-muted tnum">
           {span.open
             ? t("alerts.history.since", {
                 at: dateFormat.format(span.startedAt),
@@ -617,7 +672,14 @@ function SpanRow({ span, dateFormat }: { span: EventSpan; dateFormat: Intl.DateT
         <Badge tone={span.open ? "danger" : "success"} dot={span.open}>
           {span.open ? t("alerts.history.open") : t("alerts.history.resolved")}
         </Badge>
-        <span className="truncate font-mono text-xs text-ink-subtle">{span.event.subject}</span>
+        {/* Capped so a long subject truncates instead of squeezing the message
+            it belongs to; the full value stays available on hover. */}
+        <span
+          className="max-w-32 truncate font-mono text-xs text-ink-subtle sm:max-w-48"
+          title={span.event.subject}
+        >
+          {span.event.subject}
+        </span>
       </div>
     </li>
   );
@@ -710,9 +772,7 @@ function ChannelsCard() {
         {channels.isPending ? (
           <RowsSkeleton />
         ) : channels.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {errorText(channels.error)}
-          </p>
+          <Callout tone="danger">{errorText(channels.error)}</Callout>
         ) : channels.data!.channels.length === 0 ? (
           <EmptyState
             icon={<Send aria-hidden />}
@@ -727,8 +787,13 @@ function ChannelsCard() {
           />
         ) : (
           <ul className="divide-y divide-border">
-            {channels.data!.channels.map((channel) => (
-              <ChannelRow key={channel.id} channel={channel} onEdit={() => setEditing(channel)} />
+            {channels.data!.channels.map((channel, index) => (
+              <ChannelRow
+                key={channel.id}
+                channel={channel}
+                index={index}
+                onEdit={() => setEditing(channel)}
+              />
             ))}
           </ul>
         )}
@@ -744,7 +809,15 @@ function ChannelsCard() {
   );
 }
 
-function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () => void }) {
+function ChannelRow({
+  channel,
+  index,
+  onEdit,
+}: {
+  channel: NotifyChannel;
+  index: number;
+  onEdit: () => void;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [result, setResult] = useState<ChannelTestResult | null>(null);
@@ -772,7 +845,7 @@ function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () =>
   });
 
   return (
-    <li className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3 first:pt-0 last:pb-0">
+    <li className={`${ROW} flex-wrap items-center gap-x-3 gap-y-2`} style={staggerStyle(index)}>
       <Badge tone={channel.enabled ? "success" : "neutral"} dot={channel.enabled}>
         {channel.enabled ? t("alerts.channels.on") : t("alerts.channels.off")}
       </Badge>
@@ -782,44 +855,45 @@ function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () =>
         <p className="truncate text-xs text-ink-subtle">{t(`alerts.channelKind.${channel.kind}`)}</p>
       </div>
 
-      {/* "Configured", never the value. The API does not return the credential
-          at all, so this badge is the only honest thing to show for it. */}
-      <Badge tone="accent">{t("alerts.channels.configured")}</Badge>
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+        {/* "Configured", never the value. The API does not return the credential
+            at all, so this badge is the only honest thing to show for it. */}
+        <Badge tone="accent">{t("alerts.channels.configured")}</Badge>
 
-      <Button variant="ghost" size="sm" onClick={() => test.mutate()} disabled={test.isPending}>
-        {test.isPending ? <Spinner /> : <Send className="h-3.5 w-3.5" aria-hidden />}
-        {t("alerts.channels.test")}
-      </Button>
+        {/* The test stays in the open — the card's whole advice is to run it
+            before relying on the channel — and edit and delete go behind the
+            one ⋯ every other list on the panel uses. */}
+        <Button variant="ghost" size="sm" onClick={() => test.mutate()} loading={test.isPending}>
+          <Send className="h-3.5 w-3.5" aria-hidden />
+          {t("alerts.channels.test")}
+        </Button>
 
-      <Button variant="ghost" size="sm" onClick={onEdit}>
-        {t("alerts.channels.edit")}
-      </Button>
+        <Menu label={t("files.actions")}>
+          <MenuItem icon={<Pencil />} onClick={onEdit}>
+            {t("alerts.channels.edit")}
+          </MenuItem>
+          <MenuSeparator />
+          <MenuItem danger icon={<Trash2 />} onClick={() => setConfirming(true)}>
+            {t("alerts.channels.delete")}
+          </MenuItem>
+        </Menu>
+      </div>
 
-      <Button
-        variant="ghost"
-        size="sm"
-        className="text-danger hover:bg-danger-soft hover:text-danger"
-        onClick={() => setConfirming(true)}
-      >
-        <Trash2 className="h-3.5 w-3.5" aria-hidden />
-        {t("alerts.channels.delete")}
-      </Button>
-
+      {/* A refused delivery is rendered in the same shape as a successful one,
+          because it answers the same question. The tone and its icon carry
+          which of the two it was. */}
       {result ? (
-        <p
-          role="status"
-          className={`w-full text-xs ${result.delivered ? "text-success" : "text-danger"}`}
-        >
+        <Callout tone={result.delivered ? "success" : "danger"} className="w-full">
           {result.delivered
             ? t("alerts.channels.testOk")
             : t("alerts.channels.testFailed", { detail: result.detail ?? "" })}
-        </p>
+        </Callout>
       ) : null}
 
       {error ? (
-        <p role="alert" className="w-full text-xs text-danger">
+        <Callout tone="danger" className="w-full">
           {error}
-        </p>
+        </Callout>
       ) : null}
 
       <Dialog
@@ -832,8 +906,7 @@ function ChannelRow({ channel, onEdit }: { channel: NotifyChannel; onEdit: () =>
             <Button variant="ghost" onClick={() => setConfirming(false)}>
               {t("common.cancel")}
             </Button>
-            <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-              {remove.isPending ? <Spinner /> : null}
+            <Button variant="danger" onClick={() => remove.mutate()} loading={remove.isPending}>
               {t("alerts.channels.delete")}
             </Button>
           </>
@@ -895,9 +968,9 @@ function ChannelDialog({
           <Button
             variant="primary"
             onClick={() => save.mutate()}
-            disabled={save.isPending || !built.ok}
+            loading={save.isPending}
+            disabled={!built.ok}
           >
-            {save.isPending ? <Spinner /> : null}
             {t("alerts.channels.save")}
           </Button>
         </>
@@ -998,9 +1071,9 @@ function ChannelDialog({
       />
 
       {error ? (
-        <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger" className="mt-3">
           {error}
-        </p>
+        </Callout>
       ) : null}
     </Dialog>
   );

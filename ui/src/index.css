@@ -15,39 +15,85 @@
   --color-border-strong: oklch(85% 0.007 250);
   --color-ink: oklch(20% 0.012 260);
   --color-ink-muted: oklch(50% 0.014 260);
-  --color-ink-subtle: oklch(63% 0.012 260);
+  /* Text, despite the name: this sets timestamps, permissions and the agent's
+     own error string. 4.56:1 on surface-muted, its worst backdrop. */
+  --color-ink-subtle: oklch(54% 0.012 260);
 
+  /* These four are a public API: white-label branding overwrites them by name
+     at runtime (lib/branding.tsx). Everything accent-flavoured below is mixed
+     FROM them with color-mix, never hardcoded, so a reseller's colour carries
+     through the glows, tints and rings without them picking five more values. */
   --color-accent: oklch(58% 0.19 262);
   --color-accent-hover: oklch(53% 0.19 262);
   --color-accent-soft: oklch(95% 0.03 262);
   --color-on-accent: oklch(100% 0 0);
 
-  --color-success: oklch(56% 0.14 150);
+  /* Each of these carries text on its own `-soft` tint inside a Badge, so the
+     pair has to clear 4.5:1, not merely look like the right hue. Measured
+     against the tints below: success 4.99, warning 5.00, danger 5.21 — and
+     white on the filled danger button, 6.12. */
+  --color-success: oklch(50% 0.14 150);
   --color-success-soft: oklch(95.5% 0.04 150);
-  --color-warning: oklch(62% 0.14 70);
+  --color-warning: oklch(52% 0.13 70);
   --color-warning-soft: oklch(96% 0.05 85);
-  --color-danger: oklch(56% 0.2 25);
+  --color-danger: oklch(52% 0.2 25);
   --color-danger-soft: oklch(95.5% 0.035 25);
 
-  --radius-card: 0.75rem;
+  /* Rounder than the last pass by a hair: at this size the extra 2px is the
+     difference between "form" and "object", and objects feel friendlier. */
+  --radius-card: 0.875rem;
 
-  /* Depth is quiet: a resting card barely lifts, a popover clearly floats. */
+  /* Depth is quiet: a resting card barely lifts, a hovered one lifts enough to
+     say "clickable", and a popover clearly floats above everything. */
   --shadow-card: 0 1px 2px oklch(0% 0 0 / 0.05), 0 1px 1px oklch(0% 0 0 / 0.03);
+  --shadow-card-hover:
+    0 2px 4px oklch(0% 0 0 / 0.04), 0 8px 20px -6px oklch(0% 0 0 / 0.12);
   --shadow-pop:
     0 0 0 1px oklch(0% 0 0 / 0.04), 0 8px 16px -4px oklch(0% 0 0 / 0.12),
     0 24px 48px -12px oklch(0% 0 0 / 0.18);
+  /* The primary button's own light. Mixed from the accent so branding owns it. */
+  --shadow-glow:
+    0 1px 2px oklch(0% 0 0 / 0.08),
+    0 6px 16px -6px color-mix(in oklab, var(--color-accent) 55%, transparent);
 
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  /* Entrances only; exits are instant. All are skipped under reduced motion. */
-  --animate-fade-in: fade-in 150ms ease-out;
-  --animate-pop-in: pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-slide-in-start: slide-in-start 240ms cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-slide-in-end: slide-in-end 240ms cubic-bezier(0.16, 1, 0.3, 1);
-  --animate-slide-up: slide-up 240ms cubic-bezier(0.16, 1, 0.3, 1);
+  /* ── Motion ────────────────────────────────────────────────────────────────
+     Three curves, and each one means something. `out-quint` decelerates hard:
+     things arriving. `out-back` overshoots a touch: things the user just did,
+     never data. `standard` is symmetric: things moving from A to B. */
+  --ease-out-quint: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-back: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Entrances only; exits are instant. Leaving should feel like leaving, and a
+     dialog that animates out is a dialog you wait for. All are skipped under
+     reduced motion by the block at the bottom of this file.
+     
+     `backwards`, not `both`. Every keyframe here defines only a `from`, so the
+     two fill modes look identical — but `both` keeps the animation's transform
+     applied forever after it finishes, and a computed transform of even
+     `matrix(1,0,0,1,0,0)` still makes the element a containing block for any
+     `position: fixed` descendant, and still promotes it to its own compositing
+     layer. With 48 staggered elements on screen that is a lot of layers, and a
+     row menu positioned against a table row instead of the viewport.
+     `backwards` fills only during the delay — which is the whole reason the
+     fill mode is here — and leaves nothing behind. */
+  --animate-fade-in: fade-in 150ms ease-out backwards;
+  --animate-pop-in: pop-in 200ms var(--ease-out-quint) backwards;
+  --animate-slide-in-start: slide-in-start 240ms var(--ease-out-quint) backwards;
+  --animate-slide-in-end: slide-in-end 240ms var(--ease-out-quint) backwards;
+  --animate-slide-up: slide-up 240ms var(--ease-out-quint) backwards;
+  /* The page itself, on every route change: a short rise that gives the eye a
+     direction to follow instead of a hard swap. */
+  --animate-page-in: page-in 260ms var(--ease-out-quint) backwards;
+  /* List and grid children. The delay comes from --i, set by the renderer. */
+  --animate-rise-in: rise-in 320ms var(--ease-out-quint) backwards;
+  --animate-shimmer: shimmer 1.6s ease-in-out infinite;
+  --animate-ping-slow: ping-slow 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
 
   @keyframes fade-in {
     from {
@@ -57,7 +103,7 @@
   @keyframes pop-in {
     from {
       opacity: 0;
-      transform: translateY(4px) scale(0.98);
+      transform: translateY(6px) scale(0.97);
     }
   }
   @keyframes slide-in-start {
@@ -76,6 +122,38 @@
       transform: translateY(12px);
     }
   }
+  @keyframes page-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+  }
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+  }
+  /* A sweep of light across a placeholder, so loading reads as "working" rather
+     than "broken". Travels 200% because the element is 200% wide. */
+  @keyframes shimmer {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(100%);
+    }
+  }
+  @keyframes ping-slow {
+    from {
+      transform: scale(1);
+      opacity: 0.5;
+    }
+    to {
+      transform: scale(2.2);
+      opacity: 0;
+    }
+  }
 }
 
 @layer theme {
@@ -87,7 +165,7 @@
     --color-border-strong: oklch(34% 0.014 260);
     --color-ink: oklch(95.5% 0.004 260);
     --color-ink-muted: oklch(71% 0.012 260);
-    --color-ink-subtle: oklch(57% 0.012 260);
+    --color-ink-subtle: oklch(62% 0.012 260);
 
     --color-accent: oklch(68% 0.17 262);
     --color-accent-hover: oklch(73% 0.17 262);
@@ -104,9 +182,13 @@
     /* Shadows barely read on a dark canvas; the border does the lifting, the
        shadow only separates the popover layer. */
     --shadow-card: 0 1px 2px oklch(0% 0 0 / 0.25);
+    --shadow-card-hover: 0 2px 4px oklch(0% 0 0 / 0.3), 0 10px 24px -8px oklch(0% 0 0 / 0.45);
     --shadow-pop:
       0 0 0 1px oklch(100% 0 0 / 0.06), 0 8px 16px -4px oklch(0% 0 0 / 0.5),
       0 24px 48px -12px oklch(0% 0 0 / 0.6);
+    --shadow-glow:
+      0 1px 2px oklch(0% 0 0 / 0.3),
+      0 6px 18px -6px color-mix(in oklab, var(--color-accent) 65%, transparent);
   }
 }
 
@@ -141,7 +223,14 @@
   }
 
   /* Every interactive element gets the same visible focus ring: keyboard users
-     are not a special case (spec §16.9). */
+     are not a special case (spec §16.9). The soft halo underneath is what makes
+     it read as designed rather than as a browser default. */
+  /* One ring, and it is an outline rather than a shadow on purpose: a
+     `box-shadow` here would be overridden by the `shadow-card` utility that
+     every button, input and card already carries, so the ring would vanish on
+     exactly the elements that get focused. An outline cannot be shadowed out,
+     it follows border-radius, and at 2px with a 2px offset it satisfies the
+     WCAG 2.2 focus-appearance size and contrast rules on both themes. */
   :focus-visible {
     outline: 2px solid var(--color-accent);
     outline-offset: 2px;
@@ -152,20 +241,134 @@
     background: var(--color-accent-soft);
   }
 
+  /* Digits in a table or a metric must not dance as they update. Every number
+     the panel polls is a number that changes under the reader's eye. */
+  :is(td, th, kbd, time, .tnum) {
+    font-variant-numeric: tabular-nums;
+  }
+
   /* Quiet scrollbars, matched to the theme, on the browsers that let us. */
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--color-border-strong) transparent;
   }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--color-border-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-ink-subtle);
+  }
 }
 
 @layer utilities {
+  /* Tabular figures anywhere a number is not already in a table cell. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Staggered entrance. The renderer sets `--i` to the item's index and this
+     turns it into a delay, capped by the caller so a 200-row table does not
+     cascade for ten seconds. */
+  .stagger {
+    animation-delay: calc(var(--i, 0) * var(--stagger-step, 45ms));
+  }
+
+  /* The ambient wash behind the app: two very low-opacity accent blooms, mixed
+     from the branding accent so a reseller's colour tints the whole panel. At
+     4% it is felt rather than seen — enough to stop a large neutral surface
+     reading as dead. */
+  .app-aurora::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(
+        60rem 32rem at 78% -8%,
+        color-mix(in oklab, var(--color-accent) 9%, transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+        46rem 26rem at 8% 0%,
+        color-mix(in oklab, var(--color-accent) 5%, transparent),
+        transparent 70%
+      );
+  }
+
+  .dark .app-aurora::before {
+    background:
+      radial-gradient(
+        60rem 32rem at 78% -8%,
+        color-mix(in oklab, var(--color-accent) 14%, transparent),
+        transparent 70%
+      ),
+      radial-gradient(
+        46rem 26rem at 8% 0%,
+        color-mix(in oklab, var(--color-accent) 8%, transparent),
+        transparent 70%
+      );
+  }
+
+  /* A placeholder that sweeps instead of blinking. The sweep lives in an
+     ::after so the base colour stays a plain background. */
+  .shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+  .shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklab, var(--color-ink) 6%, transparent),
+      transparent
+    );
+    animation: var(--animate-shimmer);
+  }
+
+  /* Motion is a courtesy, not a requirement. Anyone who has asked their system
+     for less gets the final frame immediately — including the ambient wash,
+     which is decoration by definition. */
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
     *::after {
       animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+      /* The delays matter as much as the durations. `.stagger` items enter with
+         `animation-fill-mode: both`, so a delay that survives this block holds
+         the element on its opening frame — invisible — for up to 450ms. Zeroing
+         only the duration would turn "I want less motion" into "content appears
+         late for no reason". */
+      animation-delay: 0ms !important;
+      transition-delay: 0ms !important;
+    }
+
+    .shimmer::after {
+      display: none;
+    }
+
+    /* A spinner is the exception, because it is not decoration: it is the only
+       thing on screen saying the panel is still working. Frozen at 0.01ms it
+       becomes a smeared glyph that reads as a crash. It keeps turning — slowly,
+       which is the accommodation that still communicates. */
+    .animate-spin {
+      animation-duration: 1.4s !important;
+      animation-iteration-count: infinite !important;
     }
   }
 }

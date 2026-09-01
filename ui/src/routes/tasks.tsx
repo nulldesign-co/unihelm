@@ -6,9 +6,10 @@ import { useTranslation } from "react-i18next";
 import { TaskRow } from "@/components/task-drawer";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody } from "@/components/ui/card";
+import { Callout } from "@/components/ui/callout";
+import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Input } from "@/components/ui/input";
+import { Field, Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { ListSkeleton } from "@/components/ui/skeleton";
@@ -79,7 +80,7 @@ export function TasksPage() {
         actions={
           <>
             {tasks.data && tasks.data.active > 0 ? (
-              <Badge tone="accent" dot>
+              <Badge tone="accent" dot className="tnum">
                 {t("tasks.active", { count: tasks.data.active })}
               </Badge>
             ) : null}
@@ -91,17 +92,37 @@ export function TasksPage() {
         }
       />
 
+      {/* The stream reconnected and the reader may be missing lines. It is a
+          standing warning, not an error, and it can be put away once read. */}
       {lagged ? (
-        <p className="rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">
+        <Callout
+          tone="warning"
+          action={
+            <Button variant="ghost" size="sm" onClick={() => setLagged(false)}>
+              {t("common.dismiss")}
+            </Button>
+          }
+        >
           {t("tasks.reconnected")}
-        </p>
+        </Callout>
       ) : null}
 
       <Card>
-        <CardBody className="grid gap-3 pt-5 sm:grid-cols-2 lg:grid-cols-4">
-          <label className="space-y-1.5">
-            <span className="block text-xs font-medium text-ink-muted">{t("tasks.filterOp")}</span>
+        <CardHeader
+          title={t("tasks.filters")}
+          action={
+            hasFilters ? (
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                {t("tasks.filterClear")}
+              </Button>
+            ) : null
+          }
+        />
+        {/* Field reserves its own error line, which is the row gap here. */}
+        <CardBody className="grid gap-x-3 gap-y-1 sm:grid-cols-2 lg:grid-cols-4">
+          <Field label={t("tasks.filterOp")} htmlFor="tasks-filter-op">
             <Select
+              id="tasks-filter-op"
               value={filters.op ?? ""}
               onChange={(event) => setFilter({ op: event.target.value || undefined })}
             >
@@ -112,13 +133,11 @@ export function TasksPage() {
                 </option>
               ))}
             </Select>
-          </label>
+          </Field>
 
-          <label className="space-y-1.5">
-            <span className="block text-xs font-medium text-ink-muted">
-              {t("tasks.filterStatus")}
-            </span>
+          <Field label={t("tasks.filterStatus")} htmlFor="tasks-filter-status">
             <Select
+              id="tasks-filter-status"
               value={filters.status ?? ""}
               onChange={(event) =>
                 setFilter({ status: (event.target.value as TaskStatus) || undefined })
@@ -131,33 +150,25 @@ export function TasksPage() {
                 </option>
               ))}
             </Select>
-          </label>
+          </Field>
 
-          <label className="space-y-1.5">
-            <span className="block text-xs font-medium text-ink-muted">{t("tasks.filterFrom")}</span>
+          <Field label={t("tasks.filterFrom")} htmlFor="tasks-filter-from">
             <Input
+              id="tasks-filter-from"
               type="date"
               value={dateInput(filters.since)}
               onChange={(event) => setFilter({ since: startOfDay(event.target.value) })}
             />
-          </label>
+          </Field>
 
-          <label className="space-y-1.5">
-            <span className="block text-xs font-medium text-ink-muted">{t("tasks.filterTo")}</span>
+          <Field label={t("tasks.filterTo")} htmlFor="tasks-filter-to">
             <Input
+              id="tasks-filter-to"
               type="date"
               value={dateInput(filters.until)}
               onChange={(event) => setFilter({ until: endOfDay(event.target.value) })}
             />
-          </label>
-
-          {hasFilters ? (
-            <div className="sm:col-span-2 lg:col-span-4">
-              <Button variant="ghost" size="sm" onClick={clearFilters}>
-                {t("tasks.filterClear")}
-              </Button>
-            </div>
-          ) : null}
+          </Field>
         </CardBody>
       </Card>
 
@@ -192,11 +203,24 @@ export function TasksPage() {
         </Card>
       )}
 
-      <nav className="flex items-center justify-between" aria-label={t("tasks.pagination")}>
+      <nav className="flex items-center justify-between gap-3" aria-label={t("tasks.pagination")}>
         <Button variant="secondary" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
           {t("tasks.previous")}
         </Button>
-        <span className="text-xs text-ink-subtle">{t("tasks.page", { page: page + 1 })}</span>
+        {/* No total comes back with a page, so position is given as the range
+            this page covers — "Page 3" on its own says nothing about where
+            the reader is in the history. */}
+        <p className="text-center text-xs text-ink-subtle">
+          <span className="tnum block font-medium">{t("tasks.page", { page: page + 1 })}</span>
+          {list.length > 0 ? (
+            <span className="tnum block">
+              {t("tasks.showing", {
+                from: page * PAGE_SIZE + 1,
+                to: page * PAGE_SIZE + list.length,
+              })}
+            </span>
+          ) : null}
+        </p>
         <Button
           variant="secondary"
           // The API answers with a page, not a count, so "there is more" is

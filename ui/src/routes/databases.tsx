@@ -15,8 +15,10 @@ import {
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { SectionHeader } from "@/components/ui/section-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -24,9 +26,8 @@ import { Field, Input } from "@/components/ui/input";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
-import { ListSkeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
-import { Table, Td, Th } from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError } from "@/lib/api";
 import {
   confirmsName,
@@ -40,7 +41,9 @@ import {
   type DbUserRow,
   type DbUserSecret,
 } from "@/lib/databases-api";
+import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
+import { cn } from "@/lib/utils";
 
 /**
  * Databases and database users (spec §11.4).
@@ -90,9 +93,20 @@ export function DatabasesPage() {
       {list.error ? <ErrorNote error={list.error} /> : null}
 
       {list.isPending ? (
+        // Both headings render while the tables load, so the page arrives at
+        // its final shape and only the rows fill in.
         <>
-          <ListSkeleton rows={3} />
-          <ListSkeleton rows={3} />
+          <section className="space-y-3">
+            <SectionHeader
+              title={t("databases.databasesTitle")}
+              description={t("databases.databasesHint")}
+            />
+            <TableSkeleton first={t("databases.name")} />
+          </section>
+          <section className="space-y-3">
+            <SectionHeader title={t("databases.usersTitle")} description={t("databases.usersHint")} />
+            <TableSkeleton first={t("databases.username")} />
+          </section>
         </>
       ) : (
         <>
@@ -133,19 +147,77 @@ function subscriptionIds(databases: DatabaseRow[], users: DbUserRow[]): number[]
 }
 
 function ErrorNote({ error }: { error: unknown }) {
+  return <Callout tone="danger">{error instanceof ApiError ? error.message : String(error)}</Callout>;
+}
+
+
+/**
+ * Both tables carry the same four columns, so they name them the same way — and
+ * so the ghost below can borrow the real header rather than guessing at one.
+ */
+function ListHead({ first }: { first: string }) {
+  const { t } = useTranslation();
   return (
-    <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-      {error instanceof ApiError ? error.message : String(error)}
-    </p>
+    <thead>
+      <tr>
+        <Th>{first}</Th>
+        <Th>{t("databases.engineLabel")}</Th>
+        <Th>{t("databases.subscription")}</Th>
+        <Th className="w-px">
+          <span className="sr-only">{t("files.actions")}</span>
+        </Th>
+      </tr>
+    </thead>
+  );
+}
+
+/**
+ * A ghost of the tables below rather than of a generic list: a name, the engine
+ * pill, a subscription id and the row menu, in the columns they land in. A
+ * skeleton whose shape is wrong is just a different kind of jump.
+ *
+ * Built on the shared `Table` rather than a copy of its classes, like every
+ * other table ghost in the panel, so a change to --radius-card or --shadow-card
+ * reaches the loading state too.
+ */
+function TableSkeleton({ rows = 3, first }: { rows?: number; first: string }) {
+  return (
+    <div role="status" aria-live="polite">
+      <Table>
+        <ListHead first={first} />
+        <tbody>
+          {Array.from({ length: rows }, (_, i) => (
+            <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
+              <Td>
+                {/* Uneven widths: real database names are not all the same length. */}
+                <Skeleton className={cn("h-3.5", i % 2 === 0 ? "w-40" : "w-24")} />
+              </Td>
+              <Td>
+                <Skeleton className="h-5 w-20 rounded-full" />
+              </Td>
+              <Td>
+                <Skeleton className="h-3.5 w-5" />
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-8 w-8 rounded-lg" />
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </div>
   );
 }
 
 function EngineBadge({ engine }: { engine: DbEngine }) {
   const { t } = useTranslation();
-  // Two engines, two colours: an operator scanning a mixed list should not have
-  // to read the word to know which one a row belongs to.
+  // Neutral against accent, not amber against accent. Amber is the panel's
+  // warning colour everywhere else, and a perfectly healthy MariaDB row painted
+  // amber reads as a problem in a list that also has to show real ones.
   return (
-    <Badge tone={engine === "mysql" ? "warning" : "accent"}>{t(`databases.engine.${engine}`)}</Badge>
+    <Badge tone={engine === "mysql" ? "neutral" : "accent"}>
+      {t(`databases.engine.${engine}`)}
+    </Badge>
   );
 }
 
@@ -166,10 +238,7 @@ function DatabaseList({
 
   return (
     <section className="space-y-3">
-      <div>
-        <h2 className="text-sm font-semibold text-ink">{t("databases.databasesTitle")}</h2>
-        <p className="mt-0.5 text-sm text-ink-muted">{t("databases.databasesHint")}</p>
-      </div>
+      <SectionHeader title={t("databases.databasesTitle")} description={t("databases.databasesHint")} />
       {databases.length === 0 ? (
         <EmptyState
           icon={<Database aria-hidden />}
@@ -184,28 +253,23 @@ function DatabaseList({
         />
       ) : (
         <Table>
-          <thead>
-            <tr>
-              <Th>{t("databases.name")}</Th>
-              <Th>{t("databases.engineLabel")}</Th>
-              <Th>{t("databases.subscription")}</Th>
-              <Th className="w-px">
-                <span className="sr-only">{t("files.actions")}</span>
-              </Th>
-            </tr>
-          </thead>
+          <ListHead first={t("databases.name")} />
           <tbody>
-            {databases.map((row) => (
-              <tr key={row.id} className="transition-colors hover:bg-surface-muted/60">
+            {databases.map((row, index) => (
+              <Tr
+                key={row.id}
+                className="animate-rise-in stagger"
+                style={staggerStyle(index)}
+              >
                 <Td className="w-full font-mono text-xs">{row.name}</Td>
                 <Td className="whitespace-nowrap">
                   <EngineBadge engine={row.engine} />
                 </Td>
-                <Td className="whitespace-nowrap tabular-nums">{row.subscription_id}</Td>
+                <Td className="whitespace-nowrap">{row.subscription_id}</Td>
                 <Td className="py-2 text-end">
                   <DatabaseRowActions database={row} users={users} />
                 </Td>
-              </tr>
+              </Tr>
             ))}
           </tbody>
         </Table>
@@ -289,37 +353,39 @@ function GrantDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={username === "" || grant.isPending}
+            disabled={username === ""}
+            loading={grant.isPending}
             onClick={() => {
               setError(null);
               grant.mutate();
             }}
           >
-            {grant.isPending ? <Spinner /> : null}
             {t("databases.grant")}
           </Button>
         </>
       }
     >
-      {candidates.length === 0 ? (
-        <p className="text-sm text-ink-muted">{t("databases.grantNoUsers")}</p>
-      ) : (
-        <Field label={t("databases.user")} htmlFor="grant-user">
-          <Select
-            id="grant-user"
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
-          >
-            <option value="">{t("databases.choose")}</option>
-            {candidates.map((user) => (
-              <option key={user.id} value={user.username}>
-                {user.username}
-              </option>
-            ))}
-          </Select>
-        </Field>
-      )}
-      {error ? <ErrorNote error={error} /> : null}
+      <div className="space-y-3">
+        {candidates.length === 0 ? (
+          <Callout tone="info">{t("databases.grantNoUsers")}</Callout>
+        ) : (
+          <Field label={t("databases.user")} htmlFor="grant-user">
+            <Select
+              id="grant-user"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+            >
+              <option value="">{t("databases.choose")}</option>
+              {candidates.map((user) => (
+                <option key={user.id} value={user.username}>
+                  {user.username}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -366,36 +432,36 @@ function DropDatabaseDialog({
           </Button>
           <Button
             variant="danger"
-            disabled={!armed || drop.isPending}
+            disabled={!armed}
+            loading={drop.isPending}
             onClick={() => {
               setError(null);
               drop.mutate();
             }}
           >
-            {drop.isPending ? <Spinner /> : null}
             {t("databases.dropConfirm")}
           </Button>
         </>
       }
     >
-      <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-        {t("databases.dropWarning")}
-      </p>
-      <Field
-        label={t("databases.typeName")}
-        htmlFor={`drop-db-${database.id}`}
-        error={typed.length > 0 && !armed ? t("databases.typeNameMismatch") : undefined}
-      >
-        <Input
-          id={`drop-db-${database.id}`}
-          autoComplete="off"
-          autoFocus
-          placeholder={database.name}
-          value={typed}
-          onChange={(event) => setTyped(event.target.value)}
-        />
-      </Field>
-      {error ? <ErrorNote error={error} /> : null}
+      <div className="space-y-3">
+        <Callout tone="danger" title={t("databases.dropWarning")} />
+        <Field
+          label={t("databases.typeName")}
+          htmlFor={`drop-db-${database.id}`}
+          error={typed.length > 0 && !armed ? t("databases.typeNameMismatch") : undefined}
+        >
+          <Input
+            id={`drop-db-${database.id}`}
+            autoComplete="off"
+            autoFocus
+            placeholder={database.name}
+            value={typed}
+            onChange={(event) => setTyped(event.target.value)}
+          />
+        </Field>
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -417,10 +483,7 @@ function UserList({
 
   return (
     <section className="space-y-3">
-      <div>
-        <h2 className="text-sm font-semibold text-ink">{t("databases.usersTitle")}</h2>
-        <p className="mt-0.5 text-sm text-ink-muted">{t("databases.usersHint")}</p>
-      </div>
+      <SectionHeader title={t("databases.usersTitle")} description={t("databases.usersHint")} />
       {users.length === 0 ? (
         <EmptyState
           icon={<KeyRound aria-hidden />}
@@ -435,28 +498,23 @@ function UserList({
         />
       ) : (
         <Table>
-          <thead>
-            <tr>
-              <Th>{t("databases.username")}</Th>
-              <Th>{t("databases.engineLabel")}</Th>
-              <Th>{t("databases.subscription")}</Th>
-              <Th className="w-px">
-                <span className="sr-only">{t("files.actions")}</span>
-              </Th>
-            </tr>
-          </thead>
+          <ListHead first={t("databases.username")} />
           <tbody>
-            {users.map((user) => (
-              <tr key={user.id} className="transition-colors hover:bg-surface-muted/60">
+            {users.map((user, index) => (
+              <Tr
+                key={user.id}
+                className="animate-rise-in stagger"
+                style={staggerStyle(index)}
+              >
                 <Td className="w-full font-mono text-xs">{user.username}</Td>
                 <Td className="whitespace-nowrap">
                   <EngineBadge engine={user.engine} />
                 </Td>
-                <Td className="whitespace-nowrap tabular-nums">{user.subscription_id}</Td>
+                <Td className="whitespace-nowrap">{user.subscription_id}</Td>
                 <Td className="py-2 text-end">
                   <UserRowActions user={user} onSecret={onSecret} />
                 </Td>
-              </tr>
+              </Tr>
             ))}
           </tbody>
         </Table>
@@ -534,22 +592,23 @@ function ResetPasswordDialog({
           </Button>
           <Button
             variant="danger"
-            disabled={reset.isPending}
+            loading={reset.isPending}
             onClick={() => {
               setError(null);
               reset.mutate();
             }}
           >
-            {reset.isPending ? <Spinner /> : null}
             {t("databases.resetConfirm")}
           </Button>
         </>
       }
     >
-      {/* The old password stops working the moment this succeeds; anything
-          still connecting with it breaks until it is updated. */}
-      <p className="text-sm text-ink-muted">{t("databases.resetBreaks")}</p>
-      {error ? <ErrorNote error={error} /> : null}
+      <div className="space-y-3">
+        {/* The old password stops working the moment this succeeds; anything
+            still connecting with it breaks until it is updated. */}
+        <Callout tone="warning" title={t("databases.resetBreaks")} />
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -593,39 +652,39 @@ function DropUserDialog({
           </Button>
           <Button
             variant="danger"
-            disabled={!armed || drop.isPending}
+            disabled={!armed}
+            loading={drop.isPending}
             onClick={() => {
               setError(null);
               drop.mutate();
             }}
           >
-            {drop.isPending ? <Spinner /> : null}
             {t("databases.dropUserConfirm")}
           </Button>
         </>
       }
     >
-      {/* The user's databases survive; what dies is every application that
-          was connecting as this account. Say which, so the operator can
-          decide before rather than discover after. */}
-      <p className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-        {t("databases.dropUserWarning")}
-      </p>
-      <Field
-        label={t("databases.typeUsername")}
-        htmlFor={`drop-user-${user.id}`}
-        error={typed.length > 0 && !armed ? t("databases.typeUsernameMismatch") : undefined}
-      >
-        <Input
-          id={`drop-user-${user.id}`}
-          autoComplete="off"
-          autoFocus
-          placeholder={user.username}
-          value={typed}
-          onChange={(event) => setTyped(event.target.value)}
-        />
-      </Field>
-      {error ? <ErrorNote error={error} /> : null}
+      <div className="space-y-3">
+        {/* The user's databases survive; what dies is every application that
+            was connecting as this account. Say which, so the operator can
+            decide before rather than discover after. */}
+        <Callout tone="danger" title={t("databases.dropUserWarning")} />
+        <Field
+          label={t("databases.typeUsername")}
+          htmlFor={`drop-user-${user.id}`}
+          error={typed.length > 0 && !armed ? t("databases.typeUsernameMismatch") : undefined}
+        >
+          <Input
+            id={`drop-user-${user.id}`}
+            autoComplete="off"
+            autoFocus
+            placeholder={user.username}
+            value={typed}
+            onChange={(event) => setTyped(event.target.value)}
+          />
+        </Field>
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -682,11 +741,12 @@ function PasswordOnceDialog({
         </header>
 
         <div className="space-y-3 px-5 py-4">
-          <p className="rounded-lg bg-warning-soft px-3 py-2 text-sm font-medium text-warning">
-            {t("databases.secretOnlyTime")}
-          </p>
+          <Callout tone="warning" title={t("databases.secretOnlyTime")} />
 
-          <div className="flex items-stretch gap-2">
+          {/* Stacks under 640px: the password and its button both need room,
+              and squeezing them onto one line leaves a two-character window
+              onto the thing the operator is here to read. */}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
             {/* Selectable text, not a masked field: if the clipboard is
                 unavailable (no secure context, a browser that refuses the
                 permission) the operator must still be able to select it. */}
@@ -695,6 +755,7 @@ function PasswordOnceDialog({
             </code>
             <Button
               variant={copied ? "secondary" : "primary"}
+              className="self-end sm:self-auto"
               aria-label={t("databases.copyPassword")}
               onClick={() => {
                 void (async () => {
@@ -705,7 +766,7 @@ function PasswordOnceDialog({
               }}
             >
               {copied ? (
-                <Check className="h-4 w-4" aria-hidden />
+                <Check className="h-4 w-4 animate-pop-in" aria-hidden />
               ) : (
                 <Copy className="h-4 w-4" aria-hidden />
               )}
@@ -721,7 +782,7 @@ function PasswordOnceDialog({
 
           <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs text-ink-muted">
             <dt>{t("databases.user")}</dt>
-            <dd className="font-mono text-ink">{secret.username}</dd>
+            <dd className="font-mono break-all text-ink">{secret.username}</dd>
             <dt>{t("databases.engineLabel")}</dt>
             <dd className="text-ink">{t(`databases.engine.${secret.engine}`)}</dd>
             <dt>{t("databases.host")}</dt>
@@ -760,8 +821,10 @@ function SubscriptionField({
   const { t } = useTranslation();
   const invalid = value.trim() !== "" && !/^\d+$/.test(value.trim());
 
+  // One block, so the field and the hint that belongs to it move together in
+  // the form's `space-y-3` instead of each carrying its own margin.
   return (
-    <>
+    <div>
       <Field
         label={t("databases.subscriptionOptional")}
         htmlFor={id}
@@ -785,10 +848,10 @@ function SubscriptionField({
           <option key={subscriptionId} value={String(subscriptionId)} />
         ))}
       </datalist>
-      <p id={`${id}-hint`} className="-mt-1 mb-3 text-xs text-ink-muted">
+      <p id={`${id}-hint`} className="-mt-1 text-xs text-ink-muted">
         {t("databases.subscriptionHint")}
       </p>
-    </>
+    </div>
   );
 }
 
@@ -861,91 +924,92 @@ function CreateDatabaseDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={!ready || create.isPending}
+            disabled={!ready}
+            loading={create.isPending}
             onClick={() => {
               setError(null);
               create.mutate();
             }}
           >
-            {create.isPending ? <Spinner /> : null}
             {t("databases.create")}
           </Button>
         </>
       }
     >
-      <Field
-        label={t("databases.name")}
-        htmlFor="db-name"
-        error={problem ? t(`databases.nameProblem.${problem}`) : undefined}
-      >
-        <Input
-          id="db-name"
-          autoFocus
-          placeholder="shop_main"
-          aria-invalid={Boolean(problem)}
-          aria-describedby="db-name-hint"
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-        />
-      </Field>
-      <p id="db-name-hint" className="-mt-1 mb-3 text-xs text-ink-muted">
-        {t("databases.nameHint")}
-      </p>
+      <div className="space-y-3">
+        <div>
+          <Field
+            label={t("databases.name")}
+            htmlFor="db-name"
+            error={problem ? t(`databases.nameProblem.${problem}`) : undefined}
+          >
+            <Input
+              id="db-name"
+              autoFocus
+              placeholder="shop_main"
+              aria-invalid={Boolean(problem)}
+              aria-describedby="db-name-hint"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </Field>
+          <p id="db-name-hint" className="-mt-1 text-xs text-ink-muted">
+            {t("databases.nameHint")}
+          </p>
+        </div>
 
-      <Field label={t("databases.engineLabel")} htmlFor="db-engine">
-        <Select
-          id="db-engine"
-          value={engine}
-          onChange={(event) => {
-            setEngine(event.target.value as DbEngine);
-            // The owner list is engine-specific; keeping a stale pick would
-            // send a pairing the agent refuses.
+        <Field label={t("databases.engineLabel")} htmlFor="db-engine">
+          <Select
+            id="db-engine"
+            value={engine}
+            onChange={(event) => {
+              setEngine(event.target.value as DbEngine);
+              // The owner list is engine-specific; keeping a stale pick would
+              // send a pairing the agent refuses.
+              setOwner("");
+            }}
+          >
+            {DB_ENGINES.map((value) => (
+              <option key={value} value={value}>
+                {t(`databases.engine.${value}`)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        <SubscriptionField
+          id="db-subscription"
+          value={subscription}
+          onChange={(next) => {
+            setSubscription(next);
             setOwner("");
           }}
-        >
-          {DB_ENGINES.map((value) => (
-            <option key={value} value={value}>
-              {t(`databases.engine.${value}`)}
-            </option>
-          ))}
-        </Select>
-      </Field>
-      <div className="h-3" />
+          known={knownSubscriptions}
+        />
 
-      <SubscriptionField
-        id="db-subscription"
-        value={subscription}
-        onChange={(next) => {
-          setSubscription(next);
-          setOwner("");
-        }}
-        known={knownSubscriptions}
-      />
+        <div>
+          <Field label={t("databases.ownerOptional")} htmlFor="db-owner">
+            <Select
+              id="db-owner"
+              value={owner}
+              onChange={(event) => setOwner(event.target.value)}
+              aria-describedby="db-owner-hint"
+            >
+              <option value="">{t("databases.noOwner")}</option>
+              {owners.map((user) => (
+                <option key={user.id} value={user.username}>
+                  {user.username}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <p id="db-owner-hint" className="-mt-1 text-xs text-ink-muted">
+            {t("databases.ownerHint")}
+          </p>
+        </div>
 
-      <Field label={t("databases.ownerOptional")} htmlFor="db-owner">
-        <Select
-          id="db-owner"
-          value={owner}
-          onChange={(event) => setOwner(event.target.value)}
-          aria-describedby="db-owner-hint"
-        >
-          <option value="">{t("databases.noOwner")}</option>
-          {owners.map((user) => (
-            <option key={user.id} value={user.username}>
-              {user.username}
-            </option>
-          ))}
-        </Select>
-      </Field>
-      <p id="db-owner-hint" className="-mt-1 text-xs text-ink-muted">
-        {t("databases.ownerHint")}
-      </p>
-
-      {error ? (
-        <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {error}
-        </p>
-      ) : null}
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -1011,66 +1075,61 @@ function CreateUserDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={!ready || create.isPending}
+            disabled={!ready}
+            loading={create.isPending}
             onClick={() => {
               setError(null);
               create.mutate();
             }}
           >
-            {create.isPending ? <Spinner /> : null}
             {t("databases.create")}
           </Button>
         </>
       }
     >
-      <Field
-        label={t("databases.username")}
-        htmlFor="db-username"
-        error={problem ? t(`databases.nameProblem.${problem}`) : undefined}
-      >
-        <Input
-          id="db-username"
-          autoFocus
-          placeholder="shop_app"
-          aria-invalid={Boolean(problem)}
-          value={username}
-          onChange={(event) => setUsername(event.target.value)}
-        />
-      </Field>
-
-      <Field label={t("databases.engineLabel")} htmlFor="db-user-engine">
-        <Select
-          id="db-user-engine"
-          value={engine}
-          onChange={(event) => setEngine(event.target.value as DbEngine)}
+      <div className="space-y-3">
+        <Field
+          label={t("databases.username")}
+          htmlFor="db-username"
+          error={problem ? t(`databases.nameProblem.${problem}`) : undefined}
         >
-          {DB_ENGINES.map((value) => (
-            <option key={value} value={value}>
-              {t(`databases.engine.${value}`)}
-            </option>
-          ))}
-        </Select>
-      </Field>
-      <div className="h-3" />
+          <Input
+            id="db-username"
+            autoFocus
+            placeholder="shop_app"
+            aria-invalid={Boolean(problem)}
+            value={username}
+            onChange={(event) => setUsername(event.target.value)}
+          />
+        </Field>
 
-      <SubscriptionField
-        id="db-user-subscription"
-        value={subscription}
-        onChange={setSubscription}
-        known={knownSubscriptions}
-      />
+        <Field label={t("databases.engineLabel")} htmlFor="db-user-engine">
+          <Select
+            id="db-user-engine"
+            value={engine}
+            onChange={(event) => setEngine(event.target.value as DbEngine)}
+          >
+            {DB_ENGINES.map((value) => (
+              <option key={value} value={value}>
+                {t(`databases.engine.${value}`)}
+              </option>
+            ))}
+          </Select>
+        </Field>
 
-      {/* Warn before, not after: the operator needs to be somewhere they can
-          paste a password when they press the button. */}
-      <p className="rounded-lg bg-warning-soft px-3 py-2 text-sm text-warning">
-        {t("databases.passwordWarning")}
-      </p>
+        <SubscriptionField
+          id="db-user-subscription"
+          value={subscription}
+          onChange={setSubscription}
+          known={knownSubscriptions}
+        />
 
-      {error ? (
-        <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {error}
-        </p>
-      ) : null}
+        {/* Warn before, not after: the operator needs to be somewhere they can
+            paste a password when they press the button. */}
+        <Callout tone="warning" title={t("databases.passwordWarning")} />
+
+        {error ? <ErrorNote error={error} /> : null}
+      </div>
     </Dialog>
   );
 }
@@ -1108,6 +1167,14 @@ function AdminerCard() {
     onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
   });
 
+  // The tick is a receipt, not a state. Left alone it stays on the button for
+  // the rest of the session, and a permanent confirmation confirms nothing.
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
   if (!allowed) return null;
 
   const enabled = status.data?.enabled ?? false;
@@ -1121,23 +1188,21 @@ function AdminerCard() {
       <CardHeader
         title={t("databases.adminerTitle")}
         description={t("databases.adminerSubtitle")}
+        // The button carries its own loading state rather than being swapped
+        // for a spinner: a bare spinner and a button are different widths, and
+        // the header visibly jumped when the status query settled.
         action={
-          status.isPending ? (
-            <Spinner />
-          ) : (
-            <Button
-              variant={enabled ? "outline" : "primary"}
-              size="sm"
-              disabled={toggle.isPending}
-              onClick={() => {
-                setError(null);
-                toggle.mutate(!enabled);
-              }}
-            >
-              {toggle.isPending ? <Spinner /> : null}
-              {enabled ? t("databases.adminerDisable") : t("databases.adminerEnable")}
-            </Button>
-          )
+          <Button
+            variant={enabled ? "outline" : "primary"}
+            size="sm"
+            loading={status.isPending || toggle.isPending}
+            onClick={() => {
+              setError(null);
+              toggle.mutate(!enabled);
+            }}
+          >
+            {enabled ? t("databases.adminerDisable") : t("databases.adminerEnable")}
+          </Button>
         }
       />
       <CardBody className="space-y-3 pt-0">
@@ -1152,13 +1217,13 @@ function AdminerCard() {
               {status.data?.php_version ? (
                 <Badge tone="neutral">
                   <span>PHP</span>
-                  <span className="font-mono">{status.data.php_version}</span>
+                  <span className="font-mono tnum">{status.data.php_version}</span>
                 </Badge>
               ) : null}
               {status.data ? (
                 <Badge tone="neutral">
                   <span>Adminer</span>
-                  <span className="font-mono">{status.data.adminer_version}</span>
+                  <span className="font-mono tnum">{status.data.adminer_version}</span>
                 </Badge>
               ) : null}
             </div>
@@ -1178,20 +1243,24 @@ function AdminerCard() {
                   <p className="mt-3 mb-1 text-xs font-medium text-ink">
                     {t("databases.adminerTunnelStep")}
                   </p>
-                  <div className="flex items-stretch gap-2">
+                  {/* Stacks under 640px. The command does not wrap, so on a
+                      phone it shares the line with an icon button and the
+                      operator is left reading it two characters at a time. */}
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
                     <code className="min-w-0 flex-1 overflow-x-auto rounded-md border border-border-strong bg-surface px-2.5 py-2 font-mono text-xs whitespace-pre text-ink select-all">
                       {tunnel}
                     </code>
                     <Button
                       variant="ghost"
                       size="icon"
+                      className="self-end sm:self-auto"
                       aria-label={t("databases.copyCommand")}
                       onClick={() => {
                         void (async () => setCopied(await copyToClipboard(tunnel)))();
                       }}
                     >
                       {copied ? (
-                        <Check className="h-4 w-4" aria-hidden />
+                        <Check className="h-4 w-4 animate-pop-in" aria-hidden />
                       ) : (
                         <Copy className="h-4 w-4" aria-hidden />
                       )}
@@ -1199,7 +1268,7 @@ function AdminerCard() {
                   </div>
                   <p className="mt-2 text-xs text-ink-muted">
                     {t("databases.adminerThenOpen")}{" "}
-                    <span className="font-mono text-xs text-ink">
+                    <span className="font-mono tnum text-xs break-all text-ink">
                       {status.data?.url ?? `http://127.0.0.1:${port}/`}
                     </span>
                   </p>

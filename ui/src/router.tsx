@@ -5,8 +5,10 @@ import {
   Outlet,
 } from "@tanstack/react-router";
 
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+
 import { AppShell } from "@/components/app-shell";
-import { Spinner } from "@/components/ui/spinner";
 import { useSession } from "@/lib/session";
 import { AlertsPage } from "@/routes/alerts";
 import { AppsPage } from "@/routes/apps";
@@ -36,13 +38,7 @@ import { TerminalPage } from "@/routes/terminal";
 function RootLayout() {
   const { user, ready } = useSession();
 
-  if (!ready) {
-    return (
-      <div className="flex min-h-dvh items-center justify-center bg-canvas text-ink-muted">
-        <Spinner className="h-6 w-6" />
-      </div>
-    );
-  }
+  if (!ready) return <BootScreen />;
 
   if (!user) return <LoginPage />;
 
@@ -50,6 +46,43 @@ function RootLayout() {
     <AppShell>
       <Outlet />
     </AppShell>
+  );
+}
+
+/**
+ * The first frame of every load, while the server decides whether the cookie is
+ * still a session.
+ *
+ * It waits before showing anything. A restored session usually resolves in well
+ * under a tenth of a second, and a spinner that appears and vanishes inside
+ * that window is a flash of nothing — worse than the blank canvas it replaced.
+ * Past the delay the mark breathes, which says "starting" rather than
+ * "waiting".
+ */
+function BootScreen() {
+  const { t } = useTranslation();
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setVisible(true), 160);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <div className="app-aurora relative grid min-h-dvh place-items-center bg-canvas">
+      {visible ? (
+        <span className="relative grid h-12 w-12 animate-fade-in place-items-center" aria-hidden>
+          <span className="absolute inset-0 animate-ping-slow rounded-2xl bg-accent/40" />
+          <span className="relative grid h-12 w-12 place-items-center rounded-2xl bg-accent text-lg font-bold text-on-accent shadow-glow">
+            U
+          </span>
+        </span>
+      ) : null}
+      {/* The status lives for a screen reader whether or not the mark is drawn. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        {t("common.loading")}
+      </span>
+    </div>
   );
 }
 

@@ -6,15 +6,15 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
-import { Menu, MenuItem } from "@/components/ui/menu";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
 import {
   ApiError,
   DEFAULT_LOG_LINES,
@@ -24,7 +24,8 @@ import {
   type NodeEnv,
   type UnitState,
 } from "@/lib/api";
-import { formatBytes } from "@/lib/utils";
+import { staggerStyle } from "@/lib/motion";
+import { cn, formatBytes } from "@/lib/utils";
 
 /**
  * Node applications (spec §11.10).
@@ -91,8 +92,19 @@ export function AppsPage() {
       ) : (
         <Card>
           <ul className="divide-y divide-border">
-            {apps.data!.apps.map((app) => (
-              <li key={app.id}>
+            {apps.data!.apps.map((app, index) => (
+              // The hover tint lives on the <li> rather than inside AppRow so
+              // the first and last rows can round with the card they sit in;
+              // the card cannot clip them itself without also clipping the
+              // row's ⋯ popover, which is rendered inline.
+              <li
+                key={app.id}
+                className={
+                  "animate-rise-in stagger transition-colors duration-150 " +
+                  "first:rounded-t-card last:rounded-b-card hover:bg-surface-muted/60"
+                }
+                style={staggerStyle(index)}
+              >
                 <AppRow app={app} />
               </li>
             ))}
@@ -109,7 +121,7 @@ function AppRow({ app }: { app: AppView }) {
   const { t, i18n } = useTranslation();
 
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-4">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-3 px-5 py-4">
       <Badge tone={TONE[app.state]} dot={app.state === "activating" || app.state === "deactivating"}>
         {/* systemd's states are already named on the dashboard; one vocabulary
             for "running" across the panel beats two that nearly agree. */}
@@ -118,15 +130,22 @@ function AppRow({ app }: { app: AppView }) {
 
       <div className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium text-ink">{app.name}</span>
-        <p className="truncate font-mono text-xs text-ink-subtle">{app.entry}</p>
+        {/* The entry path is the one thing here longer than its column, so it
+            gets a title as well as the truncation. */}
+        <p className="truncate font-mono text-xs text-ink-subtle" title={app.entry}>
+          {app.entry}
+        </p>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2">
+      {/* Facts and actions travel together: below `sm` they take a line of
+          their own under the name instead of ragging four pills and a button
+          across three. */}
+      <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
         {/* The label and the number are separate children so the badge's own
             gap spaces them. */}
         <Badge tone="neutral">
           <span>{t("apps.port")}</span>
-          <span className="tabular-nums">{app.port}</span>
+          <span className="tnum">{app.port}</span>
         </Badge>
 
         {/* Production is the default and the boring case; the other two are
@@ -137,14 +156,20 @@ function AppRow({ app }: { app: AppView }) {
         )}
 
         {app.memory_bytes === undefined ? null : (
-          <Badge tone="neutral">{formatBytes(app.memory_bytes, i18n.language)}</Badge>
+          // Memory re-polls every 3s while an app is activating; tabular
+          // figures keep the badge from breathing as the number lands.
+          <Badge tone="neutral" className="tnum">
+            {formatBytes(app.memory_bytes, i18n.language)}
+          </Badge>
         )}
 
         <Badge tone={app.site_id === null ? "neutral" : "accent"}>
           {app.site_id === null ? t("apps.notPublished") : t("apps.published")}
         </Badge>
 
-        <AppActions app={app} />
+        <div className="ms-auto flex shrink-0 items-center gap-1 sm:ms-1">
+          <AppActions app={app} />
+        </div>
       </div>
     </div>
   );
@@ -176,22 +201,19 @@ function AppActions({ app }: { app: AppView }) {
 
   return (
     <>
-      <Button variant="ghost" size="sm" onClick={() => setShowLogs(true)}>
-        <ScrollText className="h-3.5 w-3.5" aria-hidden />
-        {t("apps.logs")}
-      </Button>
-
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => restart.mutate()}
-        disabled={restart.isPending}
-      >
-        {restart.isPending ? <Spinner /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />}
+      {/* Restart is the only one of the three worth keeping in the open: it is
+          the action with a result to watch, and a spinner inside a menu that
+          closes on click is no feedback at all. */}
+      <Button variant="ghost" size="sm" loading={restart.isPending} onClick={() => restart.mutate()}>
+        <RotateCw className="h-3.5 w-3.5" aria-hidden />
         {t("apps.restart")}
       </Button>
 
-      <Menu label={t("nav.menu")}>
+      <Menu label={t("files.actions")}>
+        <MenuItem icon={<ScrollText aria-hidden />} onClick={() => setShowLogs(true)}>
+          {t("apps.logs")}
+        </MenuItem>
+        <MenuSeparator />
         <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
           {t("apps.delete")}
         </MenuItem>
@@ -209,8 +231,7 @@ function AppActions({ app }: { app: AppView }) {
             <Button variant="ghost" onClick={() => setConfirming(false)}>
               {t("common.cancel")}
             </Button>
-            <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-              {remove.isPending ? <Spinner /> : null}
+            <Button variant="danger" loading={remove.isPending} onClick={() => remove.mutate()}>
               {t("apps.deleteConfirm")}
             </Button>
           </>
@@ -222,9 +243,9 @@ function AppActions({ app }: { app: AppView }) {
           <p className="text-sm text-ink-muted">{t("apps.deleteKeepsSite")}</p>
         )}
         {error ? (
-          <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger" className="mt-3">
             {error}
-          </p>
+          </Callout>
         ) : null}
       </Dialog>
     </>
@@ -257,8 +278,8 @@ function LogsDialog({
       description={t("apps.logsHint", { count: DEFAULT_LOG_LINES })}
       footer={
         <>
-          <Button variant="ghost" onClick={() => void logs.refetch()} disabled={logs.isFetching}>
-            {logs.isFetching ? <Spinner /> : <RotateCw className="h-3.5 w-3.5" aria-hidden />}
+          <Button variant="ghost" loading={logs.isFetching} onClick={() => void logs.refetch()}>
+            <RotateCw className="h-3.5 w-3.5" aria-hidden />
             {t("apps.refresh")}
           </Button>
           <Button variant="secondary" onClick={onClose}>
@@ -279,13 +300,29 @@ function LogsDialog({
           <Skeleton className="h-3 w-3/4" />
         </div>
       ) : logs.error ? (
-        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger">
           {logs.error instanceof ApiError ? logs.error.message : String(logs.error)}
-        </p>
+        </Callout>
       ) : (
-        <div className="max-h-[50vh] overflow-y-auto rounded-lg border border-border bg-canvas p-3 font-mono text-xs leading-relaxed">
+        <div
+          aria-busy={logs.isFetching || undefined}
+          className={cn(
+            "max-h-[50vh] overflow-y-auto rounded-lg border border-border bg-canvas p-3 font-mono text-xs leading-relaxed",
+            // A refetch replaces every line in one frame. Fading the panel out
+            // and back is what tells the reader the text they were part-way
+            // through is no longer the same text.
+            "transition-opacity duration-150",
+            logs.isFetching && "opacity-50",
+          )}
+        >
           {(logs.data?.lines.length ?? 0) === 0 ? (
-            <p className="text-ink-subtle">{t("apps.logsEmpty")}</p>
+            // No second dashed border inside the log panel's own box, and back
+            // to the UI face — the mono is for journal lines, not for prose.
+            <EmptyState
+              className="border-0 px-2 py-8 font-sans"
+              icon={<ScrollText aria-hidden />}
+              title={t("apps.logsEmpty")}
+            />
           ) : (
             logs.data!.lines.map((line, index) => (
               // Journal output is machine text; `break-all` keeps a long stack
@@ -388,8 +425,7 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={() => void submit()} disabled={isSubmitting}>
-            {isSubmitting ? <Spinner /> : null}
+          <Button variant="primary" loading={isSubmitting} onClick={() => void submit()}>
             {t("apps.create")}
           </Button>
         </>
@@ -486,31 +522,40 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
           <legend className="block text-sm font-medium text-ink">{t("apps.env")}</legend>
           <p className="mt-0.5 mb-2 text-xs text-ink-muted">{t("apps.envHint")}</p>
 
-          <ul className="space-y-2">
-            {env.fields.map((field, index) => (
-              <li key={field.id} className="flex items-center gap-2">
-                <Input
-                  className="flex-1 font-mono text-xs"
-                  aria-label={t("apps.envKey")}
-                  placeholder="DATABASE_URL"
-                  {...register(`env.${index}.key` as const)}
-                />
-                <Input
-                  className="flex-1 font-mono text-xs"
-                  aria-label={t("apps.envValue")}
-                  {...register(`env.${index}.value` as const)}
-                />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={t("apps.envRemove")}
-                  onClick={() => env.remove(index)}
-                >
-                  <X className="h-4 w-4" />
-                </Button>
-              </li>
-            ))}
-          </ul>
+          {env.fields.length === 0 ? (
+            // Without this the fieldset is a legend, a hint and a lone "Add"
+            // button with nothing between them to say what would go there.
+            <EmptyState className="px-4 py-6" title={t("apps.envEmpty")} />
+          ) : (
+            <ul className="space-y-2">
+              {/* No stagger on these: rows appear one at a time because the
+                  operator clicked Add, and a delay on the row they just asked
+                  for reads as lag. */}
+              {env.fields.map((field, index) => (
+                <li key={field.id} className="flex animate-pop-in items-center gap-2">
+                  <Input
+                    className="flex-1 font-mono text-xs"
+                    aria-label={t("apps.envKey")}
+                    placeholder="DATABASE_URL"
+                    {...register(`env.${index}.key` as const)}
+                  />
+                  <Input
+                    className="flex-1 font-mono text-xs"
+                    aria-label={t("apps.envValue")}
+                    {...register(`env.${index}.value` as const)}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={t("apps.envRemove")}
+                    onClick={() => env.remove(index)}
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
 
           <Button
             variant="outline"
@@ -524,9 +569,9 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         </fieldset>
 
         {error ? (
-          <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger" className="mt-3">
             {error}
-          </p>
+          </Callout>
         ) : null}
       </form>
     </Dialog>

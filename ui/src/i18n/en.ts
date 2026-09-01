@@ -8,6 +8,7 @@ export const en = {
     cancel: "Cancel",
     signOut: "Sign out",
     search: "Search",
+    skipToContent: "Skip to content",
     none: "—",
     unknown: "Unknown",
     noResults: "No results",
@@ -94,6 +95,22 @@ export const en = {
     alertsClear: "All clear",
     activeBans: "Active bans",
     bansHint: "Blocked now",
+    live: "Live",
+    health: {
+      allGood: "All systems healthy",
+      allGoodHint: "Nothing on this server needs your attention right now.",
+      attention_one: "{{count}} thing needs attention",
+      attention_other: "{{count}} things need attention",
+      attentionHint: "Each one links to the page that can fix it.",
+      agentOffline: "The agent is offline",
+      servicesFailed_one: "{{count}} service has failed",
+      servicesFailed_other: "{{count}} services have failed",
+      alertsOpen_one: "{{count}} alert is firing",
+      alertsOpen_other: "{{count}} alerts are firing",
+      diskFull: "{{mount}} is {{pct}} full",
+      firewallOff: "No firewall is enforcing",
+      panelOverBudget: "The panel is over its memory budget",
+    },
   },
   service: {
     active: "Running",
@@ -131,6 +148,7 @@ export const en = {
     filterTo: "To",
     filterAny: "Any",
     filterClear: "Clear filters",
+    filters: "Filters",
     noMatches: "Nothing matches these filters.",
     noMatchesHint: "Widen the date range, or clear the filters to see everything.",
     cancel: "Cancel",
@@ -140,6 +158,7 @@ export const en = {
     previous: "Previous",
     next: "Next",
     page: "Page {{page}}",
+    showing: "Tasks {{from}}–{{to}}",
   },
   terminal: {
     title: "Terminal",
@@ -149,6 +168,12 @@ export const en = {
     target: {
       root: "root",
       tenant: "My account",
+    },
+    // Short enough for the chrome strip's badge; the sentence explaining what
+    // happened belongs in the panel below, not in a pill.
+    status: {
+      closed: "Disconnected",
+      denied: "Not permitted",
     },
     tenantOnly: "The terminal opens as your own account, in your own home directory.",
     rootWarning:
@@ -171,6 +196,8 @@ export const en = {
     adding: "Adding…",
     remove: "Remove key",
     empty: "No keys yet.",
+    emptyHint:
+      "Add a public key and this account is reachable over SSH from your own machine, with no password to type or leak.",
     noComment: "No comment",
     placeholder: "ssh-ed25519 AAAA… you@laptop",
     hint: "Paste one public key line. Options such as command= are not accepted.",
@@ -182,6 +209,10 @@ export const en = {
   stack: {
     title: "Stack",
     subtitle: "Install what this server needs, from the vendors' own repositories.",
+    component: "Component",
+    version: "Installed version",
+    status: "Status",
+    actions: "Actions",
     webServer: "Web server",
     webServerHint: "Nginx from nginx.org. Required before any site can be served.",
     php: "PHP",
@@ -208,6 +239,7 @@ export const en = {
     createHint: "The panel will create the account, the directories and the vhost.",
     empty: "No sites yet.",
     emptyHint: "Add a domain and the panel will set up everything it needs to serve it.",
+    openSite: "Open {{domain}} in a new tab",
     domain: "Domain",
     domainRequired: "Enter a domain",
     domainInvalid: "That does not look like a domain name",
@@ -275,6 +307,7 @@ export const en = {
     envHint: "PORT and NODE_ENV are set by the panel and cannot be overridden.",
     envKey: "Name",
     envValue: "Value",
+    envEmpty: "No variables yet.",
     envAdd: "Add variable",
     envRemove: "Remove variable",
     port: "Port",
@@ -372,6 +405,7 @@ export const en = {
       "The redirect target is set when the site is created and cannot be changed here yet.",
     changedCount: "{{count}} unsaved change",
     changedCount_other: "{{count}} unsaved changes",
+    fieldChanged: "Unsaved change",
     save: "Save changes",
     discard: "Discard",
     saved: "Applied — the new configuration is live.",
@@ -418,6 +452,7 @@ export const en = {
     actions: "Actions",
     empty: "This folder is empty.",
     emptyHint: "Drag files here, or use Upload and New folder to get started.",
+    listError: "This folder could not be opened",
     itemCount: "{{count}} item",
     itemCount_other: "{{count}} items",
     showHidden: "Show hidden files",
@@ -431,6 +466,8 @@ export const en = {
     searchResults: "{{count}} match",
     searchResults_other: "{{count}} matches",
     searchNoResults: "Nothing named like “{{query}}” here.",
+    searchNoResultsHint: "Search looks at names in this folder and every folder below it.",
+    searchFailed: "The search did not finish",
     searchTruncated: "Only the first matches are shown.",
     newFolder: "New folder",
     createFolder: "Create folder",
@@ -700,6 +737,7 @@ export const en = {
       "Add a job and the panel installs it into this account's crontab. Nothing here runs as root — a job runs as you, with your own shell.",
     schedule: "Schedule",
     legend: "minute · hour · day-of-month · month · day-of-week",
+    presets: "Common schedules",
     runs: "Runs {{description}}",
     command: "Command",
     commandHint:
@@ -814,8 +852,13 @@ export const en = {
     chooseRepository: "Choose a repository",
     chooseRepositoryFirst: "Choose a repository to list what is inside it.",
     noRepos: "No repositories yet.",
+    noReposHint:
+      "A repository is where restic writes — a directory on this server, or an S3 bucket. Schedules and manual runs can only point at one that already exists.",
     noReposCustomer:
       "No repository has been pointed at your subscription yet. Ask your administrator to add a backup schedule for it.",
+    noReposCustomerTitle: "No repository is available to you yet.",
+    credentials: "Credentials",
+    actions: "Actions",
     kindLabel: "Kind",
     kind: {
       local: "Local directory",
@@ -861,6 +904,8 @@ export const en = {
       "A schedule is also what grants a tenant access to a repository at all — they can only back up into one an administrator has pointed at their subscription.",
     createSchedule: "Create schedule",
     noSchedules: "No schedules yet.",
+    noSchedulesHint:
+      "A schedule is what takes backups without anyone remembering to. It is also what grants a subscription access to a repository at all.",
     deleteSchedule: "Delete",
     deleteScheduleTitle: "Delete this schedule?",
     deleteScheduleHint: "The runs it has already made keep their history.",
@@ -888,6 +933,8 @@ export const en = {
     history: "History",
     historyHint: "Every run, successes and failures alike.",
     noRuns: "Nothing has been backed up yet.",
+    noRunsHint:
+      "Every run lands here with its size, its snapshot id and — when it fails — what restic said about it.",
     status: "Status",
     started: "Started",
     size: "Size",
@@ -900,6 +947,8 @@ export const en = {
     snapshots: "Snapshots",
     snapshotsHint: "What is actually inside a repository, read back from restic.",
     noSnapshots: "This repository has no snapshots matching that filter.",
+    noSnapshotsHint:
+      "Snapshots appear once a run has finished writing into this repository. Clear the subscription filter to see every one of them.",
     subscriptionFilter: "Subscription filter",
     subscriptionFilterPlaceholder: "All",
     subscriptionFilterHint:
@@ -921,6 +970,8 @@ export const en = {
       domain: "Domain",
       run: "Check",
       idle: "Enter a domain to see where it currently resolves.",
+      idleHint:
+        "This is the step most new sites fail on: a certificate cannot be issued until the name resolves to this server.",
       matches: "Points at this server",
       proxied: "Behind Cloudflare",
       noMatch: "Does not point here",
@@ -928,6 +979,7 @@ export const en = {
         "A proxied domain resolves to Cloudflare's own addresses on purpose. That is a working setup, not a fault — traffic still reaches this server, through Cloudflare.",
       name: "Name",
       serverAddresses: "This server answers on",
+      thisServer: "This server's own address",
     },
     provider: {
       title: "Cloudflare credential",
@@ -951,6 +1003,8 @@ export const en = {
         "One certificate covers both example.com and *.example.com. A wildcard matches exactly one label, so a wildcard-only certificate would leave the bare domain broken — which is the most common wildcard mistake there is.",
       issue: "Get wildcard certificate",
       noSites: "No sites yet.",
+      noSitesHint:
+        "A wildcard certificate is issued for a site's domain, so there is nothing to issue one against yet. Add a site and it appears here.",
     },
   },
   firewall: {
@@ -1077,6 +1131,10 @@ export const en = {
       allowlistAdd: "Add",
       allowlistRemove: "Remove {{entry}}",
       allowlistInvalid: "Use an address or CIDR. A typo here protects nothing.",
+      allowlistInvalidTag: "Not a valid address or range",
+      allowlistEntryInvalid: "{{entries}} is not an address or CIDR. Fix or remove it before saving.",
+      allowlistEntryInvalid_other:
+        "{{entries}} are not addresses or CIDRs. Fix or remove them before saving.",
       save: "Save Sentinel settings",
       saved: "Saved",
     },
@@ -1276,6 +1334,7 @@ export const en = {
     dns: {
       title: "SPF, DKIM and DMARC",
       hint: "The records the configured relay needs. Unihelm shows them; it does not publish or check them.",
+      noneTitle: "No records to publish yet",
       none: "Configure the relay first — which records are needed depends on which provider it is.",
       notManaged: "Not managed by Unihelm",
       noValue:

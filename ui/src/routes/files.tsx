@@ -6,6 +6,7 @@ import {
   Copy as CopyIcon,
   FolderOpen,
   FolderPlus,
+  SearchX,
   Trash2,
   Upload as UploadIcon,
   X,
@@ -24,16 +25,16 @@ import {
   RenameDialog,
 } from "@/components/files/dialogs";
 import { FileEditorOverlay } from "@/components/files/editor";
-import { FileTable, type RowAction } from "@/components/files/file-table";
+import { FileTable, FileTableSkeleton, type RowAction } from "@/components/files/file-table";
 import { TrashView } from "@/components/files/trash-view";
 import { UploadPanel, filesFromDrop, useUploader } from "@/components/files/upload";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { ListSkeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { ApiError } from "@/lib/api";
 import {
@@ -43,7 +44,7 @@ import {
   type FileEntry,
   type SearchResponse,
 } from "@/lib/files-api";
-import { cn } from "@/lib/utils";
+import { staggerStyle } from "@/lib/motion";
 
 /**
  * The file manager (spec §11.7).
@@ -264,47 +265,52 @@ export function FilesPage() {
       />
 
       {banner ? (
-        <p
-          role={banner.kind === "error" ? "alert" : "status"}
-          className={cn(
-            "flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm",
-            banner.kind === "error" ? "bg-danger-soft text-danger" : "bg-accent-soft text-accent",
-          )}
-        >
-          {banner.text}
-          <button
-            type="button"
-            onClick={() => setBanner(null)}
-            aria-label={t("common.dismiss")}
-            className="shrink-0 opacity-70 hover:opacity-100"
+        // Callout carries role="alert" for the danger tone itself; the info
+        // tone deliberately does not, so a background task starting still
+        // needs its own polite live region to be announced.
+        <div role={banner.kind === "info" ? "status" : undefined}>
+          <Callout
+            tone={banner.kind === "error" ? "danger" : "info"}
+            action={
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => setBanner(null)}
+                aria-label={t("common.dismiss")}
+              >
+                <X className="h-4 w-4" aria-hidden />
+              </Button>
+            }
           >
-            <X className="h-4 w-4" aria-hidden />
-          </button>
-        </p>
+            {banner.text}
+          </Callout>
+        </div>
       ) : null}
 
       {inTrash ? (
         <TrashView />
       ) : (
         <>
+          {/* The breadcrumb takes its own line below `sm` so the toolbar is
+              three predictable rows on a phone rather than four ragged ones. */}
           <div className="flex flex-wrap items-center gap-3">
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0 flex-1 basis-full sm:basis-auto">
               <Breadcrumbs path={path} onNavigate={goTo} />
             </div>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <Input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder={t("files.searchPlaceholder")}
                 aria-label={t("files.searchPlaceholder")}
-                className="h-8 w-48 text-sm"
+                className="w-full sm:w-56"
               />
-              <Button variant="outline" size="sm" onClick={() => setDialog({ type: "mkdir" })}>
-                <FolderPlus className="h-3.5 w-3.5" aria-hidden />
+              <Button variant="outline" onClick={() => setDialog({ type: "mkdir" })}>
+                <FolderPlus className="h-4 w-4" aria-hidden />
                 {t("files.newFolder")}
               </Button>
-              <Button variant="primary" size="sm" onClick={() => pickerRef.current?.click()}>
-                <UploadIcon className="h-3.5 w-3.5" aria-hidden />
+              <Button variant="primary" onClick={() => pickerRef.current?.click()}>
+                <UploadIcon className="h-4 w-4" aria-hidden />
                 {t("files.upload")}
               </Button>
               <input
@@ -321,8 +327,10 @@ export function FilesPage() {
           </div>
 
           {selectedEntries.length > 0 ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-accent-soft/50 px-3 py-2">
-              <span className="text-sm font-medium text-accent">
+            // It arrives on a slide because it pushes the table down as it
+            // mounts: the movement is at least explained by something moving.
+            <div className="flex animate-slide-up flex-wrap items-center gap-2 rounded-card border border-accent/20 bg-accent-soft/60 px-3 py-2">
+              <span className="tnum text-sm font-medium text-accent">
                 {t("files.selected", { count: selectedEntries.length })}
               </span>
               <span className="ms-auto flex flex-wrap items-center gap-2">
@@ -356,7 +364,8 @@ export function FilesPage() {
 
           <div className="relative">
             {dragOver ? (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card border-2 border-dashed border-accent bg-accent-soft/80 text-sm font-medium text-accent">
+              <div className="pointer-events-none absolute inset-0 z-10 flex animate-fade-in flex-col items-center justify-center gap-2 rounded-card border-2 border-dashed border-accent bg-accent-soft/80 text-sm font-medium text-accent backdrop-blur-[1px]">
+                <UploadIcon className="h-6 w-6 animate-pop-in" aria-hidden />
                 {t("files.dropHere")}
               </div>
             ) : null}
@@ -376,17 +385,21 @@ export function FilesPage() {
                 }}
               />
             ) : listing.isPending ? (
-              <ListSkeleton rows={6} />
+              <FileTableSkeleton />
             ) : listing.isError ? (
-              <Card>
-                <CardBody className="py-16 text-center">
-                  <p role="alert" className="text-sm text-danger">
-                    {listing.error instanceof ApiError
-                      ? listing.error.message
-                      : String(listing.error)}
-                  </p>
-                  <div className="mt-4 flex justify-center gap-2">
-                    <Button variant="outline" size="sm" onClick={() => void listing.refetch()}>
+              // The server's own message, verbatim: it carries the FER-xxxx
+              // reference an operator may need to search for.
+              <Callout
+                tone="danger"
+                title={t("files.listError")}
+                action={
+                  <>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      loading={listing.isFetching}
+                      onClick={() => void listing.refetch()}
+                    >
                       {t("common.retry")}
                     </Button>
                     {path !== "" ? (
@@ -394,17 +407,21 @@ export function FilesPage() {
                         {t("files.home")}
                       </Button>
                     ) : null}
-                  </div>
-                </CardBody>
-              </Card>
+                  </>
+                }
+              >
+                {listing.error instanceof ApiError
+                  ? listing.error.message
+                  : String(listing.error)}
+              </Callout>
             ) : entries.length === 0 ? (
               <EmptyState
                 icon={<FolderOpen aria-hidden />}
                 title={t("files.empty")}
                 hint={t("files.emptyHint")}
                 action={
-                  <Button variant="primary" size="sm" onClick={() => pickerRef.current?.click()}>
-                    <UploadIcon className="h-3.5 w-3.5" aria-hidden />
+                  <Button variant="primary" onClick={() => pickerRef.current?.click()}>
+                    <UploadIcon className="h-4 w-4" aria-hidden />
                     {t("files.upload")}
                   </Button>
                 }
@@ -428,7 +445,7 @@ export function FilesPage() {
               label={t("files.showHidden")}
             />
             {!searchActive && entries.length > 0 ? (
-              <p className="text-xs tabular-nums text-ink-subtle">
+              <p className="tnum text-xs text-ink-subtle">
                 {t("files.itemCount", { count: entries.length })}
               </p>
             ) : null}
@@ -510,55 +527,47 @@ function SearchResults({
 }) {
   const { t } = useTranslation();
 
-  if (results.isPending) {
-    return (
-      <Card>
-        <CardBody className="flex items-center justify-center gap-3 py-16 text-sm text-ink-muted">
-          <Spinner className="h-5 w-5" />
-          {t("files.searching")}
-        </CardBody>
-      </Card>
-    );
-  }
+  // What is coming is a list the same shape as the one already on screen, so
+  // the ghost of that list is a better stand-in than a spinner.
+  if (results.isPending) return <ListSkeleton rows={4} />;
+
   if (results.isError) {
     return (
-      <Card>
-        <CardBody className="py-16 text-center">
-          <p role="alert" className="text-sm text-danger">
-            {results.error instanceof ApiError ? results.error.message : String(results.error)}
-          </p>
-        </CardBody>
-      </Card>
+      <Callout tone="danger" title={t("files.searchFailed")}>
+        {results.error instanceof ApiError ? results.error.message : String(results.error)}
+      </Callout>
     );
   }
 
   const entries = results.data?.entries ?? [];
   if (entries.length === 0) {
     return (
-      <Card>
-        <CardBody className="py-16 text-center text-sm text-ink-muted">
-          {t("files.searchNoResults", { query })}
-        </CardBody>
-      </Card>
+      <EmptyState
+        icon={<SearchX aria-hidden />}
+        title={t("files.searchNoResults", { query })}
+        hint={t("files.searchNoResultsHint")}
+      />
     );
   }
 
   return (
     <Card>
       <CardBody className="pt-3">
-        <p className="mb-2 text-xs text-ink-muted">
+        <p className="tnum mb-2 text-xs text-ink-muted">
           {t("files.searchResults", { count: entries.length })}
           {results.data?.truncated ? ` ${t("files.searchTruncated")}` : ""}
         </p>
         <ul className="divide-y divide-border">
-          {entries.map((entry) => (
-            <li key={entry.path}>
+          {entries.map((entry, index) => (
+            <li key={entry.path} className="animate-rise-in stagger" style={staggerStyle(index)}>
               <button
                 type="button"
                 onClick={() => (entry.kind === "file" ? onOpenFile(entry) : onOpenDir(entry))}
-                className="flex w-full items-center gap-3 rounded-md px-1 py-2 text-start transition-colors hover:bg-surface-muted"
+                className="group flex w-full items-center gap-3 rounded-lg px-1 py-2 text-start transition-colors duration-150 hover:bg-surface-muted/60"
               >
-                <span className="shrink-0 text-sm font-medium text-ink">{entry.name}</span>
+                <span className="shrink-0 text-sm font-medium text-ink transition-colors group-hover:text-accent">
+                  {entry.name}
+                </span>
                 <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-subtle">
                   {entry.path}
                 </span>

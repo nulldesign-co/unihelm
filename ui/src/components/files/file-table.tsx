@@ -20,7 +20,8 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
-import { Table, Td, Th } from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import {
   archiveFormatOf,
   downloadUrl,
@@ -28,6 +29,7 @@ import {
   looksBinary,
   type FileEntry,
 } from "@/lib/files-api";
+import { staggerStyle } from "@/lib/motion";
 import { cn, formatBytes } from "@/lib/utils";
 
 export type RowAction =
@@ -60,6 +62,90 @@ function iconFor(entry: FileEntry): ComponentType<{ className?: string }> {
 }
 
 /**
+ * The listing's six columns, shared by the table and its ghost so the
+ * placeholder has the real header rather than an invented one.
+ */
+function FileTableHead({
+  selectAll,
+}: {
+  /** Omitted by the skeleton: there is nothing to select yet. */
+  selectAll?: { checked: boolean; onChange: () => void };
+}) {
+  const { t } = useTranslation();
+  return (
+    <thead>
+      <tr>
+        <Th className="w-10 px-3">
+          {selectAll ? (
+            <input
+              type="checkbox"
+              checked={selectAll.checked}
+              onChange={selectAll.onChange}
+              aria-label={t("files.selectAll")}
+              className="accent-[var(--color-accent)]"
+            />
+          ) : (
+            <Skeleton className="h-4 w-4 rounded" />
+          )}
+        </Th>
+        <Th>{t("files.name")}</Th>
+        <Th className="w-24 text-end">{t("files.size")}</Th>
+        <Th className="w-44">{t("files.modified")}</Th>
+        <Th className="w-28">{t("files.permissions")}</Th>
+        <Th className="w-20">
+          <span className="sr-only">{t("files.actions")}</span>
+        </Th>
+      </tr>
+    </thead>
+  );
+}
+
+/**
+ * The listing before it arrives.
+ *
+ * `ListSkeleton` promises an avatar-and-pill list and then a six-column table
+ * lands, which is a different kind of jump rather than none. This is the real
+ * table shell with ghost cells, the way every other table on the panel loads.
+ */
+export function FileTableSkeleton({ rows = 6 }: { rows?: number }) {
+  return (
+    <div role="status" aria-live="polite">
+      <Table className="min-w-[640px]">
+        <FileTableHead />
+        <tbody>
+          {Array.from({ length: rows }, (_, i) => (
+            <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
+              <Td className="px-3 py-2">
+                <Skeleton className="h-4 w-4 rounded" />
+              </Td>
+              <Td className="py-2">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-4 w-4 shrink-0 rounded" />
+                  {/* Uneven: real file names are not all the same length. */}
+                  <Skeleton className={cn("h-3.5", i % 2 === 0 ? "w-40" : "w-56")} />
+                </div>
+              </Td>
+              <Td className="py-2">
+                <Skeleton className="ms-auto h-3 w-12" />
+              </Td>
+              <Td className="py-2">
+                <Skeleton className="h-3 w-28" />
+              </Td>
+              <Td className="py-2">
+                <Skeleton className="h-3 w-16" />
+              </Td>
+              <Td className="py-2">
+                <Skeleton className="ms-auto h-8 w-8 rounded-lg" />
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </div>
+  );
+}
+
+/**
  * The directory listing. Directories sort before files because that is how
  * every file manager since the beginning of time has worked, and muscle
  * memory is a feature.
@@ -89,35 +175,22 @@ export function FileTable({
 
   return (
     <Table className="min-w-[640px]">
-      <thead>
-        <tr>
-          <Th className="w-10 px-3">
-            <input
-              type="checkbox"
-              checked={allSelected}
-              onChange={onToggleAll}
-              aria-label={t("files.selectAll")}
-              className="accent-[var(--color-accent)]"
-            />
-          </Th>
-          <Th>{t("files.name")}</Th>
-          <Th className="w-24 text-end">{t("files.size")}</Th>
-          <Th className="w-44">{t("files.modified")}</Th>
-          <Th className="w-28">{t("files.permissions")}</Th>
-          <Th className="w-20" />
-        </tr>
-      </thead>
+      <FileTableHead selectAll={{ checked: allSelected, onChange: onToggleAll }} />
       <tbody>
-        {entries.map((entry) => {
+        {entries.map((entry, index) => {
           const Icon = iconFor(entry);
           const isSelected = selected.has(entry.path);
           return (
-            <tr
+            <Tr
               key={entry.path}
+              // A selected row keeps its accent tint under the pointer:
+              // `cn` is tailwind-merge, so this drops Tr's own hover tint
+              // rather than racing it in the cascade.
               className={cn(
-                "transition-colors",
-                isSelected ? "bg-accent-soft/50" : "hover:bg-surface-muted/60",
+                "animate-rise-in stagger",
+                isSelected && "bg-accent-soft/50 hover:bg-accent-soft/60",
               )}
+              style={staggerStyle(index)}
             >
               <Td className="px-3 py-2">
                 <input
@@ -158,7 +231,7 @@ export function FileTable({
                   ) : null}
                 </button>
               </Td>
-              <Td className="py-2 text-end text-xs tabular-nums text-ink-muted">
+              <Td className="py-2 text-end text-xs text-ink-muted">
                 {entry.kind === "dir" ? "—" : formatBytes(entry.size, i18n.language)}
               </Td>
               <Td className="whitespace-nowrap py-2 text-xs text-ink-muted">
@@ -175,7 +248,10 @@ export function FileTable({
                     <a
                       href={downloadUrl(entry.path)}
                       download={entry.name}
-                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-ink-muted transition-colors hover:bg-surface-muted hover:text-ink"
+                      // Tinted rather than filled on hover: the row itself is
+                      // already tinted by then, and a muted fill would vanish
+                      // into it.
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-ink-muted transition-colors hover:bg-accent-soft hover:text-accent"
                       aria-label={t("files.download")}
                       title={t("files.download")}
                     >
@@ -207,7 +283,7 @@ export function FileTable({
                   </Menu>
                 </div>
               </Td>
-            </tr>
+            </Tr>
           );
         })}
       </tbody>

@@ -23,7 +23,7 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        "rounded-card border border-dashed border-border-strong px-6 py-14 text-center",
+        "animate-pop-in rounded-card border border-dashed border-border-strong px-6 py-14 text-center",
         className,
       )}
     >
