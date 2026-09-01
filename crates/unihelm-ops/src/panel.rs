@@ -29,43 +29,85 @@ use crate::services::{NginxValidator, UnitReloader};
 /// inside `unihelm-web`, so this is a ceiling, not an invitation.
 const PANEL_MAX_BODY: &str = "64m";
 
-/// Where `unihelm-web` actually listens, for the vhost's `proxy_pass`.
-pub fn web_upstream() -> String {
-    web_upstream_from(Path::new(unihelm_core::config::paths::CONFIG))
+/// An address nginx can dial, from an address the panel listens on.
+///
+/// They are not the same thing: since the default became all-interfaces, the
+/// listen value is `0.0.0.0:8088`, and `proxy_pass http://0.0.0.0:8088` is
+/// rejected by nginx — which fails `nginx -t`, so the reload takes down every
+/// vhost on the box, not just the panel's. nginx and the panel share a machine,
+/// so loopback is the honest upstream.
+fn dialable(listen: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = listen.parse().ok()?;
+    if !addr.ip().is_unspecified() {
+        return Some(listen.to_string());
+    }
+    let loopback = if addr.is_ipv6() {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    Some(std::net::SocketAddr::new(loopback, addr.port()).to_string())
 }
 
-/// The agent and the web process read the same `/etc/unihelm/config.toml`, so
-/// the listen address in that file is the address to proxy to. When the file
-/// is missing or unreadable — a dev instance builds its config in memory and
-/// writes nothing to `/etc` — the compiled default is the same loopback
-/// address `for_dev` uses, so the rendered upstream is right in both layouts.
-fn web_upstream_from(path: &Path) -> String {
-    let fallback = UnihelmConfig::default().panel.listen;
+/// How nginx should reach the panel: where, and over which scheme.
+///
+/// Both come from one read of the same file, because they have to agree. The
+/// panel terminates its own TLS by default, so proxying to `http://` is a 502 on
+/// the panel's own vhost — and the listen address it serves on is not
+/// necessarily one nginx can dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    pub address: String,
+    pub scheme: &'static str,
+}
+
+pub fn panel_upstream() -> Upstream {
+    upstream_from(Path::new(unihelm_core::config::paths::CONFIG))
+}
+
+fn upstream_from(path: &Path) -> Upstream {
+    // Absent or unreadable, assume the defaults the panel itself would use.
+    let default = UnihelmConfig::default();
+    let fallback = Upstream {
+        address: dialable(&default.panel.listen).unwrap_or_else(|| "127.0.0.1:8088".to_string()),
+        scheme: scheme_for(default.panel.tls),
+    };
+
     let Ok(text) = std::fs::read_to_string(path) else {
         return fallback;
     };
     match UnihelmConfig::from_toml(&text) {
-        // Trust the file only as far as it would have been trusted at boot: a
-        // listen value that does not parse as an address would render a
-        // `proxy_pass` nginx rejects, taking the whole `nginx -t` down.
-        Ok(config) if config.panel.listen.parse::<std::net::SocketAddr>().is_ok() => {
-            config.panel.listen
-        }
-        _ => {
+        Ok(config) => match dialable(&config.panel.listen) {
+            Some(address) => Upstream {
+                address,
+                scheme: scheme_for(config.panel.tls),
+            },
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "listen address does not parse; using the default upstream"
+                );
+                fallback
+            }
+        },
+        Err(_) => {
             tracing::warn!(
                 path = %path.display(),
-                "config file unreadable or its listen address invalid; using the default upstream"
+                "config file unreadable; using the default upstream"
             );
             fallback
         }
     }
 }
 
-/// The template context for `nginx/panel.conf`, in one place so the operation
-/// and the render tests below exercise exactly the same keys. The template is
-/// strict-undefined, so a key missing here is a render failure, not a broken
-/// vhost.
-pub fn vhost_context(domain: &Domain, upstream: &str) -> serde_json::Value {
+fn scheme_for(tls: unihelm_core::config::PanelTls) -> &'static str {
+    match tls {
+        unihelm_core::config::PanelTls::Off => "http",
+        unihelm_core::config::PanelTls::SelfSigned => "https",
+    }
+}
+
+pub fn vhost_context(domain: &Domain, upstream: &Upstream) -> serde_json::Value {
     let cert_dir = paths::cert_dir(domain.as_str());
     serde_json::json!({
         "panel_domain": domain.as_str(),
@@ -73,7 +115,8 @@ pub fn vhost_context(domain: &Domain, upstream: &str) -> serde_json::Value {
         "cert_path": cert_dir.join("fullchain.pem"),
         "key_path": cert_dir.join("privkey.pem"),
         "max_body_size": PANEL_MAX_BODY,
-        "upstream": upstream,
+        "upstream": upstream.address,
+        "upstream_scheme": upstream.scheme,
     })
 }
 
@@ -208,7 +251,7 @@ impl TypedOperation for Issue {
             .apply(ApplyRequest {
                 file: ManagedFile::nginx(paths::nginx_panel()),
                 template: "nginx/panel.conf",
-                context: vhost_context(&domain, &web_upstream()),
+                context: vhost_context(&domain, &panel_upstream()),
                 service: "nginx",
                 validator: &NginxValidator,
                 reloader: &UnitReloader::nginx(ctx.distro()),
@@ -311,10 +354,20 @@ mod tests {
     use super::*;
 
     fn render_panel(domain: &str, upstream: &str) -> String {
+        render_panel_with(domain, upstream, "http")
+    }
+
+    fn render_panel_with(domain: &str, address: &str, scheme: &'static str) -> String {
         let set = unihelm_config::TemplateSet::load().unwrap();
         set.render(
             "nginx/panel.conf",
-            &vhost_context(&Domain::parse(domain).unwrap(), upstream),
+            &vhost_context(
+                &Domain::parse(domain).unwrap(),
+                &Upstream {
+                    address: address.to_string(),
+                    scheme,
+                },
+            ),
         )
         .unwrap()
     }
@@ -377,11 +430,47 @@ mod tests {
     #[test]
     fn a_missing_config_file_falls_back_to_the_loopback_default() {
         // Dev instances build their config in memory and write nothing to
-        // /etc; the fallback must match unihelm-web's own default listen.
-        assert_eq!(
-            web_upstream_from(Path::new("/nonexistent/unihelm/config.toml")),
-            "127.0.0.1:8088"
-        );
+        // /etc. The fallback has to be an address nginx can dial, which the
+        // panel's own default listen (all interfaces) is not.
+        let up = upstream_from(Path::new("/nonexistent/unihelm/config.toml"));
+        assert_eq!(up.address, "127.0.0.1:8088");
+        assert_eq!(up.scheme, "https");
+    }
+
+    /// `proxy_pass http://0.0.0.0:8088` is rejected by nginx, and a rejected
+    /// directive fails `nginx -t` — which blocks the reload for every vhost on
+    /// the box, not just the panel's.
+    #[test]
+    fn an_all_interfaces_listen_is_dialled_over_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "[panel]\nlisten = \"0.0.0.0:8088\"\n").unwrap();
+        assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
+
+        std::fs::write(&path, "[panel]\nlisten = \"[::]:8088\"\n").unwrap();
+        assert_eq!(upstream_from(&path).address, "[::1]:8088");
+    }
+
+    /// The panel terminates its own TLS unless told otherwise, so proxying to
+    /// `http://` would answer every request on the panel's domain with a 502.
+    #[test]
+    fn the_scheme_follows_what_the_panel_is_actually_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "[panel]\nlisten = \"0.0.0.0:8088\"\n").unwrap();
+        assert_eq!(upstream_from(&path).scheme, "https", "the default is TLS");
+
+        std::fs::write(
+            &path,
+            "[panel]\nlisten = \"127.0.0.1:8088\"\ntls = \"off\"\n",
+        )
+        .unwrap();
+        assert_eq!(upstream_from(&path).scheme, "http");
+
+        let out = render_panel_with("panel.example.com", "127.0.0.1:8088", "https");
+        assert!(out.contains("proxy_pass https://127.0.0.1:8088;"), "{out}");
     }
 
     #[test]
@@ -390,16 +479,16 @@ mod tests {
         let path = dir.path().join("config.toml");
 
         std::fs::write(&path, "[panel]\nlisten = \"127.0.0.1:9001\"\n").unwrap();
-        assert_eq!(web_upstream_from(&path), "127.0.0.1:9001");
+        assert_eq!(upstream_from(&path).address, "127.0.0.1:9001");
 
         // A listen value nginx would choke on must not reach `proxy_pass`:
         // a bad upstream fails `nginx -t` and blocks every config change.
         std::fs::write(&path, "[panel]\nlisten = \"not an address\"\n").unwrap();
-        assert_eq!(web_upstream_from(&path), "127.0.0.1:8088");
+        assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
 
         // Garbage falls back rather than failing the whole issuance.
         std::fs::write(&path, "listen = = =").unwrap();
-        assert_eq!(web_upstream_from(&path), "127.0.0.1:8088");
+        assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
     }
 
     #[tokio::test]

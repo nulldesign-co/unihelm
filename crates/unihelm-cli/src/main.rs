@@ -468,7 +468,17 @@ async fn check_panel(config: &UnihelmConfig, report: &mut Report) {
     {
         Ok(Ok(mut stream)) => {
             let _ = stream.shutdown().await;
-            report.ok("panel", format!("accepting connections on {addr}"));
+            // Name the scheme: an operator who pasted http:// at an address the
+            // panel is serving TLS on gets a browser error that looks like the
+            // panel is down, and this is the command they run to find out.
+            let scheme = match config.panel.tls {
+                unihelm_core::config::PanelTls::Off => "http",
+                unihelm_core::config::PanelTls::SelfSigned => "https",
+            };
+            report.ok(
+                "panel",
+                format!("accepting connections on {scheme}://{addr}"),
+            );
         }
         Ok(Err(e)) => report.fail(
             "panel",

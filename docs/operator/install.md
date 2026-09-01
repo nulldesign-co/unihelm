@@ -81,30 +81,52 @@ precisely so that a fork cannot end up skipping verification by omission. See
 
 ## First login
 
-The panel listens on `127.0.0.1:8088` by default. That is deliberate: a brand
-new panel should not be reachable from the internet before you have decided it
-should be. Reach it over an SSH tunnel:
+The installer prints the address when it finishes. It is the server's own:
 
-```bash
-ssh -L 8088:127.0.0.1:8088 <your-login>@your-server
+```
+Panel     https://203.0.113.7:8088
 ```
 
-Then open <http://127.0.0.1:8088>.
+Your browser will warn that the certificate is not trusted, and it is right —
+the panel generated its own on first start, because a server with no domain has
+nothing a certificate authority can vouch for. The connection is encrypted
+regardless, which is the part that keeps your password off the wire. Click
+through the warning.
 
-To reach it without the tunnel, point a domain at the server and issue the
-panel's own certificate:
+Log in with the username the installer created and the password it printed once.
+
+### Giving it a real certificate
+
+Point a domain at the server and issue one:
 
 ```bash
 sudo unihelm cert panel panel.example.com
 ```
 
-Changing `listen` to `0.0.0.0` on its own is not enough, and fails in a way that
-looks like a password problem: off loopback the session cookie is marked
-`Secure`, so a browser will not send it back over plain HTTP. The password is
-accepted, no error appears, and the login form comes straight back. Leave
-`secure_cookies = true` — turning it off to work around that puts the session
-cookie on an unencrypted hop, which is the thing it exists to prevent — and put
-TLS in front of the panel instead.
+nginx then fronts the panel on 443 with a Let's Encrypt certificate, renews it
+on schedule, and the browser warning goes away.
+
+### If you would rather it were not reachable
+
+Set `listen = "127.0.0.1:8088"` in `/etc/unihelm/config.toml`, restart
+`unihelm-web`, and reach it over an SSH tunnel:
+
+```bash
+ssh -L 8088:127.0.0.1:8088 <your-login>@your-server
+```
+
+### What not to do
+
+Do not set `tls = "off"` while the panel is on a public address. That serves the
+login form over plain HTTP, where anyone on the network path can read the
+password you type. It is there for the case where something else terminates TLS
+in front of the panel and sets `X-Forwarded-Proto` — which is what
+`unihelm cert panel` sets up, and it turns `tls` off for you.
+
+Do not turn off `secure_cookies` either. Off loopback the session cookie is
+marked `Secure` so a browser will not return it over plain HTTP, and the tempting
+fix — switching the flag off — puts the session cookie on an unencrypted hop,
+which is the thing it exists to prevent. Serving TLS is the fix.
 
 ## Checking on it
 

@@ -32,9 +32,18 @@ uuid = { workspace = true }
 # `ws` for the web terminal (spec §11.16): a PTY is bidirectional and
 # byte-oriented, which is the one thing SSE cannot carry.
 axum = { version = "0.8.9", features = ["ws"] }
+# The panel terminates its own TLS so a fresh install is reachable on the
+# server's address without a domain or a tunnel. rustls, matching the rest of
+# the tree — no system OpenSSL in a release build.
+axum-server = { version = "0.7.2", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "crypto", "aws_lc_rs"] }
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 rust-embed = "8.12.0"
 mime_guess = "2.0.5"
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["trace", "compression-gzip", "limit", "set-header"] }
 async-stream = "0.3.6"
+
+[dev-dependencies]
+tempfile = "3.27.0"

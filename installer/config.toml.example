@@ -6,15 +6,30 @@
 # clear error and not a silently ignored line.
 
 [panel]
-# Where the panel listens. The default is loopback on purpose: exposing a fresh
-# install to the internet should be a decision somebody typed.
-listen = "127.0.0.1:8088"
+# Where the panel listens. All interfaces, so the panel is reachable at
+# https://<this server's address>:8088 as soon as the installer finishes —
+# needing a domain or an ssh tunnel before you can even see it is not a decision
+# to make for you. Set this to 127.0.0.1:8088 if you would rather it were not.
+listen = "0.0.0.0:8088"
 database = "/var/lib/unihelm/panel.db"
 state_dir = "/var/lib/unihelm/state"
 cli_socket = "/run/unihelm/web.sock"
 
-# Send session cookies with the Secure attribute. Turn this off only for plain
-# HTTP development — with it off, a session cookie can cross an unencrypted hop.
+# How the panel serves itself.
+#
+#   self-signed  Generate a certificate on first start and serve HTTPS. The
+#                browser warns once, because the certificate vouches for nobody
+#                — but the password and the session are encrypted, which on a
+#                public address is the part that matters.
+#   off          Plain HTTP. Correct only behind a proxy that terminates TLS and
+#                sets X-Forwarded-Proto, which is what `unihelm cert panel
+#                <domain>` sets up — and it turns this off for you. On its own it
+#                means passwords cross the network in the clear.
+tls = "self-signed"
+
+# Send session cookies with the Secure attribute. Leave this on. With it off a
+# session cookie can cross an unencrypted hop; it exists for plain-HTTP
+# development, not as a way to make an exposed panel log you in.
 secure_cookies = true
 
 [agent]

@@ -8,11 +8,14 @@
 //! It also serves the React application, embedded in this binary, so a panel
 //! install is one file plus a systemd unit.
 
+use unihelm_core::config::PanelTls;
+
 mod agent;
 mod auth;
 mod error;
 mod routes;
 mod state;
+mod tls;
 mod ui;
 
 use std::net::SocketAddr;
@@ -80,12 +83,34 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = config.panel.listen.parse().expect("validated at load");
 
+    // Read before `config` is moved into the state.
+    let config_tls = config.panel.tls;
+    let state_dir = config.panel.state_dir.clone();
+
+    // Generated once and reused, so a restart neither logs anybody out nor
+    // re-warns the browser.
+    let (cert_pem, key_pem) = if config_tls == PanelTls::SelfSigned {
+        // rustls refuses to pick a provider for you when more than one could be
+        // compiled in, and panics deep inside the accept loop rather than at
+        // startup if nobody chose — the panel listened, logged that it was
+        // listening, and then died on the first byte of the first handshake.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("a TLS provider was already installed"))?;
+        let addresses = tls::local_addresses();
+        let (c, k) = tls::load_or_generate(&state_dir, &addresses)
+            .context("preparing the panel's certificate")?;
+        (c, k)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     if !config.panel.secure_cookies {
         tracing::warn!(
             "secure_cookies is off — session cookies may be sent over plain HTTP. \
              Development only."
         );
-    } else if !addr.ip().is_loopback() {
+    } else if config_tls == PanelTls::Off && !addr.ip().is_loopback() {
         // The cookie will carry `Secure`, so a browser will refuse to send it
         // back over plain http. Without TLS in front, every login appears to
         // succeed and then bounces straight back to the login form.
@@ -138,10 +163,11 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new(db, config));
     let app = build_router(state.clone());
 
+    let serve_tls = config_tls == PanelTls::SelfSigned;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("could not bind {addr}"))?;
-    tracing::info!(%addr, "unihelm-web listening");
+    tracing::info!(%addr, tls = serve_tls, "unihelm-web listening");
 
     // Probe the agent once at startup so the log says plainly whether the two
     // halves can see each other.
@@ -157,13 +183,27 @@ async fn main() -> Result<()> {
     notify::ready();
     notify::status(&format!("listening on {addr}"));
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    if serve_tls {
+        // axum-server owns the accept loop for TLS, and it does not take an
+        // already-bound listener, so hand the descriptor over rather than
+        // binding twice and racing ourselves for the port.
+        let std_listener = listener.into_std().context("detaching the listener")?;
+        let acceptor = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
+            .await
+            .context("loading the panel's certificate")?;
+        axum_server::from_tcp_rustls(std_listener, acceptor)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("server error")?;
+    } else {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+    }
 
     notify::stopping();
     watchdog.abort();

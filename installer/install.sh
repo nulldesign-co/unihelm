@@ -871,21 +871,59 @@ login_user() {
   printf '%s' "${SUDO_USER:-root}"
 }
 
+# Let the panel's port through a firewall that is already on.
+#
+# Binding all interfaces is only half of being reachable: on any image that ships
+# ufw or firewalld enabled, the port is still shut and the panel is exactly as
+# invisible as it was on loopback — with nothing in the output to say why.
+#
+# Only a firewall that is already running is touched, and only this one port.
+# Turning a firewall *on* would be a decision of its own, and closing a port
+# nobody asked about is not this script's business either.
+open_panel_port() {
+  local port="$1"
+  [ -n "$port" ] || return 0
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+    step "Opening the panel's port"
+    if ufw allow "$port/tcp" >/dev/null 2>&1; then
+      info "ufw: allowed $port/tcp"
+    else
+      warn "could not add a ufw rule for $port/tcp; open it yourself"
+    fi
+    return 0
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    step "Opening the panel's port"
+    if firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 &&
+      firewall-cmd --reload >/dev/null 2>&1; then
+      info "firewalld: allowed $port/tcp"
+    else
+      warn "could not add a firewalld rule for $port/tcp; open it yourself"
+    fi
+    return 0
+  fi
+
+  return 0
+}
+
 print_summary() {
   local listen_addr host port
   listen_addr="$(awk -F'"' '/^listen = /{print $2}' "$CONFIG_DIR/config.toml")"
   port="${listen_addr##*:}"
   host="${listen_addr%:*}"
-  local user hint
-  user="$(login_user)"
-  hint="$(server_address_hint)"
+  local tls_mode
+  tls_mode="$(awk -F'"' '/^tls = /{print $2}' "$CONFIG_DIR/config.toml")"
+  local hint; hint="$(server_address_hint)"
+  local user; user="$(login_user)"
 
-  # `unihelm doctor` needs sudo and the summary used to omit it. /var/lib/unihelm
-  # is 0750 unihelm:unihelm, so as the ordinary cloud user doctor cannot stat the
-  # database, reports "does not exist yet" and exits non-zero — telling the
-  # operator their working install is broken, which is the whole class of bug
-  # this summary keeps producing. journalctl needs no sudo: the default cloud
-  # user is in `adm`.
+  local scheme="https"
+  [ "$tls_mode" = "off" ] && scheme="http"
+
+  # `unihelm doctor` needs sudo: /var/lib/unihelm is 0750 unihelm:unihelm, so as
+  # the ordinary cloud user it cannot stat the database and reports a healthy
+  # install as broken. journalctl needs none — the default cloud user is in `adm`.
   case "$host" in
     127.0.0.1 | ::1 | localhost | "[::1]")
       cat <<DONE
@@ -893,53 +931,55 @@ print_summary() {
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
   The panel is listening on ${listen_addr} $(printf '\033[1m')on this server$(printf '\033[0m') — not on the machine
-  you are reading this from. Nothing is exposed to the network, which is
-  deliberate: a fresh install has a generated password and no certificate yet.
+  you are reading this from. That is what the config says; it is not the default.
 
   To open it, forward the port from your own computer, using the same host you
   sshed in as:
 
       ssh -L ${port}:${listen_addr} ${user}@<this server>
 
-  and then visit http://127.0.0.1:${port} in your browser.
-
-  When you are ready to reach it without the tunnel, point a domain at this
-  server and run
-
-      sudo unihelm cert panel <domain>
-
-  Do not simply change \`listen\` to 0.0.0.0 and leave it at plain HTTP: the
-  session cookie is marked Secure off loopback, so a browser will not send it
-  back and every login bounces silently to the login form.
+  and then visit ${scheme}://127.0.0.1:${port} in your browser.
 
   Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
 DONE
-      # Stated as what it is, not as what it means: on OVH, Hetzner, DO and Vultr
-      # this is the real public address and works; on AWS, GCP, Azure and Oracle
-      # it is the private side of a 1:1 NAT and does not. We cannot tell which
-      # from in here, so we do not pretend to.
-      [ -n "$hint" ] && printf '\n  (this machine sees itself at %s — on AWS, GCP, Azure and Oracle\n   that is a private address behind NAT, not the one you connect to)\n' "$hint"
       ;;
     *)
       cat <<DONE
 
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
-  The panel listens on ${listen_addr}, so it is reachable over the network — as
-  far as this host is concerned. Nothing here opened a firewall port, and on a
-  cloud VM a security group usually still has to allow it.
-
-  $(printf '\033[1m')Logins will not stick until TLS is in front of it.$(printf '\033[0m') Off loopback the session
-  cookie is marked Secure, so a browser will not return it over plain HTTP: the
-  password is accepted and the login form comes straight back, with no error.
-  Point a domain at this server and run
-
-      sudo unihelm cert panel <domain>
-
+  Panel     $(printf '\033[1m')${scheme}://${hint:-<this server>}:${port}$(printf '\033[0m')
   Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
 DONE
+      if [ "$scheme" = "https" ]; then
+        cat <<DONE
+
+Your browser will warn that the certificate is not trusted. That is expected and
+it is accurate: the panel generated its own, because a server with no domain has
+nothing a certificate authority can vouch for. The connection is still
+encrypted, which is what stops your password crossing the network in the clear.
+Click through the warning.
+
+When you point a domain at this server, replace it with a real certificate:
+
+    sudo unihelm cert panel <domain>
+DONE
+      else
+        printf '\n%sThe panel is serving plain HTTP.%s Anyone on the network path can read the\n' \
+          "$(printf '\033[1m')" "$(printf '\033[0m')"
+        printf 'password you type. Set tls = "self-signed" in %s/config.toml, or put\n' "$CONFIG_DIR"
+        printf 'TLS in front of it with `sudo unihelm cert panel <domain>`.\n'
+      fi
+      if [ -n "$hint" ]; then
+        cat <<DONE
+
+If that address does not answer, it is the one this machine sees itself on — on
+AWS, GCP, Azure and Oracle that is the private side of a NAT, so use the address
+you connect to instead, and open port ${port} in the provider's security group.
+DONE
+      fi
       ;;
   esac
 
@@ -983,6 +1023,16 @@ main() {
   create_layout
   write_configuration
   install_units
+
+  # Only when the panel is actually meant to be reachable.
+  local listen_addr listen_host
+  listen_addr="$(awk -F'"' '/^listen = /{print $2}' "$CONFIG_DIR/config.toml")"
+  listen_host="${listen_addr%:*}"
+  case "$listen_host" in
+    127.0.0.1 | ::1 | localhost | "[::1]") ;;
+    *) open_panel_port "${listen_addr##*:}" ;;
+  esac
+
   create_first_admin
   print_summary
 }

@@ -44,6 +44,34 @@ pub struct PanelConfig {
     /// On by default — the panel is expected to be reached over TLS. Turning it
     /// off is for plain-HTTP development only, and the panel says so at startup.
     pub secure_cookies: bool,
+    /// How the panel serves itself.
+    ///
+    /// A fresh install has no domain, and requiring one — or an ssh tunnel — just
+    /// to see the panel is not a decision to make on the operator's behalf. So
+    /// the panel terminates TLS itself with a certificate it generates, and is
+    /// reachable at `https://<the server's address>:8088` the moment the
+    /// installer finishes. The browser warns that the certificate is self-signed,
+    /// which is true and is what every panel in this category does; attaching a
+    /// domain later with `unihelm cert panel` replaces it with a real one.
+    #[serde(default)]
+    pub tls: PanelTls,
+}
+
+/// Where the panel's TLS comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelTls {
+    /// Generate a certificate and serve HTTPS. The default: it is the only
+    /// setting under which a fresh install is reachable and safe to log in to.
+    #[default]
+    SelfSigned,
+    /// Serve plain HTTP.
+    ///
+    /// Correct only behind a proxy that terminates TLS and sets
+    /// `X-Forwarded-Proto` — which is what `unihelm cert panel <domain>` sets up,
+    /// and it switches this off for you. On its own it means passwords cross the
+    /// network in the clear.
+    Off,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,11 +108,12 @@ impl Default for PanelConfig {
             // Loopback by default: exposing a brand-new panel to the internet
             // should be a decision somebody typed, not what happens if they
             // don't (spec §12 rule 8).
-            listen: "127.0.0.1:8088".into(),
+            listen: "0.0.0.0:8088".into(),
             database: PathBuf::from(paths::DATABASE),
             state_dir: PathBuf::from(paths::STATE_DIR),
             cli_socket: PathBuf::from("/run/unihelm/web.sock"),
             secure_cookies: true,
+            tls: PanelTls::SelfSigned,
         }
     }
 }
@@ -122,6 +151,9 @@ impl UnihelmConfig {
     pub fn for_dev(dir: &Path) -> Self {
         Self {
             panel: PanelConfig {
+                // Dev stays on loopback and plain HTTP: it is one developer on
+                // one machine, and a self-signed certificate would only put a
+                // browser warning in front of every reload.
                 listen: "127.0.0.1:8088".into(),
                 database: dir.join("panel.db"),
                 state_dir: dir.join("state"),
@@ -129,6 +161,7 @@ impl UnihelmConfig {
                 // Dev runs on plain http://127.0.0.1, where a Secure cookie
                 // would simply never be sent back.
                 secure_cookies: false,
+                tls: PanelTls::Off,
             },
             agent: AgentConfig {
                 socket: dir.join("agent.sock"),
@@ -169,7 +202,7 @@ impl UnihelmConfig {
 /// everything that links it. If the config ever grows arrays or nesting, replace
 /// this with the `toml` crate in the binaries rather than growing it here.
 mod toml_lite {
-    use super::{LogFormat, UnihelmConfig};
+    use super::{LogFormat, PanelTls, UnihelmConfig};
     use std::path::PathBuf;
 
     pub fn parse(text: &str) -> Result<UnihelmConfig, String> {
@@ -199,6 +232,18 @@ mod toml_lite {
                 ("panel", "database") => cfg.panel.database = PathBuf::from(value),
                 ("panel", "state_dir") => cfg.panel.state_dir = PathBuf::from(value),
                 ("panel", "cli_socket") => cfg.panel.cli_socket = PathBuf::from(value),
+                ("panel", "tls") => {
+                    cfg.panel.tls = match value.as_str() {
+                        "self-signed" => PanelTls::SelfSigned,
+                        "off" => PanelTls::Off,
+                        other => {
+                            return Err(format!(
+                                "{}: tls must be self-signed or off, got `{other}`",
+                                at()
+                            ));
+                        }
+                    };
+                }
                 ("panel", "secure_cookies") => {
                     cfg.panel.secure_cookies = match value.as_str() {
                         "true" => true,
@@ -262,15 +307,55 @@ mod toml_lite {
 mod tests {
     use super::*;
 
+    /// A fresh panel is reachable, and reachable safely.
+    ///
+    /// This used to assert the opposite — that the default was loopback — and
+    /// that is what "safe" was taken to mean. It was the wrong invariant: it
+    /// made a fresh install invisible on the server it had just been installed
+    /// on, so the only ways to see the panel were an ssh tunnel or a domain,
+    /// and whether to attach a domain is the operator's decision, not a
+    /// precondition for looking at what you installed.
+    ///
+    /// The property that actually matters is the one below: off loopback, the
+    /// panel must be terminating TLS. A password typed into a public address
+    /// over plain HTTP is the thing to prevent — not the address itself.
     #[test]
-    fn defaults_are_safe() {
+    fn a_fresh_panel_is_reachable_and_encrypted() {
         let c = UnihelmConfig::default();
+        let addr: std::net::SocketAddr = c
+            .panel
+            .listen
+            .parse()
+            .expect("the default listen address parses");
+
         assert!(
-            c.panel.listen.starts_with("127.0.0.1"),
-            "a fresh panel must not be world-facing"
+            !addr.ip().is_loopback(),
+            "a fresh panel must be reachable on the server it was installed on"
         );
+        assert_eq!(
+            c.panel.tls,
+            PanelTls::SelfSigned,
+            "a panel off loopback must terminate TLS"
+        );
+        assert!(c.panel.secure_cookies);
         assert_eq!(c.agent.web_user, "unihelm");
         assert!(c.validate().is_ok());
+    }
+
+    /// The pairing above is the invariant, so state it directly: no default and
+    /// no shipped example may put the panel on a public address in the clear.
+    #[test]
+    fn the_shipped_example_never_serves_plain_http_off_loopback() {
+        let example = include_str!("../../../installer/config.toml.example");
+        let c = UnihelmConfig::from_toml(example).expect("the shipped example parses");
+        let addr: std::net::SocketAddr = c.panel.listen.parse().expect("its listen parses");
+        if !addr.ip().is_loopback() {
+            assert_eq!(
+                c.panel.tls,
+                PanelTls::SelfSigned,
+                "config.toml.example exposes the panel over plain HTTP"
+            );
+        }
     }
 
     #[test]
