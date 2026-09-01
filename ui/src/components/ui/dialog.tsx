@@ -1,8 +1,9 @@
 import { X } from "lucide-react";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { useFocusTrap } from "@/lib/focus";
 import { cn } from "@/lib/utils";
 
 /**
@@ -12,6 +13,10 @@ import { cn } from "@/lib/utils";
  * leave by finding the right button is a dialog people learn to dread. It
  * animates in and disappears instantly: entering deserves a beat of
  * orientation, leaving should feel like leaving.
+ *
+ * Focus moves into the panel on open, is trapped there while it is up, and
+ * returns to whatever opened it on close — `aria-modal="true"` claims the rest
+ * of the page does not exist, and that claim has to be true for a keyboard.
  */
 export function Dialog({
   open,
@@ -32,6 +37,8 @@ export function Dialog({
   wide?: boolean;
 }) {
   const { t } = useTranslation();
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(open, panelRef);
 
   useEffect(() => {
     if (!open) return;
@@ -46,15 +53,17 @@ export function Dialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex animate-fade-in items-start justify-center overflow-y-auto bg-black/40 p-4 pt-[8vh] backdrop-blur-[2px]"
+      className="fixed inset-0 z-50 flex animate-fade-in items-start justify-center overflow-y-auto bg-black/40 p-4 pt-[8vh] backdrop-blur-sm"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
       aria-label={title}
     >
       <div
+        ref={panelRef}
+        tabIndex={-1}
         className={cn(
-          "w-full animate-pop-in rounded-card border border-border bg-surface shadow-pop",
+          "w-full animate-pop-in rounded-card border border-border bg-surface shadow-pop outline-none",
           wide ? "max-w-2xl" : "max-w-lg",
         )}
         onClick={(event) => event.stopPropagation()}

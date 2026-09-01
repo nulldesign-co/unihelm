@@ -6,10 +6,12 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, endpoints, type Task, type TaskStatus } from "@/lib/api";
 import { useEventStream } from "@/lib/events";
+import { useFocusTrap } from "@/lib/focus";
 
 export const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
   queued: "neutral",
@@ -32,6 +34,8 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
   const { t } = useTranslation();
   const [selected, setSelected] = useState<string | null>(null);
   const [lagged, setLagged] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
+  useFocusTrap(open, panelRef);
 
   const tasks = useQuery({
     queryKey: ["tasks", {}],
@@ -61,13 +65,17 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
   return (
     <div className="fixed inset-0 z-40" role="dialog" aria-modal="true" aria-label={t("tasks.title")}>
       <button
-        className="absolute inset-0 animate-fade-in bg-black/40"
+        className="absolute inset-0 animate-fade-in bg-black/40 backdrop-blur-[2px]"
         onClick={onClose}
         aria-label={t("common.close")}
         tabIndex={-1}
       />
 
-      <aside className="fixed inset-y-0 end-0 flex w-96 max-w-[90vw] animate-slide-in-end flex-col border-s border-border bg-surface shadow-pop">
+      <aside
+        ref={panelRef}
+        tabIndex={-1}
+        className="fixed inset-y-0 end-0 flex w-96 max-w-[90vw] animate-slide-in-end flex-col border-s border-border bg-surface shadow-pop outline-none"
+      >
         <header className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <div className="flex items-center gap-2.5">
             <h2 className="text-sm font-semibold text-ink">{t("tasks.title")}</h2>
@@ -91,10 +99,22 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
           </div>
         </header>
 
+        {/* The same message the history page shows, on the same component: it
+            is a standing warning about this session, not an error, and it can
+            be put away once read. */}
         {lagged ? (
-          <p className="border-b border-border bg-warning-soft px-5 py-2 text-xs text-warning">
-            {t("tasks.reconnected")}
-          </p>
+          <div className="px-5 pt-3">
+            <Callout
+              tone="warning"
+              action={
+                <Button variant="ghost" size="sm" onClick={() => setLagged(false)}>
+                  {t("common.dismiss")}
+                </Button>
+              }
+            >
+              {t("tasks.reconnected")}
+            </Callout>
+          </div>
         ) : null}
 
         <div className="flex-1 overflow-y-auto">
@@ -158,7 +178,7 @@ export function TaskRow({
       <button
         onClick={onToggle}
         aria-expanded={expanded}
-        className="flex w-full items-center gap-3 px-5 py-3 text-start transition-colors hover:bg-surface-muted"
+        className="flex w-full items-center gap-3 px-5 py-3 text-start transition-colors duration-150 hover:bg-surface-muted/60"
       >
         <Badge tone={TONE[task.status]} dot={task.status === "running"}>
           {t(`tasks.status.${task.status}`)}
@@ -170,8 +190,21 @@ export function TaskRow({
       </button>
 
       {task.status === "running" && task.progress > 0 ? (
-        <div className="mx-5 mb-2 h-1 overflow-hidden rounded-full bg-surface-muted">
-          <div className="h-full bg-accent transition-[width]" style={{ inlineSize: `${task.progress}%` }} />
+        // A bare coloured bar says nothing to a screen reader, and "how far
+        // along is my restore" is exactly the question this drawer exists to
+        // answer. The role and the value carry it; the label names which task.
+        <div
+          role="progressbar"
+          aria-valuenow={Math.round(task.progress)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label={task.op}
+          className="mx-5 mb-2 h-1 overflow-hidden rounded-full bg-surface-muted"
+        >
+          <div
+            className="h-full origin-left bg-accent transition-transform duration-500 ease-out-quint"
+            style={{ transform: `scaleX(${Math.min(100, Math.max(0, task.progress)) / 100})` }}
+          />
         </div>
       ) : null}
 
@@ -235,14 +268,14 @@ export function TaskActions({ task }: { task: Task }) {
           variant="ghost"
           size="sm"
           onClick={() => cancel.mutate()}
-          disabled={cancel.isPending}
+          loading={cancel.isPending}
         >
           <XCircle className="h-3.5 w-3.5" aria-hidden />
           {t("tasks.cancel")}
         </Button>
       ) : null}
       {finished ? (
-        <Button variant="ghost" size="sm" onClick={() => retry.mutate()} disabled={retry.isPending}>
+        <Button variant="ghost" size="sm" onClick={() => retry.mutate()} loading={retry.isPending}>
           <RotateCcw className="h-3.5 w-3.5" aria-hidden />
           {t("tasks.retry")}
         </Button>

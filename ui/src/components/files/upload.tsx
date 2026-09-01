@@ -248,16 +248,18 @@ export function UploadPanel({
         ) : null}
       </header>
       <ul className="max-h-64 space-y-3 overflow-y-auto px-4 py-3">
+        {/* Rise in, but deliberately without `stagger`: this queue grows while
+            the reader watches, and an item appended at index 8 would sit
+            invisible for a third of a second before showing up. */}
         {items.map((item) => (
-          <li key={item.id}>
+          <li key={item.id} className="animate-rise-in">
             <div className="flex items-center gap-2">
               <span className="min-w-0 flex-1 truncate text-sm text-ink">{item.name}</span>
               {item.status === "uploading" ? <Spinner className="h-3.5 w-3.5" /> : null}
               {item.status === "error" || item.status === "cancelled" ? (
                 <Button
                   variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
+                  size="icon-sm"
                   onClick={() => onResume(item.id)}
                   aria-label={t("files.resume")}
                   title={t("files.resume")}
@@ -268,8 +270,7 @@ export function UploadPanel({
               {item.status === "queued" || item.status === "uploading" || item.status === "error" ? (
                 <Button
                   variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
+                  size="icon-sm"
                   onClick={() => onCancel(item.id)}
                   aria-label={t("common.cancel")}
                   title={t("common.cancel")}
@@ -288,7 +289,10 @@ export function UploadPanel({
             >
               <div
                 className={cn(
-                  "h-full rounded-full transition-all",
+                  // Width only, and briefly: a chunk lands every few hundred
+                  // milliseconds, so a longer tween would still be catching up
+                  // with the previous one when the next arrives.
+                  "h-full rounded-full transition-[width,background-color] duration-300 ease-standard",
                   item.status === "error"
                     ? "bg-danger"
                     : item.status === "done"
@@ -300,7 +304,7 @@ export function UploadPanel({
                 }}
               />
             </div>
-            <p className="mt-1 text-xs tabular-nums text-ink-muted">
+            <p className="tnum mt-1 text-xs text-ink-muted">
               {item.status === "error" ? (
                 <span className="text-danger">{item.error ?? t("files.uploadFailed")}</span>
               ) : item.status === "cancelled" ? (

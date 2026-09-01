@@ -1,18 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Copy, Mail, Send, ShieldAlert } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Check, ChevronRight, Copy, Mail, Send, ShieldAlert } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TaskNotice } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
   ApiError,
@@ -22,6 +22,8 @@ import {
   type MailTestReport,
   type TlsMode,
 } from "@/lib/api";
+import { staggerStyle } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 
 /**
  * Outbound mail (spec §11.18).
@@ -56,16 +58,14 @@ export function MailPage() {
     <div className="space-y-6">
       <PageHeader title={t("mail.title")} description={t("mail.subtitle")} />
 
-      <p className="rounded-lg bg-surface-muted px-3 py-2.5 text-sm text-ink-muted">
-        {t("mail.scopeNote")}
-      </p>
+      <Callout tone="info">{t("mail.scopeNote")}</Callout>
 
       {relay.isPending ? (
         <MailSkeleton />
       ) : relay.error ? (
-        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger">
           {relay.error instanceof ApiError ? relay.error.message : String(relay.error)}
-        </p>
+        </Callout>
       ) : (
         <>
           {relay.data && !relay.data.agent_installed ? (
@@ -80,11 +80,29 @@ export function MailPage() {
   );
 }
 
+/**
+ * A note that belongs to the field above it.
+ *
+ * The negative top margin absorbs the line `Field` reserves for a validation
+ * error, so a hint sits against its input instead of a row below it. Named once
+ * here rather than hand-tuned at every field, which is how the six copies of it
+ * drifted apart.
+ */
+function FieldNote({ id, children }: { id?: string; children: ReactNode }) {
+  return (
+    <p id={id} className="-mt-1 mb-3 text-xs text-ink-muted">
+      {children}
+    </p>
+  );
+}
+
 /** Ghosts shaped like the relay form and the DNS card, so nothing jumps. */
 function MailSkeleton() {
   return (
     <div role="status" aria-live="polite" className="space-y-6">
-      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+      {/* The shared Card, not a copy of its classes: a change to the card's
+          border or radius has to reach the loading state too. */}
+      <Card className="p-5">
         <Skeleton className="h-4 w-32" />
         <Skeleton className="mt-2 h-3.5 w-72 max-w-full" />
         <div className="mt-6 grid gap-4 sm:grid-cols-2">
@@ -94,14 +112,14 @@ function MailSkeleton() {
           <Skeleton className="h-9" />
         </div>
         <Skeleton className="mt-6 h-9 w-32" />
-      </div>
-      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
+      </Card>
+      <Card className="p-5">
         <Skeleton className="h-4 w-40" />
         <div className="mt-4 space-y-3">
           <Skeleton className="h-16" />
           <Skeleton className="h-16" />
         </div>
-      </div>
+      </Card>
     </div>
   );
 }
@@ -115,15 +133,9 @@ function MailSkeleton() {
 function AgentMissing({ agent }: { agent: string }) {
   const { t } = useTranslation();
   return (
-    <div role="alert" className="flex gap-3 rounded-lg bg-warning-soft px-3 py-2.5">
-      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
-      <div className="text-sm">
-        <p className="font-medium text-ink">{t("mail.agentMissing")}</p>
-        <p className="mt-0.5 text-ink-muted">
-          {t("mail.agentMissingHint", { agent })}
-        </p>
-      </div>
-    </div>
+    <Callout tone="warning" title={t("mail.agentMissing")}>
+      {t("mail.agentMissingHint", { agent })}
+    </Callout>
   );
 }
 
@@ -232,7 +244,7 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
               <Input
                 id="mail-port"
                 inputMode="numeric"
-                className="tabular-nums"
+                className="tnum"
                 value={port}
                 onChange={(e) => setPort(e.target.value)}
               />
@@ -252,9 +264,7 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
               ))}
             </Select>
           </Field>
-          <p className="-mt-1 mb-3 text-xs text-ink-muted">
-            {t(`mail.relay.tlsHint.${tlsMode}`)}
-          </p>
+          <FieldNote>{t(`mail.relay.tlsHint.${tlsMode}`)}</FieldNote>
 
           <div className="grid gap-x-4 sm:grid-cols-2">
             <Field label={t("mail.relay.username")} htmlFor="mail-user">
@@ -276,12 +286,12 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
               />
             </Field>
           </div>
-          <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("mail.relay.passwordHint")}</p>
+          <FieldNote>{t("mail.relay.passwordHint")}</FieldNote>
 
           {credentialWithoutTls ? (
-            <p role="alert" className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+            <Callout tone="danger" className="mb-3">
               {t("mail.relay.credentialNeedsTls")}
-            </p>
+            </Callout>
           ) : null}
 
           <div className="grid gap-x-4 sm:grid-cols-2">
@@ -303,7 +313,7 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
               />
             </Field>
           </div>
-          <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("mail.relay.fromHint")}</p>
+          <FieldNote>{t("mail.relay.fromHint")}</FieldNote>
 
           <Switch
             checked={enabled}
@@ -316,17 +326,18 @@ function RelayForm({ relay }: { relay: MailRelayResponse }) {
             <Button
               type="submit"
               variant="primary"
-              disabled={save.isPending || credentialWithoutTls}
+              loading={save.isPending}
+              disabled={credentialWithoutTls}
             >
-              {save.isPending ? <Spinner /> : <Mail className="h-4 w-4" aria-hidden />}
+              <Mail className="h-4 w-4" aria-hidden />
               {t("mail.relay.save")}
             </Button>
           </div>
 
           {error ? (
-            <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+            <Callout tone="danger" className="mt-3">
               {error}
-            </p>
+            </Callout>
           ) : null}
 
           {taskId ? (
@@ -381,27 +392,32 @@ function TestCard() {
             test.mutate();
           }}
         >
-          <div className="min-w-56 flex-1">
-            <Field label={t("mail.test.to")} htmlFor="mail-test-to">
-              <Input
-                id="mail-test-to"
-                autoComplete="off"
-                placeholder={t("mail.test.toPlaceholder")}
-                value={to}
-                onChange={(e) => setTo(e.target.value)}
-              />
-            </Field>
+          {/* A plain label rather than `Field`: nothing validates this input
+              inline, and Field's reserved error line is what used to force a
+              magic offset on the button to keep it level — an offset that
+              became an orphan gap the moment the row wrapped at 375px. */}
+          <div className="min-w-56 flex-1 space-y-1.5">
+            <label htmlFor="mail-test-to" className="block text-sm font-medium text-ink">
+              {t("mail.test.to")}
+            </label>
+            <Input
+              id="mail-test-to"
+              autoComplete="off"
+              placeholder={t("mail.test.toPlaceholder")}
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+            />
           </div>
-          <Button type="submit" variant="primary" className="mb-6" disabled={test.isPending}>
-            {test.isPending ? <Spinner /> : <Send className="h-4 w-4" aria-hidden />}
+          <Button type="submit" variant="primary" loading={test.isPending}>
+            <Send className="h-4 w-4" aria-hidden />
             {t("mail.test.send")}
           </Button>
         </form>
 
         {error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger" className="mt-4">
             {error}
-          </p>
+          </Callout>
         ) : null}
 
         {report ? <TestReport report={report} /> : null}
@@ -413,44 +429,47 @@ function TestCard() {
 function TestReport({ report }: { report: MailTestReport }) {
   const { t } = useTranslation();
   return (
-    <div
-      className={
-        report.delivered
-          ? "rounded-lg bg-success-soft px-3 py-2.5"
-          : "rounded-lg bg-danger-soft px-3 py-2.5"
-      }
+    // The Callout's icon and title carry the verdict, so the tint is
+    // reinforcement rather than the only signal.
+    <Callout
+      tone={report.delivered ? "success" : "danger"}
+      title={report.delivered ? t("mail.test.delivered") : t("mail.test.failed")}
+      className="mt-4"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <Badge tone={report.delivered ? "success" : "danger"} dot>
-          {report.delivered ? t("mail.test.delivered") : t("mail.test.failed")}
-        </Badge>
         {/* The stage is the headline on a failure: it is the difference
             between a wrong password and a wrong sender domain. */}
         <Badge tone="neutral">{t(`mail.stage.${report.stage}`)}</Badge>
-        <Badge tone={report.encrypted ? "success" : "warning"}>
+        <Badge tone={report.encrypted ? "success" : "warning"} dot>
           {report.encrypted ? t("mail.test.encrypted") : t("mail.test.plaintext")}
         </Badge>
       </div>
 
       {/* The relay's own words, verbatim: paraphrasing an SMTP reply throws
-          away the only precise thing in the response. */}
-      <p className="mt-2 font-mono text-xs break-words text-ink">
-        {report.detail}
-      </p>
-      <p className="mt-1.5 text-xs text-ink-muted">{t(`mail.stageHint.${report.stage}`)}</p>
+          away the only precise thing in the response. Tabular figures because
+          every one of those replies opens with a three-digit code. */}
+      <p className="tnum mt-2 font-mono text-xs break-words text-ink">{report.detail}</p>
+      <p className="mt-1.5 text-xs">{t(`mail.stageHint.${report.stage}`)}</p>
 
       {report.transcript.length > 0 ? (
-        <details className="mt-2">
-          <summary className="cursor-pointer text-xs font-medium text-ink-muted">
+        <details className="group mt-2">
+          <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-ink-muted [&::-webkit-details-marker]:hidden">
+            <ChevronRight
+              className="h-3 w-3 transition-transform duration-200 ease-standard group-open:rotate-90 motion-reduce:transition-none"
+              aria-hidden
+            />
             {t("mail.test.transcript")}
           </summary>
-          <div className="mt-1.5 max-h-56 overflow-y-auto rounded-lg bg-canvas p-2">
+          {/* The body animates as it is revealed: `details` has no height
+              transition, and 14rem of log arriving in one frame reads as a
+              jump rather than as an expansion. */}
+          <div className="mt-1.5 max-h-56 animate-slide-up overflow-y-auto rounded-lg bg-canvas p-2">
             {report.transcript.map((line, index) => (
               <div
                 // The transcript is an ordered log with repeated lines; the
                 // index is genuinely its identity here.
                 key={index}
-                className="font-mono text-xs break-all whitespace-pre-wrap text-ink-muted"
+                className="tnum font-mono text-xs break-all whitespace-pre-wrap text-ink-muted"
               >
                 {line}
               </div>
@@ -459,7 +478,7 @@ function TestReport({ report }: { report: MailTestReport }) {
           <p className="mt-1 text-xs text-ink-subtle">{t("mail.test.transcriptNote")}</p>
         </details>
       ) : null}
-    </div>
+    </Callout>
   );
 }
 
@@ -477,15 +496,17 @@ function DnsCard({ dns }: { dns: { records: MailDnsRecord[]; advice: string } })
         {dns.records.length === 0 ? (
           <EmptyState
             icon={<Mail aria-hidden />}
-            title={t("mail.dns.none")}
+            title={t("mail.dns.noneTitle")}
+            hint={t("mail.dns.none")}
             className="py-10"
           />
         ) : (
           <ul className="divide-y divide-border">
-            {dns.records.map((record) => (
+            {dns.records.map((record, index) => (
               <li
                 key={`${record.record_type}-${record.name}`}
-                className="py-4 first:pt-0 last:pb-0"
+                className="stagger animate-rise-in py-4 first:pt-0 last:pb-0"
+                style={staggerStyle(index)}
               >
                 <RecordRow record={record} />
               </li>
@@ -506,7 +527,7 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
     try {
       await navigator.clipboard.writeText(record.value);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      window.setTimeout(() => setCopied(false), 2000);
     } catch {
       // A denied clipboard permission is not worth an error banner; the value
       // is on screen and selectable.
@@ -516,26 +537,56 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
 
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-2">
+      {/* The two badges share a row of their own and the name gets the next
+          one. A long TXT name used to push the `ms-auto` badge onto a second
+          line at 375px, which read as two unrelated fragments. */}
+      <div className="flex items-center gap-2">
         <Badge tone="accent">{record.record_type}</Badge>
-        <span className="font-mono text-xs break-all text-ink">
-          {record.name}
-        </span>
         {/* Stated on every row, not once at the top: this is the difference
             between a panel that manages DNS and one that suggests records. */}
         <Badge tone="neutral" className="ms-auto">
           {t("mail.dns.notManaged")}
         </Badge>
       </div>
+      <p className="mt-1.5 font-mono text-xs break-all text-ink">{record.name}</p>
 
       {record.value ? (
         <div className="mt-2 flex items-start gap-2">
           <code className="flex-1 rounded-lg bg-surface-muted px-2 py-1.5 font-mono text-xs break-all text-ink">
             {record.value}
           </code>
-          <Button variant="ghost" size="sm" onClick={() => void copy()}>
-            <Copy className="h-3.5 w-3.5" aria-hidden />
-            {copied ? t("mail.dns.copied") : t("mail.dns.copy")}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void copy()}
+            aria-label={copied ? t("mail.dns.copied") : t("mail.dns.copy")}
+          >
+            {copied ? (
+              <Check className="h-3.5 w-3.5 text-success" aria-hidden />
+            ) : (
+              <Copy className="h-3.5 w-3.5" aria-hidden />
+            )}
+            {/* Both labels sit in one grid cell so the button keeps the wider
+                one's width: a button that grows on "Copied" shoves the value
+                the user just copied sideways. */}
+            <span aria-hidden className="grid">
+              <span
+                className={cn(
+                  "col-start-1 row-start-1 transition-opacity duration-150",
+                  copied && "opacity-0",
+                )}
+              >
+                {t("mail.dns.copy")}
+              </span>
+              <span
+                className={cn(
+                  "col-start-1 row-start-1 transition-opacity duration-150",
+                  !copied && "opacity-0",
+                )}
+              >
+                {t("mail.dns.copied")}
+              </span>
+            </span>
           </Button>
         </div>
       ) : (

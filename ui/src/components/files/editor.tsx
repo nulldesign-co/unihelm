@@ -1,10 +1,12 @@
-import { Save, X } from "lucide-react";
+import { FileWarning, Save, X } from "lucide-react";
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
+import { Callout } from "@/components/ui/callout";
+import { EmptyState } from "@/components/ui/empty-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError } from "@/lib/api";
 import {
   FileTooLargeError,
@@ -14,7 +16,8 @@ import {
   writeFileContent,
   type FileEntry,
 } from "@/lib/files-api";
-import { formatBytes } from "@/lib/utils";
+import { staggerStyle } from "@/lib/motion";
+import { cn, formatBytes } from "@/lib/utils";
 
 // The 350 KB initial-bundle budget (spec §3) is why this is a `lazy` import:
 // CodeMirror and its grammars load as a separate chunk the first time a file
@@ -130,7 +133,7 @@ export function FileEditorOverlay({
       role="dialog"
       aria-modal="true"
       aria-label={entry.name}
-      className="fixed inset-0 z-50 flex flex-col bg-canvas"
+      className="fixed inset-0 z-50 flex animate-fade-in flex-col bg-canvas"
     >
       <header className="flex items-center gap-3 border-b border-border bg-surface px-4 py-2.5">
         <p className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{entry.path}</p>
@@ -144,8 +147,8 @@ export function FileEditorOverlay({
           </Badge>
         ) : null}
         {phase.kind === "ready" ? (
-          <Button variant="primary" size="sm" onClick={save} disabled={saving || !dirty}>
-            {saving ? <Spinner /> : <Save className="h-3.5 w-3.5" aria-hidden />}
+          <Button variant="primary" size="sm" onClick={save} loading={saving} disabled={!dirty}>
+            <Save className="h-3.5 w-3.5" aria-hidden />
             {t("files.save")}
           </Button>
         ) : null}
@@ -154,31 +157,23 @@ export function FileEditorOverlay({
         </Button>
       </header>
 
-      {saveError ? (
-        <p role="alert" className="border-b border-border bg-danger-soft px-4 py-2 text-sm text-danger">
-          {saveError}
-        </p>
-      ) : null}
+      {saveError ? <Callout tone="danger" className="mx-4 mt-3">{saveError}</Callout> : null}
 
       <div className="min-h-0 flex-1">
         {phase.kind === "loading" ? (
-          <EditorNotice>
-            <Spinner className="h-5 w-5" />
-            <span>{t("files.editorLoading")}</span>
-          </EditorNotice>
+          <EditorSkeleton />
         ) : phase.kind === "refused" ? (
-          <EditorNotice>
-            <p className="max-w-md text-center">{phase.message}</p>
-          </EditorNotice>
+          <div className="grid h-full place-items-center p-6">
+            {/* The refusal is the whole message — it already says why and what
+                to do instead — so it is the title and there is no hint. */}
+            <EmptyState
+              className="max-w-lg bg-surface"
+              icon={<FileWarning aria-hidden />}
+              title={phase.message}
+            />
+          </div>
         ) : (
-          <Suspense
-            fallback={
-              <EditorNotice>
-                <Spinner className="h-5 w-5" />
-                <span>{t("files.editorLoading")}</span>
-              </EditorNotice>
-            }
-          >
+          <Suspense fallback={<EditorSkeleton />}>
             <CodeEditor
               initialValue={phase.text}
               filename={entry.name}
@@ -196,10 +191,41 @@ export function FileEditorOverlay({
   );
 }
 
-function EditorNotice({ children }: { children: React.ReactNode }) {
+/** Widths that read as code: uneven, with the odd blank line (an empty width). */
+const GHOST_LINES = [
+  "w-2/5", "w-3/5", "w-1/3", "w-4/5", "w-1/2", "", "w-2/3", "w-3/4",
+  "w-1/4", "w-1/2", "w-3/5", "", "w-2/5", "w-2/3", "w-1/3", "w-1/2",
+];
+
+/**
+ * The shape of a file, before the file.
+ *
+ * CodeMirror arrives as its own chunk, so this stands in twice — once while
+ * the content is fetched and once while the editor's grammars load. Ghost
+ * lines rather than a spinner: the gutter and the ragged right edge tell the
+ * reader what is coming, and nothing jumps when it does.
+ */
+function EditorSkeleton() {
+  const { t } = useTranslation();
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-ink-muted">
-      {children}
+    <div
+      role="status"
+      aria-live="polite"
+      aria-label={t("files.editorLoading")}
+      className="h-full overflow-hidden bg-surface p-4"
+    >
+      <div className="space-y-3">
+        {GHOST_LINES.map((width, index) => (
+          <div
+            key={index}
+            className="flex animate-rise-in items-center gap-4 stagger"
+            style={staggerStyle(index)}
+          >
+            <Skeleton className="h-3 w-5 shrink-0" />
+            {width === "" ? null : <Skeleton className={cn("h-3", width)} />}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

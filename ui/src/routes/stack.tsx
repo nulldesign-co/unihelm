@@ -1,15 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Download, Trash2 } from "lucide-react";
+import { Download, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardBody } from "@/components/ui/card";
+import { Callout } from "@/components/ui/callout";
 import { PageHeader } from "@/components/ui/page-header";
-import { ListSkeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
-import { Table, Td } from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import {
   ApiError,
   EOL_PHP_VERSIONS,
@@ -18,6 +17,7 @@ import {
   type ComponentState,
   type StackComponentView,
 } from "@/lib/api";
+import { staggerStyle } from "@/lib/motion";
 
 const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> = {
   installed: "success",
@@ -26,6 +26,18 @@ const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> 
   failed: "danger",
   absent: "neutral",
 };
+
+/** What the install and remove endpoints take. */
+type ComponentRequest = { component: "nginx" } | { component: "php"; version: string };
+
+const requestFor = (slug: string): ComponentRequest =>
+  slug === "nginx"
+    ? { component: "nginx" }
+    : { component: "php", version: slug.replace("php", "") };
+
+/** The inverse, so a pending mutation can say which row it belongs to. */
+const slugFor = (request: ComponentRequest | undefined): string | null =>
+  request === undefined ? null : request.component === "nginx" ? "nginx" : `php${request.version}`;
 
 /**
  * The Stack Manager (spec §11.1).
@@ -70,7 +82,14 @@ export function StackPage() {
     return (
       <div className="space-y-6">
         <PageHeader title={t("stack.title")} description={t("stack.subtitle")} />
-        <ListSkeleton rows={4} />
+        <section className="space-y-3">
+          <SectionHeading title={t("stack.webServer")} hint={t("stack.webServerHint")} />
+          <StackSkeleton rows={1} />
+        </section>
+        <section className="space-y-3">
+          <SectionHeading title={t("stack.php")} hint={t("stack.phpHint")} />
+          <StackSkeleton rows={PHP_VERSIONS.length} />
+        </section>
       </div>
     );
   }
@@ -80,48 +99,48 @@ export function StackPage() {
   const php = components.filter((c) => c.slug.startsWith("php"));
   const busy = install.isPending || remove.isPending;
 
-  const request = (slug: string) =>
-    slug === "nginx"
-      ? ({ component: "nginx" } as const)
-      : ({ component: "php", version: slug.replace("php", "") } as const);
+  // Only the row the operator clicked should spin. The rest are merely disabled,
+  // because the agent runs one package manager at a time.
+  const acting = install.isPending
+    ? slugFor(install.variables)
+    : remove.isPending
+      ? slugFor(remove.variables)
+      : null;
 
   return (
     <div className="space-y-6">
       <PageHeader title={t("stack.title")} description={t("stack.subtitle")} />
 
-      {error ? (
-        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {error}
-        </p>
-      ) : null}
+      {error ? <Callout tone="danger">{error}</Callout> : null}
 
-      <section className="space-y-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">{t("stack.webServer")}</h2>
-          <p className="mt-0.5 text-sm text-ink-muted">{t("stack.webServerHint")}</p>
-        </div>
-        <Table>
+      <section aria-labelledby="stack-web-server" className="space-y-3">
+        <SectionHeading
+          id="stack-web-server"
+          title={t("stack.webServer")}
+          hint={t("stack.webServerHint")}
+        />
+        <Table className="min-w-[560px]">
+          <ColumnHeadings />
           <tbody>
             {nginx ? (
               <ComponentRow
                 component={nginx}
                 busy={busy}
-                onInstall={() => install.mutate(request(nginx.slug))}
-                onRemove={() => remove.mutate(request(nginx.slug))}
+                pending={acting === nginx.slug}
+                onInstall={() => install.mutate(requestFor(nginx.slug))}
+                onRemove={() => remove.mutate(requestFor(nginx.slug))}
               />
             ) : null}
           </tbody>
         </Table>
       </section>
 
-      <section className="space-y-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">{t("stack.php")}</h2>
-          <p className="mt-0.5 text-sm text-ink-muted">{t("stack.phpHint")}</p>
-        </div>
-        <Table>
+      <section aria-labelledby="stack-php" className="space-y-3">
+        <SectionHeading id="stack-php" title={t("stack.php")} hint={t("stack.phpHint")} />
+        <Table className="min-w-[560px]">
+          <ColumnHeadings />
           <tbody>
-            {PHP_VERSIONS.map((version) => {
+            {PHP_VERSIONS.map((version, index) => {
               const component = php.find((c) => c.slug === `php${version}`);
               if (!component) return null;
               return (
@@ -130,8 +149,10 @@ export function StackPage() {
                   component={component}
                   eol={EOL_PHP_VERSIONS.has(version)}
                   busy={busy}
-                  onInstall={() => install.mutate(request(component.slug))}
-                  onRemove={() => remove.mutate(request(component.slug))}
+                  pending={acting === component.slug}
+                  index={index}
+                  onInstall={() => install.mutate(requestFor(component.slug))}
+                  onRemove={() => remove.mutate(requestFor(component.slug))}
                 />
               );
             })}
@@ -140,19 +161,77 @@ export function StackPage() {
       </section>
 
       {(stack.data?.unverified_pins.length ?? 0) > 0 ? (
-        <Card className="border-warning/30">
-          <CardBody className="flex gap-3 pt-5">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden />
-            <div>
-              <p className="text-sm font-medium text-ink">{t("stack.pinsTitle")}</p>
-              <p className="mt-0.5 text-sm text-ink-muted">{t("stack.pinsHint")}</p>
-              <p className="mt-1.5 font-mono text-xs text-ink-subtle">
-                {stack.data!.unverified_pins.join(", ")}
-              </p>
-            </div>
-          </CardBody>
-        </Card>
+        <Callout tone="warning" title={t("stack.pinsTitle")}>
+          <p>{t("stack.pinsHint")}</p>
+          <p className="mt-1.5 font-mono text-xs text-ink-subtle">
+            {stack.data!.unverified_pins.join(", ")}
+          </p>
+        </Callout>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * A section's label above its table.
+ *
+ * Deliberately not `CardHeader`: the table below brings its own card shell, and
+ * a header nested inside it would put the label behind the same border as the
+ * data it introduces.
+ */
+function SectionHeading({ id, title, hint }: { id?: string; title: string; hint: string }) {
+  return (
+    <div>
+      <h2 id={id} className="text-sm font-semibold text-ink">
+        {title}
+      </h2>
+      <p className="mt-0.5 text-sm text-ink-muted">{hint}</p>
+    </div>
+  );
+}
+
+/** Both tables carry the same four columns, so they name them the same way. */
+function ColumnHeadings() {
+  const { t } = useTranslation();
+  return (
+    <thead>
+      <tr>
+        <Th>{t("stack.component")}</Th>
+        <Th className="w-40">{t("stack.version")}</Th>
+        <Th className="w-40">{t("stack.status")}</Th>
+        <Th className="w-32">
+          <span className="sr-only">{t("stack.actions")}</span>
+        </Th>
+      </tr>
+    </thead>
+  );
+}
+
+/** Ghost rows in the real table shell, so nothing moves when the data lands. */
+function StackSkeleton({ rows }: { rows: number }) {
+  return (
+    <div role="status" aria-live="polite">
+      <Table className="min-w-[560px]">
+        <ColumnHeadings />
+        <tbody>
+          {Array.from({ length: rows }, (_, i) => (
+            <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
+              <Td>
+                <Skeleton className="h-4 w-40" />
+              </Td>
+              <Td>
+                <Skeleton className="h-3 w-16" />
+              </Td>
+              <Td>
+                <Skeleton className="h-5 w-24 rounded-full" />
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-8 w-24 rounded-lg" />
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
     </div>
   );
 }
@@ -161,25 +240,34 @@ function ComponentRow({
   component,
   eol,
   busy,
+  pending,
+  index,
   onInstall,
   onRemove,
 }: {
   component: StackComponentView;
   eol?: boolean;
   busy: boolean;
+  /** This row is the one whose mutation is in flight right now. */
+  pending: boolean;
+  index?: number;
   onInstall: () => void;
   onRemove: () => void;
 }) {
   const { t } = useTranslation();
   const inFlight = component.status === "installing" || component.status === "removing";
   const installed = component.status === "installed";
+  const working = inFlight || pending;
 
   // Our bookkeeping and systemd can disagree if somebody removed a package by
   // hand. Say so rather than quietly showing one of the two.
   const disagrees = installed && !component.unit_active;
 
   return (
-    <tr className="transition-colors hover:bg-surface-muted/60">
+    <Tr
+      className={index === undefined ? undefined : "animate-rise-in stagger"}
+      style={index === undefined ? undefined : staggerStyle(index)}
+    >
       <Td>
         <p className="text-sm font-medium text-ink">
           {component.display_name}
@@ -195,6 +283,15 @@ function ComponentRow({
         {disagrees ? (
           <p className="mt-0.5 text-xs text-warning">{t("stack.notRunning")}</p>
         ) : null}
+        {working ? (
+          // An install runs for minutes behind a 3s poll. A bar that keeps
+          // sweeping says the agent is still working on it; a disabled button
+          // on its own is indistinguishable from a page that has stopped.
+          <div
+            className="shimmer mt-2 h-0.5 w-40 max-w-full rounded-full bg-accent-soft"
+            aria-hidden
+          />
+        ) : null}
       </Td>
       <Td className="font-mono text-xs text-ink-subtle">
         {component.installed_version ? component.installed_version : t("common.none")}
@@ -206,7 +303,7 @@ function ComponentRow({
       </Td>
       <Td className="text-end whitespace-nowrap">
         {installed ? (
-          <Button variant="ghost" size="sm" disabled={busy || inFlight} onClick={onRemove}>
+          <Button variant="danger" size="sm" loading={working} disabled={busy} onClick={onRemove}>
             <Trash2 className="h-3.5 w-3.5" aria-hidden />
             {t("stack.remove")}
           </Button>
@@ -214,14 +311,15 @@ function ComponentRow({
           <Button
             variant={component.status === "failed" ? "outline" : "primary"}
             size="sm"
-            disabled={busy || inFlight}
+            loading={working}
+            disabled={busy}
             onClick={onInstall}
           >
-            {inFlight ? <Spinner /> : <Download className="h-3.5 w-3.5" aria-hidden />}
+            <Download className="h-3.5 w-3.5" aria-hidden />
             {component.status === "failed" ? t("common.retry") : t("stack.install")}
           </Button>
         )}
       </Td>
-    </tr>
+    </Tr>
   );
 }

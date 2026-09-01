@@ -3,10 +3,10 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Dialog } from "@/components/ui/dialog";
 import { Field, Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { ApiError } from "@/lib/api";
 import {
@@ -36,11 +36,9 @@ function errorText(e: unknown): string {
 
 function ErrorNote({ error }: { error: string | null }) {
   if (!error) return null;
-  return (
-    <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-      {error}
-    </p>
-  );
+  // Callout carries the alert role and the danger tone; this wrapper only
+  // exists to keep the spacing consistent across all seven dialogs.
+  return <Callout tone="danger" className="mt-3">{error}</Callout>;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +84,7 @@ export function MkdirDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={submit} disabled={create.isPending}>
-            {create.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={submit} loading={create.isPending}>
             {t("files.createFolder")}
           </Button>
         </>
@@ -160,8 +157,7 @@ export function RenameDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={submit} disabled={rename.isPending}>
-            {rename.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={submit} loading={rename.isPending}>
             {t("files.rename")}
           </Button>
         </>
@@ -237,8 +233,7 @@ export function CopyDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={() => copy.mutate()} disabled={copy.isPending}>
-            {copy.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={() => copy.mutate()} loading={copy.isPending}>
             {t("files.copy")}
           </Button>
         </>
@@ -299,14 +294,15 @@ export function DeleteDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-            {remove.isPending ? <Spinner /> : null}
+          <Button variant="danger" onClick={() => remove.mutate()} loading={remove.isPending}>
             {t("files.deleteConfirm")}
           </Button>
         </>
       }
     >
-      <ul className="max-h-40 space-y-1 overflow-y-auto font-mono text-xs text-ink-muted">
+      {/* The exact paths, boxed: this is the last screen before they move, and
+          a bare list of grey text is easy to skim past. */}
+      <ul className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-border bg-surface-muted px-3 py-2 font-mono text-xs text-ink-muted">
         {entries.map((entry) => (
           <li key={entry.path} className="truncate">
             {entry.path}
@@ -367,9 +363,8 @@ export function ChmodDialog({
           <Button
             variant="primary"
             onClick={() => (mode === null ? setError(t("files.octalInvalid")) : chmod.mutate())}
-            disabled={chmod.isPending}
+            loading={chmod.isPending}
           >
-            {chmod.isPending ? <Spinner /> : null}
             {t("files.chmodApply")}
           </Button>
         </>
@@ -408,7 +403,7 @@ export function ChmodDialog({
         <Field label={t("files.octal")} htmlFor="chmod-octal" error={mode === null ? t("files.octalInvalid") : undefined}>
           <Input
             id="chmod-octal"
-            className="w-28 font-mono"
+            className="tnum w-28 font-mono"
             value={octal}
             aria-invalid={mode === null}
             onChange={(event) => setOctal(event.target.value.trim())}
@@ -482,8 +477,7 @@ export function CompressDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={submit} disabled={compress.isPending}>
-            {compress.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={submit} loading={compress.isPending}>
             {t("files.compress")}
           </Button>
         </>
@@ -517,7 +511,9 @@ export function CompressDialog({
           </Field>
         </div>
       </div>
-      <p className="font-mono text-xs text-ink-subtle">
+      {/* Where the archive will land, spelled out, so the name field and the
+          format select read as one decision. */}
+      <p className="truncate rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-subtle">
         {joinPath(dir, `${name.trim() || "…"}.${ext}`)}
       </p>
       <ErrorNote error={error} />
@@ -565,8 +561,7 @@ export function ExtractDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={() => extract.mutate()} disabled={extract.isPending}>
-            {extract.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={() => extract.mutate()} loading={extract.isPending}>
             {t("files.extract")}
           </Button>
         </>
@@ -624,9 +619,8 @@ export function PurgeDialog({
           <Button
             variant="danger"
             onClick={() => (parsed === null ? setError(t("files.daysInvalid")) : purge.mutate())}
-            disabled={purge.isPending}
+            loading={purge.isPending}
           >
-            {purge.isPending ? <Spinner /> : null}
             {t("files.purgeConfirm")}
           </Button>
         </>
@@ -640,7 +634,7 @@ export function PurgeDialog({
         <Input
           id="purge-days"
           inputMode="numeric"
-          className="w-28"
+          className="tnum w-28"
           value={days}
           aria-invalid={parsed === null}
           onChange={(event) => setDays(event.target.value)}

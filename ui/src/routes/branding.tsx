@@ -5,9 +5,11 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/input";
-import { Spinner } from "@/components/ui/spinner";
+import { PageHeader } from "@/components/ui/page-header";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
   endpoints,
@@ -17,6 +19,8 @@ import {
   type BrandingSettings,
 } from "@/lib/api";
 import { assetUrl, useBranding } from "@/lib/branding";
+import { staggerStyle } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 
 /**
  * White-label branding (spec §11.19).
@@ -48,21 +52,14 @@ export function BrandingPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-ink">{t("branding.title")}</h1>
-        <p className="mt-1 text-sm text-ink-muted">{t("branding.subtitle")}</p>
-      </header>
+      <PageHeader title={t("branding.title")} description={t("branding.subtitle")} />
 
       {settings.isPending ? (
-        <div className="flex justify-center py-24 text-ink-muted">
-          <Spinner className="h-6 w-6" />
-        </div>
+        <BrandingSkeleton />
       ) : settings.error ? (
-        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-          {settings.error instanceof ApiError
-            ? settings.error.message
-            : String(settings.error)}
-        </p>
+        <Callout tone="danger" title={t("error.title")}>
+          {settings.error instanceof ApiError ? settings.error.message : String(settings.error)}
+        </Callout>
       ) : (
         <BrandingForm settings={settings.data!} />
       )}
@@ -71,6 +68,65 @@ export function BrandingPage() {
 }
 
 const ASSET_KINDS: BrandingAssetKind[] = ["logo", "favicon", "login_background"];
+
+/**
+ * The swatch a never-branded panel opens on.
+ *
+ * `<input type="color">` only speaks `#rrggbb`, and `--color-accent` is an
+ * oklch token it would refuse, so this one literal cannot be a token. It is a
+ * last resort: the picker prefers the colour actually being inherited, which is
+ * the same value the text field shows as its placeholder — the two used to
+ * disagree, and the swatch was always blue however the panel was branded.
+ */
+const FALLBACK_SWATCH = "#3b82f6";
+const isHex = (value: string) => /^#[0-9a-fA-F]{6}$/.test(value);
+
+/**
+ * The two cards' own shape while the settings load.
+ *
+ * A centred spinner here left the route blank for the whole fetch and then
+ * dropped both cards in at once — the largest layout shift in the panel. The
+ * ghost fields are the same heights as the real ones, so nothing moves when
+ * the answer arrives.
+ */
+function BrandingSkeleton() {
+  return (
+    <div role="status" aria-live="polite" className="space-y-6">
+      <Card>
+        <CardBody className="space-y-5 pt-5">
+          <Skeleton className="h-4 w-24" />
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="animate-rise-in space-y-2 stagger" style={staggerStyle(i)}>
+              <Skeleton className="h-3.5 w-32" />
+              <Skeleton className="h-9 w-full rounded-lg" />
+            </div>
+          ))}
+          <Skeleton className="h-9 w-36 rounded-lg" />
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardBody className="space-y-4 pt-5">
+          <Skeleton className="h-4 w-20" />
+          {ASSET_KINDS.map((kind, i) => (
+            <div
+              key={kind}
+              className="flex animate-rise-in items-center gap-3 rounded-lg border border-border p-3 stagger"
+              style={staggerStyle(i)}
+            >
+              <Skeleton className="h-12 w-12 rounded-lg" />
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <Skeleton className="h-3.5 w-28" />
+                <Skeleton className="h-3 w-20" />
+              </div>
+              <Skeleton className="h-8 w-28 rounded-lg" />
+            </div>
+          ))}
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
 
 function BrandingForm({ settings }: { settings: BrandingSettings }) {
   const { t } = useTranslation();
@@ -138,6 +194,12 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
   });
 
   const inherited = settings.resolved;
+  // What an empty colour field means here: the value this panel would fall back
+  // to. Both the placeholder and the picker read it, so they agree.
+  const inheritedColour =
+    inherited.primary_color && isHex(inherited.primary_color)
+      ? inherited.primary_color
+      : FALLBACK_SWATCH;
 
   return (
     <>
@@ -179,16 +241,17 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
                   id="branding-colour"
                   dir="ltr"
                   value={colour}
-                  placeholder={inherited.primary_color ?? "#3b82f6"}
+                  placeholder={inheritedColour}
                   onChange={(e) => setColour(e.target.value)}
                 />
                 {/* A native colour picker that only ever writes `#rrggbb`,
-                    which is exactly the grammar the server accepts. */}
+                    which is exactly the grammar the server accepts. `h-9` so it
+                    sits on the same baseline as the Input beside it. */}
                 <input
                   type="color"
                   aria-label={t("branding.primaryColorPicker")}
-                  className="h-10 w-12 shrink-0 cursor-pointer rounded-lg border border-border-strong bg-surface"
-                  value={/^#[0-9a-fA-F]{6}$/.test(colour) ? colour : "#3b82f6"}
+                  className="h-9 w-12 shrink-0 cursor-pointer rounded-lg border border-border-strong bg-surface"
+                  value={isHex(colour) ? colour : inheritedColour}
                   onChange={(e) => setColour(e.target.value)}
                 />
               </div>
@@ -207,12 +270,15 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
             <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("branding.loginHostHint")}</p>
 
             <div className="flex flex-wrap items-center gap-3">
-              <Button type="submit" variant="primary" disabled={save.isPending}>
-                {save.isPending ? <Spinner /> : <Palette className="h-4 w-4" aria-hidden />}
+              <Button type="submit" variant="primary" loading={save.isPending}>
+                <Palette className="h-4 w-4" aria-hidden />
                 {t("branding.save")}
               </Button>
+              {/* The page's only success feedback, and it self-clears after two
+                  seconds — it arrives with the pop the operator's click earned
+                  rather than simply appearing. */}
               {saved ? (
-                <Badge tone="success" dot>
+                <Badge tone="success" dot className="animate-pop-in">
                   {t("branding.saved")}
                 </Badge>
               ) : null}
@@ -220,12 +286,9 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
             </div>
 
             {error ? (
-              <p
-                role="alert"
-                className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger"
-              >
+              <Callout tone="danger" className="mt-3">
                 {error}
-              </p>
+              </Callout>
             ) : null}
           </form>
         </CardBody>
@@ -234,13 +297,12 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
       <Card>
         <CardHeader title={t("branding.images.title")} description={t("branding.images.hint")} />
         <CardBody className="space-y-4">
-          <p className="rounded-lg bg-surface-muted px-3 py-2.5 text-xs text-ink-muted">
-            {t("branding.svgNote")}
-          </p>
-          {ASSET_KINDS.map((kind) => (
+          <Callout tone="info">{t("branding.svgNote")}</Callout>
+          {ASSET_KINDS.map((kind, index) => (
             <AssetRow
               key={kind}
               kind={kind}
+              index={index}
               settings={settings}
               pending={pending[kind]}
               onChange={(change) => setPending((current) => ({ ...current, [kind]: change }))}
@@ -255,11 +317,14 @@ function BrandingForm({ settings }: { settings: BrandingSettings }) {
 
 function AssetRow({
   kind,
+  index,
   settings,
   pending,
   onChange,
 }: {
   kind: BrandingAssetKind;
+  /** Position in the list, for the staggered entrance. */
+  index: number;
   settings: BrandingSettings;
   pending: BrandingAssetChange | undefined;
   onChange: (change: BrandingAssetChange) => void;
@@ -268,6 +333,9 @@ function AssetRow({
   const branding = useBranding();
   const input = useRef<HTMLInputElement>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  // Reading a two-megabyte file is usually instant and occasionally is not.
+  // The button says so rather than looking like a click that did nothing.
+  const [reading, setReading] = useState(false);
 
   const limit = settings.limits.find((l) => l.kind === kind)?.max_bytes ?? 0;
   const stored = settings.resolved.assets.find((a) => a.kind === kind);
@@ -288,13 +356,31 @@ function AssetRow({
       setProblem(t("branding.images.tooLarge", { limit: Math.round(limit / 1024) }));
       return;
     }
-    const content = await readBase64(file);
-    onChange({ action: "set", content_b64: content });
+    setReading(true);
+    try {
+      const content = await readBase64(file);
+      onChange({ action: "set", content_b64: content });
+    } finally {
+      setReading(false);
+    }
   };
 
   return (
-    <div className="rounded-lg border border-border p-3">
-      <div className="flex flex-wrap items-center gap-3">
+    <div
+      className={cn(
+        "animate-rise-in rounded-lg border p-3 transition-colors duration-200 stagger",
+        // A staged change is a promise the operator still has to keep, so the
+        // whole row carries it — a badge alone left an edited row looking
+        // exactly like a saved one, with the Save button a card away.
+        pending?.action === "set"
+          ? "border-accent/40 bg-accent-soft/40"
+          : pending?.action === "clear"
+            ? "border-warning/40 bg-warning-soft/40"
+            : "border-border",
+      )}
+      style={staggerStyle(index)}
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-lg bg-surface-muted">
           {preview ? (
             // `alt=""` and aria-hidden: the label beside it already names the
@@ -305,35 +391,48 @@ function AssetRow({
           )}
         </div>
 
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 basis-32">
           <p className="text-sm font-medium text-ink">{t(`branding.images.${kind}`)}</p>
-          <p className="text-xs text-ink-muted">
+          <p className="tnum text-xs text-ink-muted">
             {t("branding.images.limit", { limit: Math.round(limit / 1024) })}
           </p>
         </div>
 
-        {inherited ? <Badge tone="neutral">{t("branding.images.inherited")}</Badge> : null}
-        {pending?.action === "set" ? (
-          <Badge tone="accent">{t("branding.images.stagedUpload")}</Badge>
-        ) : null}
-        {pending?.action === "clear" ? (
-          <Badge tone="warning">{t("branding.images.stagedClear")}</Badge>
-        ) : null}
+        {/* Badges and buttons travel together so a 375px viewport wraps them as
+            one block instead of scattering them over three unpredictable lines. */}
+        <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+          {inherited ? <Badge tone="neutral">{t("branding.images.inherited")}</Badge> : null}
+          {pending?.action === "set" ? (
+            <Badge tone="accent" dot>
+              {t("branding.images.stagedUpload")}
+            </Badge>
+          ) : null}
+          {pending?.action === "clear" ? (
+            <Badge tone="warning" dot>
+              {t("branding.images.stagedClear")}
+            </Badge>
+          ) : null}
 
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="sm" onClick={() => input.current?.click()}>
-            <Upload className="h-3.5 w-3.5" aria-hidden />
-            {t("branding.images.upload")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={stored === undefined || inherited}
-            onClick={() => onChange({ action: "clear" })}
-          >
-            <Trash2 className="h-3.5 w-3.5" aria-hidden />
-            {t("branding.images.clear")}
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              loading={reading}
+              onClick={() => input.current?.click()}
+            >
+              <Upload className="h-3.5 w-3.5" aria-hidden />
+              {t("branding.images.upload")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={stored === undefined || inherited}
+              onClick={() => onChange({ action: "clear" })}
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden />
+              {t("branding.images.clear")}
+            </Button>
+          </div>
         </div>
       </div>
 

@@ -20,7 +20,9 @@ export function Breadcrumbs({
 
   return (
     <nav aria-label={t("files.title")} className="min-w-0">
-      <ol className="inline-flex max-w-full flex-wrap items-center gap-0.5 rounded-lg border border-border bg-surface px-1.5 py-1 text-sm shadow-card">
+      {/* `min-h-9` so the path bar lines up with the search field and the two
+          buttons beside it; it still grows when a deep path wraps. */}
+      <ol className="inline-flex min-h-9 max-w-full flex-wrap items-center gap-0.5 rounded-lg border border-border bg-surface px-1.5 py-1 text-sm shadow-card">
         <li>
           <button
             type="button"

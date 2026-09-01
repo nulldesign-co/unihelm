@@ -1,19 +1,19 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Globe, KeyRound, Network, Search, ShieldCheck } from "lucide-react";
+import { Check, Globe, KeyRound, Network, Search, ShieldCheck, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TaskNotice } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
-import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
+import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { Table, Td, Th } from "@/components/ui/table";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import {
   ApiError,
   endpoints,
@@ -22,6 +22,7 @@ import {
   type DnsProviderResponse,
   type SiteView,
 } from "@/lib/api";
+import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
 
 /**
@@ -94,39 +95,54 @@ function DomainChecker() {
             else setAsked(value);
           }}
         >
-          <div className="min-w-56 flex-1">
-            <Field label={t("dns.check.domain")} htmlFor="dns-domain">
-              <Input
-                id="dns-domain"
-                placeholder="example.com"
-                autoComplete="off"
-                spellCheck={false}
-                value={domain}
-                onChange={(event) => setDomain(event.target.value)}
-              />
-            </Field>
+          {/* A plain label rather than `Field`: this input never shows an
+              inline error — the failure is the banner below — and Field's
+              reserved error line is what used to force a magic offset on the
+              button to keep it level, one that left an orphan gap the moment
+              the row wrapped at 375px. */}
+          <div className="min-w-56 flex-1 space-y-1.5">
+            <label htmlFor="dns-domain" className="block text-sm font-medium text-ink">
+              {t("dns.check.domain")}
+            </label>
+            <Input
+              id="dns-domain"
+              placeholder="example.com"
+              autoComplete="off"
+              spellCheck={false}
+              value={domain}
+              onChange={(event) => setDomain(event.target.value)}
+            />
           </div>
-          <Button type="submit" variant="primary" className="mb-6" disabled={check.isFetching}>
-            {check.isFetching ? <Spinner /> : <Search className="h-4 w-4" aria-hidden />}
+          <Button type="submit" variant="primary" loading={check.isFetching}>
+            <Search className="h-4 w-4" aria-hidden />
             {t("dns.check.run")}
           </Button>
         </form>
 
-        {check.error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {check.error instanceof ApiError ? check.error.message : String(check.error)}
-          </p>
-        ) : check.data ? (
-          <CheckResult result={check.data} />
-        ) : check.isFetching ? (
-          <div role="status" aria-live="polite" className="space-y-3">
-            <Skeleton className="h-6 w-48 rounded-full" />
-            <Skeleton className="h-9 w-full" />
-            <Skeleton className="h-24 w-full" />
-          </div>
-        ) : (
-          <p className="text-sm text-ink-muted">{t("dns.check.idle")}</p>
-        )}
+        <div className="mt-4">
+          {check.error ? (
+            <Callout tone="danger">
+              {check.error instanceof ApiError ? check.error.message : String(check.error)}
+            </Callout>
+          ) : check.data ? (
+            <CheckResult result={check.data} />
+          ) : check.isFetching ? (
+            // Shaped like the verdict, the table and the address pills below it,
+            // so nothing on the page moves when the answer lands.
+            <div role="status" aria-live="polite" className="space-y-4">
+              <Skeleton className="h-20 w-full rounded-card" />
+              <Skeleton className="h-28 w-full rounded-card" />
+              <Skeleton className="h-6 w-64 rounded-full" />
+            </div>
+          ) : (
+            <EmptyState
+              icon={<Search aria-hidden />}
+              title={t("dns.check.idle")}
+              hint={t("dns.check.idleHint")}
+              className="py-10"
+            />
+          )}
+        </div>
       </CardBody>
     </Card>
   );
@@ -142,28 +158,35 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
   const verdict = result.matches_server
     ? { tone: "success" as const, label: t("dns.check.matches") }
     : result.proxied_hint
-      ? { tone: "accent" as const, label: t("dns.check.proxied") }
+      ? { tone: "info" as const, label: t("dns.check.proxied") }
       : { tone: "warning" as const, label: t("dns.check.noMatch") };
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge tone={verdict.tone} dot>
-          {verdict.label}
-        </Badge>
-        <span className="font-mono text-xs text-ink">{result.domain}</span>
-      </div>
+      {/* The verdict and the advisory sentence are one message, so they are one
+          Callout — and its entrance is what keeps the card from growing 200px
+          under the reader without warning. The sentence is the server's,
+          deliberately: the decision table behind it (proxied, partial, timed
+          out) lives in `unihelm_ops::dns` and a second copy here would be a
+          second copy to keep in step. */}
+      <Callout
+        tone={verdict.tone}
+        title={
+          <span className="flex flex-wrap items-baseline gap-x-2">
+            {verdict.label}
+            <span className="font-mono text-xs font-normal text-ink-muted">
+              {result.domain}
+            </span>
+          </span>
+        }
+      >
+        <p>{result.advice}</p>
+        {result.proxied_hint ? (
+          <p className="mt-1.5 text-xs">{t("dns.check.proxiedHint")}</p>
+        ) : null}
+      </Callout>
 
-      {/* The advisory sentence is the server's, deliberately: the decision table
-          behind it (proxied, partial, timed out) lives in `unihelm_ops::dns` and
-          a second copy here would be a second copy to keep in step. */}
-      <p className="rounded-lg bg-surface-muted px-3 py-2 text-sm text-ink">{result.advice}</p>
-
-      {result.proxied_hint ? (
-        <p className="text-xs text-ink-muted">{t("dns.check.proxiedHint")}</p>
-      ) : null}
-
-      <Table className="min-w-lg" containerClassName="shadow-none">
+      <Table className="min-w-[560px]" containerClassName="shadow-none">
         <thead>
           <tr>
             <Th>{t("dns.check.name")}</Th>
@@ -172,8 +195,13 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
           </tr>
         </thead>
         <tbody>
-          {result.records.map((record) => (
-            <RecordRow key={record.name} record={record} serverAddresses={result.server_addresses} />
+          {result.records.map((record, index) => (
+            <RecordRow
+              key={record.name}
+              index={index}
+              record={record}
+              serverAddresses={result.server_addresses}
+            />
           ))}
         </tbody>
       </Table>
@@ -187,7 +215,7 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
             result.server_addresses.map((address) => (
               <li key={address}>
                 <Badge tone="neutral">
-                  <span className="font-mono">{address}</span>
+                  <span className="tnum font-mono">{address}</span>
                 </Badge>
               </li>
             ))
@@ -201,9 +229,11 @@ function CheckResult({ result }: { result: DnsCheckResponse }) {
 function RecordRow({
   record,
   serverAddresses,
+  index,
 }: {
   record: DnsNameRecords;
   serverAddresses: string[];
+  index: number;
 }) {
   const { t } = useTranslation();
   const here = new Set(serverAddresses);
@@ -213,20 +243,28 @@ function RecordRow({
       <span className="text-ink-subtle">{t("common.none")}</span>
     ) : (
       <ul className="flex flex-wrap gap-1">
-        {values.map((value) => (
-          <li key={value}>
-            {/* Marking the addresses that are this server's is the whole
-                comparison; a bare list makes the reader do it by eye. */}
-            <Badge tone={here.has(value) ? "success" : "neutral"}>
-              <span className="font-mono">{value}</span>
-            </Badge>
-          </li>
-        ))}
+        {values.map((value) => {
+          const mine = here.has(value);
+          return (
+            <li key={value}>
+              {/* Marking the addresses that are this server's is the whole
+                  comparison; a bare list makes the reader do it by eye. The
+                  tick — not the green — is what carries it: this is the one
+                  judgement the card exists to make, and colour alone would
+                  hide it from anyone who cannot see the difference. */}
+              <Badge tone={mine ? "success" : "neutral"}>
+                {mine ? <Check className="h-3 w-3" aria-hidden /> : null}
+                <span className="tnum font-mono">{value}</span>
+                {mine ? <span className="sr-only">{t("dns.check.thisServer")}</span> : null}
+              </Badge>
+            </li>
+          );
+        })}
       </ul>
     );
 
   return (
-    <tr className="transition-colors hover:bg-surface-muted/60">
+    <Tr className="stagger animate-rise-in" style={staggerStyle(index)}>
       <Td className="align-top font-mono text-xs">{record.name}</Td>
       <Td className="align-top">{cell(record.a)}</Td>
       <Td className="align-top">
@@ -238,7 +276,7 @@ function RecordRow({
           cell(record.aaaa)
         )}
       </Td>
-    </tr>
+    </Tr>
   );
 }
 
@@ -322,26 +360,35 @@ function ProviderCard() {
           <Button
             type="submit"
             variant="primary"
-            disabled={save.isPending || label.trim() === "" || token.trim() === ""}
+            loading={save.isPending}
+            disabled={label.trim() === "" || token.trim() === ""}
           >
-            {save.isPending ? <Spinner /> : <KeyRound className="h-4 w-4" aria-hidden />}
+            <KeyRound className="h-4 w-4" aria-hidden />
             {t("dns.provider.save")}
           </Button>
         </form>
 
-        {error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
-        ) : null}
+        {error ? <Callout tone="danger">{error}</Callout> : null}
 
         {saved ? (
-          <div className="rounded-lg bg-success-soft px-3 py-2.5">
-            <p className="text-sm font-medium text-success">
-              {t("dns.provider.saved", { label: saved.label, status: saved.token_status })}
-            </p>
-            <p className="mt-1.5 text-xs text-ink-muted">{t("dns.provider.zonesHint")}</p>
-            <ul className="mt-1 flex flex-wrap gap-1.5">
+          // Dismissible, because the alternative is a success from twenty
+          // minutes ago sitting above the form for the rest of the session.
+          <Callout
+            tone="success"
+            title={t("dns.provider.saved", { label: saved.label, status: saved.token_status })}
+            action={
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={t("common.dismiss")}
+                onClick={() => setSaved(null)}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            }
+          >
+            <p className="text-xs">{t("dns.provider.zonesHint")}</p>
+            <ul className="mt-1.5 flex flex-wrap gap-1.5">
               {saved.zones.map((zone) => (
                 <li key={zone}>
                   <Badge tone="neutral">
@@ -350,7 +397,7 @@ function ProviderCard() {
                 </li>
               ))}
             </ul>
-          </div>
+          </Callout>
         ) : null}
       </CardBody>
     </Card>
@@ -385,24 +432,23 @@ function WildcardCard() {
         />
 
         {sites.isPending ? (
-          <div role="status" aria-live="polite" className="divide-y divide-border">
-            {Array.from({ length: 3 }, (_, i) => (
-              <div key={i} className="flex items-center gap-3 py-3">
-                <Skeleton className="h-4 w-4 rounded" />
-                <div className="min-w-0 flex-1 space-y-1.5">
-                  <Skeleton className="h-3.5 w-1/3" />
-                  <Skeleton className="h-3 w-1/4" />
-                </div>
-                <Skeleton className="h-8 w-36 rounded-lg" />
-              </div>
-            ))}
-          </div>
+          // The shared list ghost, stripped of its own card shell because it is
+          // already standing inside one.
+          <ListSkeleton rows={3} className="border-0 bg-transparent p-0 shadow-none" />
         ) : (sites.data?.sites.length ?? 0) === 0 ? (
-          <EmptyState icon={<Network aria-hidden />} title={t("dns.wildcard.noSites")} />
+          <EmptyState
+            icon={<Network aria-hidden />}
+            title={t("dns.wildcard.noSites")}
+            hint={t("dns.wildcard.noSitesHint")}
+          />
         ) : (
           <ul className="divide-y divide-border">
-            {sites.data!.sites.map((site) => (
-              <li key={site.id}>
+            {sites.data!.sites.map((site, index) => (
+              <li
+                key={site.id}
+                className="stagger animate-rise-in transition-colors duration-150 hover:bg-surface-muted/60"
+                style={staggerStyle(index)}
+              >
                 <WildcardRow site={site} staging={staging} />
               </li>
             ))}
@@ -441,17 +487,17 @@ function WildcardRow({ site, staging }: { site: SiteView; staging: boolean }) {
           variant="outline"
           size="sm"
           onClick={() => issue.mutate()}
-          disabled={issue.isPending || site.status !== "active"}
+          loading={issue.isPending}
+          disabled={site.status !== "active"}
         >
-          {issue.isPending ? <Spinner /> : null}
           {t("dns.wildcard.issue")}
         </Button>
       </div>
 
       {error ? (
-        <p role="alert" className="mt-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger" className="mt-2">
           {error}
-        </p>
+        </Callout>
       ) : null}
       {taskId ? <TaskNotice key={taskId} taskId={taskId} /> : null}
     </div>

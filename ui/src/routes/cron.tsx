@@ -1,22 +1,25 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Clock, Pencil, Plus, Trash2 } from "lucide-react";
+import { Clock, Pencil, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ScheduleField, ScheduleText, useScheduleProblem } from "@/components/schedule-field";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
-import { ListSkeleton } from "@/components/ui/skeleton";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
-import { Table, Td, Th } from "@/components/ui/table";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError, endpoints, type CronJob, type CronSetRequest } from "@/lib/api";
 import { checkCommand } from "@/lib/cron-schedule";
+import { staggerStyle } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 
 /**
  * Cron jobs (spec §11.8).
@@ -35,6 +38,10 @@ import { checkCommand } from "@/lib/cron-schedule";
  *    trip to learn they typed four fields — and a *valid* expression can still
  *    be the wrong one, which only the plain-language preview catches.
  */
+
+/** The width of the table: the detail row and the footer both span it. */
+const COLUMNS = 4;
+
 export function CronPage() {
   const { t } = useTranslation();
   const [editing, setEditing] = useState<CronJob | "new" | null>(null);
@@ -56,11 +63,11 @@ export function CronPage() {
       />
 
       {cron.isPending ? (
-        <ListSkeleton />
+        <JobsSkeleton />
       ) : cron.error ? (
-        <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger">
           {cron.error instanceof ApiError ? cron.error.message : String(cron.error)}
-        </p>
+        </Callout>
       ) : jobs.length === 0 ? (
         <EmptyState
           icon={<Clock aria-hidden />}
@@ -74,29 +81,32 @@ export function CronPage() {
           }
         />
       ) : (
-        <>
-          <Table>
-            <thead>
-              <tr>
-                <Th>{t("cron.schedule")}</Th>
-                <Th>{t("cron.command")}</Th>
-                <Th>{t("backups.status")}</Th>
-                <Th className="text-end">{t("files.actions")}</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {jobs.map((job) => (
-                <JobRow key={job.id} job={job} onEdit={() => setEditing(job)} />
-              ))}
-            </tbody>
-          </Table>
-          <p className="text-xs text-ink-subtle tabular-nums">
-            {t("cron.limit", {
-              used: jobs.length,
-              max: cron.data?.max_jobs_per_subscription ?? 0,
-            })}
-          </p>
-        </>
+        /* Five things per row — an expression, a sentence, a command, a badge,
+           a toggle — need more than a phone's width, so the card scrolls
+           sideways rather than compressing them into an unreadable strip. */
+        <Table className="min-w-[640px]">
+          <JobsHead />
+          <tbody>
+            {jobs.map((job, index) => (
+              <JobRow key={job.id} job={job} index={index} onEdit={() => setEditing(job)} />
+            ))}
+          </tbody>
+          {/* The allowance belongs to the table, not to the page: as a loose
+              paragraph underneath it read as a stray sentence. */}
+          <tfoot>
+            <tr>
+              <Td
+                colSpan={COLUMNS}
+                className="border-t border-border bg-surface-muted/40 py-2.5 text-xs text-ink-subtle"
+              >
+                {t("cron.limit", {
+                  used: jobs.length,
+                  max: cron.data?.max_jobs_per_subscription ?? 0,
+                })}
+              </Td>
+            </tr>
+          </tfoot>
+        </Table>
       )}
 
       <JobDialog
@@ -109,7 +119,63 @@ export function CronPage() {
   );
 }
 
-function JobRow({ job, onEdit }: { job: CronJob; onEdit: () => void }) {
+/** Shared by the table and its ghost, so the placeholder has the real columns. */
+function JobsHead() {
+  const { t } = useTranslation();
+  return (
+    <thead>
+      <tr>
+        <Th>{t("cron.schedule")}</Th>
+        <Th>{t("cron.command")}</Th>
+        <Th>{t("backups.status")}</Th>
+        <Th className="text-end">{t("files.actions")}</Th>
+      </tr>
+    </thead>
+  );
+}
+
+/**
+ * The jobs table before it arrives.
+ *
+ * A list-shaped ghost promises a list and then a four-column table lands. This
+ * keeps the real header and the real column rhythm, so the only thing that
+ * changes when the data comes in is the text.
+ */
+function JobsSkeleton({ rows = 4 }: { rows?: number }) {
+  return (
+    <div role="status" aria-live="polite">
+      <Table className="min-w-[640px]">
+        <JobsHead />
+        <tbody>
+          {Array.from({ length: rows }, (_, i) => (
+            <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
+              <Td>
+                <div className="min-h-9">
+                  <Skeleton className="h-3.5 w-24" />
+                  <Skeleton className="mt-1.5 h-3 w-32" />
+                </div>
+              </Td>
+              <Td>
+                <Skeleton className={i % 2 === 0 ? "h-3.5 w-56" : "h-3.5 w-40"} />
+              </Td>
+              <Td>
+                <Skeleton className="h-5 w-20 rounded-full" />
+              </Td>
+              <Td>
+                <div className="flex items-center justify-end gap-2">
+                  <Skeleton className="h-5 w-9 rounded-full" />
+                  <Skeleton className="h-8 w-8 rounded-lg" />
+                </div>
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </div>
+  );
+}
+
+function JobRow({ job, index, onEdit }: { job: CronJob; index: number; onEdit: () => void }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
@@ -143,24 +209,35 @@ function JobRow({ job, onEdit }: { job: CronJob; onEdit: () => void }) {
   // `enabled` flag says — so that, and not the flag, decides the badge.
   const broken = job.last_error !== null;
   // The extra row below carries the install failure and any mutation error;
-  // when it is shown, the main row's bottom border moves down to it.
+  // when it is shown, the main row's bottom border moves down to it. The rule
+  // is written once against every cell, so adding a column cannot forget one.
   const detail = broken || error !== null;
 
   return (
     <>
-      <tr className="transition-colors hover:bg-surface-muted/60">
-        <Td className={detail ? "border-b-0" : undefined}>
-          <div className="font-mono text-xs font-medium whitespace-nowrap text-ink">
-            {job.schedule}
+      <Tr
+        className={cn("animate-rise-in stagger", detail && "[&>td]:border-b-0")}
+        style={staggerStyle(index)}
+      >
+        <Td>
+          {/* Two lines' worth of height whether or not the schedule reads back
+              as a sentence, so a mixed list keeps one rhythm. */}
+          <div className="min-h-9">
+            <div className="tnum font-mono text-xs font-medium whitespace-nowrap text-ink">
+              {job.schedule}
+            </div>
+            <ScheduleText schedule={job.schedule} className="mt-1 block text-xs text-ink-muted" />
           </div>
-          <ScheduleText schedule={job.schedule} className="mt-1 block text-xs text-ink-muted" />
         </Td>
-        <Td className={detail ? "border-b-0" : undefined}>
-          <span className="block max-w-md truncate font-mono text-xs text-ink-muted" title={job.command}>
+        <Td>
+          <span
+            className="block max-w-md truncate font-mono text-xs text-ink-muted"
+            title={job.command}
+          >
             {job.command}
           </span>
         </Td>
-        <Td className={detail ? "border-b-0" : undefined}>
+        <Td>
           <Badge dot tone={broken ? "danger" : job.enabled ? "success" : "neutral"}>
             {broken
               ? t("cron.notRunning")
@@ -169,13 +246,20 @@ function JobRow({ job, onEdit }: { job: CronJob; onEdit: () => void }) {
                 : t("cron.disabledBadge")}
           </Badge>
         </Td>
-        <Td className={detail ? "border-b-0" : undefined}>
+        <Td>
           <div className="flex items-center justify-end gap-2">
+            {/* A slot the spinner can appear in without widening the column —
+                and the switch's label stays "Enabled" for the same reason: a
+                label that swapped to "Disabled" moved the menu beside it on
+                every toggle. Which way it is set is the badge's job. */}
+            <span className="grid h-4 w-4 shrink-0 place-items-center">
+              {toggle.isPending ? <Spinner className="h-3.5 w-3.5 text-ink-subtle" /> : null}
+            </span>
             <Switch
               checked={job.enabled}
               disabled={toggle.isPending}
               onChange={(next) => toggle.mutate(next)}
-              label={job.enabled ? t("cron.enabled") : t("cron.disabledBadge")}
+              label={t("cron.enabled")}
             />
             <Menu label={t("files.actions")}>
               <MenuItem icon={<Pencil />} onClick={onEdit}>
@@ -198,41 +282,30 @@ function JobRow({ job, onEdit }: { job: CronJob; onEdit: () => void }) {
                 <Button variant="ghost" onClick={() => setConfirming(false)}>
                   {t("common.cancel")}
                 </Button>
-                <Button variant="danger" onClick={() => remove.mutate()} disabled={remove.isPending}>
-                  {remove.isPending ? <Spinner /> : null}
+                <Button variant="danger" onClick={() => remove.mutate()} loading={remove.isPending}>
                   {t("cron.deleteConfirm")}
                 </Button>
               </>
             }
           >
-            <p className="rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-muted">
+            <p className="tnum rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-muted">
               {job.schedule} {job.command}
             </p>
           </Dialog>
         </Td>
-      </tr>
+      </Tr>
 
       {detail ? (
-        <tr>
-          <Td colSpan={4} className="pt-0">
+        /* Same delay as the row it belongs to, so the pair arrives together. */
+        <tr className="animate-rise-in stagger" style={staggerStyle(index)}>
+          <Td colSpan={COLUMNS} className="space-y-2 pt-0">
             {job.last_error ? (
-              <div className="rounded-lg bg-danger-soft px-3 py-2.5">
-                <p className="flex items-center gap-1.5 text-sm font-medium text-danger">
-                  <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
-                  {t("cron.lastError")}
-                </p>
-                <p className="mt-1 font-mono text-xs break-words text-danger">{job.last_error}</p>
-                <p className="mt-1.5 text-xs text-ink-muted">{t("cron.lastErrorHint")}</p>
-              </div>
+              <Callout tone="danger" title={t("cron.lastError")}>
+                <p className="font-mono text-xs break-words">{job.last_error}</p>
+                <p className="mt-1.5">{t("cron.lastErrorHint")}</p>
+              </Callout>
             ) : null}
-            {error ? (
-              <p
-                role="alert"
-                className={`rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger ${job.last_error ? "mt-2" : ""}`}
-              >
-                {error}
-              </p>
-            ) : null}
+            {error ? <Callout tone="danger">{error}</Callout> : null}
           </Td>
         </tr>
       ) : null}
@@ -326,8 +399,7 @@ function JobDialog({
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" onClick={submit} disabled={save.isPending}>
-            {save.isPending ? <Spinner /> : null}
+          <Button variant="primary" onClick={submit} loading={save.isPending}>
             {t("cron.save")}
           </Button>
         </>
@@ -400,11 +472,7 @@ function JobDialog({
           description={t("cron.enabledHint")}
         />
 
-        {error ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
-        ) : null}
+        {error ? <Callout tone="danger">{error}</Callout> : null}
       </form>
     </Dialog>
   );

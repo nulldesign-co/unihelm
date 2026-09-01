@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  AlertTriangle,
   Ban,
+  CheckCircle2,
   Globe,
   Pencil,
   Plus,
   Trash2,
-  TriangleAlert,
   Undo2,
   Users,
   Wallet,
@@ -15,17 +16,19 @@ import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
-import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import { Table, Td, Th } from "@/components/ui/table";
+import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError, endpoints } from "@/lib/api";
+import { staggerStyle } from "@/lib/motion";
 import {
   limitProblem,
   planDiff,
@@ -74,7 +77,7 @@ export function PlansPage() {
       {plans.error ? <ErrorNote error={plans.error} /> : null}
 
       {plans.isPending ? (
-        <ListSkeleton rows={3} />
+        <PlansTableSkeleton />
       ) : (plans.data?.plans.length ?? 0) === 0 ? (
         <EmptyState
           icon={<Wallet aria-hidden />}
@@ -98,11 +101,11 @@ export function PlansPage() {
   );
 }
 
-function ErrorNote({ error }: { error: unknown }) {
+function ErrorNote({ error, className }: { error: unknown; className?: string }) {
   return (
-    <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+    <Callout tone="danger" className={className}>
       {error instanceof ApiError ? error.message : String(error)}
-    </p>
+    </Callout>
   );
 }
 
@@ -110,40 +113,94 @@ function ErrorNote({ error }: { error: unknown }) {
 // Plans
 // ---------------------------------------------------------------------------
 
-function PlansTable({ plans }: { plans: PlanView[] }) {
+/** Shared by the table and its skeleton, so the ghost has the real columns. */
+function PlansHead() {
   const { t } = useTranslation();
   return (
+    <thead>
+      <tr>
+        <Th>{t("plans.name")}</Th>
+        <Th className="text-end">{t("plans.maxSites")}</Th>
+        <Th className="text-end">{t("plans.maxDbs")}</Th>
+        <Th className="text-end">{t("plans.storage")}</Th>
+        <Th>{t("plans.features")}</Th>
+        <Th>
+          <span className="sr-only">{t("files.actions")}</span>
+        </Th>
+      </tr>
+    </thead>
+  );
+}
+
+function PlansTable({ plans }: { plans: PlanView[] }) {
+  return (
     <Table>
-      <thead>
-        <tr>
-          <Th>{t("plans.name")}</Th>
-          <Th className="text-end">{t("plans.maxSites")}</Th>
-          <Th className="text-end">{t("plans.maxDbs")}</Th>
-          <Th className="text-end">{t("plans.storage")}</Th>
-          <Th>{t("plans.features")}</Th>
-          <Th />
-        </tr>
-      </thead>
+      <PlansHead />
       <tbody>
-        {plans.map((plan) => (
-          <PlanRow key={plan.id} plan={plan} />
+        {plans.map((plan, index) => (
+          <PlanRow key={plan.id} plan={plan} index={index} />
         ))}
       </tbody>
     </Table>
   );
 }
 
-function PlanRow({ plan }: { plan: PlanView }) {
+/**
+ * The plans table before it arrives.
+ *
+ * A list-shaped ghost promises a list and then a six-column table lands. This
+ * keeps the real header and column rhythm, so the only thing that changes when
+ * the data comes in is the text.
+ */
+function PlansTableSkeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div role="status" aria-live="polite">
+      <Table>
+        <PlansHead />
+        <tbody>
+          {Array.from({ length: rows }, (_, i) => (
+            <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
+              <Td>
+                <Skeleton className="h-4 w-40" />
+                <Skeleton className="mt-1.5 h-3 w-24" />
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-4 w-8" />
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-4 w-8" />
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-4 w-16" />
+              </Td>
+              <Td>
+                <div className="flex gap-1.5">
+                  <Skeleton className="h-5 w-24 rounded-full" />
+                  <Skeleton className="h-5 w-16 rounded-full" />
+                </div>
+              </Td>
+              <Td>
+                <Skeleton className="ms-auto h-8 w-8 rounded-lg" />
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </div>
+  );
+}
+
+function PlanRow({ plan, index }: { plan: PlanView; index: number }) {
   const { t, i18n } = useTranslation();
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  // The count that gates deletion. Showing it next to a disabled button is the
+  // The count that gates deletion. Showing it with the disabled action is the
   // difference between "why can't I" and "because these three are on it".
   const inUse = plan.subscriptions > 0;
 
   return (
-    <tr className="transition-colors hover:bg-surface-muted/60">
+    <Tr className="animate-rise-in stagger" style={staggerStyle(index)}>
       <Td>
         <div className="flex items-center gap-2">
           <span className="truncate text-sm font-medium text-ink">{plan.name}</span>
@@ -151,13 +208,13 @@ function PlanRow({ plan }: { plan: PlanView }) {
             {plan.owner_user_id === null ? t("plans.global") : t("plans.owned")}
           </Badge>
         </div>
-        <p className="mt-0.5 text-xs text-ink-muted">
+        <p className="tnum mt-0.5 text-xs text-ink-muted">
           {t("plans.subscriptionsOn", { count: plan.subscriptions })}
         </p>
       </Td>
-      <Td className="text-end text-sm tabular-nums">{plan.max_sites}</Td>
-      <Td className="text-end text-sm tabular-nums">{plan.max_dbs}</Td>
-      <Td className="text-end text-sm whitespace-nowrap tabular-nums">
+      <Td className="text-end text-sm">{plan.max_sites}</Td>
+      <Td className="text-end text-sm">{plan.max_dbs}</Td>
+      <Td className="text-end text-sm whitespace-nowrap">
         {formatBytes(plan.storage_mb * 1024 * 1024, i18n.language)}
       </Td>
       <Td>
@@ -168,37 +225,42 @@ function PlanRow({ plan }: { plan: PlanView }) {
         </ul>
       </Td>
       <Td className="text-end">
-        <div className="flex flex-col items-end gap-1">
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="sm" onClick={() => setEditing(true)}>
-              <Pencil className="h-3.5 w-3.5" aria-hidden />
-              {t("plans.edit")}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
+        <Menu label={t("files.actions")}>
+          <MenuItem icon={<Pencil aria-hidden />} onClick={() => setEditing(true)}>
+            {t("plans.edit")}
+          </MenuItem>
+          <MenuSeparator />
+          {/* A group, not two loose children: `role="menu"` only admits items,
+              separators and groups, and the reason belongs to the item above
+              it. */}
+          <div role="group">
+            <MenuItem
+              danger
+              icon={<Trash2 aria-hidden />}
               disabled={inUse}
-              // The reason sits beside the button as visible text rather than in
-              // a `title`: a tooltip is invisible on a touch screen, and a title
-              // on a button that already has a label muddies its accessible name.
+              // The reason sits under the item as visible text rather than in a
+              // `title`: a tooltip is invisible on a touch screen, and a title
+              // on an item that already has a label muddies its accessible name.
               aria-describedby={inUse ? `plan-${plan.id}-blocked` : undefined}
               onClick={() => setDeleting(true)}
             >
-              <Trash2 className="h-3.5 w-3.5" aria-hidden />
               {t("plans.delete")}
-            </Button>
+            </MenuItem>
+            {inUse ? (
+              <p
+                id={`plan-${plan.id}-blocked`}
+                className="px-2.5 pb-1 text-start text-xs text-ink-subtle"
+              >
+                {t("plans.deleteBlocked")}
+              </p>
+            ) : null}
           </div>
-          {inUse ? (
-            <span id={`plan-${plan.id}-blocked`} className="text-xs text-ink-subtle">
-              {t("plans.deleteBlocked")}
-            </span>
-          ) : null}
-        </div>
+        </Menu>
 
         <PlanFormDialog open={editing} onClose={() => setEditing(false)} plan={plan} />
         <DeletePlanDialog open={deleting} onClose={() => setDeleting(false)} plan={plan} />
       </Td>
-    </tr>
+    </Tr>
   );
 }
 
@@ -328,13 +390,13 @@ function PlanFormDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={!ready || save.isPending}
+            disabled={!ready}
+            loading={save.isPending}
             onClick={() => {
               setError(null);
               save.mutate();
             }}
           >
-            {save.isPending ? <Spinner /> : null}
             {plan ? t("plans.save") : t("plans.create")}
           </Button>
         </>
@@ -404,9 +466,9 @@ function PlanFormDialog({
       {plan ? <p className="mt-3 text-xs text-ink-muted">{t("plans.lowerLimitsNote")}</p> : null}
 
       {error ? (
-        <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+        <Callout tone="danger" className="mt-3">
           {error}
-        </p>
+        </Callout>
       ) : null}
     </Dialog>
   );
@@ -478,13 +540,12 @@ function DeletePlanDialog({
           </Button>
           <Button
             variant="danger"
-            disabled={remove.isPending}
+            loading={remove.isPending}
             onClick={() => {
               setError(null);
               remove.mutate();
             }}
           >
-            {remove.isPending ? <Spinner /> : null}
             {t("plans.deleteConfirm")}
           </Button>
         </>
@@ -494,7 +555,7 @@ function DeletePlanDialog({
           statement itself, so a subscription assigned a moment ago still wins.
           Say so, so the button is not read as more dangerous than it is. */}
       <p className="text-sm text-ink-muted">{t("plans.deleteBody")}</p>
-      {error ? <ErrorNote error={error} /> : null}
+      {error ? <ErrorNote error={error} className="mt-3" /> : null}
     </Dialog>
   );
 }
@@ -505,6 +566,15 @@ function DeletePlanDialog({
 
 /** What this session did, so the list can say something a refetch cannot. */
 type LastAction = Record<number, "suspended" | "reinstated">;
+
+/**
+ * The receipt for an assignment.
+ *
+ * An over-limit assignment succeeded, so it is not an error — but it is not
+ * plain good news either, and the tone has to say which one the operator is
+ * looking at without them re-reading the sentence.
+ */
+type AssignNote = { tone: "success" | "warning"; text: string };
 
 function SubscriptionsCard({ plans }: { plans: PlanView[] }) {
   const { t } = useTranslation();
@@ -528,22 +598,26 @@ function SubscriptionsCard({ plans }: { plans: PlanView[] }) {
       <CardBody className="space-y-3 pt-0">
         {/* The honest caveat, stated once at the top rather than implied by a
             row that quietly shows less than it seems to. */}
-        <p className="rounded-lg border border-border bg-canvas px-3 py-2 text-xs text-ink-muted">
-          {t("plans.derivedNotice")}
-        </p>
+        <Callout tone="info">{t("plans.derivedNotice")}</Callout>
 
         {sites.error ? <ErrorNote error={sites.error} /> : null}
 
         {sites.isPending ? (
           <div role="status" aria-live="polite" className="divide-y divide-border">
             {Array.from({ length: 3 }, (_, i) => (
-              <div key={i} className="flex items-center gap-3 py-3">
-                <Skeleton className="h-6 w-28 rounded-full" />
+              <div
+                key={i}
+                className="flex animate-rise-in flex-wrap items-center gap-x-3 gap-y-2 py-3 stagger"
+                style={staggerStyle(i)}
+              >
+                <Skeleton className="h-5 w-32 rounded-full" />
                 <div className="min-w-0 flex-1 space-y-1.5">
                   <Skeleton className="h-3.5 w-1/2" />
                   <Skeleton className="h-3 w-1/4" />
                 </div>
-                <Skeleton className="h-8 w-40 rounded-lg" />
+                <Skeleton className="h-9 w-40 rounded-lg" />
+                <Skeleton className="h-9 w-20 rounded-lg" />
+                <Skeleton className="h-8 w-8 rounded-lg" />
               </div>
             ))}
           </div>
@@ -552,11 +626,23 @@ function SubscriptionsCard({ plans }: { plans: PlanView[] }) {
             icon={<Users aria-hidden />}
             title={t("plans.noSubscriptions")}
             hint={t("plans.noSubscriptionsHint")}
+            // The list is derived from sites, so there is nothing to create
+            // here — the one thing that *can* be done is reach a subscription
+            // the list cannot see, which is exactly what this dialog is for.
+            action={
+              <Button variant="primary" onClick={() => setAssigningById(true)}>
+                {t("plans.assignById")}
+              </Button>
+            }
           />
         ) : (
           <ul className="divide-y divide-border">
-            {subscriptions.map((subscription) => (
-              <li key={subscription.id}>
+            {subscriptions.map((subscription, index) => (
+              <li
+                key={subscription.id}
+                className="animate-rise-in transition-colors duration-150 stagger hover:bg-surface-muted/60"
+                style={staggerStyle(index)}
+              >
                 <SubscriptionRow
                   subscription={subscription}
                   plans={plans}
@@ -598,37 +684,46 @@ function SubscriptionRow({
   const all = [...subscription.liveDomains, ...subscription.otherDomains];
 
   return (
+    // The identity and the controls are two wrap units, not seven loose ones:
+    // at 375px the row folds into "who" above "what you can do to them" rather
+    // than scattering a select, two buttons and a badge across four lines.
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 py-3">
       <Badge tone="neutral">
         <span>{t("plans.subscriptionShort")}</span>
-        <span className="tabular-nums">{subscription.id}</span>
+        <span className="tnum">{subscription.id}</span>
       </Badge>
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 basis-40">
         <p className="truncate font-mono text-xs text-ink">
           {all.length === 0 ? "—" : all.join(", ")}
         </p>
-        <p className="mt-0.5 text-xs text-ink-subtle">
+        <p className="tnum mt-0.5 text-xs text-ink-subtle">
           {t("plans.liveCount", { count: subscription.liveDomains.length })}
         </p>
       </div>
 
       {last ? (
-        <Badge tone={last === "suspended" ? "danger" : "success"} dot>
+        <Badge tone={last === "suspended" ? "danger" : "success"} dot className="animate-pop-in">
           {t(`plans.justAction.${last}`)}
         </Badge>
       ) : null}
 
-      <AssignInline subscription={subscription} plans={plans} />
-
-      <Button variant="ghost" size="sm" onClick={() => setSuspending(true)}>
-        <Ban className="h-3.5 w-3.5" aria-hidden />
-        {t("plans.suspend")}
-      </Button>
-      <Button variant="ghost" size="sm" onClick={() => setReinstating(true)}>
-        <Undo2 className="h-3.5 w-3.5" aria-hidden />
-        {t("plans.unsuspend")}
-      </Button>
+      <div className="flex items-start gap-2">
+        <AssignInline subscription={subscription} plans={plans} />
+        {/* Fixed to the control row's height so the ⋯ trigger centres against
+            the select beside it instead of sitting 4px high. */}
+        <div className="flex h-9 items-center">
+          <Menu label={t("files.actions")}>
+            <MenuItem danger icon={<Ban aria-hidden />} onClick={() => setSuspending(true)}>
+              {t("plans.suspend")}
+            </MenuItem>
+            <MenuSeparator />
+            <MenuItem icon={<Undo2 aria-hidden />} onClick={() => setReinstating(true)}>
+              {t("plans.unsuspend")}
+            </MenuItem>
+          </Menu>
+        </div>
+      </div>
 
       <SuspendDialog
         open={suspending}
@@ -656,7 +751,7 @@ function AssignInline({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [planId, setPlanId] = useState("");
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<AssignNote | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const assign = useMutation({
@@ -667,8 +762,8 @@ function AssignInline({
       // next site creation.
       setNote(
         result.over_limit
-          ? t("plans.assignedOverLimit", { plan: result.plan_name })
-          : t("plans.assigned", { plan: result.plan_name }),
+          ? { tone: "warning", text: t("plans.assignedOverLimit", { plan: result.plan_name }) }
+          : { tone: "success", text: t("plans.assigned", { plan: result.plan_name }) },
       );
       void queryClient.invalidateQueries({ queryKey: ["plans"] });
     },
@@ -676,10 +771,12 @@ function AssignInline({
   });
 
   return (
-    <div className="flex flex-col items-end gap-1">
+    <div className="flex min-w-0 flex-col gap-1">
       <div className="flex items-center gap-2">
+        {/* The primitive is one height; a bespoke h-8 here left the select
+            sitting 4px shorter than the button next to it. */}
         <Select
-          className="h-8 w-40 text-xs"
+          className="w-40"
           aria-label={t("plans.assignTo", { id: subscription.id })}
           value={planId}
           onChange={(event) => {
@@ -696,19 +793,32 @@ function AssignInline({
           ))}
         </Select>
         <Button
-          variant="outline"
-          size="sm"
-          disabled={planId === "" || assign.isPending}
+          variant="secondary"
+          disabled={planId === ""}
+          loading={assign.isPending}
           onClick={() => {
             setError(null);
             assign.mutate();
           }}
         >
-          {assign.isPending ? <Spinner /> : null}
           {t("plans.assign")}
         </Button>
       </div>
-      {note ? <span className="text-xs text-ink-muted">{note}</span> : null}
+      {note ? (
+        <span
+          className={cn(
+            "flex items-start gap-1.5 text-xs",
+            note.tone === "warning" ? "text-warning" : "text-ink-muted",
+          )}
+        >
+          {note.tone === "warning" ? (
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+          ) : (
+            <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-success" aria-hidden />
+          )}
+          {note.text}
+        </span>
+      ) : null}
       {error ? (
         <span role="alert" className="text-xs text-danger">
           {error}
@@ -731,7 +841,7 @@ function AssignByIdDialog({
   const queryClient = useQueryClient();
   const [subscriptionId, setSubscriptionId] = useState("");
   const [planId, setPlanId] = useState("");
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<AssignNote | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const idInvalid = subscriptionId.trim() !== "" && !/^\d+$/.test(subscriptionId.trim());
@@ -742,8 +852,8 @@ function AssignByIdDialog({
     onSuccess: (result) => {
       setNote(
         result.over_limit
-          ? t("plans.assignedOverLimit", { plan: result.plan_name })
-          : t("plans.assigned", { plan: result.plan_name }),
+          ? { tone: "warning", text: t("plans.assignedOverLimit", { plan: result.plan_name }) }
+          : { tone: "success", text: t("plans.assigned", { plan: result.plan_name }) },
       );
       void queryClient.invalidateQueries({ queryKey: ["plans"] });
     },
@@ -763,14 +873,14 @@ function AssignByIdDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={!ready || assign.isPending}
+            disabled={!ready}
+            loading={assign.isPending}
             onClick={() => {
               setError(null);
               setNote(null);
               assign.mutate();
             }}
           >
-            {assign.isPending ? <Spinner /> : null}
             {t("plans.assign")}
           </Button>
         </>
@@ -806,8 +916,8 @@ function AssignByIdDialog({
         </Select>
       </Field>
 
-      {note ? <p className="text-sm text-ink-muted">{note}</p> : null}
-      {error ? <ErrorNote error={error} /> : null}
+      {note ? <Callout tone={note.tone}>{note.text}</Callout> : null}
+      {error ? <ErrorNote error={error} className="mt-3" /> : null}
     </Dialog>
   );
 }
@@ -816,13 +926,14 @@ function AssignByIdDialog({
 // Suspension
 // ---------------------------------------------------------------------------
 
+/** `ui/` has no textarea primitive yet, so this wears `Input`'s chrome exactly. */
 const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(
   ({ className, ...props }, ref) => (
     <textarea
       ref={ref}
       className={cn(
         "w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-ink shadow-card",
-        "transition-colors placeholder:text-ink-subtle hover:border-border-strong",
+        "transition-[border-color,box-shadow] duration-150 placeholder:text-ink-subtle hover:border-border-strong",
         "focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent",
         "aria-[invalid=true]:border-danger",
         className,
@@ -884,13 +995,13 @@ function SuspendDialog({
           </Button>
           <Button
             variant="danger"
-            disabled={problem !== null || suspend.isPending}
+            disabled={problem !== null}
+            loading={suspend.isPending}
             onClick={() => {
               setError(null);
               suspend.mutate();
             }}
           >
-            {suspend.isPending ? <Spinner /> : null}
             {t("plans.suspendConfirm")}
           </Button>
         </>
@@ -899,17 +1010,22 @@ function SuspendDialog({
       {/* The concrete cost of the click, named in full. `subscription.suspend`
           switches exactly the active sites, so exactly those domains are
           promised — no "and others". */}
-      <div className="mb-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
-        <p className="flex items-start gap-2 font-medium">
-          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-          <span>
+      <Callout
+        tone="danger"
+        className="mb-3"
+        title={
+          <span className="tnum">
             {subscription.liveDomains.length === 0
               ? t("plans.goDarkNone")
               : t("plans.goDark", { count: subscription.liveDomains.length })}
           </span>
-        </p>
+        }
+      >
         {subscription.liveDomains.length === 0 ? null : (
-          <ul className="mt-1 ps-6">
+          // Capped and scrollable: a subscription with thirty live domains
+          // otherwise pushes the reason field and the buttons off the screen,
+          // which is the one thing this dialog cannot afford to hide.
+          <ul className="max-h-40 list-disc space-y-0.5 overflow-y-auto ps-5">
             {subscription.liveDomains.map((domain) => (
               <li key={domain} className="truncate font-mono text-xs">
                 {domain}
@@ -917,7 +1033,7 @@ function SuspendDialog({
             ))}
           </ul>
         )}
-      </div>
+      </Callout>
 
       {subscription.otherDomains.length > 0 ? (
         <p className="mb-3 text-xs text-ink-muted">
@@ -950,7 +1066,7 @@ function SuspendDialog({
 
       <p className="mt-3 text-xs text-ink-muted">{t("plans.suspendReversible")}</p>
 
-      {error ? <ErrorNote error={error} /> : null}
+      {error ? <ErrorNote error={error} className="mt-3" /> : null}
     </Dialog>
   );
 }
@@ -993,13 +1109,12 @@ function UnsuspendDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={unsuspend.isPending}
+            loading={unsuspend.isPending}
             onClick={() => {
               setError(null);
               unsuspend.mutate();
             }}
           >
-            {unsuspend.isPending ? <Spinner /> : null}
             {t("plans.unsuspendConfirm")}
           </Button>
         </>
@@ -1009,11 +1124,11 @@ function UnsuspendDialog({
           so a site the tenant had put in maintenance themselves comes back in
           maintenance. Worth saying, or it reads as a failed unsuspend. */}
       <p className="text-sm text-ink-muted">{t("plans.unsuspendBody")}</p>
-      <p className="mt-2 flex items-center gap-2 text-xs text-ink-subtle">
+      <p className="tnum mt-2 flex items-center gap-2 text-xs text-ink-subtle">
         <Globe className="h-3.5 w-3.5" aria-hidden />
         {t("plans.liveCount", { count: subscription.liveDomains.length })}
       </p>
-      {error ? <ErrorNote error={error} /> : null}
+      {error ? <ErrorNote error={error} className="mt-3" /> : null}
     </Dialog>
   );
 }

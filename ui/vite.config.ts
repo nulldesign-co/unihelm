@@ -21,7 +21,11 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8088", changeOrigin: true },
+      // `ws: true` or the dev server never registers an upgrade handler for
+      // this context and the terminal's WebSocket is dropped — the page works
+      // in a build and only fails under `npm run dev`, which is the worst
+      // shape a bug can have.
+      "/api": { target: "http://127.0.0.1:8088", changeOrigin: true, ws: true },
       "/healthz": { target: "http://127.0.0.1:8088", changeOrigin: true },
     },
   },

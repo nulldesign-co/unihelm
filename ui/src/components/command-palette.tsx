@@ -1,7 +1,8 @@
 import { Search, SearchX, type LucideIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useFocusTrap } from "@/lib/focus";
 import { cn } from "@/lib/utils";
 
 export interface Command {
@@ -30,6 +31,11 @@ export function CommandPalette({
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const listRef = useRef<HTMLUListElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // The input takes focus itself; this is here for the return trip — closing the
+  // palette should put the caret back on whatever the user was doing.
+  useFocusTrap(open, panelRef);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -49,6 +55,15 @@ export function CommandPalette({
       setActive(0);
     }
   }, [open]);
+
+  // Arrowing past the eighth command must not walk the highlight off the
+  // bottom of a scrolling list. `nearest` scrolls only when it has to, so
+  // moving within view does not jerk the list around.
+  useEffect(() => {
+    if (!open) return;
+    const option = listRef.current?.querySelector<HTMLElement>(`[data-index="${active}"]`);
+    option?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
 
   const matches = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -74,6 +89,7 @@ export function CommandPalette({
       aria-label={t("nav.commandPalette")}
     >
       <div
+        ref={panelRef}
         className="w-full max-w-lg animate-pop-in overflow-hidden rounded-card border border-border bg-surface shadow-pop"
         onClick={(event) => event.stopPropagation()}
       >
@@ -100,6 +116,10 @@ export function CommandPalette({
             }}
             placeholder={t("common.search")}
             aria-label={t("common.search")}
+            role="combobox"
+            aria-expanded
+            aria-controls="command-palette-list"
+            aria-activedescendant={matches[active] ? `command-${matches[active]!.id}` : undefined}
             className="w-full bg-transparent py-3.5 text-sm text-ink outline-none placeholder:text-ink-subtle"
           />
           <kbd className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-ink-subtle">
@@ -113,14 +133,24 @@ export function CommandPalette({
             <p className="text-sm">{t("common.noResults")}</p>
           </div>
         ) : (
-          <ul className="max-h-80 overflow-y-auto p-1.5">
+          <ul
+            id="command-palette-list"
+            ref={listRef}
+            role="listbox"
+            aria-label={t("nav.commandPalette")}
+            className="max-h-80 overflow-y-auto p-1.5"
+          >
             {matches.map((command, index) => (
               <li key={command.id}>
                 <button
+                  id={`command-${command.id}`}
+                  data-index={index}
+                  role="option"
+                  aria-selected={index === active}
                   onMouseEnter={() => setActive(index)}
                   onClick={() => choose(index)}
                   className={cn(
-                    "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-start text-sm transition-colors",
+                    "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-start text-sm transition-colors duration-100",
                     index === active ? "bg-accent-soft text-accent" : "text-ink",
                   )}
                 >

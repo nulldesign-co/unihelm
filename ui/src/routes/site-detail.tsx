@@ -1,18 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, useNavigate } from "@tanstack/react-router";
-import { ExternalLink, FileDiff, Lock, LockOpen, RefreshCw, Wrench } from "lucide-react";
-import { forwardRef, useEffect, useRef, useState, type TextareaHTMLAttributes } from "react";
+import { ExternalLink, FileDiff, Link2, Lock, LockOpen, RefreshCw, Wrench } from "lucide-react";
+import { forwardRef, useState, type ReactNode, type TextareaHTMLAttributes } from "react";
 import { useTranslation } from "react-i18next";
 
+import { TaskNotice } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import {
   ApiError,
@@ -22,11 +24,11 @@ import {
   type DriftResponse,
   type SiteState,
   type SiteView,
-  type Task,
   type TaskAccepted,
   type TaskStatus,
   type UpdateSiteRequest,
 } from "@/lib/api";
+import { staggerStyle } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -133,16 +135,20 @@ export function SiteDetailPage() {
         title={site.domain}
         actions={
           <>
-            <Badge tone={STATE_TONE[site.status]} dot={site.status === "provisioning"}>
-              {t(`sites.state.${site.status}`)}
-            </Badge>
-            {site.maintenance_mode ? (
-              <Badge tone="warning">
-                <Wrench className="h-3 w-3" aria-hidden />
-                {t("sites.maintenance")}
+            {/* One cluster, so the badges wrap together instead of scattering
+                across three lines of their own at 375px. */}
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone={STATE_TONE[site.status]} dot={site.status === "provisioning"}>
+                {t(`sites.state.${site.status}`)}
               </Badge>
-            ) : null}
-            <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
+              {site.maintenance_mode ? (
+                <Badge tone="warning">
+                  <Wrench className="h-3 w-3" aria-hidden />
+                  {t("sites.maintenance")}
+                </Badge>
+              ) : null}
+              <Badge tone="neutral">{t(`sites.kind.${site.site_type}`)}</Badge>
+            </div>
             <a
               href={`http${site.has_certificate ? "s" : ""}://${site.domain}`}
               target="_blank"
@@ -167,7 +173,12 @@ export function SiteDetailPage() {
   );
 }
 
-/** Ghost layout matching the loaded page, so nothing jumps when data lands. */
+/**
+ * Ghost layout matching the loaded page, so nothing jumps when data lands.
+ *
+ * Built from Card, not from a copy of its classes: the loading state has to
+ * follow --radius-card and --shadow-card wherever they go next.
+ */
 function PageSkeleton() {
   return (
     <div role="status" aria-live="polite" className="space-y-6">
@@ -175,36 +186,42 @@ function PageSkeleton() {
         <Skeleton className="h-4 w-20" />
         <Skeleton className="h-7 w-64" />
       </div>
-      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
-        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-5">
-          {Array.from({ length: 5 }, (_, i) => (
-            <div key={i} className="space-y-1.5">
-              <Skeleton className="h-3 w-16" />
-              <Skeleton className="h-4 w-24" />
-            </div>
-          ))}
-        </div>
-      </div>
+      <Card>
+        <CardBody className="pt-5">
+          <div className={META_GRID}>
+            {Array.from({ length: 5 }, (_, i) => (
+              <div key={i} className="animate-rise-in space-y-1.5 stagger" style={staggerStyle(i)}>
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="h-4 w-24" />
+              </div>
+            ))}
+          </div>
+        </CardBody>
+      </Card>
       <div className="grid gap-6 lg:grid-cols-2">
         {Array.from({ length: 2 }, (_, i) => (
-          <div key={i} className="rounded-card border border-border bg-surface p-5 shadow-card">
-            <Skeleton className="mb-4 h-4 w-32" />
-            <div className="space-y-3">
-              <Skeleton className="h-4 w-2/3" />
-              <Skeleton className="h-4 w-1/2" />
-              <Skeleton className="h-4 w-3/5" />
-            </div>
-          </div>
+          <Card key={i}>
+            <CardBody className="pt-5">
+              <Skeleton className="mb-4 h-4 w-32" />
+              <div className="space-y-3">
+                <Skeleton className="h-4 w-2/3" />
+                <Skeleton className="h-4 w-1/2" />
+                <Skeleton className="h-4 w-3/5" />
+              </div>
+            </CardBody>
+          </Card>
         ))}
       </div>
-      <div className="rounded-card border border-border bg-surface p-5 shadow-card">
-        <Skeleton className="mb-4 h-4 w-24" />
-        <div className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
-          {Array.from({ length: 4 }, (_, i) => (
-            <Skeleton key={i} className="h-9 w-full" />
-          ))}
-        </div>
-      </div>
+      <Card>
+        <CardBody className="pt-5">
+          <Skeleton className="mb-4 h-4 w-24" />
+          <div className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
+            {Array.from({ length: 4 }, (_, i) => (
+              <Skeleton key={i} className="h-9 w-full" />
+            ))}
+          </div>
+        </CardBody>
+      </Card>
     </div>
   );
 }
@@ -213,13 +230,19 @@ function PageSkeleton() {
 // Overview
 // ---------------------------------------------------------------------------
 
+/**
+ * One column on a phone, not two: these are mostly filesystem paths, and two
+ * 160px columns of truncated `/home/…` tell the operator nothing at all.
+ */
+const META_GRID = "grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-5";
+
 function OverviewCard({ site }: { site: SiteDetail }) {
   const { t, i18n } = useTranslation();
 
   return (
     <Card>
       <CardBody className="pt-5">
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-sm sm:grid-cols-3 lg:grid-cols-5">
+        <dl className={cn(META_GRID, "text-sm")}>
           {site.php_version ? (
             <MetaItem label={t("siteDetail.phpVersion")} value={`PHP ${site.php_version}`} mono />
           ) : null}
@@ -249,13 +272,35 @@ function OverviewCard({ site }: { site: SiteDetail }) {
   );
 }
 
-function MetaItem({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+/**
+ * One `dt`/`dd` shape for every fact on the page.
+ *
+ * `value` takes a node as well as a string so the rows that carry a badge or a
+ * callout keep the same label size and the same 2px gap as the plain ones —
+ * there used to be two hand-written shapes inside one `<dl>`.
+ */
+function MetaItem({
+  label,
+  value,
+  mono,
+  className,
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  mono?: boolean;
+  className?: string;
+}) {
+  const plain = typeof value === "string";
   return (
-    <div className="min-w-0">
+    <div className={cn("min-w-0", className)}>
       <dt className="text-xs text-ink-subtle">{label}</dt>
       <dd
-        className={cn("mt-0.5 truncate text-ink", mono && "font-mono text-xs leading-5")}
-        title={value}
+        className={cn(
+          "tnum mt-0.5 text-ink",
+          plain ? "truncate" : "flex flex-wrap items-center gap-2",
+          mono && "font-mono text-xs leading-5",
+        )}
+        title={plain ? (value as string) : undefined}
       >
         {value}
       </dd>
@@ -269,67 +314,6 @@ function formatDate(iso: string, language: string): string {
   } catch {
     return iso;
   }
-}
-
-// ---------------------------------------------------------------------------
-// Task receipt
-// ---------------------------------------------------------------------------
-
-/**
- * The receipt for a 202: polls the task until it settles so the user watches
- * the change apply instead of wondering whether the button worked.
- */
-function TaskNotice({
-  taskId,
-  onSettled,
-}: {
-  taskId: string;
-  onSettled?: (status: TaskStatus) => void;
-}) {
-  const { t } = useTranslation();
-  const task = useQuery({
-    queryKey: ["task", taskId],
-    queryFn: () => api.get<Task>(`/api/tasks/${taskId}`),
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return status === undefined || status === "queued" || status === "running" ? 1_500 : false;
-    },
-  });
-
-  const status = task.data?.status;
-  // Fire the settle callback exactly once, even though polling keeps the query
-  // re-rendering afterwards.
-  const settled = useRef(false);
-  useEffect(() => {
-    if (!status || status === "queued" || status === "running" || settled.current) return;
-    settled.current = true;
-    onSettled?.(status);
-  }, [status, onSettled]);
-
-  const tone: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
-    queued: "neutral",
-    running: "accent",
-    ok: "success",
-    failed: "danger",
-    cancelled: "warning",
-  };
-
-  return (
-    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-surface-muted px-3 py-2 text-sm">
-      {status === undefined || status === "queued" || status === "running" ? (
-        <Spinner className="h-3.5 w-3.5" />
-      ) : null}
-      <span className="text-ink-muted">
-        {t("siteDetail.task")} <span className="font-mono text-xs">{taskId.slice(0, 8)}</span>
-      </span>
-      {task.data ? <Badge tone={tone[task.data.status]}>{t(`tasks.status.${task.data.status}`)}</Badge> : null}
-      {task.data?.status === "failed" && task.data.error_detail ? (
-        <span role="alert" className="basis-full text-danger">
-          {task.data.error_detail}
-        </span>
-      ) : null}
-    </div>
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -386,54 +370,63 @@ function CertificateCard({ site }: { site: SiteDetail }) {
           <div
             role="status"
             aria-live="polite"
-            className="grid grid-cols-2 gap-x-6 gap-y-3 py-0.5"
+            className="grid grid-cols-1 gap-x-6 gap-y-3 py-0.5 sm:grid-cols-2"
           >
             {Array.from({ length: 4 }, (_, i) => (
-              <div key={i} className="space-y-1.5">
+              <div key={i} className="animate-rise-in space-y-1.5 stagger" style={staggerStyle(i)}>
                 <Skeleton className="h-3 w-16" />
                 <Skeleton className="h-4 w-28" />
               </div>
             ))}
           </div>
         ) : cert ? (
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+          <dl className="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
             <MetaItem
               label={t("siteDetail.issuer")}
               value={cert.issuer ?? t(`siteDetail.certKind.${cert.kind}`)}
               mono
             />
-            <div className="min-w-0">
-              <dt className="text-xs text-ink-subtle">{t("siteDetail.expires")}</dt>
-              <dd className="mt-0.5 flex items-center gap-2">
-                {cert.not_after ? (
+            <MetaItem
+              label={t("siteDetail.expires")}
+              value={
+                cert.not_after ? (
                   <>
-                    <span className="text-ink">{formatDate(cert.not_after, i18n.language)}</span>
-                    <Badge tone={daysTone}>{t("sites.certDays", { count: days ?? 0 })}</Badge>
+                    <span>{formatDate(cert.not_after, i18n.language)}</span>
+                    <Badge tone={daysTone} className="tnum">
+                      {t("sites.certDays", { count: days ?? 0 })}
+                    </Badge>
                   </>
                 ) : (
                   <span className="text-ink-muted">{t("common.none")}</span>
-                )}
-              </dd>
-            </div>
+                )
+              }
+            />
             <MetaItem label={t("siteDetail.domains")} value={cert.domains.join(", ")} mono />
             <MetaItem
               label={t(`siteDetail.certKind.${cert.kind}`)}
               value={cert.auto_renew ? t("siteDetail.autoRenewOn") : t("siteDetail.autoRenewOff")}
             />
             {cert.last_error ? (
-              <div className="col-span-2 min-w-0">
-                <dt className="text-xs text-ink-subtle">{t("siteDetail.lastError")}</dt>
-                <dd className="mt-0.5 rounded-lg bg-danger-soft px-3 py-2 font-mono text-xs text-danger">
-                  {cert.last_error}
-                </dd>
-              </div>
+              <MetaItem
+                className="sm:col-span-2"
+                label={t("siteDetail.lastError")}
+                value={
+                  <Callout tone="danger" className="w-full">
+                    <span className="font-mono text-xs break-words">{cert.last_error}</span>
+                  </Callout>
+                }
+              />
             ) : null}
           </dl>
         ) : (
-          <div className="py-2">
-            <p className="text-sm font-medium text-ink">{t("siteDetail.noCert")}</p>
-            <p className="mt-1 text-sm text-ink-muted">{t("siteDetail.noCertHint")}</p>
-          </div>
+          /* The issue button lives directly beneath this, always visible, so
+             the empty state teaches rather than repeating the action. */
+          <EmptyState
+            className="py-8"
+            icon={<LockOpen />}
+            title={t("siteDetail.noCert")}
+            hint={t("siteDetail.noCertHint")}
+          />
         )}
 
         <div className="mt-4 border-t border-border pt-4">
@@ -447,15 +440,16 @@ function CertificateCard({ site }: { site: SiteDetail }) {
             variant={cert?.status === "active" ? "outline" : "primary"}
             className="mt-2"
             onClick={() => issue.mutate()}
-            disabled={issue.isPending || site.status !== "active"}
+            loading={issue.isPending}
+            disabled={site.status !== "active"}
           >
-            {issue.isPending ? <Spinner /> : <RefreshCw className="h-4 w-4" aria-hidden />}
+            <RefreshCw className="h-4 w-4" aria-hidden />
             {cert?.status === "active" ? t("siteDetail.renew") : t("siteDetail.issue")}
           </Button>
           {error ? (
-            <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+            <Callout tone="danger" className="mt-3">
               {error}
-            </p>
+            </Callout>
           ) : null}
           {taskId ? (
             <TaskNotice
@@ -484,19 +478,28 @@ function AliasesCard({ site }: { site: SiteDetail }) {
       <CardHeader title={t("siteDetail.aliases")} description={t("siteDetail.aliasesHint")} />
       <CardBody>
         {site.aliases.length === 0 ? (
-          <p className="text-sm text-ink-muted">{t("siteDetail.noAliases")}</p>
+          /* No action: aliases are fixed at creation, so the hint is the whole
+             teachable part. */
+          <EmptyState
+            className="py-8"
+            icon={<Link2 />}
+            title={t("siteDetail.noAliases")}
+            hint={t("siteDetail.aliasesReadOnly")}
+          />
         ) : (
-          <ul className="flex flex-wrap gap-2">
-            {site.aliases.map((alias) => (
-              <li key={alias}>
-                <Badge tone="neutral">
-                  <span className="font-mono text-xs">{alias}</span>
-                </Badge>
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="flex flex-wrap gap-2">
+              {site.aliases.map((alias, index) => (
+                <li key={alias} className="animate-rise-in stagger" style={staggerStyle(index)}>
+                  <Badge tone="neutral">
+                    <span className="font-mono text-xs">{alias}</span>
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-3 text-xs text-ink-subtle">{t("siteDetail.aliasesReadOnly")}</p>
+          </>
         )}
-        <p className="mt-3 text-xs text-ink-subtle">{t("siteDetail.aliasesReadOnly")}</p>
       </CardBody>
     </Card>
   );
@@ -781,26 +784,39 @@ function SettingsCard({ site }: { site: SiteDetail }) {
           <p className="text-xs text-ink-subtle">{t("siteDetail.redirectFixed")}</p>
         ) : null}
 
-        <div className="flex items-center gap-2 border-t border-border pt-4">
+        <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
           <Button
             variant="primary"
             onClick={submit}
-            disabled={dirtyKeys.length === 0 || bodySizeInvalid || saving}
+            loading={saving}
+            disabled={dirtyKeys.length === 0 || bodySizeInvalid}
           >
-            {saving ? <Spinner /> : null}
             {t("siteDetail.save")}
           </Button>
           {dirtyKeys.length > 0 ? (
-            <Button variant="ghost" onClick={() => setEdits({})} disabled={saving}>
-              {t("siteDetail.discard")}
-            </Button>
+            <>
+              <Button
+                variant="ghost"
+                className="animate-pop-in"
+                onClick={() => setEdits({})}
+                disabled={saving}
+              >
+                {t("siteDetail.discard")}
+              </Button>
+              {/* The same count as the header badge, but beside the button that
+                  acts on it — the header is a long way from the field the user
+                  just edited. */}
+              <span className="tnum animate-fade-in text-xs text-ink-muted">
+                {t("siteDetail.changedCount", { count: dirtyKeys.length })}
+              </span>
+            </>
           ) : null}
         </div>
 
         {error ? (
-          <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger" className="mt-3">
             {error}
-          </p>
+          </Callout>
         ) : null}
         {saveTask ? <TaskNotice key={saveTask.id} taskId={saveTask.id} onSettled={settle} /> : null}
       </CardBody>
@@ -808,28 +824,46 @@ function SettingsCard({ site }: { site: SiteDetail }) {
   );
 }
 
-/** A start-side accent bar on fields that differ from what the server has. */
-function DirtyMark({ dirty, children }: { dirty: boolean; children: React.ReactNode }) {
+/**
+ * A start-side accent bar on fields that differ from what the server has.
+ *
+ * The bar grows instead of fading its colour in: a field going dirty is the
+ * one moment on this page where something needs to be noticed in peripheral
+ * vision, and a 2px colour change is exactly what peripheral vision misses.
+ * The bar is decoration to a screen reader, so the state is also stated.
+ */
+function DirtyMark({ dirty, children }: { dirty: boolean; children: ReactNode }) {
+  const { t } = useTranslation();
   return (
-    <div
-      className={cn(
-        "border-s-2 ps-3 transition-colors",
-        dirty ? "border-accent" : "border-transparent",
-      )}
-    >
+    <div className="relative ps-3">
+      <span
+        aria-hidden
+        className={cn(
+          "absolute inset-y-0 start-0 w-0.5 origin-top rounded-full bg-accent",
+          "transition-transform duration-200 ease-out-quint",
+          dirty ? "scale-y-100" : "scale-y-0",
+        )}
+      />
+      {dirty ? <span className="sr-only">{t("siteDetail.fieldChanged")}</span> : null}
       {children}
     </div>
   );
 }
 
+/**
+ * The multi-line twin of `Input`, wearing its border, shadow and hover so a
+ * snippet box and a text field do not read as controls from two different
+ * design systems. There is no textarea in ui/ to reach for yet.
+ */
 const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(
   ({ className, ...props }, ref) => (
     <textarea
       ref={ref}
       className={cn(
-        "w-full rounded-lg border border-border-strong bg-surface px-3 py-2 font-mono text-xs text-ink",
-        "placeholder:text-ink-subtle",
+        "w-full rounded-lg border border-border bg-surface px-3 py-2 font-mono text-xs text-ink shadow-card",
+        "transition-[border-color,box-shadow] duration-150 placeholder:text-ink-subtle hover:border-border-strong",
         "focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent",
+        "aria-[invalid=true]:border-danger",
         className,
       )}
       {...props}
@@ -882,9 +916,9 @@ function DriftCard({ siteId }: { siteId: number }) {
             variant="ghost"
             size="sm"
             onClick={() => void drift.refetch()}
-            disabled={drift.isFetching}
+            loading={drift.isFetching}
           >
-            {drift.isFetching ? <Spinner /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />}
+            <RefreshCw className="h-3.5 w-3.5" aria-hidden />
             {t("siteDetail.recheck")}
           </Button>
         }
@@ -899,9 +933,9 @@ function DriftCard({ siteId }: { siteId: number }) {
             <Skeleton className="h-4 w-2/3" />
           </div>
         ) : drift.isError ? (
-          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger">
             {drift.error instanceof ApiError ? drift.error.message : String(drift.error)}
-          </p>
+          </Callout>
         ) : drift.data && key ? (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
@@ -923,6 +957,12 @@ function capitalize<T extends string>(s: T): Capitalize<T> {
   return (s.charAt(0).toUpperCase() + s.slice(1)) as Capitalize<T>;
 }
 
+/**
+ * Not the shared `<Table>`: that one is a card with 12px cell padding, and a
+ * diff is a dense block of monospace inside another card. Rows deliberately do
+ * not respond to hover either — nothing here is clickable, and hover feedback
+ * on a target that cannot be hit is a promise the panel does not keep.
+ */
 function DiffView({ diff }: { diff: DriftResponse["diff"] }) {
   const { t } = useTranslation();
   return (
@@ -944,7 +984,10 @@ function DiffView({ diff }: { diff: DriftResponse["diff"] }) {
                 <td className="w-10 select-none border-e border-border px-2 text-end text-ink-subtle">
                   {line.line}
                 </td>
-                <td className="w-4 select-none px-1 text-center">
+                {/* The glyph is what keeps added/removed from being colour
+                    alone, so it gets room to render rather than a 4-unit
+                    column that clips the sign off it. */}
+                <td className="w-6 select-none px-1 text-center font-semibold">
                   {line.kind === "added" ? "+" : line.kind === "removed" ? "−" : ""}
                 </td>
                 <td className="whitespace-pre px-2">{line.text || " "}</td>
@@ -984,16 +1027,23 @@ function DangerZone({ site }: { site: SiteDetail }) {
   });
 
   return (
-    <Card className="border-danger/40">
+    <Card>
       <CardHeader title={t("siteDetail.danger")} description={t("siteDetail.dangerHint")} />
-      <CardBody className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-ink">{t("siteDetail.deleteTitle")}</p>
-          <p className="mt-0.5 text-sm text-ink-muted">{t("siteDetail.deleteBody")}</p>
-        </div>
-        <Button variant="danger" onClick={() => setOpen(true)}>
-          {t("sites.delete")}
-        </Button>
+      <CardBody>
+        {/* The tint and the icon come from Callout rather than from a one-off
+            danger border on the card — one component owns what a warning looks
+            like, wherever the operator meets one. */}
+        <Callout
+          tone="danger"
+          title={t("siteDetail.deleteTitle")}
+          action={
+            <Button variant="danger" onClick={() => setOpen(true)}>
+              {t("sites.delete")}
+            </Button>
+          }
+        >
+          {t("siteDetail.deleteBody")}
+        </Callout>
       </CardBody>
 
       <Dialog
@@ -1009,9 +1059,9 @@ function DangerZone({ site }: { site: SiteDetail }) {
             <Button
               variant="danger"
               onClick={() => remove.mutate()}
-              disabled={!confirmed || remove.isPending}
+              loading={remove.isPending}
+              disabled={!confirmed}
             >
-              {remove.isPending ? <Spinner /> : null}
               {t("sites.deleteConfirm")}
             </Button>
           </>
@@ -1043,9 +1093,9 @@ function DangerZone({ site }: { site: SiteDetail }) {
           description={t("sites.purgeFilesHint")}
         />
         {error ? (
-          <p role="alert" className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+          <Callout tone="danger" className="mt-3">
             {error}
-          </p>
+          </Callout>
         ) : null}
       </Dialog>
     </Card>

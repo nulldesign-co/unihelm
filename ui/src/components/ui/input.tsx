@@ -1,4 +1,4 @@
-import { forwardRef, type InputHTMLAttributes } from "react";
+import { cloneElement, forwardRef, isValidElement, type InputHTMLAttributes } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -8,7 +8,7 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
       ref={ref}
       className={cn(
         "h-9 w-full rounded-lg border border-border bg-surface px-3 text-sm text-ink shadow-card",
-        "transition-colors placeholder:text-ink-subtle hover:border-border-strong",
+        "transition-[border-color,box-shadow,background-color] duration-150 placeholder:text-ink-subtle hover:border-border-strong",
         "focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent",
         "aria-[invalid=true]:border-danger",
         className,
@@ -30,14 +30,26 @@ export function Field({
   error?: string;
   children: React.ReactNode;
 }) {
+  const errorId = `${htmlFor}-error`;
   return (
     <div className="space-y-1.5">
       <label htmlFor={htmlFor} className="block text-sm font-medium text-ink">
         {label}
       </label>
-      {children}
-      {/* aria-live so a screen reader announces validation without a focus jump. */}
-      <p className="min-h-4 text-xs text-danger" aria-live="polite">
+      {/* The control is the caller's, so the link to the message is made here
+          rather than asking eighteen call sites to remember it. `describedby`
+          is dropped when the field is valid — pointing at an empty paragraph
+          makes a screen reader announce a description that is not there. */}
+      {isValidElement<{ "aria-describedby"?: string }>(children)
+        ? cloneElement(children, {
+            "aria-describedby": error
+              ? [children.props["aria-describedby"], errorId].filter(Boolean).join(" ")
+              : children.props["aria-describedby"],
+          })
+        : children}
+      {/* The box is always here so the layout does not jump when a message
+          arrives; aria-live announces it without stealing focus. */}
+      <p id={errorId} className="min-h-4 text-xs text-danger" aria-live="polite">
         {error ?? ""}
       </p>
     </div>

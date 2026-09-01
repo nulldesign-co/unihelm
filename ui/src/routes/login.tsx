@@ -4,11 +4,13 @@ import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
 import { Field, Input } from "@/components/ui/input";
-import { Spinner } from "@/components/ui/spinner";
 import { ApiError } from "@/lib/api";
 import { assetUrl, safeSupportUrl, useApplyBranding, useBranding } from "@/lib/branding";
+import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
+import { cn } from "@/lib/utils";
 
 interface LoginForm {
   username: string;
@@ -59,19 +61,20 @@ export function LoginPage() {
       // is absent rather than set to `none`, so the canvas colour shows.
       style={background ? { backgroundImage: `url("${background}")` } : undefined}
     >
-      {/* A quiet accent glow behind the card — only when no reseller image
-          owns the backdrop. It tints with the brand colour for free, because
-          it is painted with the accent token. */}
-      {!background ? (
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-x-0 -top-40 h-96 bg-accent/10 blur-3xl"
-          style={{ borderRadius: "50%" }}
-        />
-      ) : null}
+      {/* Two backdrops, one rule: the text on top of it must stay readable.
+          With no reseller image we paint the same ambient wash the panel itself
+          uses, mixed from the accent token so branding tints it for free. With
+          one, we cannot know whether they uploaded a white beach or a black
+          server rack, so a scrim goes down and the heading switches to light —
+          the alternative is a panel name that disappears on someone's photo. */}
+      {background ? (
+        <div aria-hidden className="absolute inset-0 bg-black/55" />
+      ) : (
+        <div aria-hidden className="app-aurora absolute inset-0" />
+      )}
 
-      <div className="relative w-full max-w-sm animate-slide-up">
-        <div className="mb-8 text-center">
+      <div className="relative w-full max-w-sm">
+        <div className="mb-8 animate-slide-up text-center stagger" style={staggerStyle(0)}>
           {logo ? (
             <img
               src={logo}
@@ -84,18 +87,26 @@ export function LoginPage() {
               className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-2xl bg-accent text-lg font-bold text-on-accent shadow-card"
               aria-hidden
             >
-              F
+              U
             </span>
           )}
-          <h1 className="text-xl font-semibold tracking-tight text-ink">
+          <h1
+            className={cn(
+              "text-xl font-semibold tracking-tight",
+              background ? "text-white drop-shadow-sm" : "text-ink",
+            )}
+          >
             {branding.panel_name ?? t("login.title")}
           </h1>
-          <p className="mt-1 text-sm text-ink-muted">{t("login.subtitle")}</p>
+          <p className={cn("mt-1 text-sm", background ? "text-white/80" : "text-ink-muted")}>
+            {t("login.subtitle")}
+          </p>
         </div>
 
         <form
           onSubmit={onSubmit}
-          className="rounded-card border border-border bg-surface p-6 shadow-pop"
+          className="animate-slide-up rounded-card border border-border bg-surface p-6 shadow-pop stagger"
+          style={staggerStyle(1)}
           noValidate
         >
           <Field label={t("login.username")} htmlFor="username" error={errors.username?.message}>
@@ -138,24 +149,24 @@ export function LoginPage() {
           </Field>
 
           {formError ? (
-            <p role="alert" className="mb-4 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
+            <Callout tone="danger" className="mb-4">
               {formError}
-            </p>
+            </Callout>
           ) : null}
 
-          <Button type="submit" variant="primary" size="lg" className="w-full" disabled={isSubmitting}>
-            {isSubmitting ? (
-              <>
-                <Spinner /> {t("login.submitting")}
-              </>
-            ) : (
-              t("login.submit")
-            )}
+          <Button
+            type="submit"
+            variant="primary"
+            size="lg"
+            className="w-full"
+            loading={isSubmitting}
+          >
+            {isSubmitting ? t("login.submitting") : t("login.submit")}
           </Button>
         </form>
 
         {support ? (
-          <p className="mt-4 text-center text-sm">
+          <p className="mt-4 animate-slide-up text-center text-sm stagger" style={staggerStyle(2)}>
             {/* `noreferrer` as well as `noopener`: the support URL belongs to
                 the reseller, and the panel's own address is not theirs to
                 collect from a Referer header. */}
@@ -163,7 +174,10 @@ export function LoginPage() {
               href={support}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-accent hover:underline"
+              className={cn(
+                "underline-offset-4 hover:underline",
+                background ? "text-white/90" : "text-accent",
+              )}
             >
               {t("login.support")}
             </a>

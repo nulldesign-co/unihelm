@@ -1,7 +1,8 @@
-import { CalendarClock } from "lucide-react";
+import { CalendarClock, Check } from "lucide-react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { checkSchedule, formatSchedule, type Translate } from "@/lib/cron-schedule";
 import { cn } from "@/lib/utils";
@@ -83,6 +84,15 @@ export function ScheduleField({
 
   const problem = problemOf(value);
   const preview = problem ? null : textOf(value);
+  // One verdict, so the line below the field has one shape: the refusal when
+  // there is one to show, otherwise the reading-back, otherwise nothing.
+  const verdict = problem
+    ? showProblem
+      ? problem
+      : null
+    : preview
+      ? t("cron.runs", { description: preview })
+      : null;
 
   return (
     <div className="space-y-2">
@@ -90,11 +100,11 @@ export function ScheduleField({
         {label}
       </label>
 
-      {/* A cron expression is machine text: monospaced so the five fields
-          line up under the legend below. */}
+      {/* A cron expression is machine text: monospaced and tabular so the five
+          fields line up under the legend below. */}
       <Input
         id={id}
-        className="font-mono"
+        className="tnum font-mono"
         placeholder="*/15 * * * *"
         autoComplete="off"
         spellCheck={false}
@@ -113,41 +123,65 @@ export function ScheduleField({
         {t("cron.legend")}
       </p>
 
-      {/* aria-live so the verdict is announced without moving focus. */}
+      {/* aria-live so the verdict is announced without moving focus. The room
+          is reserved only once there is something to say — an untouched field
+          does not need to be 32px taller — and the height is animated so the
+          form settles rather than jumping on the first keystroke. */}
       <p
         id={`${id}-verdict`}
         aria-live="polite"
-        className={cn("flex min-h-8 items-start gap-1.5 text-xs", problem ? "text-danger" : "text-ink-muted")}
+        className={cn(
+          "flex items-start gap-1.5 text-xs transition-[min-height,color] duration-200 ease-standard",
+          verdict ? "min-h-8" : "min-h-0",
+          problem ? "text-danger" : "text-ink-muted",
+        )}
       >
-        {problem ? (
-          showProblem ? (
-            <span>{problem}</span>
-          ) : null
-        ) : preview ? (
-          <>
-            <CalendarClock className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
-            <span>{t("cron.runs", { description: preview })}</span>
-          </>
+        {verdict ? (
+          // Keyed on the text so each new verdict fades in: this line changes
+          // on every keystroke, and a hard swap between a red refusal and a
+          // grey preview is the noisiest thing in the dialog.
+          <span key={verdict} className="flex animate-fade-in items-start gap-1.5">
+            {problem ? null : (
+              <CalendarClock className="mt-px h-3.5 w-3.5 shrink-0" aria-hidden />
+            )}
+            <span>{verdict}</span>
+          </span>
         ) : null}
       </p>
 
-      <ul className="flex flex-wrap gap-1.5">
-        {PRESETS.map((preset) => (
-          <li key={preset}>
-            <button
-              type="button"
-              onClick={() => onChange(preset)}
-              title={textOf(preset) ?? preset}
-              className={cn(
-                "rounded-full border border-border px-2.5 py-0.5 font-mono text-[11px] text-ink-muted transition-colors",
-                "hover:border-border-strong hover:bg-surface-muted hover:text-ink",
-                value.trim() === preset && "border-accent bg-accent-soft text-accent",
-              )}
-            >
-              {preset}
-            </button>
-          </li>
-        ))}
+      <ul className="flex flex-wrap gap-2" aria-label={t("cron.presets")}>
+        {PRESETS.map((preset) => {
+          const selected = value.trim() === preset;
+          return (
+            <li key={preset}>
+              <Button
+                variant="secondary"
+                size="sm"
+                aria-pressed={selected}
+                onClick={() => onChange(preset)}
+                title={textOf(preset) ?? preset}
+                className={cn(
+                  "tnum gap-1.5 rounded-full font-mono text-[11px] text-ink-muted",
+                  selected &&
+                    "border-accent bg-accent-soft text-accent hover:border-accent hover:bg-accent-soft hover:text-accent",
+                )}
+              >
+                {/* The tick is always in the layout and only its opacity
+                    changes: a chip that grew when it was chosen would shove
+                    the five beside it sideways. Which one is set must also be
+                    readable without colour. */}
+                <Check
+                  className={cn(
+                    "h-3 w-3 shrink-0 transition-opacity duration-150",
+                    selected ? "opacity-100" : "opacity-0",
+                  )}
+                  aria-hidden
+                />
+                {preset}
+              </Button>
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
