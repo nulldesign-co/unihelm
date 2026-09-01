@@ -580,7 +580,13 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
                 println!("  password: {password}");
                 println!();
                 println!(
-                    "This is the only time it is shown. Store it, then change it in the panel."
+                    // Not "change it in the panel": there is no account page, and
+                    // the only password route the panel has is for database
+                    // users. Saying otherwise sends the operator hunting for a
+                    // screen that is not there, which is what the install
+                    // summary used to do about the admin's email address.
+                    "This is the only time it is shown — store it now. Changing it is not \
+                     possible yet."
                 );
             }
         }

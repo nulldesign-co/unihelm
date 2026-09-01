@@ -326,9 +326,16 @@ ensure_minisign() {
 
   case "$family" in
     debian)
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq ||
+      # A fresh cloud VM runs unattended-upgrades on first boot and holds the
+      # dpkg lock for a minute or two. Racing it means apt fails, minisign never
+      # arrives, and the install dies at the signature check telling the operator
+      # to install a package that was about to install itself. apt can wait:
+      # DPkg::Lock::Timeout landed in apt 2.1.5, so every supported Debian and
+      # Ubuntu has it.
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq ||
         warn "apt-get update failed; trying the install anyway"
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends minisign || true
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 \
+        install -y --no-install-recommends minisign || true
       ;;
     rhel)
       # minisign is an EPEL package on the RHEL family, and epel-release itself
@@ -801,7 +808,9 @@ resolve_admin_email() {
   fi
 
   ADMIN_EMAIL="$candidate"
-  info "using $ADMIN_EMAIL — change it from the panel's account page"
+  # Deliberately not "change it later in the panel": there is no account page and
+  # `unihelm user` has only create-admin and list, so nothing can change it yet.
+  info "using $ADMIN_EMAIL — pass --admin-email to set your own; it cannot be changed afterwards yet"
   return 0
 }
 
@@ -906,7 +915,11 @@ $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
   Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
 DONE
-      [ -n "$hint" ] && printf '\n  (this machine sees itself at %s — behind NAT that is not the address you reach it on)\n' "$hint"
+      # Stated as what it is, not as what it means: on OVH, Hetzner, DO and Vultr
+      # this is the real public address and works; on AWS, GCP, Azure and Oracle
+      # it is the private side of a 1:1 NAT and does not. We cannot tell which
+      # from in here, so we do not pretend to.
+      [ -n "$hint" ] && printf '\n  (this machine sees itself at %s — on AWS, GCP, Azure and Oracle\n   that is a private address behind NAT, not the one you connect to)\n' "$hint"
       ;;
     *)
       cat <<DONE
