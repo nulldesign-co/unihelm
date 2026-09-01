@@ -114,7 +114,7 @@ async fn unknown_operation_returns_a_stable_error_code() {
     match body {
         ResponseBody::Err { error } => {
             assert_eq!(error.code, ErrorCode::UnknownOperation);
-            assert_eq!(error.code.code(), "FER-1504");
+            assert_eq!(error.code.code(), "UNI-1504");
         }
         other => panic!("unexpected body: {other:?}"),
     }

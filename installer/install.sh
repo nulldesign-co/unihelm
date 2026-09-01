@@ -730,10 +730,65 @@ install_units() {
   return 0
 }
 
+# An address the panel will actually accept.
+#
+# `Email::parse` requires a domain with at least one dot, and a fresh cloud VM
+# usually answers `hostname -f` with a bare name like `ubuntu-server`. Deriving
+# `admin@$(hostname -f)` and hoping therefore failed at the very last step of an
+# otherwise perfect install, with `UNI-1200 email domain is not a valid domain
+# name` — after the account, the binaries, the config and both services were
+# already in place. The address is the one thing here only the operator can
+# supply, so ask for it rather than guessing and failing.
+valid_admin_email() { # candidate -> 0 when the panel would accept it
+  case "$1" in
+    *@*.*) [ "${#1}" -le 254 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_admin_email() {
+  local candidate answer
+  candidate="admin@$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
+  valid_admin_email "$candidate" || candidate="admin@$(hostname 2>/dev/null || echo unihelm).local"
+
+  # /dev/tty, never stdin: under `curl … | sudo bash` stdin is the script itself,
+  # and after the bootstrap hands over it is /dev/null. Reading from it would
+  # either swallow the rest of the installer or return nothing at all.
+  # Opened, not stat'ed. `/dev/tty` passes -r and -w in contexts where opening it
+  # still fails with ENXIO — a process with no controlling terminal, which is
+  # what a systemd unit, a CI runner and `ssh host 'curl … | bash'` all are.
+  if { : >/dev/tty; } 2>/dev/null && { : </dev/tty; } 2>/dev/null; then
+    printf '    Administrator email [%s]: ' "$candidate" >/dev/tty
+    IFS= read -r answer </dev/tty || answer=""
+    if [ -n "$answer" ]; then
+      if valid_admin_email "$answer"; then
+        ADMIN_EMAIL="$answer"
+        return 0
+      fi
+      # One correction, then fall back — a prompt loop in an installer somebody
+      # is watching a progress log scroll past is its own kind of trap.
+      printf '    that needs a domain with a dot, e.g. you@example.com [%s]: ' \
+        "$candidate" >/dev/tty
+      IFS= read -r answer </dev/tty || answer=""
+      if [ -n "$answer" ] && valid_admin_email "$answer"; then
+        ADMIN_EMAIL="$answer"
+        return 0
+      fi
+    fi
+  fi
+
+  ADMIN_EMAIL="$candidate"
+  info "using $ADMIN_EMAIL — change it from the panel's account page"
+  return 0
+}
+
 create_first_admin() {
   step "Creating the first administrator"
   if [ -z "$ADMIN_EMAIL" ]; then
-    ADMIN_EMAIL="admin@$(hostname -f 2>/dev/null || hostname)"
+    resolve_admin_email
+  elif ! valid_admin_email "$ADMIN_EMAIL"; then
+    die "--admin-email $ADMIN_EMAIL is not an address the panel will accept:
+  the domain needs at least one dot, as in you@example.com"
   fi
 
   # `create-admin` already refuses when any account exists, and says so — it is

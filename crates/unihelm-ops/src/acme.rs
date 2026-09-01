@@ -384,7 +384,7 @@ fn strip_leaf(chain_pem: &str) -> String {
 /// Map a CA error onto the panel's error vocabulary.
 ///
 /// `pub(crate)` for the same reason as [`RETRY`]: a rate-limit from Let's
-/// Encrypt must read as `FER-1003` whether the order was HTTP-01 or DNS-01, or
+/// Encrypt must read as `UNI-1003` whether the order was HTTP-01 or DNS-01, or
 /// the renewal scheduler's backoff would only recognise half of them.
 pub(crate) fn acme_error(e: instant_acme::Error) -> UnihelmError {
     use instant_acme::Error;

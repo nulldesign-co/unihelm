@@ -14,7 +14,7 @@ export interface ApiErrorBody {
   request_id?: string;
 }
 
-/** An error carrying the panel's stable `FER-xxxx` code, so callers can branch. */
+/** An error carrying the panel's stable `UNI-xxxx` code, so callers can branch. */
 export class ApiError extends Error {
   readonly code: string;
   readonly slug: string;

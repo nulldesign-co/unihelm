@@ -5,7 +5,7 @@
 //! so it must stay small and side-effect free.
 //!
 //! Contents:
-//! - [`error`] — the stable `FER-xxxx` error taxonomy (spec §10.5)
+//! - [`error`] — the stable `UNI-xxxx` error taxonomy (spec §10.5)
 //! - [`ids`]   — typed identifiers, so a `UserId` can never be passed as a `SiteId`
 //! - [`newtypes`] — validated-at-deserialization inputs (spec §12 rule 3)
 //! - [`rbac`]  — roles, permissions, auth context, tenant scoping (spec §6.1, §12 rule 4)

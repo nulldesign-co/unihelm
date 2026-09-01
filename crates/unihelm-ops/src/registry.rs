@@ -512,7 +512,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::UnknownOperation);
-        assert_eq!(err.code.code(), "FER-1504");
+        assert_eq!(err.code.code(), "UNI-1504");
     }
 
     #[tokio::test]

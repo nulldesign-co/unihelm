@@ -8,7 +8,7 @@
 //!
 //! 1. **Newtypes are parsed at the edge.** `AppName`, `TenantPath` and `Domain`
 //!    are parsed before the operation is called so a typo comes back as
-//!    `FER-1201` with `field` set — which the form can highlight — instead of a
+//!    `UNI-1201` with `field` set — which the form can highlight — instead of a
 //!    202, a task, and a failure a second later in the task drawer.
 //!
 //! 2. **The audit row records environment variable *names*, never values.** An

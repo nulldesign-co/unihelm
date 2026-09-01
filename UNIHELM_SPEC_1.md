@@ -343,7 +343,7 @@ Every state-changing API call → `audit_log` (actor, ip, before/after summary).
 5. Every activation stores a `config_revisions` row; UI offers one-click rollback to any revision.
 
 ### 10.5 Error taxonomy
-Stable machine codes (`FER-1201 domain_already_exists`, …) in every API error + docs page listing all codes. Task failures link to the exact log line span that failed.
+Stable machine codes (`UNI-1201 domain_already_exists`, …) in every API error + docs page listing all codes. Task failures link to the exact log line span that failed.
 
 ---
 

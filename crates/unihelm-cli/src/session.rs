@@ -15,10 +15,10 @@
 //! | 0 | success |
 //! | 1 | the CLI could not get far enough to ask (no config, no database, no admin) |
 //! | 2 | clap's own usage error |
-//! | 10–18 | the operation failed; the digit pair is the `FER-1xxx` block |
+//! | 10–18 | the operation failed; the digit pair is the `UNI-1xxx` block |
 //!
-//! `FER-1402 domain_already_exists` exits **14**, the resource-state block; an
-//! agent that is not running is `FER-1500` and exits **15**. The full four-digit
+//! `UNI-1402 domain_already_exists` exits **14**, the resource-state block; an
+//! agent that is not running is `UNI-1500` and exits **15**. The full four-digit
 //! code is always printed, so a script that needs the exact reason reads that
 //! (or `--json`) and a script that only needs a category reads `$?`.
 
@@ -56,10 +56,10 @@ pub fn exit_code_for(code: ErrorCode) -> i32 {
     i32::from(code.number() / 100)
 }
 
-/// The same mapping for a code that has already been rendered to `FER-1402`, as
+/// The same mapping for a code that has already been rendered to `UNI-1402`, as
 /// the `tasks` table stores it.
 pub fn exit_code_for_stored(code: &str) -> i32 {
-    code.strip_prefix("FER-")
+    code.strip_prefix("UNI-")
         .and_then(|digits| digits.parse::<u16>().ok())
         .map(|n| i32::from(n / 100))
         .unwrap_or(EXIT_LOCAL_FAILURE)
@@ -115,7 +115,7 @@ impl Session {
         let mut session = Self::local(config, json, follow).await?;
         session.client = Some(match IpcClient::connect(&config.agent.socket).await {
             Ok(client) => client,
-            // A dead agent is `FER-1500`, and the documented exit code for that
+            // A dead agent is `UNI-1500`, and the documented exit code for that
             // is 15. Wrapping this in a plain string error instead would make
             // "the agent is not running" — the single most likely failure a
             // script has to branch on — indistinguishable from a typo in the
@@ -297,7 +297,7 @@ impl Session {
             if let Some(detail) = &task.error_detail {
                 eprintln!(
                     "error: {} {detail}",
-                    task.error_code.as_deref().unwrap_or("FER-1702")
+                    task.error_code.as_deref().unwrap_or("UNI-1702")
                 );
             }
         }
@@ -458,8 +458,8 @@ mod tests {
 
     #[test]
     fn a_stored_task_error_code_maps_back_to_the_same_exit() {
-        assert_eq!(exit_code_for_stored("FER-1402"), 14);
-        assert_eq!(exit_code_for_stored("FER-1702"), 17);
+        assert_eq!(exit_code_for_stored("UNI-1402"), 14);
+        assert_eq!(exit_code_for_stored("UNI-1702"), 17);
         // A row written by an older build, or garbage: fail, but do not pretend
         // to know which block it came from.
         assert_eq!(exit_code_for_stored("nonsense"), EXIT_LOCAL_FAILURE);

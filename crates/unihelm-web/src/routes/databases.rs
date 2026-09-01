@@ -72,7 +72,7 @@ pub async fn create(
         .map_err(ApiError::from)?;
 
     // The agent validates this too, but rejecting it here gives the user
-    // `FER-1202` with the field highlighted instead of a round trip.
+    // `UNI-1202` with the field highlighted instead of a round trip.
     let name =
         unihelm_core::DbName::parse(&body.name).map_err(|e| ApiError::new(e.with_field("name")))?;
 

@@ -47,7 +47,7 @@ same path. Each step names the code that enforces it.
    the `unihelm` user does not get to speak the protocol at all.
 3. **The agent looks the name up in the registry**
    (`crates/unihelm-ops/src/registry.rs`). The registry is a whitelist, not a
-   dispatcher: an unknown name is `FER-1504`, never a fallback.
+   dispatcher: an unknown name is `UNI-1504`, never a fallback.
 4. **The agent re-derives the caller's rights from the database**
    (auth validation in `crates/unihelm-ops/src/registry.rs`) and intersects
    them with what the frame claimed. The frame's asserted permissions are advisory downward only —

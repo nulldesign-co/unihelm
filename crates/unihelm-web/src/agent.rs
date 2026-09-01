@@ -4,7 +4,7 @@
 //! a self-update, after a crash, or because an operator restarted it. This
 //! wrapper makes that a hiccup rather than an outage: a call on a dead connection
 //! reconnects once and retries, and a failure to reach the agent is reported as
-//! `FER-1500`, never as a 500.
+//! `UNI-1500`, never as a 500.
 
 use std::path::PathBuf;
 use std::sync::Arc;

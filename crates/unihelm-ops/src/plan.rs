@@ -414,7 +414,7 @@ impl TypedOperation for Delete {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         // The repository refuses while subscriptions are on the plan
-        // (`FER-1404 dependents_exist`), with the guard inside the DELETE
+        // (`UNI-1404 dependents_exist`), with the guard inside the DELETE
         // statement itself so a concurrent assignment cannot slip past it.
         ctx.db()
             .plans(ctx.scope())
@@ -928,7 +928,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::DependentsExist);
-        assert_eq!(err.code.code(), "FER-1404");
+        assert_eq!(err.code.code(), "UNI-1404");
         assert!(err.detail.contains("subscription"), "{}", err.detail);
     }
 

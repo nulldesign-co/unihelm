@@ -206,7 +206,7 @@ impl UserRepo<'_> {
 }
 
 /// SQLite reports a unique-index violation as a constraint error; turn it into
-/// something the API can render as `FER-1401`.
+/// something the API can render as `UNI-1401`.
 fn map_unique_violation(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db_err) = &e
         && db_err.message().contains("UNIQUE constraint failed")

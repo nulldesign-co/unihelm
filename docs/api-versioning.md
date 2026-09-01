@@ -81,7 +81,7 @@ These are the things integrators build on, so they are called out rather than
 left to inference:
 
 - **The error envelope.** Every error is
-  `{ "code": "FER-1201", "slug": "invalid_domain", "message": "…", "field": … }`.
+  `{ "code": "UNI-1201", "slug": "invalid_domain", "message": "…", "field": … }`.
   Branch on `slug`. An existing slug will not be reused for a different
   condition, and an existing condition will not silently change slug. New slugs
   appear in minor releases (`docs/api-errors.md` and `docs/api/errors.md` are

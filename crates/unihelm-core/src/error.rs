@@ -1,7 +1,7 @@
 //! Stable error taxonomy (spec §10.5).
 //!
 //! Every error that can cross the API boundary has a **stable machine code**
-//! (`FER-1201`) and a **stable slug** (`domain_already_exists`). Clients and the
+//! (`UNI-1201`) and a **stable slug** (`domain_already_exists`). Clients and the
 //! docs page key off those; the human message is free to change with translations.
 //!
 //! Code ranges — keep new codes inside their block so the docs table stays readable:
@@ -157,9 +157,9 @@ impl ErrorCode {
         }
     }
 
-    /// The wire form clients match on, e.g. `"FER-1201"`.
+    /// The wire form clients match on, e.g. `"UNI-1201"`.
     pub fn code(self) -> String {
-        format!("FER-{}", self.number())
+        format!("UNI-{}", self.number())
     }
 
     /// The stable slug, e.g. `"domain_already_exists"`.
@@ -369,7 +369,7 @@ const fn area_of(number: u16) -> &'static str {
 
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FER-{} {}", self.number(), self.slug())
+        write!(f, "UNI-{} {}", self.number(), self.slug())
     }
 }
 
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn wire_format_is_stable() {
-        assert_eq!(ErrorCode::DomainAlreadyExists.code(), "FER-1402");
+        assert_eq!(ErrorCode::DomainAlreadyExists.code(), "UNI-1402");
         assert_eq!(
             ErrorCode::DomainAlreadyExists.slug(),
             "domain_already_exists"

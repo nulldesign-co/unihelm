@@ -142,7 +142,7 @@ fn load_config(cli: &Cli) -> Result<UnihelmConfig> {
 /// Print a failure that never reached an operation, and answer with its exit
 /// code.
 ///
-/// A transport failure carries a real `FER-15xx` code and gets the same
+/// A transport failure carries a real `UNI-15xx` code and gets the same
 /// treatment as an operation that ran and said no; anything else is the CLI
 /// failing before it could ask, which is exit 1.
 fn report_failure(error: &anyhow::Error, json: bool) -> i32 {

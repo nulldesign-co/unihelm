@@ -106,7 +106,7 @@ describe("telling a missing route apart from a refusal", () => {
 
   it("does not mistake the panel's own not_found for a missing API", () => {
     const real = new ApiError(404, {
-      code: "FER-0404",
+      code: "UNI-0404",
       slug: "not_found",
       message: "no such ban",
     });

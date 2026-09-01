@@ -27,7 +27,7 @@ import {
  *
  * Every dialog owns its mutation and reports the server's message verbatim —
  * the API's error taxonomy already speaks in sentences, and rewrapping them
- * here would only hide the `FER-xxxx` reference the operator might search for.
+ * here would only hide the `UNI-xxxx` reference the operator might search for.
  */
 
 function errorText(e: unknown): string {

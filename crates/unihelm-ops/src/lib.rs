@@ -4,7 +4,7 @@
 //! panel can take is a named entry in one table, and reaching it requires:
 //!
 //! 1. a **name that exists** in the registry — an unknown name is not "run
-//!    something else", it is `FER-1504`;
+//!    something else", it is `UNI-1504`;
 //! 2. an **[`AuthContext`] that the agent re-validates against the database**,
 //!    not merely the one the web process asserted (spec §12 rule 4);
 //! 3. a **permission** the operation declares up front;

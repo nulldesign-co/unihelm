@@ -111,7 +111,7 @@ pub async fn create(
         .map_err(ApiError::from)?;
 
     // The agent validates this too — it has to, because it does not trust us —
-    // but rejecting it here means the user gets `FER-1201` with the field
+    // but rejecting it here means the user gets `UNI-1201` with the field
     // highlighted instead of a task that fails a second later.
     let domain = unihelm_core::Domain::parse(&body.domain)
         .map_err(|e| ApiError::new(e.with_field("domain")))?;

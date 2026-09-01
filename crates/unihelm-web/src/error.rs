@@ -1,6 +1,6 @@
 //! Mapping the panel's error taxonomy onto HTTP (spec §10.5).
 //!
-//! Every failure a client sees carries the same shape — a stable `FER-xxxx` code,
+//! Every failure a client sees carries the same shape — a stable `UNI-xxxx` code,
 //! a stable slug, and a human message — so a UI can branch on the code and a
 //! script can grep for it.
 
@@ -13,19 +13,19 @@ use utoipa::ToSchema;
 
 /// The JSON body of every error response.
 ///
-/// This struct doubles as the OpenAPI model for the `FER-xxxx` envelope
+/// This struct doubles as the OpenAPI model for the `UNI-xxxx` envelope
 /// (spec §13): every documented error response references it, so the shape is
 /// written down exactly once.
 #[derive(Debug, Serialize, ToSchema)]
 #[schema(example = json!({
-    "code": "FER-1201",
+    "code": "UNI-1201",
     "slug": "invalid_domain",
     "message": "domain labels cannot start with a hyphen",
     "field": "domain",
     "request_id": "0f3a1c2e"
 }))]
 pub struct ApiErrorBody {
-    /// `FER-1402`
+    /// `UNI-1402`
     pub code: String,
     /// `domain_already_exists`
     pub slug: &'static str,
@@ -158,7 +158,7 @@ mod tests {
             request_id: e.request_id.clone(),
         };
         let json = serde_json::to_value(&body).unwrap();
-        assert_eq!(json["code"], "FER-1201");
+        assert_eq!(json["code"], "UNI-1201");
         assert_eq!(json["slug"], "invalid_domain");
         assert_eq!(json["request_id"], "req-9");
         assert!(

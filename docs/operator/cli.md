@@ -47,14 +47,14 @@ in the exit status and the exact reason is printed:
 | `17` | task engine — including a followed task that failed or was cancelled |
 | `18` | config management — drift, validation, rollback |
 
-The digit pair is the block of the `FER-1xxx` code from the error taxonomy
-([error codes](../api/errors.md)), so `FER-1402 domain_already_exists` exits
+The digit pair is the block of the `UNI-1xxx` code from the error taxonomy
+([error codes](../api/errors.md)), so `UNI-1402 domain_already_exists` exits
 `14` and an agent that is not running exits `15`. The full code is always
 printed:
 
 ```console
 $ unihelm site create shop.example
-error: FER-1402 domain_already_exists: shop.example is already served here
+error: UNI-1402 domain_already_exists: shop.example is already served here
 $ echo $?
 14
 ```
@@ -65,7 +65,7 @@ With `--json` the same failure goes to **stdout**, so a script reads one stream:
 $ unihelm --json site create shop.example
 {
   "error": {
-    "code": "FER-1402",
+    "code": "UNI-1402",
     "slug": "domain_already_exists",
     "detail": "shop.example is already served here",
     "field": null

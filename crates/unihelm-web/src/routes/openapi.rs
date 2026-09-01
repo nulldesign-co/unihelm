@@ -49,7 +49,7 @@ pub const API_VERSION: &str = "1.0.0";
         version = API_VERSION,
         description = "Everything the UI can do goes through these endpoints \
             (spec §2.6) — there is no private channel, so this document is the \
-            product surface. Errors always carry the `FER-xxxx` envelope \
+            product surface. Errors always carry the `UNI-xxxx` envelope \
             (`ApiErrorBody`); clients should branch on the `slug`.\n\n\
             **Stability.** This document's `info.version` is the API contract \
             version (semver), independent of the panel release it ships in. \
@@ -410,7 +410,7 @@ mod tests {
         let envelope = &doc["components"]["schemas"]["ApiErrorBody"];
         assert!(
             envelope.is_object(),
-            "the FER-xxxx envelope must be a shared schema, not restated per route"
+            "the UNI-xxxx envelope must be a shared schema, not restated per route"
         );
         for field in ["code", "slug", "message"] {
             assert!(

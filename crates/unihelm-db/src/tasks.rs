@@ -676,7 +676,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(failed.status, TaskStatus::Failed);
-        assert_eq!(failed.error_code.as_deref(), Some("FER-1601"));
+        assert_eq!(failed.error_code.as_deref(), Some("UNI-1601"));
         assert!(failed.error_detail.unwrap().contains("mirror"));
     }
 

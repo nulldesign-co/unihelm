@@ -8,7 +8,7 @@
 //!
 //! 1. **Paths are [`TenantPath`]s at deserialization.** A traversal attempt
 //!    (`../../etc/passwd`, an absolute path, a NUL byte) dies in serde with
-//!    `FER-1204` and never becomes an op call. The agent re-validates — it does
+//!    `UNI-1204` and never becomes an op call. The agent re-validates — it does
 //!    not trust us (spec §5.2 rule 3) — but rejecting here means hostile input
 //!    cannot even *reach* the privileged process.
 //! 2. **Bodies are bounded.** The JSON envelope is capped at 12 MiB and the
@@ -24,7 +24,7 @@
 //! `{path, offset, content_b64, done}` chunks, the first chunk truncates and
 //! every later chunk appends. Append is inherently monotonic, and a stat
 //! before each append confirms the file is exactly `offset` bytes long, so a
-//! retried or reordered chunk gets `FER-1403` instead of silently corrupting
+//! retried or reordered chunk gets `UNI-1403` instead of silently corrupting
 //! the file.
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -425,7 +425,7 @@ pub(crate) struct ReadChunk {
     pub eof: bool,
 }
 
-/// Interpret an `fs.read` reply. Anything malformed is `FER-1501` — the agent
+/// Interpret an `fs.read` reply. Anything malformed is `UNI-1501` — the agent
 /// speaking a shape we do not recognise is a protocol failure, not user error.
 pub(crate) fn parse_read_chunk(data: &Value) -> Result<ReadChunk, UnihelmError> {
     let content = data
@@ -673,7 +673,7 @@ pub(crate) fn checked_content_len(content_b64: &str) -> Result<u64, UnihelmError
 ///
 /// The upload protocol keeps no server-side session; monotonicity comes from
 /// append itself, and this check is what turns a duplicated or reordered
-/// chunk into `FER-1403` instead of a corrupted file. Offset zero always
+/// chunk into `UNI-1403` instead of a corrupted file. Offset zero always
 /// starts over — that *is* the resume-from-scratch path.
 pub(crate) fn plan_upload_chunk(
     offset: u64,
@@ -1701,7 +1701,7 @@ mod tests {
             .unwrap();
         let resp = p.app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(body_text(resp).await.contains("FER-1107"));
+        assert!(body_text(resp).await.contains("UNI-1107"));
     }
 
     #[tokio::test]
@@ -1769,7 +1769,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body_text(resp).await.contains("FER-1500"));
+        assert!(body_text(resp).await.contains("UNI-1500"));
     }
 
     #[tokio::test]
@@ -1837,7 +1837,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
-        assert!(text.contains("FER-1200"), "{text}");
+        assert!(text.contains("UNI-1200"), "{text}");
         assert!(text.contains("content_b64"), "{text}");
     }
 
@@ -1852,7 +1852,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(resp).await.contains("FER-1204"));
+        assert!(body_text(resp).await.contains("UNI-1204"));
     }
 
     #[tokio::test]
@@ -1869,7 +1869,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(resp).await.contains("FER-1200"));
+        assert!(body_text(resp).await.contains("UNI-1200"));
 
         // 0755 (=493) is an ordinary mode and passes through to the agent.
         let resp = p
