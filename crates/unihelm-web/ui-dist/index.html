@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <!-- The browser's own chrome, matched to the panel's canvas in each theme,
+         so a phone does not frame a dark panel in a white address bar. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f8f9fb" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f1117" />
     <title>Unihelm</title>
     <!--
       Set the theme before first paint. Doing this in React would mean a flash of
@@ -21,8 +25,8 @@
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="/assets/index-Dti0qyO2.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-hbLB7ZlH.css">
+    <script type="module" crossorigin src="/assets/index-BNFNgmeg.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-jNBq07IT.css">
   </head>
   <body>
     <div id="root"></div>
