@@ -810,25 +810,82 @@ create_first_admin() {
   return 0
 }
 
+# This server's address as somebody else would reach it.
+#
+# `hostname -f` is not it: a fresh cloud VM answers with a bare name that
+# resolves nowhere but on itself, and printing that in an ssh command gives the
+# operator a line that cannot work. Ask the routing table which source address
+# this machine would use to reach the internet.
+server_address() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$ip" ] || ip="$(hostname -f 2>/dev/null || hostname 2>/dev/null)"
+  printf '%s' "${ip:-this-server}"
+}
+
 print_summary() {
-  local listen_addr
+  local listen_addr host port
   listen_addr="$(awk -F'"' '/^listen = /{print $2}' "$CONFIG_DIR/config.toml")"
-  cat <<DONE
+  port="${listen_addr##*:}"
+  host="${listen_addr%:*}"
+  local server; server="$(server_address)"
+
+  # Loopback and exposed are genuinely different instructions, and the old
+  # summary printed one line for both: `Panel http://127.0.0.1:8088`, which an
+  # operator reads as a link, pastes into the browser on their own laptop, and
+  # reaches nothing — because that address is this server's loopback, not
+  # theirs. Say where the panel is, then say what to actually type.
+  case "$host" in
+    127.0.0.1 | ::1 | localhost)
+      cat <<DONE
 
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
-  Panel     http://${listen_addr}
+  The panel is listening on ${listen_addr} $(printf '\033[1m')on this server$(printf '\033[0m') — not on the machine
+  you are reading this from. Nothing is exposed to the network, which is
+  deliberate: a fresh install has a generated password and no certificate yet.
+
+  To open it, forward the port from your own computer:
+
+      ssh -L ${port}:${listen_addr} root@${server}
+
+  and then visit http://127.0.0.1:${port} in your browser.
+
+  To serve it on this server's own address instead, set
+
+      listen = "0.0.0.0:${port}"
+
+  in ${CONFIG_DIR}/config.toml and run \`systemctl restart unihelm-web\`. Issue a
+  certificate first if it will face the internet.
+
   Health    unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
-
-The panel listens on ${listen_addr}. If that is loopback, reach it over an SSH
-tunnel until you have pointed a domain at this server and issued a certificate:
-
-  ssh -L 8088:${listen_addr} root@$(hostname -f 2>/dev/null || hostname)
 
 No stack components are installed yet — add nginx, PHP and a database from the
 panel when you are ready.
 DONE
+      ;;
+    *)
+      cat <<DONE
+
+$(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
+
+  Panel     http://${server}:${port}
+  Health    unihelm doctor
+  Logs      journalctl -u unihelm-agentd -u unihelm-web -f
+
+The panel is reachable on the network (it listens on ${listen_addr}). Point a
+domain at this server and issue a certificate before you rely on it — until
+then the login form is served over plain HTTP.
+
+No stack components are installed yet — add nginx, PHP and a database from the
+panel when you are ready.
+DONE
+      ;;
+  esac
   return 0
 }
 
