@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 # Raised from 1.85 when `zip` 8 arrived with the file manager: it declares
 # rust-version 1.88, and a workspace claiming less than its dependencies is a
