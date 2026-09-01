@@ -48,9 +48,13 @@ chrooted SFTP deliberately makes the tenant home root-owned. None of those were
 reachable from a test suite that runs in a temporary directory without root or
 a network.
 
-**Not yet a product.** There is no release, no binary download, and the Debian
-family — implemented and unit-tested — has not yet been exercised on a real
-server. AlmaLinux has.
+**Early.** Signed releases exist and the installer downloads them. Every release
+is installed and smoke-tested on nine distributions across both families in CI,
+and both families have now been exercised on a real server — AlmaLinux 9 and
+Ubuntu 24.04. What that does not buy you is age: the panel is young, upgrades
+are a re-run of the installer rather than a considered migration path, and the
+first four releases each shipped a first-install bug found by somebody
+installing it. Read the release notes before you upgrade.
 
 ## Why
 
@@ -148,7 +152,7 @@ itself, which is why reading
 rather than what the release does. The installer inside the tarball is the same
 file at the tag you install.
 
-Pin a version with `UNIHELM_VERSION=v0.1.0`, or point the installer at a fork
+Pin a version with `UNIHELM_VERSION=v0.1.4`, or point the installer at a fork
 with `UNIHELM_REPO=owner/name`.
 
 ### From source (works today)

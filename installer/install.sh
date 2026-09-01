@@ -6,7 +6,7 @@
 # build artefacts and twenty minutes on a 1 GB VPS:
 #
 #     sudo ./install.sh                          # the latest release
-#     sudo UNIHELM_VERSION=v0.4.1 ./install.sh    # a pinned one
+#     sudo UNIHELM_VERSION=v0.1.4 ./install.sh    # a pinned one
 #
 # and a source build stays available for developers, for architectures we do
 # not publish binaries for, and for anyone who would rather compile than trust
@@ -132,7 +132,7 @@ verifies its minisign signature and SHA-256 checksum, and installs it.
 
   --from-source       Build from this source tree instead of downloading
   --from DIR          Install binaries already built in DIR (implies source mode)
-  --version TAG       Install this release instead of the latest (e.g. v0.4.1)
+  --version TAG       Install this release instead of the latest (e.g. v0.1.4)
   --admin-user NAME   Username for the first administrator (default: admin)
   --admin-email MAIL  Email for the first administrator (default: admin@<hostname>)
   --listen ADDR:PORT  Panel listen address (default: 127.0.0.1:8088)
@@ -712,12 +712,34 @@ install_units() {
   step "Installing systemd units"
   install -m 0644 "$here/systemd/unihelm-agentd.service" "$UNIT_DIR/unihelm-agentd.service"
   install -m 0644 "$here/systemd/unihelm-web.service" "$UNIT_DIR/unihelm-web.service"
+
+  # Recreates /run/unihelm/fpm on boot. Without it the first reboot after a site
+  # exists takes every PHP site down with a 502 that nothing in the panel
+  # reports, because /run is tmpfs and RuntimeDirectory= only covers the parent.
+  install -d -m 0755 /usr/lib/tmpfiles.d
+  install -m 0644 "$here/systemd/unihelm-tmpfiles.conf" /usr/lib/tmpfiles.d/unihelm.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/unihelm.conf 2>/dev/null || true
+
   systemctl daemon-reload
-  systemctl enable --now unihelm-agentd.service
+
+  # `enable --now` is a no-op start on a unit that is already active, so on a
+  # re-run — which is how anyone upgrades, there being no other upgrade path —
+  # install_binaries has just replaced the executables underneath two daemons
+  # that go on running the old, now-unlinked inodes. The operator sees
+  # "unihelm-agentd started", asks `unihelm --version` (a fresh process, so it
+  # answers with the new version) and is served the old code until the next
+  # reboot. Enable and restart are separate steps for that reason. Both units
+  # are Type=notify, so `restart` also starts an inactive unit and does not
+  # return until the daemon has signalled READY=1 — first install stays correct.
+  systemctl enable unihelm-agentd.service
+  systemctl restart unihelm-agentd.service
   info "unihelm-agentd started"
 
   # The agent creates the database on first start; wait for it before the web
-  # process and the CLI need it.
+  # process and the CLI need it. RuntimeDirectoryPreserve keeps the socket file
+  # across a restart, so on an upgrade this loop can be satisfied by the old
+  # socket — it is a check that something is listening, not proof the new agent
+  # is up. `systemctl restart` returning on READY=1 is what proves that.
   for _ in $(seq 1 30); do
     [ -S /run/unihelm/agent.sock ] && break
     sleep 0.5
@@ -725,7 +747,8 @@ install_units() {
   [ -S /run/unihelm/agent.sock ] ||
     die "unihelm-agentd did not come up; check: journalctl -u unihelm-agentd"
 
-  systemctl enable --now unihelm-web.service
+  systemctl enable unihelm-web.service
+  systemctl restart unihelm-web.service
   info "unihelm-web started"
   return 0
 }
@@ -799,31 +822,44 @@ create_first_admin() {
   # was never created, leaving an install nobody could log in to. Let the binary
   # answer, and treat its refusal as the "already done" case it is.
   if "$BIN_DIR/unihelm" user create-admin \
-       --username "$ADMIN_USER" --email "$ADMIN_EMAIL" 2>"$WORKDIR/create-admin.err"; then
+       --username "$ADMIN_USER" --email "$ADMIN_EMAIL" 2>"${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err"; then
     :
-  elif grep -q "an account already exists" "$WORKDIR/create-admin.err"; then
+  elif grep -q "an account already exists" "${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err"; then
     info "an account already exists; skipping"
   else
-    cat "$WORKDIR/create-admin.err" >&2
+    cat "${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err" >&2
     die "could not create the first administrator"
   fi
   return 0
 }
 
-# This server's address as somebody else would reach it.
+# The address this machine sees itself on.
 #
-# `hostname -f` is not it: a fresh cloud VM answers with a bare name that
-# resolves nowhere but on itself, and printing that in an ssh command gives the
-# operator a line that cannot work. Ask the routing table which source address
-# this machine would use to reach the internet.
-server_address() {
+# Deliberately NOT called "the address others reach you at": on AWS, GCP, Azure
+# and Oracle the primary NIC holds an RFC1918 address behind 1:1 NAT, so what
+# the routing table reports is a private address the operator's laptop cannot
+# route to. `hostname -f` is worse still — a fresh cloud VM answers with a bare
+# name that resolves nowhere but on itself, which is the assumption that made
+# the first administrator's email invalid in 0.1.2.
+#
+# So this is only ever printed as a labelled hint, never substituted into a
+# command the operator is told to run. The host they already sshed in as is the
+# one that works, and they have it; we do not.
+server_address_hint() {
   local ip=""
   if command -v ip >/dev/null 2>&1; then
     ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
   fi
   [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [ -n "$ip" ] || ip="$(hostname -f 2>/dev/null || hostname 2>/dev/null)"
-  printf '%s' "${ip:-this-server}"
+  printf '%s' "$ip"
+}
+
+# sudo keeps SUDO_USER, and it survives into the bootstrap child, so the piped
+# and executed paths both get the right name. Ubuntu, Debian and the RHEL cloud
+# images all refuse `root@` with a forced command telling you to use the image's
+# own account, and `curl | sudo bash` means the operator's account is not root.
+login_user() {
+  printf '%s' "${SUDO_USER:-root}"
 }
 
 print_summary() {
@@ -831,15 +867,18 @@ print_summary() {
   listen_addr="$(awk -F'"' '/^listen = /{print $2}' "$CONFIG_DIR/config.toml")"
   port="${listen_addr##*:}"
   host="${listen_addr%:*}"
-  local server; server="$(server_address)"
+  local user hint
+  user="$(login_user)"
+  hint="$(server_address_hint)"
 
-  # Loopback and exposed are genuinely different instructions, and the old
-  # summary printed one line for both: `Panel http://127.0.0.1:8088`, which an
-  # operator reads as a link, pastes into the browser on their own laptop, and
-  # reaches nothing — because that address is this server's loopback, not
-  # theirs. Say where the panel is, then say what to actually type.
+  # `unihelm doctor` needs sudo and the summary used to omit it. /var/lib/unihelm
+  # is 0750 unihelm:unihelm, so as the ordinary cloud user doctor cannot stat the
+  # database, reports "does not exist yet" and exits non-zero — telling the
+  # operator their working install is broken, which is the whole class of bug
+  # this summary keeps producing. journalctl needs no sudo: the default cloud
+  # user is in `adm`.
   case "$host" in
-    127.0.0.1 | ::1 | localhost)
+    127.0.0.1 | ::1 | localhost | "[::1]")
       cat <<DONE
 
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
@@ -848,44 +887,54 @@ $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
   you are reading this from. Nothing is exposed to the network, which is
   deliberate: a fresh install has a generated password and no certificate yet.
 
-  To open it, forward the port from your own computer:
+  To open it, forward the port from your own computer, using the same host you
+  sshed in as:
 
-      ssh -L ${port}:${listen_addr} root@${server}
+      ssh -L ${port}:${listen_addr} ${user}@<this server>
 
   and then visit http://127.0.0.1:${port} in your browser.
 
-  To serve it on this server's own address instead, set
+  When you are ready to reach it without the tunnel, point a domain at this
+  server and run
 
-      listen = "0.0.0.0:${port}"
+      sudo unihelm cert panel <domain>
 
-  in ${CONFIG_DIR}/config.toml and run \`systemctl restart unihelm-web\`. Issue a
-  certificate first if it will face the internet.
+  Do not simply change \`listen\` to 0.0.0.0 and leave it at plain HTTP: the
+  session cookie is marked Secure off loopback, so a browser will not send it
+  back and every login bounces silently to the login form.
 
-  Health    unihelm doctor
+  Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
-
-No stack components are installed yet — add nginx, PHP and a database from the
-panel when you are ready.
 DONE
+      [ -n "$hint" ] && printf '\n  (this machine sees itself at %s — behind NAT that is not the address you reach it on)\n' "$hint"
       ;;
     *)
       cat <<DONE
 
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
-  Panel     http://${server}:${port}
-  Health    unihelm doctor
-  Logs      journalctl -u unihelm-agentd -u unihelm-web -f
+  The panel listens on ${listen_addr}, so it is reachable over the network — as
+  far as this host is concerned. Nothing here opened a firewall port, and on a
+  cloud VM a security group usually still has to allow it.
 
-The panel is reachable on the network (it listens on ${listen_addr}). Point a
-domain at this server and issue a certificate before you rely on it — until
-then the login form is served over plain HTTP.
+  $(printf '\033[1m')Logins will not stick until TLS is in front of it.$(printf '\033[0m') Off loopback the session
+  cookie is marked Secure, so a browser will not return it over plain HTTP: the
+  password is accepted and the login form comes straight back, with no error.
+  Point a domain at this server and run
+
+      sudo unihelm cert panel <domain>
+
+  Health    sudo unihelm doctor
+  Logs      journalctl -u unihelm-agentd -u unihelm-web -f
+DONE
+      ;;
+  esac
+
+  cat <<'DONE'
 
 No stack components are installed yet — add nginx, PHP and a database from the
 panel when you are ready.
 DONE
-      ;;
-  esac
   return 0
 }
 

@@ -24,7 +24,7 @@ panel already installed, Apache running on port 80.
 
 ```bash
 sudo installer/install.sh                        # the latest release
-sudo UNIHELM_VERSION=v0.4.1 installer/install.sh  # a pinned one
+sudo UNIHELM_VERSION=v0.1.4 installer/install.sh  # a pinned one
 ```
 
 That downloads the release built for this machine's architecture, verifies it,
@@ -86,19 +86,30 @@ new panel should not be reachable from the internet before you have decided it
 should be. Reach it over an SSH tunnel:
 
 ```bash
-ssh -L 8088:127.0.0.1:8088 root@your-server
+ssh -L 8088:127.0.0.1:8088 <your-login>@your-server
 ```
 
 Then open <http://127.0.0.1:8088>.
 
-To expose it directly, set `listen` in `/etc/unihelm/config.toml` and restart
-`unihelm-web`. Leave `secure_cookies = true` and put TLS in front of it — with
-`secure_cookies` off, a session cookie can cross an unencrypted hop.
+To reach it without the tunnel, point a domain at the server and issue the
+panel's own certificate:
+
+```bash
+sudo unihelm cert panel panel.example.com
+```
+
+Changing `listen` to `0.0.0.0` on its own is not enough, and fails in a way that
+looks like a password problem: off loopback the session cookie is marked
+`Secure`, so a browser will not send it back over plain HTTP. The password is
+accepted, no error appears, and the login form comes straight back. Leave
+`secure_cookies = true` — turning it off to work around that puts the session
+cookie on an unencrypted hop, which is the thing it exists to prevent — and put
+TLS in front of the panel instead.
 
 ## Checking on it
 
 ```bash
-unihelm doctor          # config, database, agent, disk — exits non-zero on failure
+sudo unihelm doctor     # config, database, agent, panel, disk — exits non-zero on failure
 unihelm status          # cpu, memory, disk, uptime
 journalctl -u unihelm-agentd -u unihelm-web -f
 ```
@@ -116,7 +127,7 @@ the sites you host.
 ```bash
 systemctl status unihelm-agentd unihelm-web
 journalctl -u unihelm-agentd -n 100 --no-pager
-unihelm doctor
+sudo unihelm doctor
 ```
 
 The agent is the one to check first: `unihelm-web` will serve the interface and

@@ -264,6 +264,7 @@ async fn doctor(config: &UnihelmConfig, json: bool) -> Result<i32> {
     check_system(&mut report);
     check_database(config, &mut report).await;
     check_agent(config, &mut report).await;
+    check_panel(config, &mut report).await;
     check_disk(config, &mut report);
 
     if json {
@@ -319,6 +320,14 @@ async fn check_database(config: &UnihelmConfig, report: &mut Report) {
 
     let (db, state) = match Db::open_unchecked(path).await {
         Ok(pair) => pair,
+        Err(e @ DbError::Unreadable { .. }) => {
+            // Present and healthy, but this process cannot see it. Saying "the
+            // agent has never run" here sends the operator hunting a fault that
+            // is not there, which is what the bare `unihelm doctor` in the
+            // install summary used to do on every working box.
+            report.fail("database", e.to_string());
+            return;
+        }
         Err(DbError::NotInitialised { .. }) => {
             // The "the agent has never run" case, and a legitimate failure on a
             // box that is supposed to be installed.
@@ -416,6 +425,63 @@ async fn check_agent(config: &UnihelmConfig, report: &mut Report) {
             Err(e) => report.fail("agent", format!("connected but did not answer: {e}")),
         },
         Err(e) => report.fail("agent", format!("could not connect: {e}")),
+    }
+}
+
+/// Whether the panel itself is up.
+///
+/// Everything else here checks the agent side, so `doctor` would report a
+/// perfectly healthy install while unihelm-web was dead — and it is nominated in
+/// the install summary as the way to answer "is the panel working?", which is
+/// the one question it could not answer. Connecting is the check: the port being
+/// bound by something else is a failure worth naming too.
+async fn check_panel(config: &UnihelmConfig, report: &mut Report) {
+    use tokio::io::AsyncWriteExt;
+
+    // Validated at load, so this parses; be gentle anyway rather than panicking
+    // inside the command an operator runs when things already look wrong.
+    let Ok(addr) = config.panel.listen.parse::<std::net::SocketAddr>() else {
+        report.fail(
+            "panel",
+            format!("cannot parse panel.listen `{}`", config.panel.listen),
+        );
+        return;
+    };
+    // A listener on 0.0.0.0 or :: is not connectable at that address; talk to
+    // loopback on the same port instead.
+    let target = if addr.ip().is_unspecified() {
+        let ip = if addr.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+        std::net::SocketAddr::new(ip, addr.port())
+    } else {
+        addr
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
+    {
+        Ok(Ok(mut stream)) => {
+            let _ = stream.shutdown().await;
+            report.ok("panel", format!("accepting connections on {addr}"));
+        }
+        Ok(Err(e)) => report.fail(
+            "panel",
+            format!(
+                "nothing accepting connections on {addr}: {e} — check: systemctl status unihelm-web"
+            ),
+        ),
+        Err(_) => report.fail(
+            "panel",
+            format!(
+                "{addr} did not accept a connection within 3s — check: systemctl status unihelm-web"
+            ),
+        ),
     }
 }
 

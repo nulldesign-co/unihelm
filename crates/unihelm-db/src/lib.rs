@@ -133,6 +133,9 @@ pub enum DbError {
     )]
     NotInitialised { path: std::path::PathBuf },
 
+    #[error("cannot read the panel database at {path}: permission denied — try again with sudo")]
+    Unreadable { path: std::path::PathBuf },
+
     #[error("the panel database at {path} is not ready: {state}")]
     SchemaNotReady {
         path: std::path::PathBuf,
@@ -266,6 +269,24 @@ pub struct Db {
     pool: SqlitePool,
 }
 
+/// `Path::exists` is `metadata().is_ok()`, so it answers false for a file that
+/// is there but unreadable exactly as it does for one that is not there — and
+/// those two want opposite advice. Told "the agent has never run" about a
+/// database that is present and healthy, an operator goes looking for a fault
+/// that does not exist. /var/lib/unihelm is 0750 unihelm:unihelm, so this is
+/// the ordinary case of `unihelm doctor` without sudo, not a corner.
+fn probe(path: &Path) -> Option<DbError> {
+    match std::fs::metadata(path) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(DbError::Unreadable {
+            path: path.to_path_buf(),
+        }),
+        Err(_) => Some(DbError::NotInitialised {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
 impl Db {
     /// Open a panel database that already exists, and take its schema as it
     /// stands. **Never creates the file, never migrates.**
@@ -283,10 +304,8 @@ impl Db {
         // `create_if_missing(false)` answers a missing file with SQLite error
         // 14, "unable to open database file", which tells an operator nothing.
         // Check first, so the error names the file and the daemon that makes it.
-        if !path.exists() {
-            return Err(DbError::NotInitialised {
-                path: path.to_path_buf(),
-            });
+        if let Some(e) = probe(path) {
+            return Err(e);
         }
         let db = Self::attach(path, false).await?;
         let state = {
@@ -408,10 +427,8 @@ impl Db {
     /// whoever typed it and then reported it healthy.
     pub async fn open_unchecked(path: impl AsRef<Path>) -> Result<(Self, SchemaState)> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Err(DbError::NotInitialised {
-                path: path.to_path_buf(),
-            });
+        if let Some(e) = probe(path) {
+            return Err(e);
         }
         let db = Self::attach(path, false).await?;
         // A short cap, and never fatal: `doctor` must not hang behind another
@@ -632,5 +649,52 @@ mod tests {
     fn timestamps_roundtrip() {
         let t = now();
         assert_eq!(from_sql_time(&to_sql_time(t)).unwrap(), t);
+    }
+
+    /// A database that is present but unreadable must not be reported as one
+    /// that was never created.
+    ///
+    /// `Path::exists` collapses those two, and `unihelm doctor` run without sudo
+    /// hits the unreadable case on every healthy install — /var/lib/unihelm is
+    /// 0750 unihelm:unihelm. Before this, doctor answered "does not exist yet —
+    /// unihelm-agentd creates it on first start" about a database that was
+    /// there, healthy and being served, and exited non-zero.
+    #[tokio::test]
+    async fn unreadable_database_is_not_reported_as_missing() {
+        // root ignores the permission bits, so there is nothing to observe.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panel.db");
+        std::fs::write(&path, b"not really a database").unwrap();
+
+        // Deny on the directory, so the failure is at the metadata call the way
+        // it is when /var/lib/unihelm is 0750 and we are somebody else.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = Db::open_unchecked(&path).await;
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        match got {
+            Err(DbError::Unreadable { .. }) => {}
+            Err(DbError::NotInitialised { .. }) => {
+                panic!("an unreadable database was reported as never created")
+            }
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    /// The genuinely-absent case still says so.
+    #[tokio::test]
+    async fn missing_database_is_reported_as_not_initialised() {
+        let dir = tempfile::tempdir().unwrap();
+        match Db::open_unchecked(dir.path().join("panel.db")).await {
+            Err(DbError::NotInitialised { .. }) => {}
+            other => panic!("expected NotInitialised, got {other:?}"),
+        }
     }
 }

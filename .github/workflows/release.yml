@@ -375,6 +375,7 @@ jobs:
           install -m 0644 installer/config.toml.example "$stage/config.toml.example"
           install -m 0644 installer/systemd/unihelm-agentd.service "$stage/systemd/"
           install -m 0644 installer/systemd/unihelm-web.service    "$stage/systemd/"
+          install -m 0644 installer/systemd/unihelm-tmpfiles.conf  "$stage/systemd/"
 
           # Shipped so an operator can verify the *next* release (and so
           # self-update has a key on disk before it has a network) — spec §5.5.

@@ -108,8 +108,13 @@ pub fn maintenance_root() -> PathBuf {
     under("/var/lib/unihelm/state/maintenance")
 }
 
-/// Per-site FPM sockets. Under `/run`, so they are recreated on boot and never
-/// leave a stale socket behind.
+/// Per-site FPM sockets.
+///
+/// Under `/run`, so no stale socket survives a reboot — but nothing under /run
+/// survives one either, and php-fpm will not create the parent of its listen
+/// socket. The directory is recreated by /usr/lib/tmpfiles.d/unihelm.conf, which
+/// the installer ships; without it the first reboot after a site exists 502s
+/// every PHP site while the panel still reports healthy.
 pub fn fpm_socket_dir() -> PathBuf {
     under("/run/unihelm/fpm")
 }

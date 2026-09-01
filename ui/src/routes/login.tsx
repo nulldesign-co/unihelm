@@ -84,7 +84,7 @@ export function LoginPage() {
               className="mx-auto mb-4 grid h-12 w-12 place-items-center rounded-2xl bg-accent text-lg font-bold text-on-accent shadow-card"
               aria-hidden
             >
-              F
+              U
             </span>
           )}
           <h1 className="text-xl font-semibold tracking-tight text-ink">
