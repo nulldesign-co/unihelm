@@ -3887,6 +3887,7 @@ dependencies = [
  "unihelm-metrics",
  "utoipa",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

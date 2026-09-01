@@ -595,9 +595,48 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
                     // users. Saying otherwise sends the operator hunting for a
                     // screen that is not there, which is what the install
                     // summary used to do about the admin's email address.
-                    "This is the only time it is shown — store it now. Changing it is not \
-                     possible yet."
+                    "This is the only time it is shown. Store it now, or set a new one \
+                     later with `unihelm user passwd <username>`."
                 );
+            }
+        }
+
+        UserCommand::Passwd {
+            username,
+            password_stdin,
+        } => {
+            // The install prints the generated password once and stores only a
+            // hash. Without this there is no way back into the panel for an
+            // operator who lost that line — no account page in the UI, and no
+            // second create-admin, which refuses once an account exists.
+            let Some(user) = db.find_user_for_login(username).await? else {
+                db.close().await;
+                anyhow::bail!("no account named `{username}` — `unihelm user list` shows them all");
+            };
+
+            let password = if *password_stdin {
+                let mut buf = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)?;
+                let given = buf.trim_end_matches(['\n', '\r']).to_string();
+                if given.is_empty() {
+                    db.close().await;
+                    anyhow::bail!("no password on stdin");
+                }
+                given
+            } else {
+                generate_password()
+            };
+
+            db.users(&TenantScope::Global)
+                .set_password(user.id, &password)
+                .await?;
+
+            println!("password set for `{}`", user.username);
+            if !*password_stdin {
+                println!();
+                println!("  password: {password}");
+                println!();
+                println!("This is the only time it is shown — store it now.");
             }
         }
 

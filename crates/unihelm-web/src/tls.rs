@@ -82,6 +82,18 @@ fn generate(addresses: &[IpAddr]) -> Result<(Vec<u8>, Vec<u8>)> {
 
     let mut params = CertificateParams::default();
     params.subject_alt_names = names;
+
+    // rcgen defaults to 1975..4096, which is not a validity period so much as
+    // the absence of one, and TLS stacks treat it that way: a browser that would
+    // have offered "proceed anyway" for an untrusted issuer refuses outright for
+    // a certificate valid for twenty-one centuries. Ten years, starting an hour
+    // ago so a server whose clock is still settling does not reject its own
+    // certificate on first boot.
+    let now = std::time::SystemTime::now();
+    let hour = std::time::Duration::from_secs(3600);
+    let decade = std::time::Duration::from_secs(3600 * 24 * 365 * 10);
+    params.not_before = (now - hour).into();
+    params.not_after = (now + decade).into();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "Unihelm panel");
     dn.push(DnType::OrganizationName, "Unihelm");
@@ -151,6 +163,42 @@ mod tests {
         let first = load_or_generate(dir.path(), &[]).unwrap();
         let second = load_or_generate(dir.path(), &[]).unwrap();
         assert_eq!(first.0, second.0, "the certificate was regenerated");
+    }
+
+    /// rcgen's default validity is 1975..4096, and a TLS stack reads that as a
+    /// broken certificate rather than a long-lived one: browsers that would
+    /// offer "proceed anyway" for an untrusted issuer refuse it outright, which
+    /// makes the panel unreachable in exactly the browser it is meant to be
+    /// opened in.
+    #[test]
+    fn the_certificate_has_a_believable_validity_period() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (pem, _) = load_or_generate(dir.path(), &[]).unwrap();
+        let text = String::from_utf8_lossy(&pem);
+
+        let (_, der) = x509_parser::pem::parse_x509_pem(text.as_bytes()).expect("valid PEM");
+        let cert = der.parse_x509().expect("valid certificate");
+
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        assert!(not_before <= now, "not_before is in the future");
+        assert!(
+            now - not_before < Duration::from_secs(3600 * 25).as_secs() as i64,
+            "not_before is a day or more in the past: the 1975 default is back"
+        );
+        assert!(not_after > now, "the certificate is already expired");
+        let years = (not_after - now) / (3600 * 24 * 365);
+        assert!(
+            (1..=20).contains(&years),
+            "validity is {years} years; a browser will refuse it"
+        );
     }
 
     #[cfg(unix)]

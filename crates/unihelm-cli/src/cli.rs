@@ -175,6 +175,19 @@ pub enum UserCommand {
     },
     /// List accounts.
     List,
+    /// Set an account's password.
+    ///
+    /// The generated one is printed once at install and stored only as a hash,
+    /// so without this an operator who lost that line is locked out of their own
+    /// panel with no way back in — there is no account page in the UI either.
+    Passwd {
+        /// The account to change.
+        username: String,
+        /// Read the new password from stdin instead of generating one, so it
+        /// never reaches the shell history or the process list.
+        #[arg(long)]
+        password_stdin: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

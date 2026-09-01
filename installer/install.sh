@@ -689,6 +689,24 @@ create_layout() {
   return 0
 }
 
+# Add a key to the [panel] table.
+#
+# Not `>>`: config.toml has [agent] and [log] after [panel], so appending puts
+# the key in whichever table happens to be last and the daemons refuse to start
+# on "unknown key in table [log]". The migration did exactly that, and the test
+# that was supposed to catch it used a config with no other tables — which is
+# the one shape where appending happens to work.
+set_panel_key() {
+  local cfg="$1" key="$2" value="$3" comment="$4"
+  awk -v key="$key" -v value="$value" -v comment="$comment" '
+    BEGIN { done = 0 }
+    /^\[/ && seen && !done { print comment; print key " = \"" value "\""; print ""; done = 1 }
+    /^\[panel\]/ { seen = 1 }
+    { print }
+    END { if (seen && !done) { print comment; print key " = \"" value "\"" } }
+  ' "$cfg" >"$cfg.new" && mv "$cfg.new" "$cfg"
+}
+
 # Bring an existing config up to the current defaults, and nothing more.
 #
 # An upgrade leaves config.toml alone, which is right — it is the operator's
@@ -713,7 +731,7 @@ migrate_config() {
   # under that would answer their domain with a 502, so record what is already
   # true and change nothing else.
   if [ -f /etc/nginx/unihelm.d/01-panel.conf ]; then
-    printf '\n# Added on upgrade: nginx is terminating TLS in front of the panel.\ntls = "off"\n' >>"$cfg"
+    set_panel_key "$cfg" tls off "# Added on upgrade: nginx is terminating TLS in front of the panel."
     info "nginx fronts the panel here; recorded tls = \"off\" and left the rest alone"
     return 0
   fi
@@ -722,26 +740,26 @@ migrate_config() {
     "127.0.0.1:8088")
       # The shipped default, never edited. Move it to the current one.
       sed -i 's|^listen = .*|listen = "0.0.0.0:8088"|' "$cfg"
-      printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+      set_panel_key "$cfg" tls self-signed "# Added on upgrade: the panel terminates its own TLS."
       info "moved the panel from loopback to 0.0.0.0:8088 with its own certificate"
       info "set listen back to 127.0.0.1:8088 in $cfg if you would rather it were not reachable"
       ;;
     "")
       # No listen line at all; the panel is on its default, which is now
       # all-interfaces, so it needs the certificate that makes that safe.
-      printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+      set_panel_key "$cfg" tls self-signed "# Added on upgrade: the panel terminates its own TLS."
       ;;
     *)
       # A listen address somebody chose. Leave it, and pick the tls value that
       # keeps this machine behaving exactly as it does today.
       case "$listen_now" in
         127.0.0.1:* | "[::1]:"* | localhost:*)
-          printf '\n# Added on upgrade, preserving this installs behaviour.\ntls = "off"\n' >>"$cfg"
+          set_panel_key "$cfg" tls off "# Added on upgrade, preserving this install's behaviour."
           ;;
         *)
           # Public and, until now, plain HTTP — which is the configuration where
           # the session cookie is Secure and the login could never stick.
-          printf '\n# Added on upgrade: the panel terminates its own TLS.\ntls = "self-signed"\n' >>"$cfg"
+          set_panel_key "$cfg" tls self-signed "# Added on upgrade: the panel terminates its own TLS."
           info "the panel is on a public address; enabled its own TLS so logins work"
           ;;
       esac
@@ -873,6 +891,7 @@ resolve_admin_email() {
   # Deliberately not "change it later in the panel": there is no account page and
   # `unihelm user` has only create-admin and list, so nothing can change it yet.
   info "using $ADMIN_EMAIL — pass --admin-email to set your own; it cannot be changed afterwards yet"
+  info "the password can be reset later with \`unihelm user passwd\`"
   return 0
 }
 
