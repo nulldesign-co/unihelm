@@ -13,6 +13,50 @@ use rust_embed::Embed;
 #[folder = "ui-dist"]
 struct Assets;
 
+/// CSP hashes for the inline scripts in the served `index.html`.
+///
+/// index.html carries one inline script, and it has to be inline: it sets the
+/// dark class from localStorage before the first paint, and an external file
+/// would arrive too late to stop the page flashing the wrong theme. Under
+/// `script-src 'self'` the browser refused to run it, so the panel shipped a
+/// theme flash and an error in everybody's console — its own policy blocking
+/// its own script.
+///
+/// The hashes are computed from the bytes actually being served rather than
+/// written down next to the policy, because a hardcoded hash is wrong the moment
+/// somebody edits the script, and wrong in a way that only shows up as a flicker
+/// nobody connects to a CSP.
+pub fn inline_script_hashes() -> Vec<String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let Some(index) = Assets::get("index.html") else {
+        return Vec::new();
+    };
+    let Ok(html) = std::str::from_utf8(index.data.as_ref()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut rest = html;
+    // Only bare `<script>` blocks: a `<script src=...>` has no body to hash, and
+    // its opening tag does not end in `>` immediately.
+    while let Some(start) = rest.find("<script>") {
+        let after = &rest[start + "<script>".len()..];
+        let Some(end) = after.find("</script>") else {
+            break;
+        };
+        let body = &after[..end];
+        let digest = Sha256::digest(body.as_bytes());
+        out.push(format!(
+            "'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        ));
+        rest = &after[end..];
+    }
+    out
+}
+
 /// Serve a built asset, falling back to `index.html` so client-side routes work
 /// on a hard refresh.
 pub async fn serve(uri: Uri) -> Response {
@@ -85,6 +129,44 @@ fn is_fingerprinted(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The policy has to name every inline script index.html actually carries.
+    ///
+    /// Under a bare `script-src 'self'` the browser refused to run the theme
+    /// script, so the panel shipped a flash of the wrong theme and a CSP error
+    /// in every console — its own policy blocking its own script, on every page
+    /// load, for anybody who looked.
+    #[test]
+    fn every_inline_script_is_named_by_the_policy() {
+        let index = Assets::get("index.html").expect("the UI bundle is embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index.html is utf-8");
+
+        let inline = html.matches("<script>").count();
+        let hashes = inline_script_hashes();
+        assert_eq!(
+            hashes.len(),
+            inline,
+            "index.html has {inline} inline script(s) but the policy names {}",
+            hashes.len()
+        );
+        for h in &hashes {
+            assert!(
+                h.starts_with("'sha256-") && h.ends_with('\''),
+                "malformed: {h}"
+            );
+        }
+    }
+
+    /// A `<script src=…>` has no body, so hashing it would be meaningless.
+    #[test]
+    fn external_scripts_are_not_hashed() {
+        let index = Assets::get("index.html").expect("the UI bundle is embedded");
+        let html = std::str::from_utf8(index.data.as_ref()).expect("index.html is utf-8");
+        assert_eq!(
+            inline_script_hashes().len(),
+            html.matches("<script>").count()
+        );
+    }
+
     use super::*;
 
     #[test]

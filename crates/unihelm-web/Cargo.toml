@@ -17,6 +17,7 @@ unihelm-metrics = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }

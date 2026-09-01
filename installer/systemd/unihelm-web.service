@@ -9,6 +9,12 @@ After=network-online.target unihelm-agentd.service
 # which this unit deliberately survives.
 Wants=network-online.target unihelm-agentd.service
 
+# systemd reads these in [Unit] only. They sat in [Service] until 0.1.8,
+# where every start logged "Unknown key name ... ignoring" and the restart
+# limit they describe was never actually applied.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
 [Service]
 Type=notify
 NotifyAccess=main
@@ -19,8 +25,6 @@ ExecStart=/usr/local/unihelm/bin/unihelm-web --config /etc/unihelm/config.toml
 Restart=always
 RestartSec=2
 WatchdogSec=30
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 LogsDirectory=unihelm
 

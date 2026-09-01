@@ -186,17 +186,33 @@ fn spawn_watchdog() -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// The panel loads nothing from anywhere else, so the policy can be strict
+/// enough to make an injected script useless — with one exception it has to
+/// name: the theme script index.html runs before the first paint. Its hash is
+/// taken from the bytes being served, so editing the script cannot leave the
+/// policy behind.
+fn csp_header() -> HeaderValue {
+    let hashes = ui::inline_script_hashes();
+    let script_src = if hashes.is_empty() {
+        "'self'".to_string()
+    } else {
+        format!("'self' {}", hashes.join(" "))
+    };
+    let policy = format!(
+        "default-src 'self'; script-src {script_src}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self' data:; connect-src 'self'; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    );
+    HeaderValue::from_str(&policy).expect("the policy is ascii")
+}
+
 fn build_router(state: state::SharedState) -> Router {
     let security_headers = tower::ServiceBuilder::new()
         // The panel loads nothing from anywhere else, so the policy can be
         // strict enough to make an injected script useless.
         .layer(SetResponseHeaderLayer::overriding(
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-                 img-src 'self' data:; font-src 'self' data:; connect-src 'self'; \
-                 frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-            ),
+            csp_header(),
         ))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,

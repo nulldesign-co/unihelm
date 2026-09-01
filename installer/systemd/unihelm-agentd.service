@@ -7,6 +7,12 @@ Wants=network-online.target
 # process starting first is survivable — it reconnects.
 Before=unihelm-web.service
 
+# systemd reads these in [Unit] only. They sat in [Service] until 0.1.8,
+# where every start logged "Unknown key name ... ignoring" and the restart
+# limit they describe was never actually applied.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
 [Service]
 Type=notify
 NotifyAccess=main
@@ -25,8 +31,6 @@ OOMScoreAdjust=-500
 
 # Rate limiting exists to stop a crash loop from hiding a real problem, not to
 # give up on restarting.
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 # The agent owns the shared runtime directory. `unihelm-web` only needs to
 # traverse it to reach the socket, so it must not declare it too — two units
