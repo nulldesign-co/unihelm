@@ -48,6 +48,20 @@ export function getCsrfToken(): string | null {
   return csrfToken;
 }
 
+// What to do when the server stops recognising this session.
+//
+// Sessions expire, and the panel can be restarted out from under an open tab.
+// Without this every request simply threw a 401 that each screen rendered as its
+// own error, leaving the operator on a dashboard where nothing loads and no
+// screen ever says the word "login" — the tab looked broken rather than logged
+// out. SessionProvider registers a handler that clears the user, which sends the
+// router back to the login route.
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  onUnauthorized = handler;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   const method = (init.method ?? "GET").toUpperCase();
@@ -74,6 +88,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         slug: "unexpected_response",
         message: response.statusText || "Request failed",
       };
+    }
+    // The login request answers 401 for a wrong password; that is a failed
+    // attempt, not an expired session, and must not bounce the form.
+    if (response.status === 401 && !path.endsWith("/auth/login")) {
+      onUnauthorized?.();
     }
     throw new ApiError(response.status, body);
   }
