@@ -176,13 +176,21 @@ server {
 {% endif %}
 {% endif %}
 
+{% if site.site_type == "php" or site.site_type == "static" %}
     # Static assets get a long cache; the site's own HTML does not.
+    #
+    # Only for sites that serve from disk. A regex location outranks a prefix
+    # one in nginx, so on a proxy site this block beat `location /` for every
+    # css, js and image request and answered it with `try_files $uri =404`
+    # against a document root that holds none of them — every application the
+    # panel put behind a proxy came up with no styles, no scripts and no images.
     location ~* \.(?:jpg|jpeg|png|gif|webp|avif|svg|ico|woff2?|ttf|otf|eot|css|js|mp4|webm)$ {
         expires 30d;
         add_header Cache-Control "public, immutable";
         access_log off;
         try_files $uri =404;
     }
+{% endif %}
 
     # Dotfiles, version control and editor leftovers. `.well-known` is excluded
     # because ACME and security.txt live there.

@@ -386,6 +386,32 @@ mod tests {
         SiteContext::new("example.com", "uh_abc123", SiteType::Php, PhpVersion::V83)
     }
 
+    /// A regex location outranks a prefix one, so the asset block must not exist
+    /// on a site that has nothing on disk to serve.
+    ///
+    /// It did, unconditionally, and it beat `location /` for every css, js and
+    /// image request — answering each with `try_files $uri =404` against a
+    /// document root that holds none of them. Every application the panel put
+    /// behind a proxy came up with no styles, no scripts and no images.
+    #[test]
+    fn the_asset_cache_block_is_only_for_sites_served_from_disk() {
+        let has_asset_block = |t: SiteType| {
+            render_site(&SiteContext::new("a.test", "u", t, PhpVersion::V83))
+                .contains("expires 30d")
+        };
+
+        assert!(has_asset_block(SiteType::Php), "php serves from disk");
+        assert!(has_asset_block(SiteType::Static), "static serves from disk");
+        assert!(
+            !has_asset_block(SiteType::Proxy),
+            "a proxy site has no document root; this block 404s its whole front end"
+        );
+        assert!(
+            !has_asset_block(SiteType::Redirect),
+            "a redirect site serves nothing at all"
+        );
+    }
+
     #[test]
     fn a_php_vhost_renders_with_the_path_info_guard() {
         let out = render_site(&php_site());

@@ -434,9 +434,21 @@ pub(crate) fn parse_read_chunk(data: &Value) -> Result<ReadChunk, UnihelmError> 
         .ok_or_else(|| {
             UnihelmError::new(ErrorCode::AgentProtocol, "fs.read reply has no content_b64")
         })?;
-    let eof = data.get("eof").and_then(Value::as_bool).ok_or_else(|| {
-        UnihelmError::new(ErrorCode::AgentProtocol, "fs.read reply has no eof flag")
-    })?;
+    // `fs.read` reports `truncated` — more bytes exist past this chunk — and has
+    // never sent an `eof` field. Requiring one here failed every download with
+    // "fs.read reply has no eof flag", which is to say file download did not
+    // work at all. Read the field the agent actually sends, and take eof as its
+    // inverse.
+    let truncated = data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            UnihelmError::new(
+                ErrorCode::AgentProtocol,
+                "fs.read reply has no truncated flag",
+            )
+        })?;
+    let eof = !truncated;
     let bytes = BASE64.decode(content).map_err(|e| {
         UnihelmError::new(
             ErrorCode::AgentProtocol,
@@ -1390,22 +1402,41 @@ mod tests {
 
     // -- parsing the agent's replies ------------------------------------
 
+    /// The shape `fs.read` actually replies with.
+    ///
+    /// These tests used to be written against an `eof` field, and so did the
+    /// parser — but `ReadOutput` has never had one. It sends `truncated`, and
+    /// every download failed with "fs.read reply has no eof flag". A test
+    /// written from the same wrong assumption as the code it covers proves
+    /// nothing, which is exactly what happened here.
     #[test]
-    fn a_read_chunk_decodes_and_carries_eof() {
-        let data = json!({ "size": 5, "eof": true, "binary": false, "content_b64": "aGVsbG8=" });
-        let c = parse_read_chunk(&data).unwrap();
+    fn a_read_chunk_decodes_and_derives_eof_from_truncated() {
+        let last = json!({
+            "size": 5, "offset": 0, "truncated": false,
+            "binary": false, "content_b64": "aGVsbG8="
+        });
+        let c = parse_read_chunk(&last).unwrap();
         assert_eq!(c.bytes, b"hello");
-        assert!(c.eof);
+        assert!(c.eof, "a chunk that is not truncated is the last one");
+
+        let more = json!({
+            "size": 10, "offset": 0, "truncated": true,
+            "binary": false, "content_b64": "aGVsbG8="
+        });
+        assert!(
+            !parse_read_chunk(&more).unwrap().eof,
+            "a truncated chunk has more after it"
+        );
     }
 
     #[test]
     fn a_malformed_read_reply_is_a_protocol_error_not_a_panic() {
         for bad in [
             json!({}),
-            json!({ "content_b64": "aGVsbG8=" }), // no eof
-            json!({ "eof": false }),              // no content
-            json!({ "eof": false, "content_b64": "@@@" }), // not base64
-            json!({ "eof": "yes", "content_b64": "" }), // eof not a bool
+            json!({ "content_b64": "aGVsbG8=" }), // no truncated flag
+            json!({ "truncated": false }),        // no content
+            json!({ "truncated": false, "content_b64": "@@@" }), // not base64
+            json!({ "truncated": "yes", "content_b64": "" }), // not a bool
         ] {
             let err = parse_read_chunk(&bad).unwrap_err();
             assert_eq!(err.code, ErrorCode::AgentProtocol, "{bad}");

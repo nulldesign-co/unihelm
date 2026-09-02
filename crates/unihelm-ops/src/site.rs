@@ -783,6 +783,9 @@ impl TypedOperation for Update {
         if let Some(snippet) = input.custom_nginx_snippet.as_ref().and_then(|s| s.as_ref()) {
             check_snippet(snippet)?;
         }
+        if let Some(size) = input.client_max_body_size.as_ref() {
+            check_body_size(size)?;
+        }
 
         let site = repo
             .update(
@@ -841,6 +844,51 @@ impl TypedOperation for Update {
 ///
 /// `nginx -t` is the real check and runs before anything is activated; this only
 /// catches the obvious cases early, with a message that points at the problem.
+/// An nginx size value, and nothing else.
+///
+/// This lands in the vhost unquoted — `client_max_body_size {{ … }};` — so
+/// anything accepted here is a directive a tenant gets to write. `64m; root
+/// /etc; #` was a valid value: it closed the directive, opened a document root
+/// over the system's configuration, and commented out the rest of the line. The
+/// snippet field next to it has been validated since it was added; this one
+/// never was.
+///
+/// nginx accepts a number with an optional k, m or g suffix, case-insensitive.
+/// Nothing else is a size, so nothing else is accepted.
+fn check_body_size(value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    let reject = || {
+        UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "`{value}` is not a size. Use a number with an optional k, m or g \
+                 suffix, for example `64m`."
+            ),
+        )
+        .with_field("client_max_body_size")
+    };
+
+    if trimmed.is_empty() || trimmed.len() > 16 {
+        return Err(reject());
+    }
+
+    let (digits, suffix) = match trimmed.as_bytes().last() {
+        Some(c) if c.is_ascii_digit() => (trimmed, None),
+        Some(c) => (&trimmed[..trimmed.len() - 1], Some(*c)),
+        None => return Err(reject()),
+    };
+
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(reject());
+    }
+    if let Some(c) = suffix
+        && !matches!(c.to_ascii_lowercase(), b'k' | b'm' | b'g')
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
 fn check_snippet(snippet: &str) -> Result<()> {
     const MAX: usize = 16 * 1024;
     if snippet.len() > MAX {
@@ -1144,5 +1192,54 @@ mod tests {
     fn a_site_type_cannot_be_an_arbitrary_string() {
         assert!(serde_json::from_str::<SiteTypeInput>("\"php\"").is_ok());
         assert!(serde_json::from_str::<SiteTypeInput>("\"wordpress\"").is_err());
+    }
+}
+#[cfg(test)]
+mod body_size_tests {
+    use super::*;
+
+    /// The value lands unquoted in `client_max_body_size {…};`, so anything
+    /// accepted here is a directive the tenant gets to write into their own
+    /// vhost — and nginx reads the whole file, so "their own" is optimistic.
+    #[test]
+    fn a_size_that_closes_the_directive_is_refused() {
+        let attacks = [
+            "64m; root /etc; #",
+            "1m;}\nserver{listen 80;server_name _;root /;",
+            "10m; autoindex on",
+            "5m\nroot /etc",
+            "1m; include /etc/passwd;",
+        ];
+        for attack in attacks {
+            assert!(
+                check_body_size(attack).is_err(),
+                "accepted an injection: {attack:?}"
+            );
+        }
+    }
+
+    /// Sizes people actually set must still work, or the fix is a regression.
+    #[test]
+    fn real_sizes_are_accepted() {
+        for ok in ["0", "64m", "64M", "1g", "512k", "1024", "20m"] {
+            assert!(check_body_size(ok).is_ok(), "refused a real size: {ok:?}");
+        }
+    }
+
+    /// Neither an empty value nor a suffix nginx does not know is a size.
+    #[test]
+    fn nonsense_is_refused() {
+        for bad in [
+            "",
+            "  ",
+            "m",
+            "64x",
+            "-1m",
+            "1.5m",
+            "64 m",
+            "999999999999999999999m",
+        ] {
+            assert!(check_body_size(bad).is_err(), "accepted nonsense: {bad:?}");
+        }
     }
 }
