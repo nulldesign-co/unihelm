@@ -741,6 +741,9 @@ mod tests {
                     "default_cert": "/var/lib/unihelm/state/certs/_default/cert.pem",
                     "default_key": "/var/lib/unihelm/state/certs/_default/key.pem",
                     "http3": true,
+                    // On a server Unihelm set up, nothing else claims these.
+                    "owns_default": true,
+                    "catchall_names": "unihelm-catchall.invalid",
                 }),
             )
             .unwrap();
@@ -749,6 +752,52 @@ mod tests {
         assert!(
             out.contains("return 444;"),
             "an unconfigured host should get nothing"
+        );
+    }
+
+    /// The same file on a server that was already hosting sites.
+    ///
+    /// `default_server` and `reuseport` may each appear once per listening
+    /// address in the whole configuration. Writing a second one is not an
+    /// override, it is a configuration nginx refuses to load — so the panel
+    /// would fail `nginx -t`, roll the stack install back, and decline to set
+    /// itself up on a working server.
+    #[test]
+    fn the_catchall_yields_to_a_configuration_that_was_here_first() {
+        let set = TemplateSet::load().unwrap();
+        let out = set
+            .render(
+                "nginx/catchall.conf",
+                &serde_json::json!({
+                    "acme_webroot": paths::acme_webroot(),
+                    "default_cert": "/var/lib/unihelm/state/certs/_default/cert.pem",
+                    "default_key": "/var/lib/unihelm/state/certs/_default/key.pem",
+                    "http3": true,
+                    "owns_default": false,
+                    "catchall_names": "unihelm-catchall.invalid",
+                }),
+            )
+            .unwrap();
+
+        let directives: String = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!directives.contains("default_server"), "{directives}");
+        assert!(
+            !directives.contains("reuseport"),
+            "reuseport is once-per-address too: {directives}"
+        );
+        assert!(
+            directives.contains("unihelm-catchall.invalid"),
+            "the yielding block still needs a name of its own"
+        );
+        assert!(
+            out.contains("/.well-known/acme-challenge/"),
+            "ACME must work on an adopted server too, or no certificate can be issued"
         );
     }
 

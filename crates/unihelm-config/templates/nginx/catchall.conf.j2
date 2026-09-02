@@ -1,3 +1,7 @@
+{# `http2 on;` exists only from nginx 1.25.1. Before that HTTP/2 was a listen
+   parameter, and the directive is a hard `unknown directive` that fails
+   `nginx -t` — Ubuntu 24.04 ships 1.24.0, so every vhost rendered here was
+   invalid on a distribution this project supports and tests on. #}
 # Default server.
 #
 # Every request whose Host matches no configured site lands here rather than
@@ -7,11 +11,26 @@
 # This file also owns the two directives that may appear exactly once per
 # listening address in the whole configuration: `default_server` and, for QUIC,
 # `reuseport`. Per-site vhosts must never carry them.
-
+#
+# Unless somebody else already owns them. On a server that was hosting sites
+# before Unihelm arrived, a second `default_server` is not an override — it is a
+# configuration nginx refuses to load, so `nginx -t` fails and the whole stack
+# install rolls back. The panel then declines to install on exactly the servers
+# people most want a panel for. Where an existing default server is found, this
+# file yields it and serves only the names it is given.
+{% if owns_default %}
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+{% else %}
+server {
+    listen 80;
+    listen [::]:80;
+    # Yielding the default server to the configuration that was here first, so
+    # this block answers only for the panel's own names.
+    server_name {{ catchall_names }};
+{% endif %}
 
     # ACME challenges must work before a site exists, so the webroot is served
     # by the default server too.
@@ -26,15 +45,27 @@ server {
     }
 }
 
+{% if owns_default %}
 server {
-    listen 443 ssl default_server{% if http3 %} reuseport{% endif %};
-    listen [::]:443 ssl default_server;
+    listen 443 ssl default_server{% if http3 %} reuseport{% endif %}{% if not http2_on %} http2{% endif %};
+    listen [::]:443 ssl default_server{% if not http2_on %} http2{% endif %};
 {% if http3 %}
     listen 443 quic default_server reuseport;
     listen [::]:443 quic default_server;
 {% endif %}
+{% if http2_on %}
     http2 on;
+{% endif %}
     server_name _;
+{% else %}
+server {
+    listen 443 ssl{% if not http2_on %} http2{% endif %};
+    listen [::]:443 ssl{% if not http2_on %} http2{% endif %};
+{% if http2_on %}
+    http2 on;
+{% endif %}
+    server_name {{ catchall_names }};
+{% endif %}
 
     # A self-signed certificate, because TLS on the default server has to be
     # *something* and presenting another customer's certificate would be worse.

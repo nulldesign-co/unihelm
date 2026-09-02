@@ -1,3 +1,7 @@
+{# `http2 on;` exists only from nginx 1.25.1. Before that HTTP/2 was a listen
+   parameter, and the directive is a hard `unknown directive` that fails
+   `nginx -t` — Ubuntu 24.04 ships 1.24.0, so every vhost rendered here was
+   invalid on a distribution this project supports and tests on. #}
 # The panel's own vhost.
 #
 # `unihelm-web` terminates its own TLS, so a server with no domain is still
@@ -24,9 +28,11 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl{% if not http2_on %} http2{% endif %};
+    listen [::]:443 ssl{% if not http2_on %} http2{% endif %};
+{% if http2_on %}
     http2 on;
+{% endif %}
     server_name {{ panel_domain }};
 
     ssl_certificate     {{ cert_path }};

@@ -475,6 +475,26 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
         .await?;
 
     // The default server. Now nginx -t can see the whole tree.
+    //
+    // Only if nothing else has claimed it. `default_server` may appear once per
+    // listening address, so on a machine that was already serving sites a second
+    // one fails `nginx -t`, the engine rolls the whole apply back, and the panel
+    // refuses to set up a stack on a working server — which is the opposite of
+    // what a control panel is for.
+    let existing = crate::nginx_survey::survey();
+    let owns_default = !existing.has_foreign_default_server();
+    if !owns_default {
+        ctx.log(format!(
+            "nginx already has a default server ({}); leaving it in place",
+            existing
+                .default_server_files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     engine
         .apply(ApplyRequest {
             file: ManagedFile::nginx(paths::nginx_catchall()),
@@ -483,6 +503,10 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
                 "acme_webroot": paths::acme_webroot(),
                 "default_cert": default_certs.join("fullchain.pem"),
                 "default_key": default_certs.join("privkey.pem"),
+                "owns_default": owns_default,
+                // Something has to answer, and it must not be a name anyone
+                // else serves. Only used when yielding the default server.
+                "catchall_names": "unihelm-catchall.invalid",
                 // HTTP/3 needs UDP/443 open; enabling it by default would make
                 // the panel depend on a firewall change nobody made.
                 "http3": false,

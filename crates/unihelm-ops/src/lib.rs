@@ -39,6 +39,7 @@ pub mod harden;
 pub mod importer;
 pub mod mail;
 pub mod metrics;
+pub mod nginx_survey;
 pub mod nodeapp;
 pub mod panel;
 pub mod php;

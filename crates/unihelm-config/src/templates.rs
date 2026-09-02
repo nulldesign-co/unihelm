@@ -122,6 +122,15 @@ impl TemplateSet {
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
 
+        // Which HTTP/2 spelling this machine's nginx accepts.
+        //
+        // A global rather than a key threaded through every render context,
+        // because it is a property of the server rather than of the thing being
+        // rendered, and every nginx template needs it. `true` is the safe
+        // default for the same reason `supports_http2_on` treats an unknown
+        // version as new: the directive has been correct since 2023.
+        env.add_global("http2_on", minijinja::Value::from(true));
+
         for (name, source) in TEMPLATES {
             env.add_template(name, source)
                 .map_err(|e| ConfigError::Template {
@@ -131,6 +140,17 @@ impl TemplateSet {
         }
 
         Ok(Self { env })
+    }
+
+    /// Record what the installed nginx accepts.
+    ///
+    /// Called once the version is known. Until 1.25.1, HTTP/2 was a listen
+    /// parameter and `http2 on;` is an `unknown directive` that fails
+    /// `nginx -t` — on Ubuntu 24.04, which ships 1.24.0, every vhost the panel
+    /// rendered was invalid.
+    pub fn set_http2_on(&mut self, supported: bool) {
+        self.env
+            .add_global("http2_on", minijinja::Value::from(supported));
     }
 
     pub fn render(&self, name: &str, context: &serde_json::Value) -> Result<String> {
@@ -186,6 +206,63 @@ mod tests {
     fn every_embedded_template_parses() {
         let set = TemplateSet::load().expect("a template that does not parse must fail at load");
         assert_eq!(set.names().len(), TEMPLATES.len());
+    }
+
+    /// The catchall owns `default_server` on a server Unihelm set up, and must
+    /// yield it on one that was already serving sites: the directive may appear
+    /// once per listening address, so a second one fails `nginx -t` and rolls
+    /// the entire stack install back.
+    #[test]
+    fn the_catchall_yields_an_existing_default_server() {
+        let set = TemplateSet::load().unwrap();
+        let ctx = |owns| {
+            json!({
+                "acme_webroot": "/var/lib/unihelm/acme",
+                "default_cert": "/x/fullchain.pem",
+                "default_key": "/x/privkey.pem",
+                "owns_default": owns,
+                "catchall_names": "unihelm-catchall.invalid",
+                "http3": false,
+            })
+        };
+
+        // Only directives count. The file's own header explains what
+        // `default_server` is, and a comment is not a declaration — which is
+        // exactly the distinction nginx makes too.
+        let directives = |rendered: &str| -> String {
+            rendered
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let owning = set.render("nginx/catchall.conf", &ctx(true)).unwrap();
+        assert!(
+            directives(&owning).contains("default_server"),
+            "on a server we own, the catchall must be the default"
+        );
+
+        let yielding = set.render("nginx/catchall.conf", &ctx(false)).unwrap();
+        let yielded = directives(&yielding);
+        assert!(
+            !yielded.contains("default_server"),
+            "a second default_server is what nginx -t refuses:\n{yielded}"
+        );
+        assert!(
+            !yielded.contains("server_name _;"),
+            "yielding means not claiming every unmatched name either"
+        );
+        assert!(
+            yielding.contains("unihelm-catchall.invalid"),
+            "the yielding block still needs a name of its own"
+        );
+        // Both shapes must still serve ACME, or a certificate can never be
+        // issued for the panel on an adopted server.
+        for rendered in [&owning, &yielding] {
+            assert!(rendered.contains("/.well-known/acme-challenge/"));
+        }
     }
 
     #[test]

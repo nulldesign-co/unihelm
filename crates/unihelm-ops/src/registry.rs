@@ -50,7 +50,29 @@ impl Services {
     /// A template that does not parse fails here, at startup, rather than the
     /// first time somebody creates a site.
     pub fn new(distro: Distro, db: Db, master_key: unihelm_db::MasterKey) -> Result<Self> {
-        let templates = TemplateSet::load().map_err(UnihelmError::from)?;
+        let mut templates = TemplateSet::load().map_err(UnihelmError::from)?;
+
+        // Which HTTP/2 spelling this machine's nginx accepts. Read once here
+        // rather than assumed: `http2 on;` arrived in 1.25.1, and Ubuntu 24.04 —
+        // which this project supports and tests on — ships 1.24.0, where it is
+        // an `unknown directive` that fails `nginx -t`. Every vhost the panel
+        // rendered was invalid on that distribution until this existed.
+        // Probed on a blocking thread: `Services::new` is synchronous and is
+        // called while the agent starts, before there is a runtime to await on.
+        let nginx = std::thread::spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|rt| rt.block_on(crate::nginx_survey::installed_version()))
+        })
+        .join()
+        .unwrap_or(None);
+        templates.set_http2_on(crate::nginx_survey::supports_http2_on(nginx));
+        if let Some((a, b, c)) = nginx {
+            tracing::info!(version = %format!("{a}.{b}.{c}"), "nginx detected");
+        }
+
         let config = ConfigEngine::new(templates)
             .with_revisions(crate::services::DbRevisions::new(db.clone()));
         Ok(Self {
