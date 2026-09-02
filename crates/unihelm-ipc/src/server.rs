@@ -19,6 +19,8 @@ use crate::frame::{
     ClientFrame, ControlFrame, EventFrame, PROTOCOL_VERSION, RequestFrame, ResponseBody,
     ResponseFrame, ServerFrame,
 };
+use unihelm_core::UnihelmError;
+
 use crate::peercred::{PeerCred, PeerPolicy, peer_cred};
 use crate::transport::{FrameTransport, StreamTransport, recv_json, send_json};
 use crate::{IpcError, Result};
@@ -187,9 +189,35 @@ async fn serve_connection<F: HandlerFactory>(
 
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if let Err(e) = send_json(writer.as_mut(), &frame).await {
-                tracing::debug!(error = %e, "ipc write failed");
+            let Err(e) = send_json(writer.as_mut(), &frame).await else {
+                continue;
+            };
+
+            // Only a broken socket ends the connection. Breaking on every error
+            // wedged the panel: an over-sized reply is rejected by the codec
+            // before a byte reaches the wire, so the socket was still perfectly
+            // good — but this task exited, the peer never saw EOF because the
+            // read half stayed open, and from then on every reply was dropped
+            // silently. Each privileged call in the panel then timed out after
+            // 30s, for every user, until somebody restarted the agent.
+            if matches!(e, IpcError::Io(_) | IpcError::Closed) {
+                tracing::debug!(error = %e, "ipc write failed; closing the connection");
                 break;
+            }
+
+            tracing::warn!(error = %e, "could not send an ipc frame");
+
+            // A request that produced an unsendable reply still needs an answer,
+            // or the caller waits out its timeout for nothing.
+            if let ServerFrame::Response(resp) = &frame {
+                let replacement = ServerFrame::Response(ResponseFrame::err(
+                    resp.id,
+                    UnihelmError::internal(format!("the response could not be sent: {e}")),
+                ));
+                if let Err(e) = send_json(writer.as_mut(), &replacement).await {
+                    tracing::debug!(error = %e, "could not send the replacement error either");
+                    break;
+                }
             }
         }
     });

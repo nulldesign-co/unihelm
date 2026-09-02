@@ -631,7 +631,19 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
                 .set_password(user.id, &password)
                 .await?;
 
+            // The reason to reset a password is usually that somebody else has
+            // it, and a session does not consult the hash: without this the
+            // intruder stays logged in, and auth.rs extends their cookie on
+            // every request, so it never ages out either. Revoked here rather
+            // than inside set_password, which a future "change my own password"
+            // screen will call and must not sign the operator out of the very
+            // session they are doing it from.
+            let revoked = db.revoke_all_sessions(user.id).await?;
+
             println!("password set for `{}`", user.username);
+            if revoked > 0 {
+                println!("signed out {revoked} existing session(s)");
+            }
             if !*password_stdin {
                 println!();
                 println!("  password: {password}");

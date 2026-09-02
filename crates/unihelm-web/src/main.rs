@@ -183,26 +183,43 @@ async fn main() -> Result<()> {
     notify::ready();
     notify::status(&format!("listening on {addr}"));
 
+    // One accept loop for both schemes, so the shutdown path cannot differ
+    // between them again — it already had, and in both directions: the TLS
+    // branch had no shutdown at all, and the plain branch's had no deadline.
+    //
+    // A deadline is the point. `with_graceful_shutdown` waits for every
+    // connection to end, and /api/events never ends: its sender lives in
+    // AppState for the life of the process and a 15s keep-alive comment stops
+    // the socket idling out, so one open panel tab held the drain until
+    // systemd's 90s stop timeout expired and SIGKILLed us — during an upgrade
+    // the operator was watching.
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal().await;
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+        }
+    });
+
+    let std_listener = listener.into_std().context("detaching the listener")?;
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+
     if serve_tls {
-        // axum-server owns the accept loop for TLS, and it does not take an
-        // already-bound listener, so hand the descriptor over rather than
-        // binding twice and racing ourselves for the port.
-        let std_listener = listener.into_std().context("detaching the listener")?;
         let acceptor = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem)
             .await
             .context("loading the panel's certificate")?;
         axum_server::from_tcp_rustls(std_listener, acceptor)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .handle(handle)
+            .serve(service)
             .await
             .context("server error")?;
     } else {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+        axum_server::from_tcp(std_listener)
+            .handle(handle)
+            .serve(service)
+            .await
+            .context("server error")?;
     }
 
     notify::stopping();

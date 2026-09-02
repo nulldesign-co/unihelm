@@ -246,10 +246,24 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
 }
 
 /// The caller's address, for rate limiting and the audit trail.
+///
+/// `X-Forwarded-For` is honoured only from a loopback peer. It used to be
+/// honoured from anyone, on the reasoning that a reverse proxy is the normal
+/// deployment and the value is "only a label" — but since 0.1.9 the normal
+/// deployment is the panel on 0.0.0.0 with no proxy at all, and that label is
+/// what the per-IP login budget counts, what the audit trail records, and what
+/// Sentinel feeds to the firewall when it decides whom to ban. A header anyone
+/// could set made the throttle count forged buckets instead of callers, and let
+/// an anonymous caller spend somebody else's failure budget until the panel
+/// banned an address of their choosing.
+///
+/// Loopback is the right test rather than "is TLS off": `unihelm cert panel`
+/// renders `proxy_pass https://127.0.0.1:8088`, so nginx keeps talking to a
+/// panel whose own TLS is still on, and it reaches us over loopback either way.
 pub fn client_ip(peer: Option<&SocketAddr>, headers: &HeaderMap) -> String {
-    // A reverse proxy in front of the panel is the normal deployment, so trust
-    // `X-Forwarded-For` only for its left-most entry and only as a label.
-    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+    let from_proxy = peer.is_some_and(|a| a.ip().is_loopback());
+    if from_proxy
+        && let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
         && let Some(first) = value.split(',').next()
     {
         let candidate = first.trim();
@@ -356,22 +370,37 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_for_is_used_only_when_it_is_an_address() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("203.0.113.7, 10.0.0.1"),
-        );
-        assert_eq!(client_ip(None, &headers), "203.0.113.7");
+    fn forwarded_for_is_honoured_from_a_proxy_and_ignored_from_everyone_else() {
+        let xff = |v| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", HeaderValue::from_static(v));
+            h
+        };
+        let proxy: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+        let caller: SocketAddr = "198.51.100.9:44444".parse().unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        // nginx on loopback, which is what `unihelm cert panel` sets up.
         assert_eq!(
-            client_ip(None, &headers),
-            "unknown",
-            "a junk header must not become an identity"
+            client_ip(Some(&proxy), &xff("203.0.113.7, 10.0.0.1")),
+            "203.0.113.7"
         );
 
+        // The panel's own default is 0.0.0.0 with no proxy at all, so this
+        // header is written by whoever is calling. Believing it let an
+        // anonymous caller spend another address's login budget until Sentinel
+        // banned the address they named — the operator's own, if they chose.
+        assert_eq!(
+            client_ip(Some(&caller), &xff("203.0.113.7")),
+            "198.51.100.9",
+            "a header from a direct caller must not become their identity"
+        );
+
+        // Junk from a genuine proxy falls back to the peer rather than becoming
+        // an identity of its own.
+        assert_eq!(client_ip(Some(&proxy), &xff("not-an-ip")), "127.0.0.1");
+
+        // No peer means no evidence of a proxy, so the header is not trusted.
+        assert_eq!(client_ip(None, &xff("203.0.113.7")), "unknown");
         assert_eq!(client_ip(None, &HeaderMap::new()), "unknown");
     }
 

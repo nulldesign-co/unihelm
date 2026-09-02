@@ -135,7 +135,7 @@ verifies its minisign signature and SHA-256 checksum, and installs it.
   --version TAG       Install this release instead of the latest (e.g. v0.1.4)
   --admin-user NAME   Username for the first administrator (default: admin)
   --admin-email MAIL  Email for the first administrator (default: admin@<hostname>)
-  --listen ADDR:PORT  Panel listen address (default: 127.0.0.1:8088)
+  --listen ADDR:PORT  Panel listen address (default: 0.0.0.0:8088)
   --skip-preflight    Install anyway on an unsupported system. Not recommended.
   -h, --help          This text
 
@@ -689,6 +689,26 @@ create_layout() {
   return 0
 }
 
+# A yes/no question, on the terminal rather than stdin.
+#
+# Same reasoning as the administrator's address: under `curl … | sudo bash`
+# stdin is the script, and /dev/tty can pass -r and -w in contexts where opening
+# it still fails. With no terminal — CI, cloud-init, `ssh host '…'` — the answer
+# is no, because the question is only ever asked before doing something the
+# operator cannot easily undo.
+ask_yes_no() {
+  local prompt="$1" answer=""
+  if { : >/dev/tty; } 2>/dev/null && { : </dev/tty; } 2>/dev/null; then
+    printf '    %s [Y/n]: ' "$prompt" >/dev/tty
+    IFS= read -r answer </dev/tty || answer=""
+    case "$answer" in
+      [Nn] | [Nn][Oo]) return 1 ;;
+      *) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
 # Add a key to the [panel] table.
 #
 # Not `>>`: config.toml has [agent] and [log] after [panel], so appending puts
@@ -738,11 +758,20 @@ migrate_config() {
 
   case "$listen_now" in
     "127.0.0.1:8088")
-      # The shipped default, never edited. Move it to the current one.
-      sed -i 's|^listen = .*|listen = "0.0.0.0:8088"|' "$cfg"
-      set_panel_key "$cfg" tls self-signed "# Added on upgrade: the panel terminates its own TLS."
-      info "moved the panel from loopback to 0.0.0.0:8088 with its own certificate"
-      info "set listen back to 127.0.0.1:8088 in $cfg if you would rather it were not reachable"
+      # The value this installer shipped as its default — but byte-identical to
+      # what somebody gets by passing `--listen 127.0.0.1:8088` on purpose, and
+      # nothing on disk tells the two apart. Moving it exposes the panel to the
+      # network and opens a firewall port for it, so this asks rather than
+      # assuming, and a machine with nobody at the keyboard keeps what it has.
+      if ask_yes_no "Make the panel reachable on this server's address (https, port 8088)?"; then
+        sed -i 's|^listen = .*|listen = "0.0.0.0:8088"|' "$cfg"
+        set_panel_key "$cfg" tls self-signed "# Added on upgrade: the panel terminates its own TLS."
+        info "the panel now listens on 0.0.0.0:8088 with its own certificate"
+        info "set listen back to 127.0.0.1:8088 in $cfg to undo this"
+      else
+        set_panel_key "$cfg" tls off "# Added on upgrade, preserving this install's behaviour."
+        info "left the panel on loopback; reach it over an ssh port-forward"
+      fi
       ;;
     "")
       # No listen line at all; the panel is on its default, which is now
@@ -772,6 +801,10 @@ write_configuration() {
   step "Writing configuration"
   if [ -f "$CONFIG_DIR/config.toml" ]; then
     info "$CONFIG_DIR/config.toml exists; leaving it alone"
+    if [ -n "$LISTEN" ]; then
+      sed -i "s|^listen = .*|listen = \"$LISTEN\"|" "$CONFIG_DIR/config.toml"
+      info "listen set to $LISTEN"
+    fi
     migrate_config
   else
     install -m 0644 "$here/config.toml.example" "$CONFIG_DIR/config.toml"
