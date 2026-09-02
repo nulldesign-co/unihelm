@@ -338,6 +338,7 @@ impl OpRegistry {
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
         registry.register(crate::nginx_survey::Discover);
+        registry.register(crate::runtimes::List);
         registry.register(crate::webhook::List);
         registry.register(crate::webhook::Set);
         registry.register(crate::webhook::Delete);

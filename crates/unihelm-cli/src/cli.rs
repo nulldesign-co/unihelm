@@ -60,6 +60,9 @@ pub enum Command {
     /// Websites and their vhosts.
     #[command(subcommand)]
     Site(SiteCommand),
+    /// Language runtimes installed on this server.
+    #[command(subcommand)]
+    Runtime(RuntimeCommand),
     /// PHP versions.
     #[command(subcommand)]
     Php(PhpCommand),
@@ -201,6 +204,13 @@ pub enum OpsCommand {
 // ---------------------------------------------------------------------------
 // sites
 // ---------------------------------------------------------------------------
+
+/// Language runtimes installed on this server.
+#[derive(Subcommand, Debug)]
+pub enum RuntimeCommand {
+    /// Every runtime found, with each version and where it lives.
+    List,
+}
 
 #[derive(Subcommand, Debug)]
 pub enum SiteCommand {

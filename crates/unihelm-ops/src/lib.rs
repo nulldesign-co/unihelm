@@ -49,6 +49,7 @@ pub mod posture;
 pub mod provision;
 pub mod quota;
 pub mod registry;
+pub mod runtimes;
 pub mod services;
 pub mod sftp;
 pub mod site;

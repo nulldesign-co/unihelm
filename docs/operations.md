@@ -152,6 +152,26 @@ back as `UNI-1404 dependents_exist` instead of breaking those sites.
 Lists the sites visible in the caller's tenant scope, with their domain, type,
 PHP version, document root and current status.
 
+### `runtime.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Every language runtime found on the server — Node, Python, PHP, Ruby, Go, Deno,
+Bun — with each installed version, its absolute path, and which one a bare
+command name resolves to.
+
+Read-only. It exists because pinning an application to a version starts with
+being able to see which versions are there: `nodeapp` resolves one absolute
+`node` at create time, and until this existed there was no way to ask the
+machine what else it had. Versioned interpreters are found both as siblings in
+`/usr/bin` (`php8.3` next to `php8.2`) and as per-version directories left by a
+version manager such as `fnm` or `nvm`; `phpize` and `php-config` are not
+mistaken for interpreters.
+
 ### `sites.discover`
 
 | | |
