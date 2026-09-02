@@ -797,6 +797,12 @@ pub enum AppCommand {
         /// Per-app `MemoryMax`, inside the tenant slice's own ceiling.
         #[arg(long)]
         memory_mb: Option<u32>,
+        /// Pin to an installed runtime version, e.g. `22.11.0`.
+        ///
+        /// `unihelm runtime list` shows which are on this server. Without it the
+        /// app runs on whichever a bare `node` resolves to.
+        #[arg(long)]
+        runtime_version: Option<String>,
         /// Publish the app behind this domain as a reverse-proxy site.
         #[arg(long)]
         proxy_domain: Option<String>,

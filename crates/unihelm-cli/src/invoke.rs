@@ -606,6 +606,7 @@ fn app(cmd: &AppCommand) -> Result<Action> {
             node_env,
             memory_mb,
             proxy_domain,
+            runtime_version,
         } => {
             let node_env = node_env.map(|e| match e {
                 NodeEnvArg::Production => "production",
@@ -620,6 +621,7 @@ fn app(cmd: &AppCommand) -> Result<Action> {
                 .maybe("node_env", node_env)
                 .maybe("memory_mb", *memory_mb)
                 .maybe("proxy_domain", proxy_domain.clone())
+                .maybe("runtime_version", runtime_version.clone())
                 .done();
             call("app.create", input)
         }

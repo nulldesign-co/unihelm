@@ -1,0 +1,11 @@
+-- Pin an application to a runtime version.
+--
+-- `nodeapp` resolved one absolute `node` at create time and its own header said
+-- per-app pinning "changes only which path that is". This is the column that
+-- decides which. NULL keeps today's behaviour exactly: whichever interpreter a
+-- bare `node` resolves to, which is what every existing row means.
+--
+-- The version rather than the path is stored, because a path goes stale when a
+-- version manager moves its directories and a version does not; the path is
+-- resolved again at every render through `runtimes::survey()`.
+ALTER TABLE node_apps ADD COLUMN runtime_version TEXT;

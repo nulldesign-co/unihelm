@@ -86,6 +86,12 @@ pub struct NodeApp {
     pub entry: String,
     pub port: i64,
     pub node_env: NodeEnv,
+    /// The runtime version this app is pinned to, e.g. `22.11.0`.
+    ///
+    /// `None` means whatever a bare `node` resolves to, which is what every app
+    /// created before pinning existed means — and still the right default for
+    /// somebody who has only one Node installed.
+    pub runtime_version: Option<String>,
     pub enabled: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
@@ -102,6 +108,7 @@ pub struct NodeAppRow {
     pub entry: String,
     pub port: i64,
     pub node_env: String,
+    pub runtime_version: Option<String>,
     pub enabled: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -119,6 +126,7 @@ impl TryFrom<NodeAppRow> for NodeApp {
             entry: r.entry,
             port: r.port,
             node_env: NodeEnv::parse(&r.node_env)?,
+            runtime_version: r.runtime_version,
             enabled: r.enabled != 0,
             created_at: from_sql_time(&r.created_at)?,
             updated_at: from_sql_time(&r.updated_at)?,
@@ -134,6 +142,8 @@ pub struct NewNodeApp {
     pub name: AppName,
     pub entry: TenantPath,
     pub node_env: NodeEnv,
+    /// Pin to a specific installed version, or `None` for the default one.
+    pub runtime_version: Option<String>,
 }
 
 pub struct NodeAppRepo<'a> {
@@ -185,8 +195,8 @@ impl Db {
                 // lowest port itself was freed by a deleted app.
                 "INSERT INTO node_apps
                      (subscription_id, site_id, name, entry, port, node_env,
-                      enabled, created_at, updated_at)
-                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, 1, ?5, ?5 FROM (
+                      runtime_version, enabled, created_at, updated_at)
+                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, ?8, 1, ?5, ?5 FROM (
                      SELECT ?6 AS candidate
                      UNION ALL
                      SELECT port + 1 FROM node_apps WHERE port >= ?6
@@ -202,6 +212,7 @@ impl Db {
             .bind(&ts)
             .bind(min_port)
             .bind(max_port)
+            .bind(new.runtime_version.as_deref())
             .fetch_one(self.pool())
             .await;
 
@@ -421,6 +432,7 @@ mod tests {
             name: AppName::parse(name).unwrap(),
             entry: TenantPath::parse(&format!("apps/{name}/server.js")).unwrap(),
             node_env: NodeEnv::Production,
+            runtime_version: None,
         }
     }
 

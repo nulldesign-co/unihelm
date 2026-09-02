@@ -305,6 +305,39 @@ fn locate_node(program: &str) -> Result<PathBuf> {
     })
 }
 
+/// The absolute path of one installed Node version.
+///
+/// Fails rather than falling back to the default: an app pinned to 20 that
+/// quietly starts on 22 is worse than one that refuses to start, because the
+/// first failure happens in production at some later time and the second happens
+/// here, in front of the person who asked.
+async fn resolve_pinned_node(version: &str) -> Result<PathBuf> {
+    let installed = crate::runtimes::survey().await;
+    let nodes = installed.get(&crate::runtimes::Runtime::Node);
+
+    if let Some(found) = nodes.and_then(|v| v.iter().find(|r| r.version == version)) {
+        return Ok(PathBuf::from(&found.path));
+    }
+
+    let available = nodes
+        .map(|v| {
+            v.iter()
+                .map(|r| r.version.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".into());
+
+    Err(UnihelmError::new(
+        ErrorCode::NotFound,
+        format!(
+            "Node {version} is not installed on this server. Available: {available}. \
+             Install it, or create the app without a version to use the default."
+        ),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The unit file
 // ---------------------------------------------------------------------------
@@ -660,6 +693,13 @@ pub struct CreateInput {
     /// Per-app `MemoryMax`, inside the tenant slice's own ceiling.
     #[serde(default)]
     pub memory_mb: Option<u32>,
+    /// Pin this app to an installed runtime version, e.g. `22.11.0`.
+    ///
+    /// Omit it and the app runs on whatever a bare `node` resolves to, which is
+    /// what every app created before this existed does. `runtime.list` shows
+    /// which versions this machine has.
+    #[serde(default)]
+    pub runtime_version: Option<String>,
     /// Publish the app behind this domain as a reverse-proxy site.
     #[serde(default)]
     pub proxy_domain: Option<Domain>,
@@ -699,7 +739,13 @@ impl TypedOperation for Create {
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
         ensure_plan_allows_node_apps(ctx, &subscription).await?;
 
-        let node_binary = locate_node(&self.node_program)?;
+        // A pinned version resolves to a path here rather than being stored as
+        // one: a path goes stale when a version manager moves its directories,
+        // and a version does not.
+        let node_binary = match &input.runtime_version {
+            Some(want) => resolve_pinned_node(want).await?,
+            None => locate_node(&self.node_program)?,
+        };
         check_entry(&input.entry)?;
         let env = environment_lines(&input.env)?;
 
@@ -718,6 +764,7 @@ impl TypedOperation for Create {
                 name: input.name.clone(),
                 entry: input.entry.clone(),
                 node_env: input.node_env,
+                runtime_version: input.runtime_version.clone(),
             })
             .await
             .map_err(UnihelmError::from)?;
@@ -1214,6 +1261,7 @@ mod tests {
             entry: entry.into(),
             port,
             node_env: NodeEnv::Production,
+            runtime_version: None,
             enabled: true,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -1685,6 +1733,7 @@ mod tests {
                 name: AppName::parse("blog").unwrap(),
                 entry: TenantPath::parse("apps/blog/server.js").unwrap(),
                 node_env: NodeEnv::Production,
+                runtime_version: None,
             })
             .await
             .unwrap();
@@ -2004,6 +2053,7 @@ mod tests {
                     env: Vec::new(),
                     node_env: NodeEnv::Production,
                     memory_mb: None,
+                    runtime_version: None,
                     proxy_domain: None,
                 },
             )
@@ -2070,6 +2120,7 @@ mod tests {
             env: Vec::new(),
             node_env: NodeEnv::Production,
             memory_mb: None,
+            runtime_version: None,
             proxy_domain: None,
         };
 
@@ -2136,6 +2187,7 @@ mod tests {
                     env: Vec::new(),
                     node_env: NodeEnv::Production,
                     memory_mb: None,
+                    runtime_version: None,
                     proxy_domain: None,
                 },
             )
@@ -2198,6 +2250,7 @@ mod tests {
                 name: AppName::parse("blog2").unwrap(),
                 entry: TenantPath::parse("apps/blog2/server.js").unwrap(),
                 node_env: NodeEnv::Production,
+                runtime_version: None,
             })
             .await
             .unwrap();
@@ -2294,6 +2347,7 @@ mod tests {
             name: AppName::parse("admins-app").unwrap(),
             entry: TenantPath::parse("apps/admins-app/server.js").unwrap(),
             node_env: NodeEnv::Production,
+            runtime_version: None,
         })
         .await
         .unwrap();
@@ -2303,5 +2357,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all["apps"].as_array().unwrap().len(), 2);
+    }
+}
+#[cfg(test)]
+mod pinning_tests {
+    use super::*;
+
+    /// A version that is not installed must fail loudly.
+    ///
+    /// Falling back to the default would be worse than refusing: an app pinned
+    /// to 20 that quietly starts on 22 fails in production at some later time,
+    /// where a refusal fails here, in front of the person who asked for it.
+    #[tokio::test]
+    async fn a_version_that_is_not_installed_is_refused() {
+        let err = resolve_pinned_node("0.0.1-nonexistent")
+            .await
+            .expect_err("an uninstalled version must not resolve");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("0.0.1-nonexistent"),
+            "the error must name the version asked for: {text}"
+        );
+        assert!(
+            text.contains("Available"),
+            "and say what there is instead: {text}"
+        );
+    }
+
+    /// The version this machine actually has must resolve to a real binary, or
+    /// pinning to it would produce a unit that dies at first start.
+    #[tokio::test]
+    async fn an_installed_version_resolves_to_a_path_that_exists() {
+        let installed = crate::runtimes::survey().await;
+        let Some(node) = installed
+            .get(&crate::runtimes::Runtime::Node)
+            .and_then(|v| v.first())
+        else {
+            // No Node here; nothing to assert, and skipping is honest.
+            return;
+        };
+
+        let path = resolve_pinned_node(&node.version)
+            .await
+            .expect("the version this machine reports must resolve");
+        assert!(path.is_file(), "{} is not a file", path.display());
     }
 }

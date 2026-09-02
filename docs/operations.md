@@ -1472,7 +1472,7 @@ listing, so one broken app cannot blank the page.
 |---|---|
 | Permission | `node_apps` |
 | Execution | task — not cancellable, **not** idempotent |
-| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |
+| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |, `runtime_version` *(optional string)*
 
 Allocates a port, creates `<home>/apps/<name>` owned by the tenant at `0750`,
 writes the slice drop-in, writes and verifies the unit, enables it (so a reboot
