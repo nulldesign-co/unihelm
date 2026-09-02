@@ -152,6 +152,32 @@ back as `UNI-1404 dependents_exist` instead of breaking those sites.
 Lists the sites visible in the caller's tenant scope, with their domain, type,
 PHP version, document root and current status.
 
+### `sites.discover`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Reads the vhosts nginx is already serving that Unihelm did not write, and
+reports each one's domain, every name it answers for, what kind of site it is
+(`php`, `static`, `proxy`, `redirect`, or `unknown` when it cannot tell), its
+document root or upstream, its certificate, and the file it came from.
+
+Also reports whether another configuration already declares `default_server` —
+which is what decides whether the panel's own catchall claims it — and the
+installed nginx version, which decides whether vhosts are rendered with
+`http2 on;` or the older listen parameter.
+
+Read-only. Nothing here adopts, rewrites or takes ownership of anything: a
+server that was hosting sites before the panel arrived showed up as empty, and a
+control panel that cannot see what a machine is doing is one you cannot trust to
+change it. `server_read` rather than `site_manage` for the same reason
+`security.posture` uses it — being allowed to look is not being allowed to act,
+and nothing is disclosed here that `ls /etc/nginx/conf.d` would not show the
+same account.
+
 ### `site.create`
 
 | | |

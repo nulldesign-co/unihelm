@@ -169,6 +169,7 @@ fn call(op: &'static str, input: Value) -> Action {
 fn site(cmd: &SiteCommand) -> Result<Action> {
     Ok(match cmd {
         SiteCommand::List(page) => call("site.list", paged(*page)),
+        SiteCommand::Discover => call("sites.discover", json!({})),
         SiteCommand::Create {
             domain,
             kind,

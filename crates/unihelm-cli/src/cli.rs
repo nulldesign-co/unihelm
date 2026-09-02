@@ -206,6 +206,12 @@ pub enum OpsCommand {
 pub enum SiteCommand {
     /// List sites.
     List(Page),
+    /// Sites nginx is already serving that the panel did not create.
+    ///
+    /// Read-only. A server that was hosting sites before Unihelm arrived showed
+    /// up in the panel as empty, which is a poor thing for a control panel to
+    /// say about a machine running a dozen vhosts.
+    Discover,
     /// Create a site and render its vhost.
     Create {
         /// The domain to serve, e.g. `shop.example`.
