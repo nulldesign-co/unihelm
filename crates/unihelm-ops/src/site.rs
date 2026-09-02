@@ -525,7 +525,29 @@ pub async fn render_vhost_mode(
 ) -> Result<()> {
     let db = ctx.db();
     let mut context = site_context(site, linux_user)?;
-    if force_maintenance {
+
+    // Suspension is a property of the subscription, so it is read here rather
+    // than trusted from the caller.
+    //
+    // It used to live only in `force_maintenance`, which `plan.rs` passed when
+    // it suspended — and nothing else did. Certificate renewal calls
+    // `render_vhost`, which passes false, so the first renewal inside the
+    // thirty-day window rewrote a suspended tenant's vhost without the 503 and
+    // reloaded nginx: the site came back, unattended, while the panel still
+    // showed it as suspended. `site.drift` built its expected file the same way,
+    // so every suspended site also reported as hand-edited.
+    let suspended = match db
+        .subscriptions(&unihelm_core::TenantScope::Global)
+        .by_id(site.subscription_id)
+        .await
+        .map_err(UnihelmError::from)?
+    {
+        Some(sub) => !sub.status.can_serve(),
+        // A site whose subscription has gone is not one to serve either.
+        None => true,
+    };
+
+    if force_maintenance || suspended {
         context.maintenance_mode = true;
     }
 
@@ -779,6 +801,25 @@ impl TypedOperation for Update {
 
         if let Some(version) = input.php_version {
             require_php_installed(ctx, version).await?;
+        }
+        // Raw configuration is an operator's tool, not a tenant's.
+        //
+        // `check_snippet` bounds the length, refuses a NUL and balances braces —
+        // and none of that constrains what the directives *do*. A customer holds
+        // SiteManage, the snippet lands inside their own server block, and the
+        // nginx worker can traverse every tenant's tree and reach every tenant's
+        // FPM socket, so `location ^~ /grab/ { alias /home/; }` reads other
+        // people's sites. There is no validator that makes arbitrary nginx safe;
+        // the answer is who is allowed to write it.
+        if (input.custom_nginx_snippet.is_some() || input.php_ini_overrides.is_some())
+            && !matches!(ctx.auth().acting_role, unihelm_core::Role::Admin)
+        {
+            return Err(UnihelmError::new(
+                ErrorCode::PermissionDenied,
+                "custom_nginx_snippet and php_ini_overrides are operator settings; \
+                     ask your administrator to set them",
+            )
+            .with_field("custom_nginx_snippet"));
         }
         if let Some(snippet) = input.custom_nginx_snippet.as_ref().and_then(|s| s.as_ref()) {
             check_snippet(snippet)?;
