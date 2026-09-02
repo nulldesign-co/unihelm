@@ -673,6 +673,158 @@ fn view(relay: Option<&MailRelay>) -> RelayView {
     }
 }
 
+/// `mail.dns.publish` — write the advisory's records into the operator's zone.
+///
+/// The advisory stays advisory: `AdvisoryRecord::managed` is still always false,
+/// and nothing publishes on its own or keeps a record in step afterwards. This
+/// is the operator saying "yes, put those in", once, and being told exactly what
+/// went in and what did not.
+///
+/// A dry run is the default. Publishing into somebody's live zone is not a thing
+/// to do because a field happened to be set, and a mail domain's SPF record is
+/// one an operator may already have written by hand — an existing record is
+/// reported and left alone rather than overwritten, because merging two SPF
+/// policies correctly is not something to guess at.
+pub struct DnsPublish;
+
+#[derive(Debug, Deserialize)]
+pub struct DnsPublishInput {
+    /// Write the records. Without this, the operation only reports what it would
+    /// do — which is the answer most people want the first time.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DnsPublishOutput {
+    /// Whether anything was actually written.
+    pub applied: bool,
+    /// One line per record, saying what happened to it.
+    pub results: Vec<PublishedRecord>,
+    pub advice: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublishedRecord {
+    pub name: String,
+    pub record_type: &'static str,
+    pub value: Option<String>,
+    /// `would-create`, `created`, `exists`, `skipped` or `failed`.
+    pub outcome: &'static str,
+    pub detail: Option<String>,
+}
+
+#[async_trait]
+impl TypedOperation for DnsPublish {
+    type Input = DnsPublishInput;
+    type Output = DnsPublishOutput;
+
+    const NAME: &'static str = "mail.dns.publish";
+    // Writes into the zone that fronts every site on this server. Server-wide
+    // configuration, server-wide permission.
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let relay = ctx.db().mail_relay().await.map_err(UnihelmError::from)?;
+        let advisory = dns_advisory(relay.as_ref());
+
+        let mut results = Vec::new();
+        for record in &advisory.records {
+            // A record whose value only the provider can supply — a DKIM public
+            // key, typically. Publishing a placeholder would be worse than
+            // publishing nothing.
+            let Some(value) = record.value.clone() else {
+                results.push(PublishedRecord {
+                    name: record.name.clone(),
+                    record_type: record.record_type,
+                    value: None,
+                    outcome: "skipped",
+                    detail: Some(
+                        "only your provider can supply this value; copy it from their dashboard"
+                            .into(),
+                    ),
+                });
+                continue;
+            };
+
+            // The advisory leaves `{domain}` in place where the record belongs
+            // to whichever domain the operator sends as. Publishing that
+            // literally would create a record named `{domain}`.
+            if record.name.contains('{') {
+                results.push(PublishedRecord {
+                    name: record.name.clone(),
+                    record_type: record.record_type,
+                    value: Some(value),
+                    outcome: "skipped",
+                    detail: Some(
+                        "this record belongs to each sending domain; publish it per domain".into(),
+                    ),
+                });
+                continue;
+            }
+
+            if !input.apply {
+                results.push(PublishedRecord {
+                    name: record.name.clone(),
+                    record_type: record.record_type,
+                    value: Some(value),
+                    outcome: "would-create",
+                    detail: None,
+                });
+                continue;
+            }
+
+            match publish_one(ctx, &record.name, record.record_type, &value).await {
+                Ok(outcome) => results.push(PublishedRecord {
+                    name: record.name.clone(),
+                    record_type: record.record_type,
+                    value: Some(value),
+                    outcome,
+                    detail: None,
+                }),
+                Err(e) => results.push(PublishedRecord {
+                    name: record.name.clone(),
+                    record_type: record.record_type,
+                    value: Some(value),
+                    outcome: "failed",
+                    detail: Some(e.to_string()),
+                }),
+            }
+        }
+
+        Ok(DnsPublishOutput {
+            applied: input.apply,
+            results,
+            advice: advisory.advice,
+        })
+    }
+}
+
+/// Put one record into the operator's zone, if it is not already there.
+///
+/// Never overwrites. An SPF record the operator wrote by hand is a policy, and
+/// merging two SPF policies correctly is not something to guess at — the
+/// existing one is reported and left exactly as it is.
+async fn publish_one(
+    ctx: &OpContext,
+    name: &str,
+    record_type: &str,
+    value: &str,
+) -> Result<&'static str> {
+    let (_, zone, cloudflare) = crate::dns::resolve_provider(ctx, name).await?;
+
+    let existing = cloudflare.find_records(&zone.id, record_type, name).await?;
+    if !existing.is_empty() {
+        return Ok("exists");
+    }
+
+    cloudflare
+        .create_record(&zone.id, record_type, name, value, None)
+        .await?;
+    Ok("created")
+}
+
 /// `mail.relay.get` — the configured relay, and the DNS records it needs.
 pub struct RelayGet;
 

@@ -682,3 +682,59 @@ async fn a_site_whose_subscription_vanished_is_skipped_rather_than_failing_the_r
     assert_eq!(out.sites.rewired, 1);
     assert_eq!(out.sites.skipped_no_subscription, 1);
 }
+
+// ---------------------------------------------------------------------------
+// publishing the advisory
+// ---------------------------------------------------------------------------
+
+/// A record whose value only the provider can supply must never be published.
+///
+/// A DKIM record with a placeholder in it is worse than no DKIM record: mail
+/// signed against a key the zone does not carry fails verification, where mail
+/// with no DKIM record at all merely goes unsigned.
+#[test]
+fn a_record_with_no_value_is_skipped_rather_than_invented() {
+    let advisory = dns_advisory(Some(&relay_for("smtp.postmarkapp.com", "no@acme.example")));
+    for record in &advisory.records {
+        if record.value.is_none() {
+            assert!(
+                record.purpose.to_lowercase().contains("dkim")
+                    || record.purpose.to_lowercase().contains("provider"),
+                "a valueless record must say why: {record:?}"
+            );
+        }
+    }
+}
+
+/// The advisory leaves `{domain}` where a record belongs to each sending domain.
+/// Publishing that literally creates a record actually named `{domain}`.
+#[test]
+fn a_per_domain_placeholder_is_never_published_literally() {
+    let advisory = dns_advisory(Some(&relay_for("smtp.postmarkapp.com", "no@acme.example")));
+    for record in &advisory.records {
+        if record.name.contains('{') {
+            assert!(
+                record.name.contains("{domain}"),
+                "the only placeholder publishing knows to skip is {{domain}}: {record:?}"
+            );
+        }
+    }
+}
+
+/// Whatever else changes, these stay advisory: nothing in the panel keeps a
+/// published record in step afterwards, and a field that could read `true` would
+/// invite an operator to believe otherwise.
+#[test]
+fn advisory_records_never_claim_to_be_managed() {
+    for relay in [
+        None,
+        Some(relay_for("smtp.postmarkapp.com", "no@acme.example")),
+        Some(relay_for("mail.internal.example", "no@acme.example")),
+    ] {
+        let advisory = dns_advisory(relay.as_ref());
+        assert!(
+            advisory.records.iter().all(|r| !r.managed),
+            "the panel does not manage these"
+        );
+    }
+}

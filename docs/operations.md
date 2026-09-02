@@ -152,6 +152,30 @@ back as `UNI-1404 dependents_exist` instead of breaking those sites.
 Lists the sites visible in the caller's tenant scope, with their domain, type,
 PHP version, document root and current status.
 
+### `mail.dns.publish`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `apply` *(optional bool, default false)* |
+
+Writes the records from `mail.relay.get`'s advisory into the zone held by the
+configured DNS provider.
+
+A dry run by default: without `apply` it reports what it would write and changes
+nothing. **An existing record is never overwritten.** More than one SPF record on
+a name is a permanent error rather than a merge, and an operator who wrote theirs
+by hand meant it — such a record is reported as `exists` and left alone.
+
+Two kinds of record are skipped and say why: one whose value only the provider
+can supply (a DKIM public key), and one the advisory leaves `{domain}` in,
+because it belongs to each sending domain rather than to the server.
+
+The advisory itself stays advisory. `AdvisoryRecord::managed` is still always
+false and nothing keeps a published record in step afterwards; this is the
+operator saying "yes, put those in", once.
+
 ### `runtime.list`
 
 | | |

@@ -420,6 +420,86 @@ impl Cloudflare {
         Ok(out)
     }
 
+    /// Records of one type already at one name.
+    ///
+    /// Used to decide whether to write at all: a record an operator put there by
+    /// hand is theirs, and the panel adding a second SPF policy beside it would
+    /// break mail delivery rather than improve it — more than one SPF record on
+    /// a name is a permerror, not a merge.
+    pub async fn find_records(
+        &self,
+        zone_id: &str,
+        record_type: &str,
+        name: &str,
+    ) -> Result<Vec<String>> {
+        let result = self
+            .call(CfRequest {
+                method: CfMethod::Get,
+                path: format!("/zones/{zone_id}/dns_records"),
+                query: vec![
+                    ("type".into(), record_type.into()),
+                    ("name".into(), name.into()),
+                ],
+                body: None,
+            })
+            .await?;
+
+        Ok(result
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Create one record of any type, and return its id.
+    ///
+    /// The ACME path has its own `create_txt` with a 60 s TTL because those
+    /// records are deleted minutes later. These are records an operator means to
+    /// keep, so they get the zone's default TTL and a comment saying where they
+    /// came from — a zone is somebody's, and a record that appears in it without
+    /// explanation is worse than no record.
+    pub async fn create_record(
+        &self,
+        zone_id: &str,
+        record_type: &str,
+        name: &str,
+        content: &str,
+        priority: Option<u16>,
+    ) -> Result<String> {
+        let mut body = serde_json::json!({
+            "type": record_type,
+            "name": name,
+            "content": content,
+            "comment": "added by Unihelm",
+        });
+        if let Some(p) = priority {
+            body["priority"] = serde_json::json!(p);
+        }
+
+        let result = self
+            .call(CfRequest {
+                method: CfMethod::Post,
+                path: format!("/zones/{zone_id}/dns_records"),
+                query: Vec::new(),
+                body: Some(body),
+            })
+            .await?;
+
+        result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                UnihelmError::new(
+                    ErrorCode::Internal,
+                    "Cloudflare accepted the record but returned no id",
+                )
+            })
+    }
+
     /// Create one TXT record and return its id.
     pub async fn create_txt(&self, zone_id: &str, name: &str, content: &str) -> Result<String> {
         // 60 s is Cloudflare's floor for an explicit TTL. It matters: the
@@ -1385,7 +1465,10 @@ impl TypedOperation for IssueWildcard {
 /// call, which is why the walk stops at the first hit rather than gathering
 /// every candidate: the common case is one token, and the expensive case is an
 /// operator with many zone-scoped ones.
-async fn resolve_provider(ctx: &OpContext, name: &str) -> Result<(String, Zone, Cloudflare)> {
+pub(crate) async fn resolve_provider(
+    ctx: &OpContext,
+    name: &str,
+) -> Result<(String, Zone, Cloudflare)> {
     let providers = ctx
         .db()
         .dns_providers(DnsProviderKind::Cloudflare)

@@ -1380,6 +1380,15 @@ pub enum ImportSourceArg {
 /// no mailboxes, no inbound mail, no queue (spec §11.18).
 #[derive(Debug, Subcommand)]
 pub enum MailCommand {
+    /// Publish the mail DNS records into the configured provider's zone.
+    ///
+    /// Reports what it would write unless --apply is given. An existing record
+    /// is left exactly as it is.
+    DnsPublish {
+        /// Actually write the records.
+        #[arg(long)]
+        apply: bool,
+    },
     /// The outbound relay.
     #[command(subcommand)]
     Relay(MailRelayCommand),

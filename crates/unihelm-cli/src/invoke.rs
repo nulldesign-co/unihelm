@@ -1040,6 +1040,7 @@ fn import(cmd: &ImportCommand) -> Result<Action> {
 fn mail(cmd: &MailCommand, secrets: &Secrets) -> Action {
     match cmd {
         MailCommand::Relay(MailRelayCommand::Get) => call("mail.relay.get", json!({})),
+        MailCommand::DnsPublish { apply } => call("mail.dns.publish", json!({ "apply": apply })),
         MailCommand::Relay(MailRelayCommand::Set {
             host,
             port,
