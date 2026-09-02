@@ -233,6 +233,27 @@ fn quote_name(name: &DbName) -> String {
 /// A MySQL account in `'user'@'localhost'` form. `localhost` is deliberate:
 /// remote access is a separate, firewall-coupled flow (spec §11.4), not a
 /// default anyone gets for free.
+/// A PostgreSQL identifier, quoted.
+///
+/// Postgres folds an unquoted identifier to lower case, so `CREATE DATABASE
+/// MyApp` makes a database called `myapp` — and every later statement that
+/// names it as stored, `MyApp`, folds too and happens to find it, right up
+/// until something quotes it and does not. `DbName` accepts upper case
+/// (`is_ascii_alphanumeric`), so this is reachable with an ordinary name.
+///
+/// The value is already constrained to `[A-Za-z0-9_]` by `DbName::parse`, so
+/// there is nothing here to escape; the quotes are what stop the folding, and
+/// the assertion is what keeps that true if the newtype ever widens.
+fn pg_ident(name: &DbName) -> String {
+    debug_assert!(
+        name.as_str()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "DbName widened without updating pg_ident"
+    );
+    format!("\"{}\"", name.as_str())
+}
+
 fn mysql_account(user: &DbName) -> String {
     format!("'{}'@'localhost'", user.as_str())
 }
@@ -279,11 +300,11 @@ pub fn sql_create_db(engine: DbEngine, name: &DbName, owner: Option<&DbName>) ->
             name.as_str(),
             mysql_account(user)
         ),
-        (DbEngine::Postgres, None) => format!("CREATE DATABASE {};\n", name.as_str()),
+        (DbEngine::Postgres, None) => format!("CREATE DATABASE {};\n", pg_ident(name)),
         (DbEngine::Postgres, Some(user)) => format!(
             "CREATE DATABASE {} OWNER {};\n",
-            name.as_str(),
-            user.as_str()
+            pg_ident(name),
+            pg_ident(user)
         ),
     }
 }
@@ -292,8 +313,23 @@ pub fn sql_create_db(engine: DbEngine, name: &DbName, owner: Option<&DbName>) ->
 /// row left behind) must be re-runnable to completion, not stuck on an error.
 pub fn sql_drop_db(engine: DbEngine, name: &DbName) -> String {
     match engine {
-        DbEngine::Mysql => format!("DROP DATABASE IF EXISTS {};\n", name.as_str()),
-        DbEngine::Postgres => format!("DROP DATABASE IF EXISTS {};\n", name.as_str()),
+        // MySQL does not remove privileges when a database is dropped: the rows
+        // in mysql.db outlive it, so the next tenant to be given the same name
+        // inherits whatever the last one's users were granted on it. The
+        // privilege tables are cleared explicitly, and FLUSH makes the running
+        // server forget the in-memory copy it would otherwise keep serving.
+        DbEngine::Mysql => format!(
+            "DROP DATABASE IF EXISTS {};\n\
+             DELETE FROM mysql.db WHERE Db = {};\n\
+             DELETE FROM mysql.tables_priv WHERE Db = {};\n\
+             DELETE FROM mysql.columns_priv WHERE Db = {};\n\
+             FLUSH PRIVILEGES;\n",
+            name.as_str(),
+            quote_name(name),
+            quote_name(name),
+            quote_name(name)
+        ),
+        DbEngine::Postgres => format!("DROP DATABASE IF EXISTS {};\n", pg_ident(name)),
     }
 }
 
@@ -307,7 +343,7 @@ pub fn sql_create_user(engine: DbEngine, user: &DbName, password: &str) -> Resul
         ),
         DbEngine::Postgres => format!(
             "CREATE ROLE {} WITH LOGIN PASSWORD {};\n",
-            user.as_str(),
+            pg_ident(user),
             pw
         ),
     })
@@ -316,7 +352,7 @@ pub fn sql_create_user(engine: DbEngine, user: &DbName, password: &str) -> Resul
 pub fn sql_drop_user(engine: DbEngine, user: &DbName) -> String {
     match engine {
         DbEngine::Mysql => format!("DROP USER IF EXISTS {};\n", mysql_account(user)),
-        DbEngine::Postgres => format!("DROP ROLE IF EXISTS {};\n", user.as_str()),
+        DbEngine::Postgres => format!("DROP ROLE IF EXISTS {};\n", pg_ident(user)),
     }
 }
 
@@ -343,8 +379,8 @@ pub fn sql_grant(engine: DbEngine, name: &DbName, user: &DbName) -> String {
         ),
         DbEngine::Postgres => format!(
             "GRANT ALL PRIVILEGES ON DATABASE {} TO {};\n",
-            name.as_str(),
-            user.as_str()
+            pg_ident(name),
+            pg_ident(user)
         ),
     }
 }
@@ -1208,7 +1244,7 @@ mod tests {
         );
         assert_eq!(
             sql_create_db(DbEngine::Postgres, &name, Some(&owner)),
-            "CREATE DATABASE shop OWNER shop_rw;\n"
+            "CREATE DATABASE \"shop\" OWNER \"shop_rw\";\n"
         );
     }
 
@@ -1284,7 +1320,7 @@ mod tests {
         let jobs = sh.recorded();
         assert_eq!(jobs[0].argv, postgres_argv(true));
         assert_eq!(jobs[1].argv, postgres_argv(false));
-        assert_eq!(jobs[1].sql, "CREATE DATABASE warehouse;\n");
+        assert_eq!(jobs[1].sql, "CREATE DATABASE \"warehouse\";\n");
     }
 
     #[tokio::test]
@@ -1498,7 +1534,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ok["dropped"], true);
-        assert_eq!(sh.recorded()[0].sql, "DROP DATABASE IF EXISTS keeper;\n");
+        assert_eq!(
+            sh.recorded()[0].sql,
+            concat!(
+                "DROP DATABASE IF EXISTS keeper;\n",
+                // MySQL keeps a dropped database's privilege rows, so the next
+                // tenant handed the same name would inherit them.
+                "DELETE FROM mysql.db WHERE Db = 'keeper';\n",
+                "DELETE FROM mysql.tables_priv WHERE Db = 'keeper';\n",
+                "DELETE FROM mysql.columns_priv WHERE Db = 'keeper';\n",
+                "FLUSH PRIVILEGES;\n",
+            )
+        );
         assert!(
             reg.services()
                 .db
@@ -1730,5 +1777,68 @@ mod tests {
             sh.recorded().is_empty(),
             "hostile names must die at deserialization, never near a client"
         );
+    }
+}
+#[cfg(test)]
+mod tenancy_tests {
+    use super::*;
+
+    /// A dropped MySQL database must not leave its privileges behind.
+    ///
+    /// MySQL keeps the rows in mysql.db, mysql.tables_priv and
+    /// mysql.columns_priv when a database is dropped. Hand the same name to the
+    /// next tenant — which a panel does, because names are chosen by customers
+    /// and `shop` is a popular one — and their database arrives with the
+    /// previous tenant's users already granted on it.
+    #[test]
+    fn dropping_a_mysql_database_clears_its_privileges() {
+        let name = DbName::parse("shop").unwrap();
+        let sql = sql_drop_db(DbEngine::Mysql, &name);
+
+        assert!(sql.contains("DROP DATABASE IF EXISTS shop"));
+        for table in ["mysql.db", "mysql.tables_priv", "mysql.columns_priv"] {
+            assert!(
+                sql.contains(&format!("DELETE FROM {table} WHERE Db = 'shop'")),
+                "privileges left in {table}:\n{sql}"
+            );
+        }
+        assert!(
+            sql.contains("FLUSH PRIVILEGES"),
+            "the running server keeps an in-memory copy:\n{sql}"
+        );
+    }
+
+    /// Postgres folds an unquoted identifier to lower case, so a name with a
+    /// capital in it creates an object under a different name than the one the
+    /// panel recorded.
+    #[test]
+    fn postgres_identifiers_are_quoted_so_case_survives() {
+        let name = DbName::parse("MyApp").unwrap();
+        let user = DbName::parse("MyApp_rw").unwrap();
+
+        // Each statement names whichever identifiers it is about, so the
+        // expectation is per statement rather than one string for all of them.
+        for (sql, want) in [
+            (
+                sql_create_db(DbEngine::Postgres, &name, Some(&user)),
+                vec!["\"MyApp\"", "\"MyApp_rw\""],
+            ),
+            (sql_drop_db(DbEngine::Postgres, &name), vec!["\"MyApp\""]),
+            (
+                sql_grant(DbEngine::Postgres, &name, &user),
+                vec!["\"MyApp\"", "\"MyApp_rw\""],
+            ),
+            (
+                sql_drop_user(DbEngine::Postgres, &user),
+                vec!["\"MyApp_rw\""],
+            ),
+        ] {
+            for ident in want {
+                assert!(
+                    sql.contains(ident),
+                    "{ident} unquoted gets folded to lower case:\n{sql}"
+                );
+            }
+        }
     }
 }
