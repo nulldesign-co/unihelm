@@ -112,6 +112,8 @@ pub struct CreateRequest {
     #[serde(default)]
     #[schema(example = "production")]
     pub node_env: Option<String>,
+    /// Which language: node, python, ruby, bun, deno, go. Absent means node.
+    pub runtime: Option<String>,
     /// Per-app `MemoryMax`, inside the tenant slice's own ceiling.
     #[serde(default)]
     pub memory_mb: Option<u32>,
@@ -214,6 +216,12 @@ fn create_input(body: &CreateRequest) -> ApiResult<serde_json::Value> {
     // is simply "production".
     if let Some(node_env) = &body.node_env {
         object.insert("node_env".into(), json!(node_env));
+    }
+    // `AppRuntime` has the same shape as `NodeEnv` — a plain enum behind
+    // `#[serde(default)]` — so it needs the same treatment: an explicit `null`
+    // is a deserialization error in the agent where an absent key is "node".
+    if let Some(runtime) = &body.runtime {
+        object.insert("runtime".into(), json!(runtime));
     }
     if let Some(domain) = &body.proxy_domain {
         let domain = unihelm_core::Domain::parse(domain)
@@ -463,6 +471,20 @@ mod tests {
         assert_eq!(input["env"][0]["value"], json!("postgres://localhost/blog"));
     }
 
+    /// `AppRuntime` is the same shape as `NodeEnv`, and reaches the agent by
+    /// the same path — so a language somebody did pick has to arrive, and one
+    /// they did not has to be absent rather than null.
+    #[test]
+    fn a_chosen_runtime_reaches_the_agent() {
+        let body = request(json!({
+            "name": "api",
+            "entry": "apps/api/main.py",
+            "runtime": "python",
+        }));
+        let input = create_input(&body).expect("a valid request builds an input");
+        assert_eq!(input["runtime"], json!("python"));
+    }
+
     /// `CreateInput::node_env` is a bare enum behind `#[serde(default)]`, so an
     /// explicit `null` is a deserialization error in the agent — "the user did
     /// not pick an environment" has to arrive as an absent key.
@@ -473,7 +495,7 @@ mod tests {
         let object = input.as_object().expect("object");
 
         assert!(!object.contains_key("node_env"), "{input}");
-        for absent in ["memory_mb", "subscription_id", "proxy_domain"] {
+        for absent in ["memory_mb", "subscription_id", "proxy_domain", "runtime"] {
             assert!(
                 !object.contains_key(absent),
                 "`{absent}` must be absent, not null: {input}"

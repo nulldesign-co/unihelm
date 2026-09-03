@@ -422,6 +422,9 @@ export const en = {
     },
   },
   apps: {
+    runtime: "Language",
+    runtimeHint:
+      "Node, Python, Ruby, Bun and Deno run under an interpreter this server has; Go runs the entry file itself, because it is already compiled.",
     title: "Node apps",
     subtitle: "Node.js applications this server runs for you.",
     create: "New app",

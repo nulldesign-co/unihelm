@@ -363,6 +363,8 @@ export type NodeEnv = "production" | "development" | "test";
  * an app that crash-looped overnight is exactly where the two differ.
  */
 export interface AppView {
+  /** Absent on rows written before other runtimes existed; those are Node. */
+  runtime?: AppRuntime;
   id: number;
   subscription_id: number;
   site_id: number | null;
@@ -387,7 +389,18 @@ export interface AppEnvVar {
   value: string;
 }
 
+/**
+ * The languages an application can be written in.
+ *
+ * Not every runtime the server reports: PHP is a vhost and an FPM pool rather
+ * than a long-running process with a port, and is served by the site machinery
+ * instead.
+ */
+export type AppRuntime = "node" | "python" | "ruby" | "bun" | "deno" | "go";
+
 export interface CreateAppRequest {
+  /** Which language it is written in. Omitted means Node, as it always was. */
+  runtime?: AppRuntime;
   name: string;
   entry: string;
   env?: AppEnvVar[];

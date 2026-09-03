@@ -19,6 +19,7 @@ import {
   ApiError,
   DEFAULT_LOG_LINES,
   endpoints,
+  type AppRuntime,
   type AppView,
   type CreateAppRequest,
   type NodeEnv,
@@ -151,6 +152,9 @@ function AppRow({ app }: { app: AppView }) {
         {/* Production is the default and the boring case; the other two are
             worth flagging, because a hosted app in `development` leaks stack
             traces to the internet. */}
+        {app.runtime && app.runtime !== "node" ? (
+          <Badge tone="neutral">{runtimeLabel(app.runtime)}</Badge>
+        ) : null}
         {app.node_env === "production" ? null : (
           <Badge tone="warning">{t(`apps.envName.${app.node_env}`)}</Badge>
         )}
@@ -338,9 +342,23 @@ function LogsDialog({
   );
 }
 
+/** `Node.js`, not `node`. Mirrors AppRuntime::label on the agent. */
+function runtimeLabel(runtime: AppRuntime): string {
+  const names: Record<AppRuntime, string> = {
+    node: "Node.js",
+    python: "Python",
+    ruby: "Ruby",
+    bun: "Bun",
+    deno: "Deno",
+    go: "Go",
+  };
+  return names[runtime];
+}
+
 interface CreateForm {
   name: string;
   entry: string;
+  runtime: AppRuntime;
   node_env: NodeEnv;
   memory_mb: string;
   proxy_domain: string;
@@ -377,6 +395,7 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
     defaultValues: {
       name: "",
       entry: "",
+      runtime: "node",
       node_env: "production",
       memory_mb: "",
       proxy_domain: "",
@@ -392,6 +411,7 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
       name: values.name.trim(),
       entry: values.entry.trim(),
       node_env: values.node_env,
+      runtime: values.runtime,
     };
 
     // A blank row is somebody who clicked "add" and changed their mind, not an
@@ -470,6 +490,21 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
         <p id="app-entry-hint" className="-mt-1 mb-3 text-xs text-ink-muted">
           {t("apps.entryHint")}
         </p>
+
+        {/* After the entry field, not before it: the entry is what people came
+            to type, and asking for the language first makes the common case —
+            Node, the default — answer a question nobody had. */}
+        <Field label={t("apps.runtime")} htmlFor="app-runtime">
+          <Select id="app-runtime" {...register("runtime")}>
+            <option value="node">Node.js</option>
+            <option value="python">Python</option>
+            <option value="ruby">Ruby</option>
+            <option value="bun">Bun</option>
+            <option value="deno">Deno</option>
+            <option value="go">Go</option>
+          </Select>
+        </Field>
+        <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("apps.runtimeHint")}</p>
 
         <Field label={t("apps.nodeEnv")} htmlFor="app-node-env">
           <Select id="app-node-env" {...register("node_env")}>
