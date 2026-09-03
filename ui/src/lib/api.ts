@@ -365,6 +365,8 @@ export type NodeEnv = "production" | "development" | "test";
 export interface AppView {
   /** Absent on rows written before other runtimes existed; those are Node. */
   runtime?: AppRuntime;
+  /** Null when the app runs on whatever a bare command name resolves to. */
+  runtime_version?: string | null;
   id: number;
   subscription_id: number;
   site_id: number | null;
@@ -397,6 +399,27 @@ export interface AppEnvVar {
  * instead.
  */
 export type AppRuntime = "node" | "python" | "ruby" | "bun" | "deno" | "go";
+
+/** One installed version of one runtime, as `runtime.list` reports it. */
+export interface InstalledRuntime {
+  runtime: string;
+  /** As the binary reports it, e.g. `22.11.0`. */
+  version: string;
+  /** Absolute, because that is what a systemd unit or a pinned app needs. */
+  path: string;
+  /** Whether a bare command name resolves to this one. */
+  is_default: boolean;
+}
+
+export interface RuntimeListResponse {
+  runtimes: InstalledRuntime[];
+}
+
+export interface UpdateAppRuntimeRequest {
+  runtime?: AppRuntime;
+  /** Absent leaves the pin alone; null unpins. */
+  runtime_version?: string | null;
+}
 
 export interface CreateAppRequest {
   /** Which language it is written in. Omitted means Node, as it always was. */
@@ -809,9 +832,19 @@ export const endpoints = {
     api.post<TaskAccepted>(`/api/sites/${id}/certificate`, { staging }),
 
   apps: () => api.get<AppsResponse>("/api/apps"),
+  runtimes: () => api.get<RuntimeListResponse>("/api/runtimes"),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),
+  /**
+   * Move an application to a different runtime or version.
+   *
+   * `runtime_version` distinguishes absent from null on purpose: omit the key to
+   * leave the pin alone, send null to unpin back to whatever a bare command name
+   * resolves to. Collapsing the two would make unpinning unreachable.
+   */
+  updateAppRuntime: (id: number, body: UpdateAppRuntimeRequest) =>
+    api.post<TaskAccepted>(`/api/apps/${id}/runtime`, body),
   appLogs: (id: number, lines = DEFAULT_LOG_LINES) =>
     api.get<AppLogsResponse>(`/api/apps/${id}/logs?lines=${lines}`),
 

@@ -293,6 +293,85 @@ pub async fn delete(
 }
 
 /// Restart an application's systemd unit.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateRequest {
+    /// Move to a different language. Omit to keep the one it has.
+    pub runtime: Option<String>,
+    /// Pin to a version. Send an explicit `null` to unpin back to the default.
+    ///
+    /// Absent and null mean different things here, which is why this is not
+    /// flattened: without the distinction, unpinning would be unreachable.
+    #[serde(default, deserialize_with = "double_option")]
+    pub runtime_version: Option<Option<String>>,
+}
+
+/// `Option<Option<T>>` where absent and null are distinguishable.
+fn double_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Move an application to a different runtime or version.
+#[utoipa::path(
+    post,
+    path = "/api/apps/{id}/runtime",
+    tag = "apps",
+    request_body = UpdateRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "App id")),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 400, description = "`invalid_input`: a compiled runtime takes no version", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such app, or that version is not installed", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn update(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    current: CurrentUser,
+    Json(body): Json<UpdateRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::NodeApps)
+        .map_err(ApiError::from)?;
+
+    let mut input = json!({ "app_id": id });
+    let object = input.as_object_mut().expect("just built as an object");
+
+    // `AppRuntime` is a plain enum behind `#[serde(default)]`, so a `null` here
+    // is a deserialization error in the agent where an absent key means "keep
+    // the one it has". Same rule `node_env` documents on the create path.
+    if let Some(runtime) = &body.runtime {
+        object.insert("runtime".into(), json!(runtime));
+    }
+    // This one is the opposite: an explicit null is meaningful — it unpins.
+    if let Some(version) = &body.runtime_version {
+        object.insert("runtime_version".into(), json!(version));
+    }
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "app.update",
+        &id.to_string(),
+        input.clone(),
+    )
+    .await?;
+
+    ops::invoke(&state, &current.auth, "app.update", input).await
+}
+
 #[utoipa::path(
     post,
     path = "/api/apps/{id}/restart",

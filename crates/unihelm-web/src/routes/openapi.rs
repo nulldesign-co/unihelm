@@ -109,6 +109,7 @@ pub const API_VERSION: &str = "1.0.0";
         super::apps::list,
         super::apps::create,
         super::apps::delete,
+        super::apps::update,
         super::apps::restart,
         super::apps::logs,
         super::cron::list,

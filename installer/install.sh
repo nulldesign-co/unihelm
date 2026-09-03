@@ -1084,6 +1084,9 @@ DONE
         printf '\n%sThe panel is serving plain HTTP.%s Anyone on the network path can read the\n' \
           "$(printf '\033[1m')" "$(printf '\033[0m')"
         printf 'password you type. Set tls = "self-signed" in %s/config.toml, or put\n' "$CONFIG_DIR"
+        # Single quotes on purpose: this is a command for the reader to type,
+        # not an expression for the shell to expand.
+        # shellcheck disable=SC2016
         printf 'TLS in front of it with `sudo unihelm cert panel <domain>`.\n'
       fi
       if [ -n "$hint" ]; then

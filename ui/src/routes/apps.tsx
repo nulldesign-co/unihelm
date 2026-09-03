@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Boxes, Plus, RotateCw, ScrollText, Trash2, X } from "lucide-react";
+import { Boxes, Plus, RotateCw, ScrollText, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -184,6 +184,7 @@ function AppActions({ app }: { app: AppView }) {
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [changingRuntime, setChangingRuntime] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["apps"] });
@@ -217,6 +218,12 @@ function AppActions({ app }: { app: AppView }) {
         <MenuItem icon={<ScrollText aria-hidden />} onClick={() => setShowLogs(true)}>
           {t("apps.logs")}
         </MenuItem>
+        <MenuItem
+          icon={<SlidersHorizontal aria-hidden />}
+          onClick={() => setChangingRuntime(true)}
+        >
+          {t("apps.changeRuntime")}
+        </MenuItem>
         <MenuSeparator />
         <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
           {t("apps.delete")}
@@ -224,6 +231,12 @@ function AppActions({ app }: { app: AppView }) {
       </Menu>
 
       <LogsDialog app={app} open={showLogs} onClose={() => setShowLogs(false)} />
+
+      <RuntimeDialog
+        app={app}
+        open={changingRuntime}
+        onClose={() => setChangingRuntime(false)}
+      />
 
       <Dialog
         open={confirming}
@@ -253,6 +266,145 @@ function AppActions({ app }: { app: AppView }) {
         ) : null}
       </Dialog>
     </>
+  );
+}
+
+/**
+ * Change which runtime and version an application runs on.
+ *
+ * Three decisions worth stating, because each is a place this could mislead:
+ *
+ * 1. **The restart is announced before the button, not after it.** Re-rendering
+ *    the unit and restarting means seconds of connection refused, and an
+ *    operator who learns that from their monitoring rather than from this dialog
+ *    has been ambushed.
+ * 2. **The version list is what the server actually has.** Read from
+ *    `runtime.list` rather than typed, because the operation refuses a version
+ *    that is not installed — offering a free-text box would be inviting a
+ *    failure the page could have prevented.
+ * 3. **Go takes no version.** The entry file is the program; the panel has no
+ *    interpreter to point at, so the version control disappears rather than
+ *    showing an empty list somebody would read as "none installed".
+ */
+function RuntimeDialog({
+  app,
+  open,
+  onClose,
+}: {
+  app: AppView;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [runtime, setRuntime] = useState<AppRuntime>(app.runtime ?? "node");
+  const [version, setVersion] = useState<string>(app.runtime_version ?? "");
+  const [error, setError] = useState<string | null>(null);
+
+  // Only asked for while the dialog is open: it shells out to every interpreter
+  // on the machine, which is cheap but not free, and the Apps list has no use
+  // for it.
+  const runtimes = useQuery({
+    queryKey: ["runtimes"],
+    queryFn: () => endpoints.runtimes(),
+    enabled: open,
+  });
+
+  const compiled = runtime === "go";
+  const available = (runtimes.data?.runtimes ?? []).filter((r) => r.runtime === runtime);
+
+  const save = useMutation({
+    mutationFn: () =>
+      endpoints.updateAppRuntime(app.id, {
+        runtime,
+        // An empty selection is "unpin", which the API spells as an explicit
+        // null — undefined would mean "leave the pin alone" and the two must
+        // not collapse. A compiled runtime sends neither.
+        ...(compiled ? {} : { runtime_version: version === "" ? null : version }),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["apps"] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("apps.changeRuntime")}
+      description={t("apps.changeRuntimeHint", { name: app.name })}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button loading={save.isPending} onClick={() => save.mutate()}>
+            {t("apps.changeRuntimeConfirm")}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {error}
+        </Callout>
+      ) : null}
+
+      <Callout tone="info" className="mb-4">
+        {t("apps.changeRuntimeRestart")}
+      </Callout>
+
+      <Field label={t("apps.runtime")} htmlFor="change-runtime">
+        <Select
+          id="change-runtime"
+          value={runtime}
+          onChange={(e) => {
+            setRuntime(e.target.value as AppRuntime);
+            // The version belonged to the old runtime, and carrying it over
+            // would send Node's 22.14.0 to Python.
+            setVersion("");
+          }}
+        >
+          <option value="node">Node.js</option>
+          <option value="python">Python</option>
+          <option value="ruby">Ruby</option>
+          <option value="bun">Bun</option>
+          <option value="deno">Deno</option>
+          <option value="go">Go</option>
+        </Select>
+      </Field>
+
+      {compiled ? (
+        <p className="mt-3 text-xs text-ink-muted">{t("apps.compiledNoVersion")}</p>
+      ) : (
+        <>
+          <div className="mt-3">
+          <Field label={t("apps.version")} htmlFor="change-version">
+            <Select
+              id="change-version"
+              value={version}
+              onChange={(e) => setVersion(e.target.value)}
+            >
+              <option value="">{t("apps.versionDefault")}</option>
+              {available.map((r) => (
+                <option key={r.path} value={r.version}>
+                  {r.version}
+                  {r.is_default ? ` — ${t("apps.versionIsDefault")}` : ""}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          </div>
+          <p className="mt-1 text-xs text-ink-muted">
+            {available.length === 0 && !runtimes.isLoading
+              ? t("apps.versionNoneInstalled")
+              : t("apps.versionHint")}
+          </p>
+        </>
+      )}
+    </Dialog>
   );
 }
 

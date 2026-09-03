@@ -138,6 +138,7 @@ fn protected() -> Router<SharedState> {
         )
         .route("/api/apps", get(apps::list).post(apps::create))
         .route("/api/apps/{id}", axum::routing::delete(apps::delete))
+        .route("/api/apps/{id}/runtime", post(apps::update))
         .route("/api/apps/{id}/restart", post(apps::restart))
         .route("/api/apps/{id}/logs", get(apps::logs))
         .route("/api/cron", get(cron::list).post(cron::create))

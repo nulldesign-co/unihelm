@@ -422,11 +422,25 @@ export const en = {
     },
   },
   apps: {
+    changeRuntime: "Change runtime",
+    changeRuntimeHint:
+      "Move {{name}} to a different language or version. It keeps its port, its address and everything in its directory.",
+    changeRuntimeConfirm: "Apply and restart",
+    changeRuntimeRestart:
+      "The app restarts to pick this up, so it refuses connections for a few seconds. If the version you choose is not installed, nothing changes and the app keeps running on what it has.",
+    version: "Version",
+    versionDefault: "Whatever the server resolves by default",
+    versionIsDefault: "the default",
+    versionHint: "Only versions installed on this server. Manage them on the Runtimes page.",
+    versionNoneInstalled:
+      "No version of this language is installed on the server yet. Install one from the Runtimes page, or from your distribution.",
+    compiledNoVersion:
+      "Go programs are compiled, so there is no interpreter version to choose — the binary runs as it was built.",
     runtime: "Language",
     runtimeHint:
       "Node, Python, Ruby, Bun and Deno run under an interpreter this server has; Go runs the entry file itself, because it is already compiled.",
-    title: "Node apps",
-    subtitle: "Node.js applications this server runs for you.",
+    title: "Apps",
+    subtitle: "Long-running applications this server runs for you.",
     create: "New app",
     createHint: "The panel allocates a port, writes a systemd unit and starts it.",
     empty: "No apps yet.",

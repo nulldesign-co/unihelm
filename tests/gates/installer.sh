@@ -514,6 +514,10 @@ fi
 # touches UNIHELM_PUBKEY. The placeholder would have shipped, and the advertised
 # install command, which fetches install.sh from main, would have refused every
 # release for want of a key it could never obtain.
+# The pattern must contain a literal `$` — it is matched against the
+# installer's source, where that character is the shell syntax being
+# asserted about. Expanding it here would defeat the assertion.
+# shellcheck disable=SC2016
 installer_key="$(sed -n 's/^UNIHELM_PUBKEY="${UNIHELM_PUBKEY:-\(.*\)}"$/\1/p' installer/install.sh)"
 case "$installer_key" in
   PLACEHOLDER-* | "")
@@ -594,6 +598,10 @@ fi
 # other check in this file: the install still worked, and nothing it ran had a
 # signature. So the shape of the bootstrap is asserted directly.
 bootstrap_body="$(awk '/^bootstrap_from_release\(\)/,/^}/' installer/install.sh)"
+# The pattern must contain a literal `$` — it is matched against the
+# installer's source, where that character is the shell syntax being
+# asserted about. Expanding it here would defeat the assertion.
+# shellcheck disable=SC2016
 if printf '%s' "$bootstrap_body" | grep -q 'download_and_verify_release'; then
   ok "the piped bootstrap goes through the verified download"
 else
@@ -628,6 +636,10 @@ fi
 
 # The hand-over must run the installer out of the extraction directory, not a
 # path that could name anything else on the machine.
+# The pattern must contain a literal `$` — it is matched against the
+# installer's source, where that character is the shell syntax being
+# asserted about. Expanding it here would defeat the assertion.
+# shellcheck disable=SC2016
 if printf '%s' "$bootstrap_body" | grep -q '"\$root/install.sh"'; then
   ok "the hand-over runs the installer found inside the verified tarball"
 else
@@ -637,6 +649,10 @@ fi
 # A candidate root must be a real directory. `-d` follows symlinks, so an
 # archive member that is a link would point the hand-over at bytes that were
 # never in the signed tarball.
+# The pattern must contain a literal `$` — it is matched against the
+# installer's source, where that character is the shell syntax being
+# asserted about. Expanding it here would defeat the assertion.
+# shellcheck disable=SC2016
 if grep -q 'real_dir "\$candidate"' installer/install.sh &&
    grep -qE '^real_dir\(\).*\{|\[ ! -L' installer/install.sh; then
   ok "extraction roots are rejected when they are symlinks"
@@ -644,6 +660,12 @@ else
   fail "locate_binaries/locate_installer_root accept a symlinked candidate:
   a signed tarball carrying a link could redirect what gets run and installed"
 fi
+
+# `cat file | bash` rather than `bash < file` throughout this section. The
+# "useless cat" warning is wrong about it here: the point is that the script's
+# stdin is a PIPE rather than a file, which is exactly what a curl-to-bash
+# install looks like and precisely what these three assertions measure.
+# shellcheck disable=SC2002
 
 # Silence is the failure mode worth naming: a piped run that neither installs
 # nor explains itself looks like success to every caller.
