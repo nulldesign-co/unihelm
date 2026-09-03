@@ -9,7 +9,7 @@
    built (and %-escaped) in Rust, because systemd's quoting rules are not
    something a template should be trusted to get right. #}
 [Unit]
-Description=Unihelm Node app {{ app.name }} ({{ app.linux_user }})
+Description=Unihelm {{ app.runtime_label }} app {{ app.name }} ({{ app.linux_user }})
 {# The app almost certainly talks to something. network-online.target is the
    one that actually waits for an address, unlike network.target. #}
 After=network-online.target
@@ -27,7 +27,9 @@ Type=simple
 User={{ app.linux_user }}
 Group={{ app.linux_user }}
 WorkingDirectory={{ app.working_dir }}
-ExecStart={{ app.node_binary }} {{ app.entry_path }}
+{# Interpreter and entry, or the entry alone for a compiled program.
+   Which of those it is was decided in Rust; see AppUnitContext. #}
+ExecStart={{ app.exec_start }}
 {% for line in app.environment %}
 Environment={{ line }}
 {% endfor %}

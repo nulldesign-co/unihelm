@@ -59,6 +59,99 @@ pub enum NodeEnv {
     Test,
 }
 
+/// The language an application runs on.
+///
+/// Not every runtime this panel can *see* belongs here. `runtime.list` reports
+/// PHP too, but a PHP site is a vhost and an FPM pool rather than a long-running
+/// process with a port, and it is served by the site machinery instead — putting
+/// it in this enum would promise a shape of application that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRuntime {
+    #[default]
+    Node,
+    Python,
+    Ruby,
+    Bun,
+    Deno,
+    /// A compiled binary. There is no interpreter to resolve and no version to
+    /// pin: the entry *is* the program, and which Go built it is a fact about
+    /// the build rather than about this server.
+    Go,
+}
+
+impl AppRuntime {
+    pub const ALL: &'static [AppRuntime] = &[
+        AppRuntime::Node,
+        AppRuntime::Python,
+        AppRuntime::Ruby,
+        AppRuntime::Bun,
+        AppRuntime::Deno,
+        AppRuntime::Go,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AppRuntime::Node => "node",
+            AppRuntime::Python => "python",
+            AppRuntime::Ruby => "ruby",
+            AppRuntime::Bun => "bun",
+            AppRuntime::Deno => "deno",
+            AppRuntime::Go => "go",
+        }
+    }
+
+    /// What to show a person. `Node.js`, not `node`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            AppRuntime::Node => "Node.js",
+            AppRuntime::Python => "Python",
+            AppRuntime::Ruby => "Ruby",
+            AppRuntime::Bun => "Bun",
+            AppRuntime::Deno => "Deno",
+            AppRuntime::Go => "Go",
+        }
+    }
+
+    /// Whether the entry file is handed to an interpreter or executed directly.
+    pub const fn is_compiled(self) -> bool {
+        matches!(self, AppRuntime::Go)
+    }
+
+    /// The environment variable this ecosystem reads to know it is in
+    /// production, if it has one.
+    ///
+    /// Node and Bun share `NODE_ENV`; Deno reads it too under its Node
+    /// compatibility layer. Python and Ruby each have their own long-standing
+    /// convention. Go has none — configuration there is whatever the program
+    /// chose, and inventing a variable for it would be the panel guessing.
+    pub const fn env_var(self) -> Option<&'static str> {
+        match self {
+            AppRuntime::Node | AppRuntime::Bun | AppRuntime::Deno => Some("NODE_ENV"),
+            AppRuntime::Python => Some("PYTHON_ENV"),
+            AppRuntime::Ruby => Some("RACK_ENV"),
+            AppRuntime::Go => None,
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "node" => AppRuntime::Node,
+            "python" => AppRuntime::Python,
+            "ruby" => AppRuntime::Ruby,
+            "bun" => AppRuntime::Bun,
+            "deno" => AppRuntime::Deno,
+            "go" => AppRuntime::Go,
+            other => {
+                return Err(DbError::Corrupt {
+                    field: "node_apps.runtime",
+                    detail: format!("unknown runtime `{other}`"),
+                });
+            }
+        })
+    }
+}
+
 impl NodeEnv {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -91,6 +184,7 @@ pub struct NodeApp {
     pub name: String,
     pub entry: String,
     pub port: i64,
+    pub runtime: AppRuntime,
     pub node_env: NodeEnv,
     /// The runtime version this app is pinned to, e.g. `22.11.0`.
     ///
@@ -114,6 +208,7 @@ pub struct NodeAppRow {
     pub entry: String,
     pub port: i64,
     pub node_env: String,
+    pub runtime: String,
     pub runtime_version: Option<String>,
     pub enabled: i64,
     pub created_at: String,
@@ -131,6 +226,7 @@ impl TryFrom<NodeAppRow> for NodeApp {
             name: r.name,
             entry: r.entry,
             port: r.port,
+            runtime: AppRuntime::parse(&r.runtime)?,
             node_env: NodeEnv::parse(&r.node_env)?,
             runtime_version: r.runtime_version,
             enabled: r.enabled != 0,
@@ -147,6 +243,7 @@ pub struct NewNodeApp {
     pub subscription_id: SubscriptionId,
     pub name: AppName,
     pub entry: TenantPath,
+    pub runtime: AppRuntime,
     pub node_env: NodeEnv,
     /// Pin to a specific installed version, or `None` for the default one.
     pub runtime_version: Option<String>,
@@ -212,8 +309,8 @@ impl Db {
                 // exhausted.
                 "INSERT INTO node_apps
                      (subscription_id, site_id, name, entry, port, node_env,
-                      runtime_version, enabled, created_at, updated_at)
-                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, ?8, 1, ?5, ?5 FROM (
+                      runtime, runtime_version, enabled, created_at, updated_at)
+                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, ?9, ?8, 1, ?5, ?5 FROM (
                      SELECT ?6 AS candidate
                      UNION ALL
                      SELECT port + 1 FROM node_apps WHERE port >= ?6
@@ -234,6 +331,7 @@ impl Db {
             .bind(min_port)
             .bind(max_port)
             .bind(new.runtime_version.as_deref())
+            .bind(new.runtime.as_str())
             .fetch_one(self.pool())
             .await;
 
@@ -402,6 +500,48 @@ impl NodeAppRepo<'_> {
     ///
     /// Scoped through [`Self::by_id`], so a tenant cannot delete an app they
     /// cannot see — and the port comes back to the allocator with the row.
+    /// Change which runtime and version an application runs on.
+    ///
+    /// Scoped through `by_id` first rather than putting the tenant filter in the
+    /// UPDATE: the same reasoning `delete` gives — one place decides whether the
+    /// caller may see this row, and the write then addresses it by id.
+    ///
+    /// `runtime_version` is `Option<Option<String>>` so that "leave it alone"
+    /// and "unpin it back to the default" are different requests. A single
+    /// Option would make them the same one, and unpinning would be unreachable.
+    pub async fn set_runtime(
+        &self,
+        id: i64,
+        runtime: Option<AppRuntime>,
+        runtime_version: Option<Option<String>>,
+    ) -> Result<NodeApp> {
+        let current = self
+            .by_id(id)
+            .await?
+            .ok_or(DbError::NotFound { what: "node app" })?;
+
+        let runtime = runtime.unwrap_or(current.runtime);
+        let version = match runtime_version {
+            Some(v) => v,
+            None => current.runtime_version.clone(),
+        };
+
+        let row = sqlx::query_as::<_, NodeAppRow>(
+            "UPDATE node_apps
+                SET runtime = ?2, runtime_version = ?3, updated_at = ?4
+              WHERE id = ?1
+              RETURNING *",
+        )
+        .bind(id)
+        .bind(runtime.as_str())
+        .bind(version.as_deref())
+        .bind(to_sql_time(now()))
+        .fetch_one(self.db.pool())
+        .await?;
+
+        NodeApp::try_from(row)
+    }
+
     pub async fn delete(&self, id: i64) -> Result<NodeApp> {
         let app = self
             .by_id(id)
@@ -452,6 +592,7 @@ mod tests {
             subscription_id: sub,
             name: AppName::parse(name).unwrap(),
             entry: TenantPath::parse(&format!("apps/{name}/server.js")).unwrap(),
+            runtime: AppRuntime::Node,
             node_env: NodeEnv::Production,
             runtime_version: None,
         }

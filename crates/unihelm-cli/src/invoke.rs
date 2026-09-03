@@ -611,6 +611,7 @@ fn app(cmd: &AppCommand) -> Result<Action> {
             memory_mb,
             proxy_domain,
             runtime_version,
+            runtime,
         } => {
             let node_env = node_env.map(|e| match e {
                 NodeEnvArg::Production => "production",
@@ -626,11 +627,32 @@ fn app(cmd: &AppCommand) -> Result<Action> {
                 .maybe("memory_mb", *memory_mb)
                 .maybe("proxy_domain", proxy_domain.clone())
                 .maybe("runtime_version", runtime_version.clone())
+                .maybe("runtime", runtime.clone())
                 .done();
             call("app.create", input)
         }
         AppCommand::Delete { app_id } => call("app.delete", json!({ "app_id": app_id })),
         AppCommand::Restart { app_id } => call("app.restart", json!({ "app_id": app_id })),
+        AppCommand::Update {
+            app_id,
+            runtime,
+            runtime_version,
+            unpin,
+        } => {
+            let mut input = json!({ "app_id": app_id });
+            if let Some(r) = runtime {
+                input["runtime"] = json!(r);
+            }
+            // `--unpin` sends an explicit null, which is what tells the
+            // operation to go back to the default rather than to leave the
+            // pin alone. Omitting the key entirely is the "leave it" case.
+            if *unpin {
+                input["runtime_version"] = serde_json::Value::Null;
+            } else if let Some(v) = runtime_version {
+                input["runtime_version"] = json!(v);
+            }
+            call("app.update", input)
+        }
         AppCommand::Logs { app_id, lines } => {
             let input = Input::new()
                 .set("app_id", *app_id)

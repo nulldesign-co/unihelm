@@ -821,6 +821,9 @@ pub enum AppCommand {
         /// app runs on whichever a bare `node` resolves to.
         #[arg(long)]
         runtime_version: Option<String>,
+        /// Which language it is written in: node, python, ruby, bun, deno, go.
+        #[arg(long, value_name = "RUNTIME")]
+        runtime: Option<String>,
         /// Publish the app behind this domain as a reverse-proxy site.
         #[arg(long)]
         proxy_domain: Option<String>,
@@ -834,6 +837,23 @@ pub enum AppCommand {
     Restart {
         /// Application id.
         app_id: i64,
+    },
+    /// Move an application to a different runtime or version.
+    ///
+    /// Re-renders its unit and restarts it, keeping the port, the proxy site
+    /// and everything in the app directory.
+    Update {
+        /// Which app.
+        app_id: i64,
+        /// Change the language: node, python, ruby, bun, deno, go.
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Pin to a version.
+        #[arg(long, conflicts_with = "unpin")]
+        runtime_version: Option<String>,
+        /// Run on whatever a bare command name resolves to.
+        #[arg(long)]
+        unpin: bool,
     },
     /// Recent journal output for an application.
     Logs {

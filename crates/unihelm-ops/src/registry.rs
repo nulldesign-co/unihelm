@@ -312,6 +312,7 @@ impl OpRegistry {
         registry.register(crate::nodeapp::Create::live());
         registry.register(crate::nodeapp::Delete);
         registry.register(crate::nodeapp::Restart);
+        registry.register(crate::nodeapp::Update);
         registry.register(crate::nodeapp::Logs);
         registry.register(crate::cron::List);
         registry.register(crate::cron::Set::live());

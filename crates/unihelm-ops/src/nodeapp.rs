@@ -53,7 +53,7 @@ use unihelm_core::{
     AppName, Domain, ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantPath,
     TenantScope, UnihelmError,
 };
-use unihelm_db::node_apps::{NewNodeApp, NodeApp, NodeEnv};
+use unihelm_db::node_apps::{AppRuntime, NewNodeApp, NodeApp, NodeEnv};
 use unihelm_db::subscriptions::Subscription;
 use unihelm_distro::svc::{SvcAction, UnitName, UnitState};
 use unihelm_distro::{Cmd, Distro};
@@ -293,41 +293,152 @@ fn check_entry(entry: &TenantPath) -> Result<()> {
     Ok(())
 }
 
-/// Where `node` lives on this machine, or a refusal naming what to install.
+/// The `Environment=` lines already in a unit, minus the two the panel owns.
 ///
-/// [`unihelm_distro::exec::resolve_program`] (the `program_available` check
-/// with its answer kept) searches a fixed list of system directories rather
-/// than `$PATH`, so a poisoned environment cannot point tenant apps at
-/// something else — and systemd needs the absolute path anyway, since
-/// `ExecStart` does not do lookups.
-fn locate_node(program: &str) -> Result<PathBuf> {
-    unihelm_distro::exec::resolve_program(program).map_err(|_| {
-        UnihelmError::new(
-            ErrorCode::NotFound,
-            format!(
-                "Node.js is not installed: no `{program}` binary in the system directories. \
-                 Install a Node LTS line first — `apt install nodejs` / `dnf install nodejs`, \
-                 or a NodeSource release — then create the app again."
-            ),
-        )
+/// `PORT` and the runtime's own env var are rebuilt by `AppUnitContext` from the
+/// database, so carrying them over as well would put each in the file twice —
+/// harmless to systemd, which takes the last, but a unit that reads as though
+/// somebody edited it badly.
+fn carried_environment(unit_path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(unit_path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("Environment="))
+        .filter(|payload| {
+            let key = payload.split('=').next().unwrap_or_default();
+            key != "PORT" && !AppRuntime::ALL.iter().any(|r| r.env_var() == Some(key))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The interpreter an application runs under, or `None` when it is compiled.
+///
+/// This is the whole of what makes an application Node rather than Python: an
+/// interpreter path and an entry file. Everything else in the unit — the user,
+/// the slice, the restart policy, the hardening — was never language-specific,
+/// which is why generalising it came down to this function.
+///
+/// A compiled runtime has no interpreter. The entry *is* the program, so the
+/// line is the entry alone, and pinning a version would be meaningless: which
+/// Go built the binary is a fact about the build, not about this server.
+async fn resolve_interpreter(
+    runtime: AppRuntime,
+    version: Option<&str>,
+    fallback_program: &str,
+) -> Result<Option<PathBuf>> {
+    if runtime.is_compiled() {
+        if version.is_some() {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "{} programs are compiled, so there is no interpreter version \
+                     to pin. Remove the version and the binary runs as it was built.",
+                    runtime.label()
+                ),
+            )
+            .with_field("runtime_version"));
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(match version {
+        Some(want) => resolve_pinned(runtime, want).await?,
+        None => locate_default(runtime, fallback_program)?,
+    }))
+}
+
+/// The runtime survey's idea of a language, from the database's.
+///
+/// Two enums rather than one because they answer different questions: the survey
+/// reports every runtime a machine has, including PHP, and the application model
+/// carries only what a long-running process can be written in. Go appears in
+/// both but resolves to no interpreter, so it never reaches this.
+fn survey_runtime(runtime: AppRuntime) -> Option<crate::runtimes::Runtime> {
+    Some(match runtime {
+        AppRuntime::Node => crate::runtimes::Runtime::Node,
+        AppRuntime::Python => crate::runtimes::Runtime::Python,
+        AppRuntime::Ruby => crate::runtimes::Runtime::Ruby,
+        AppRuntime::Bun => crate::runtimes::Runtime::Bun,
+        AppRuntime::Deno => crate::runtimes::Runtime::Deno,
+        AppRuntime::Go => return None,
     })
 }
 
-/// The absolute path of one installed Node version.
+/// The interpreter a bare command name resolves to.
+///
+/// Searched through a fixed list of system directories rather than `$PATH`, so a
+/// poisoned environment cannot point tenant apps at something else — and systemd
+/// needs the absolute path anyway, since `ExecStart` does not do lookups.
+fn locate_default(runtime: AppRuntime, fallback_program: &str) -> Result<PathBuf> {
+    // Node keeps the operation's configured program name so an operator can
+    // point it somewhere; the others have no such setting and use the name their
+    // ecosystem installs under. `python3`, not `python`: modern distributions
+    // ship no bare `python` on purpose.
+    let candidates: &[&str] = match runtime {
+        AppRuntime::Node => &[fallback_program],
+        AppRuntime::Python => &["python3", "python"],
+        AppRuntime::Ruby => &["ruby"],
+        AppRuntime::Bun => &["bun"],
+        AppRuntime::Deno => &["deno"],
+        AppRuntime::Go => &[],
+    };
+
+    for name in candidates {
+        if let Ok(path) = unihelm_distro::exec::resolve_program(name) {
+            return Ok(path);
+        }
+    }
+
+    // Naming the package, not just the binary. "no `ruby` binary" tells somebody
+    // what is missing; "apt install ruby-full" tells them what to do about it,
+    // and the second is the sentence worth writing.
+    let package = match runtime {
+        AppRuntime::Node => "nodejs",
+        AppRuntime::Python => "python3",
+        AppRuntime::Ruby => "ruby-full",
+        // Bun and Deno ship as single binaries from their vendors rather than
+        // in any distribution, so there is no package to name.
+        AppRuntime::Bun => "bun (from bun.sh)",
+        AppRuntime::Deno => "deno (from deno.land)",
+        AppRuntime::Go => "golang",
+    };
+
+    Err(UnihelmError::new(
+        ErrorCode::NotFound,
+        format!(
+            "{} is not installed on this server: no `{}` binary in the system \
+             directories. Install {package} first, then create the app again.",
+            runtime.label(),
+            candidates.first().copied().unwrap_or(runtime.as_str())
+        ),
+    ))
+}
+
+/// The absolute path of one installed version of one runtime.
 ///
 /// Fails rather than falling back to the default: an app pinned to 20 that
 /// quietly starts on 22 is worse than one that refuses to start, because the
 /// first failure happens in production at some later time and the second happens
 /// here, in front of the person who asked.
-async fn resolve_pinned_node(version: &str) -> Result<PathBuf> {
-    let installed = crate::runtimes::survey().await;
-    let nodes = installed.get(&crate::runtimes::Runtime::Node);
+async fn resolve_pinned(runtime: AppRuntime, version: &str) -> Result<PathBuf> {
+    let Some(kind) = survey_runtime(runtime) else {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!("{} has no interpreter to pin", runtime.label()),
+        )
+        .with_field("runtime_version"));
+    };
 
-    if let Some(found) = nodes.and_then(|v| v.iter().find(|r| r.version == version)) {
-        return Ok(PathBuf::from(&found.path));
+    let installed = crate::runtimes::survey().await;
+    let found = installed.get(&kind);
+
+    if let Some(hit) = found.and_then(|v| v.iter().find(|r| r.version == version)) {
+        return Ok(PathBuf::from(&hit.path));
     }
 
-    let available = nodes
+    let available = found
         .map(|v| {
             v.iter()
                 .map(|r| r.version.as_str())
@@ -340,10 +451,12 @@ async fn resolve_pinned_node(version: &str) -> Result<PathBuf> {
     Err(UnihelmError::new(
         ErrorCode::NotFound,
         format!(
-            "Node {version} is not installed on this server. Available: {available}. \
-             Install it, or create the app without a version to use the default."
+            "{} {version} is not installed on this server. Available: {available}. \
+             Install it, or create the app without a version to use the default.",
+            runtime.label()
         ),
-    ))
+    )
+    .with_field("runtime_version"))
 }
 
 // ---------------------------------------------------------------------------
@@ -357,9 +470,15 @@ struct AppUnitContext {
     name: String,
     linux_user: String,
     working_dir: String,
-    node_binary: String,
-    entry_path: String,
-    /// Pre-formatted `Environment=` payloads, `PORT` and `NODE_ENV` first.
+    /// The whole `ExecStart` line: interpreter and entry, or the entry alone
+    /// when the program is compiled. Built here rather than in the template
+    /// because whether there is an interpreter at all is a property of the
+    /// runtime, and a template deciding that would be a template making a
+    /// language decision.
+    exec_start: String,
+    /// What to call this in the unit's Description. `Node.js`, not `node`.
+    runtime_label: String,
+    /// Pre-formatted `Environment=` payloads, the panel's own first.
     environment: Vec<String>,
     memory_max_mb: Option<u32>,
 }
@@ -369,17 +488,22 @@ impl AppUnitContext {
         app: &NodeApp,
         name: &AppName,
         user: &LinuxUser,
-        node_binary: &Path,
+        interpreter: Option<&Path>,
         env: Vec<String>,
         memory_max_mb: Option<u32>,
     ) -> Self {
-        // The panel's own two come first so a future edit of this list cannot
+        // The panel's own come first so a future edit of this list cannot
         // accidentally let a tenant value win the last-one-wins rule; the
         // reserved-key check in `environment_lines` is the other half.
-        let mut environment = vec![
-            environment_line("NODE_ENV", app.node_env.as_str()),
-            environment_line("PORT", &app.port.to_string()),
-        ];
+        //
+        // Each ecosystem reads a different variable to know it is in production,
+        // and Go reads none — setting an invented one there would be the panel
+        // guessing at a convention that does not exist.
+        let mut environment = Vec::new();
+        if let Some(var) = app.runtime.env_var() {
+            environment.push(environment_line(var, app.node_env.as_str()));
+        }
+        environment.push(environment_line("PORT", &app.port.to_string()));
         environment.extend(env);
 
         Self {
@@ -388,11 +512,17 @@ impl AppUnitContext {
             working_dir: paths::app_dir(user.as_str(), name.as_str())
                 .to_string_lossy()
                 .into_owned(),
-            node_binary: node_binary.to_string_lossy().into_owned(),
-            entry_path: paths::tenant_home(user.as_str())
-                .join(app.entry.as_str())
-                .to_string_lossy()
-                .into_owned(),
+            exec_start: {
+                let entry = paths::tenant_home(user.as_str())
+                    .join(app.entry.as_str())
+                    .to_string_lossy()
+                    .into_owned();
+                match interpreter {
+                    Some(bin) => format!("{} {entry}", bin.display()),
+                    None => entry,
+                }
+            },
+            runtime_label: app.runtime.label().to_string(),
             environment,
             // A cap below a few megabytes cannot start a Node process at all;
             // clamping is the same courtesy the slice module extends to a plan
@@ -465,11 +595,11 @@ async fn apply_app_unit_at(
     app: &NodeApp,
     name: &AppName,
     user: &LinuxUser,
-    node_binary: &Path,
+    interpreter: Option<&Path>,
     env: Vec<String>,
     memory_max_mb: Option<u32>,
 ) -> Result<ApplyOutcome> {
-    let context = AppUnitContext::new(app, name, user, node_binary, env, memory_max_mb);
+    let context = AppUnitContext::new(app, name, user, interpreter, env, memory_max_mb);
     ctx.config()
         .apply(ApplyRequest {
             file: managed_for(path),
@@ -701,6 +831,12 @@ pub struct CreateInput {
     /// Per-app `MemoryMax`, inside the tenant slice's own ceiling.
     #[serde(default)]
     pub memory_mb: Option<u32>,
+    /// Which language this application is written in.
+    ///
+    /// Defaults to Node, which is what every application created before other
+    /// runtimes existed is, and still the common case.
+    #[serde(default)]
+    pub runtime: AppRuntime,
     /// Pin this app to an installed runtime version, e.g. `22.11.0`.
     ///
     /// Omit it and the app runs on whatever a bare `node` resolves to, which is
@@ -747,13 +883,15 @@ impl TypedOperation for Create {
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
         ensure_plan_allows_node_apps(ctx, &subscription).await?;
 
-        // A pinned version resolves to a path here rather than being stored as
-        // one: a path goes stale when a version manager moves its directories,
-        // and a version does not.
-        let node_binary = match &input.runtime_version {
-            Some(want) => resolve_pinned_node(want).await?,
-            None => locate_node(&self.node_program)?,
-        };
+        // Resolved here rather than stored: a path goes stale when a version
+        // manager moves its directories, and a version does not. A compiled
+        // runtime resolves to nothing, because the entry is the program.
+        let interpreter = resolve_interpreter(
+            input.runtime,
+            input.runtime_version.as_deref(),
+            &self.node_program,
+        )
+        .await?;
         check_entry(&input.entry)?;
         let env = environment_lines(&input.env)?;
 
@@ -768,6 +906,7 @@ impl TypedOperation for Create {
         let app = ctx
             .db()
             .create_node_app(NewNodeApp {
+                runtime: input.runtime,
                 subscription_id: subscription.id,
                 name: input.name.clone(),
                 entry: input.entry.clone(),
@@ -782,7 +921,7 @@ impl TypedOperation for Create {
             input.name.as_str()
         ));
 
-        match provision_app(ctx, &app, &input, &user, &node_binary, env).await {
+        match provision_app(ctx, &app, &input, &user, interpreter.as_deref(), env).await {
             Ok(site_id) => {
                 let unit = app_unit_name(&user, &input.name);
                 ctx.log(format!("{unit} is running"));
@@ -839,7 +978,7 @@ async fn provision_app(
     app: &NodeApp,
     input: &CreateInput,
     user: &LinuxUser,
-    node_binary: &Path,
+    interpreter: Option<&Path>,
     env: Vec<String>,
 ) -> Result<Option<i64>> {
     // 1. The account and the app directory.
@@ -858,7 +997,7 @@ async fn provision_app(
         app,
         &input.name,
         user,
-        node_binary,
+        interpreter,
         env,
         input.memory_mb,
     )
@@ -1185,6 +1324,133 @@ pub struct RestartOutput {
     pub restarted: bool,
 }
 
+/// `app.update` — move an application to a different runtime or version.
+///
+/// The reason this exists separately from create: an application is a directory
+/// of somebody's code with a port and a URL in front of it, and "delete it and
+/// make a new one" loses the port, the proxy site and the deploy. Changing which
+/// interpreter starts it is one line of the unit file, so it should cost one
+/// operation.
+///
+/// It re-renders the unit and restarts, which is a real interruption — seconds
+/// of connection refused — so it is a task with a log rather than something that
+/// answers instantly and leaves the operator wondering whether it took.
+pub struct Update;
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateInput {
+    pub app_id: i64,
+    /// Move to a different language. Omit to keep the one it has.
+    #[serde(default)]
+    pub runtime: Option<AppRuntime>,
+    /// Pin to a version, or unpin back to the default.
+    ///
+    /// Nested so that "leave it alone" (absent) and "unpin it" (present, null)
+    /// are different requests. Flattening them would make unpinning unreachable.
+    #[serde(default, deserialize_with = "double_option")]
+    pub runtime_version: Option<Option<String>>,
+}
+
+/// `Option<Option<T>>` where absent and null mean different things.
+fn double_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateOutput {
+    pub app_id: i64,
+    pub runtime: String,
+    /// The version it now runs on, or null when it runs on the default.
+    pub runtime_version: Option<String>,
+    /// The interpreter the unit now names, or null for a compiled program.
+    pub interpreter: Option<String>,
+}
+
+#[async_trait]
+impl TypedOperation for Update {
+    type Input = UpdateInput;
+    type Output = UpdateOutput;
+
+    const NAME: &'static str = "app.update";
+    const PERMISSION: Permission = Permission::NodeApps;
+    // Re-renders the unit and restarts the app. Seconds of downtime, and the
+    // operator should see it happen.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let (app, user, name) = app_and_user(ctx, input.app_id).await?;
+
+        let runtime = input.runtime.unwrap_or(app.runtime);
+        let version = match &input.runtime_version {
+            Some(v) => v.clone(),
+            None => app.runtime_version.clone(),
+        };
+
+        // Resolve before writing anything. A version that is not installed must
+        // fail with the app still running on what it had, not with a unit that
+        // names a binary the machine does not have.
+        let interpreter = resolve_interpreter(runtime, version.as_deref(), "node").await?;
+
+        let updated = ctx
+            .db()
+            .node_apps(ctx.scope())
+            .set_runtime(input.app_id, Some(runtime), Some(version.clone()))
+            .await
+            .map_err(UnihelmError::from)?;
+
+        // The tenant's own `Environment=` lines, carried over verbatim.
+        //
+        // They live only in the unit file — nothing persists them — so changing
+        // a runtime by re-rendering from the database alone would silently wipe
+        // every variable the app was configured with. They are read back out of
+        // the file on disk and written again as they were.
+        let env = carried_environment(&app_unit_path(&user, &name));
+
+        apply_app_unit_at(
+            ctx,
+            &app_unit_path(&user, &name),
+            &updated,
+            &name,
+            &user,
+            interpreter.as_deref(),
+            env,
+            None,
+        )
+        .await?;
+
+        let unit = app_unit_name(&user, &name);
+        ctx.distro()
+            .svc
+            .action(&unit, SvcAction::Restart)
+            .await
+            .map_err(UnihelmError::from)?;
+
+        ctx.log(format!(
+            "{} now runs on {}{}",
+            name.as_str(),
+            runtime.label(),
+            version
+                .as_deref()
+                .map(|v| format!(" {v}"))
+                .unwrap_or_default()
+        ));
+
+        Ok(UpdateOutput {
+            app_id: updated.id,
+            runtime: runtime.as_str().to_string(),
+            runtime_version: version,
+            interpreter: interpreter.map(|p| p.display().to_string()),
+        })
+    }
+}
+
 #[async_trait]
 impl TypedOperation for Restart {
     type Input = RestartInput;
@@ -1329,6 +1595,7 @@ mod tests {
             name: "blog".into(),
             entry: entry.into(),
             port,
+            runtime: AppRuntime::Node,
             node_env: NodeEnv::Production,
             runtime_version: None,
             enabled: true,
@@ -1342,7 +1609,7 @@ mod tests {
             app,
             &name(),
             &user(),
-            Path::new("/usr/bin/node"),
+            Some(Path::new("/usr/bin/node")),
             env,
             memory_mb,
         );
@@ -1709,7 +1976,7 @@ mod tests {
         assert_eq!(
             body,
             "[Unit]\n\
-             Description=Unihelm Node app blog (uh_abc12345)\n\
+             Description=Unihelm Node.js app blog (uh_abc12345)\n\
              After=network-online.target\n\
              Wants=network-online.target\n\
              StartLimitIntervalSec=60\n\
@@ -1824,7 +2091,7 @@ mod tests {
             &app_row(20_000, "apps/blog/server.js"),
             &name(),
             &user(),
-            Path::new("/bin/sh"),
+            Some(Path::new("/bin/sh")),
             vec![],
             None,
         )
@@ -1856,7 +2123,7 @@ mod tests {
             &app_row(20_000, "apps/blog/server.js"),
             &name(),
             &user(),
-            Path::new("/usr/bin/node"),
+            Some(Path::new("/usr/bin/node")),
             vec![],
             None,
         )
@@ -1881,6 +2148,7 @@ mod tests {
                 subscription_id: sub.id,
                 name: AppName::parse("blog").unwrap(),
                 entry: TenantPath::parse("apps/blog/server.js").unwrap(),
+                runtime: AppRuntime::Node,
                 node_env: NodeEnv::Production,
                 runtime_version: None,
             })
@@ -2202,6 +2470,7 @@ mod tests {
                     env: Vec::new(),
                     node_env: NodeEnv::Production,
                     memory_mb: None,
+                    runtime: AppRuntime::Node,
                     runtime_version: None,
                     proxy_domain: None,
                 },
@@ -2269,6 +2538,7 @@ mod tests {
             env: Vec::new(),
             node_env: NodeEnv::Production,
             memory_mb: None,
+            runtime: AppRuntime::Node,
             runtime_version: None,
             proxy_domain: None,
         };
@@ -2336,6 +2606,7 @@ mod tests {
                     env: Vec::new(),
                     node_env: NodeEnv::Production,
                     memory_mb: None,
+                    runtime: AppRuntime::Node,
                     runtime_version: None,
                     proxy_domain: None,
                 },
@@ -2398,6 +2669,7 @@ mod tests {
                 subscription_id: sub,
                 name: AppName::parse("blog2").unwrap(),
                 entry: TenantPath::parse("apps/blog2/server.js").unwrap(),
+                runtime: AppRuntime::Node,
                 node_env: NodeEnv::Production,
                 runtime_version: None,
             })
@@ -2495,6 +2767,7 @@ mod tests {
             subscription_id: other_sub.id,
             name: AppName::parse("admins-app").unwrap(),
             entry: TenantPath::parse("apps/admins-app/server.js").unwrap(),
+            runtime: AppRuntime::Node,
             node_env: NodeEnv::Production,
             runtime_version: None,
         })
@@ -2519,7 +2792,7 @@ mod pinning_tests {
     /// where a refusal fails here, in front of the person who asked for it.
     #[tokio::test]
     async fn a_version_that_is_not_installed_is_refused() {
-        let err = resolve_pinned_node("0.0.1-nonexistent")
+        let err = resolve_pinned(AppRuntime::Node, "0.0.1-nonexistent")
             .await
             .expect_err("an uninstalled version must not resolve");
 
@@ -2547,9 +2820,118 @@ mod pinning_tests {
             return;
         };
 
-        let path = resolve_pinned_node(&node.version)
+        let path = resolve_pinned(AppRuntime::Node, &node.version)
             .await
             .expect("the version this machine reports must resolve");
         assert!(path.is_file(), "{} is not a file", path.display());
+    }
+}
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    /// A compiled program has no interpreter, and pinning a version to one is a
+    /// request that cannot mean anything — the Go that built the binary is a
+    /// fact about the build, not about this server.
+    #[tokio::test]
+    async fn a_compiled_runtime_takes_no_interpreter_and_refuses_a_version() {
+        assert!(
+            resolve_interpreter(AppRuntime::Go, None, "node")
+                .await
+                .expect("go needs no interpreter")
+                .is_none()
+        );
+
+        let err = resolve_interpreter(AppRuntime::Go, Some("1.22.2"), "node")
+            .await
+            .expect_err("pinning a compiled runtime must be refused");
+        assert!(
+            err.to_string().contains("compiled"),
+            "the error must say why: {err}"
+        );
+    }
+
+    /// Every interpreted runtime this machine has must resolve to a real file,
+    /// or an app created on it would produce a unit that dies at first start.
+    #[tokio::test]
+    async fn each_installed_runtime_resolves_to_a_binary_that_exists() {
+        let installed = crate::runtimes::survey().await;
+        let mut checked = 0;
+
+        for runtime in AppRuntime::ALL.iter().copied() {
+            let Some(kind) = survey_runtime(runtime) else {
+                continue;
+            };
+            let Some(version) = installed.get(&kind).and_then(|v| v.first()) else {
+                continue; // not on this machine; nothing to assert
+            };
+
+            let path = resolve_pinned(runtime, &version.version)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{} {} did not resolve: {e}",
+                        runtime.label(),
+                        version.version
+                    )
+                });
+            assert!(path.is_file(), "{} is not a file", path.display());
+            checked += 1;
+        }
+
+        assert!(
+            checked > 0,
+            "no runtime at all was installed to check against"
+        );
+    }
+
+    /// Each ecosystem reads a different variable, and Go reads none. Setting an
+    /// invented one there would be the panel guessing at a convention.
+    #[test]
+    fn each_runtime_gets_the_variable_its_ecosystem_actually_reads() {
+        assert_eq!(AppRuntime::Node.env_var(), Some("NODE_ENV"));
+        assert_eq!(AppRuntime::Bun.env_var(), Some("NODE_ENV"));
+        assert_eq!(AppRuntime::Python.env_var(), Some("PYTHON_ENV"));
+        assert_eq!(AppRuntime::Ruby.env_var(), Some("RACK_ENV"));
+        assert_eq!(AppRuntime::Go.env_var(), None);
+    }
+
+    /// A runtime change re-renders the unit from the database, and the tenant's
+    /// own variables live only in the file — so they have to be read back out,
+    /// or changing a version silently wipes the app's configuration.
+    #[test]
+    fn a_runtime_change_carries_the_tenants_own_environment_across() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("app.service");
+        std::fs::write(
+            &unit,
+            "[Service]\n\
+             Environment=NODE_ENV=production\n\
+             Environment=PORT=20042\n\
+             Environment=DATABASE_URL=postgres://localhost/app\n\
+             Environment=API_KEY=secret\n",
+        )
+        .unwrap();
+
+        let carried = carried_environment(&unit);
+        assert!(carried.contains(&"DATABASE_URL=postgres://localhost/app".to_string()));
+        assert!(carried.contains(&"API_KEY=secret".to_string()));
+        // The panel rebuilds these two from the database; carrying them as well
+        // would write each into the unit twice.
+        assert!(
+            carried.iter().all(|l| !l.starts_with("PORT=")),
+            "PORT was carried and will be duplicated: {carried:?}"
+        );
+        assert!(
+            carried.iter().all(|l| !l.starts_with("NODE_ENV=")),
+            "the runtime's own variable was carried: {carried:?}"
+        );
+    }
+
+    /// A unit that is not there yet is not an error — it is an app being
+    /// created, with nothing to carry.
+    #[test]
+    fn a_missing_unit_carries_nothing_rather_than_failing() {
+        assert!(carried_environment(Path::new("/nonexistent/app.service")).is_empty());
     }
 }

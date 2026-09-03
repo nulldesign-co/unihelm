@@ -1522,7 +1522,7 @@ listing, so one broken app cannot blank the page.
 |---|---|
 | Permission | `node_apps` |
 | Execution | task — not cancellable, **not** idempotent |
-| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |, `runtime_version` *(optional string)*
+| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |, `runtime_version` *(optional string)*, `runtime` *(optional: node, python, ruby, bun, deno, go — default node)*
 
 Allocates a port, creates `<home>/apps/<name>` owned by the tenant at `0750`,
 writes the slice drop-in, writes and verifies the unit, enables it (so a reboot
@@ -1570,6 +1570,35 @@ against the **target** subscription, which is a different question from the
 caller's permission whenever an admin or reseller creates an app for a
 customer. Not idempotent: it makes an account, a directory and a port
 allocation, so a re-run is a second attempt rather than a converging one.
+
+### `app.update`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | task |
+| Input | `app_id`, `runtime` *(optional)*, `runtime_version` *(optional, nullable)* |
+
+Moves an application to a different language or version. Re-renders its unit and
+restarts it, keeping the port, the proxy site in front of it, and everything in
+the app directory.
+
+This exists separately from delete-and-recreate because an application is
+somebody's code with a port and a URL attached: changing which interpreter starts
+it is one line of the unit file, and should cost one operation rather than the
+loss of all three.
+
+`runtime_version` distinguishes absent from null. Omit the key to leave the pin
+alone; send an explicit `null` to unpin back to whatever a bare command name
+resolves to. On the CLI those are the default and `--unpin`.
+
+The interpreter is resolved **before** anything is written, so a version that is
+not installed fails with the application still running on what it had, rather
+than with a unit naming a binary the machine does not have.
+
+The tenant's own `Environment=` lines are carried across. They live only in the
+unit file — nothing persists them — so re-rendering from the database alone would
+silently wipe every variable the app was configured with.
 
 ### `app.delete`
 
