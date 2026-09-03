@@ -580,6 +580,7 @@ fi
 # conclude it was sourced, and exit 0 having installed nothing at all. So both
 # halves are asserted here — it must run, and it must run the right thing. None
 # of these reach the network.
+# shellcheck disable=SC2002
 piped_help="$(cat installer/install.sh | bash -s -- --help 2>&1 || true)"
 if printf '%s' "$piped_help" | grep -q 'Usage: install.sh'; then
   ok "piped into bash, the installer reaches its own argument parsing"
@@ -661,14 +662,16 @@ else
   a signed tarball carrying a link could redirect what gets run and installed"
 fi
 
-# `cat file | bash` rather than `bash < file` throughout this section. The
-# "useless cat" warning is wrong about it here: the point is that the script's
-# stdin is a PIPE rather than a file, which is exactly what a curl-to-bash
-# install looks like and precisely what these three assertions measure.
-# shellcheck disable=SC2002
+# `cat file | bash` rather than `bash < file` in the three checks below. The
+# "useless cat" warning is wrong about them: the point is that the script's stdin
+# is a PIPE rather than a file, which is exactly what a curl-to-bash install
+# looks like and precisely what these assertions measure. Each carries its own
+# directive because shellcheck's disable applies to the next command, not to a
+# section.
 
 # Silence is the failure mode worth naming: a piped run that neither installs
 # nor explains itself looks like success to every caller.
+# shellcheck disable=SC2002
 piped_bare="$(cat installer/install.sh | bash 2>&1 || true)"
 if [ -n "$piped_bare" ]; then
   ok "a piped run with no arguments says something"
@@ -678,6 +681,7 @@ fi
 
 # --from-source needs a source tree and --from needs a directory; a pipe has
 # neither. Both must refuse in words, and must do it before any request.
+# shellcheck disable=SC2002
 piped_src="$(cat installer/install.sh | bash -s -- --from-source 2>&1 || true)"
 if printf '%s' "$piped_src" | grep -q 'git clone'; then
   ok "piped --from-source refuses with the clone command that would work"
@@ -688,6 +692,7 @@ fi
 # The bootstrap hands over to the installer inside the verified tarball. If that
 # child ever came back round to the bootstrap it would fork-bomb the machine,
 # so the guard that makes that one error line is worth an assertion of its own.
+# shellcheck disable=SC2002
 piped_loop="$(cat installer/install.sh | UNIHELM_BOOTSTRAPPED=1 bash 2>&1 || true)"
 if printf '%s' "$piped_loop" | grep -q 'refusing to loop'; then
   ok "the bootstrap refuses to re-enter itself"
