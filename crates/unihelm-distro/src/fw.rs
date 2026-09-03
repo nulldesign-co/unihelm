@@ -651,16 +651,27 @@ impl FwBackend for UfwBackend {
 fn parse_ufw_status(text: &str) -> Vec<PortRule> {
     let mut rules = Vec::new();
     for line in text.lines() {
-        let Some((body, comment)) = line.split_once('#') else {
-            continue;
-        };
-        let comment = comment.trim();
-        let Some(comment) = comment.strip_prefix(&format!("{MARK}: ")) else {
-            continue;
+        // Every ALLOW rule, not only the ones this panel wrote.
+        //
+        // The parser used to require a `# unihelm: ` comment and skip everything
+        // else, so on a machine whose firewall was configured before Unihelm
+        // arrived — ssh, http, https, and the panel's own 8088, which the
+        // installer adds without a mark — `fw.rules` answered "(none)". The
+        // documented contract is "the backend's live rules", and an operator
+        // told their active firewall is empty may well decide it is not doing
+        // anything and turn it off.
+        let (body, raw_comment) = match line.split_once('#') {
+            Some((b, c)) => (b, c.trim()),
+            None => (line, ""),
         };
         if !body.contains("ALLOW") {
             continue;
         }
+        // Ours keeps the mark stripped, as it always did; anything else carries
+        // whatever comment its author gave it, or none.
+        let comment = raw_comment
+            .strip_prefix(&format!("{MARK}: "))
+            .unwrap_or(raw_comment);
         let mut fields = body.split_whitespace();
         let Some(target) = fields.next() else {
             continue;
@@ -1219,8 +1230,15 @@ mod tests {
         }
     }
 
+    /// Every ALLOW rule, whoever wrote it.
+    ///
+    /// This test used to assert the opposite — that only rules carrying the
+    /// panel's own mark were returned — with no reason given for it. The
+    /// documented contract for `fw.rules` is "the backend's live rules", and on
+    /// a real server whose firewall predated the panel that filter reported an
+    /// active firewall with eight rules as empty.
     #[test]
-    fn ufw_status_yields_only_our_rules() {
+    fn ufw_status_yields_every_open_port_not_only_ours() {
         let status = "\
 Status: active
 
@@ -1233,16 +1251,20 @@ To                         Action      From
 5432/tcp                   ALLOW IN    Anywhere                   # my own rule
 ";
         let rules = parse_ufw_status(status);
-        assert_eq!(rules.len(), 3, "{rules:?}");
-        assert_eq!(rules[0].port, 80);
-        assert_eq!(rules[0].source, None);
-        assert_eq!(rules[2].port, 3306);
-        assert_eq!(rules[2].source.as_deref(), Some("10.0.0.0/8"));
-        assert_eq!(rules[2].comment, "remote mysql");
-        assert!(
-            !rules.iter().any(|r| r.port == 22 || r.port == 5432),
-            "rules we did not create must not be listed as ours"
+        let ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+        assert_eq!(ports, vec![22, 80, 443, 3306, 5432], "{rules:?}");
+
+        // What the mark is still for: our comment loses the prefix, and a rule
+        // somebody else wrote keeps theirs verbatim.
+        let ours = rules.iter().find(|r| r.port == 3306).unwrap();
+        assert_eq!(ours.comment, "remote mysql");
+        assert_eq!(ours.source.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(
+            rules.iter().find(|r| r.port == 5432).unwrap().comment,
+            "my own rule"
         );
+        // An unmarked, uncommented rule is still a rule.
+        assert_eq!(rules.iter().find(|r| r.port == 22).unwrap().comment, "");
     }
 
     #[test]
@@ -1382,5 +1404,77 @@ table inet unihelm {
                 backend.name()
             );
         }
+    }
+}
+#[cfg(test)]
+mod ufw_status_tests {
+    use super::*;
+
+    /// Verbatim from a live Ubuntu 24.04 server whose firewall predated the
+    /// panel. It reported "(none)" against all of this.
+    const REAL_STATUS: &str = "\
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), deny (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+80,443/tcp (Nginx Full)    ALLOW IN    Anywhere
+22/tcp                     ALLOW IN    Anywhere                   # ssh
+80/tcp                     ALLOW IN    Anywhere                   # http
+443/tcp                    ALLOW IN    Anywhere                   # https
+8088/tcp                   ALLOW IN    Anywhere
+22/tcp (v6)                ALLOW IN    Anywhere (v6)              # ssh
+";
+
+    /// A firewall configured by hand must not read as empty. An operator told
+    /// their active firewall has no rules may reasonably conclude it is doing
+    /// nothing and switch it off.
+    #[test]
+    fn rules_written_by_somebody_else_are_still_rules() {
+        let rules = parse_ufw_status(REAL_STATUS);
+        let ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+
+        for expected in [22, 80, 443, 8088] {
+            assert!(
+                ports.contains(&expected),
+                "port {expected} missing: {ports:?}"
+            );
+        }
+        assert!(
+            !rules.is_empty(),
+            "an active firewall with rules in it read as empty"
+        );
+    }
+
+    /// The panel's own mark is still stripped, and a rule without one keeps
+    /// whatever its author wrote.
+    #[test]
+    fn our_mark_is_stripped_and_other_comments_are_kept() {
+        let text = format!(
+            "To Action From\n\
+             3306/tcp    ALLOW IN    10.0.0.0/8    # {MARK}: mysql for the app tier\n\
+             22/tcp      ALLOW IN    Anywhere      # ssh\n\
+             8088/tcp    ALLOW IN    Anywhere\n"
+        );
+        let rules = parse_ufw_status(&text);
+
+        let ours = rules.iter().find(|r| r.port == 3306).expect("3306");
+        assert_eq!(ours.comment, "mysql for the app tier");
+        assert_eq!(ours.source.as_deref(), Some("10.0.0.0/8"));
+
+        assert_eq!(rules.iter().find(|r| r.port == 22).unwrap().comment, "ssh");
+        assert_eq!(rules.iter().find(|r| r.port == 8088).unwrap().comment, "");
+    }
+
+    /// A DENY line is not a hole in the firewall and must not be listed as one.
+    #[test]
+    fn deny_rules_are_not_open_ports() {
+        let text = "To Action From\n\
+                    23/tcp      DENY IN     Anywhere\n\
+                    22/tcp      ALLOW IN    Anywhere\n";
+        let ports: Vec<u16> = parse_ufw_status(text).iter().map(|r| r.port).collect();
+        assert_eq!(ports, vec![22], "a DENY was reported as an open port");
     }
 }
