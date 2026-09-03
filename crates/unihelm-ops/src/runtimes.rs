@@ -186,10 +186,17 @@ fn versioned_binaries(runtime: Runtime, dir: &Path, prefix: &str) -> Vec<PathBuf
             && name.starts_with(prefix)
             && name.len() > prefix.len()
             // `php8.3` yes, `phpize` and `php-config` no.
+            // The WHOLE suffix must be a version, not merely start like one.
+            // `php8.3` and `phpize` are told apart by the first character, but
+            // `python3.12-config` is not: it is the same kind of helper script
+            // as `php-config`, and its name carries a real version before the
+            // `-config`. A server with it installed offered `3.12` as a version
+            // to pin an application to, and the unit that produced would have
+            // run `python3.12-config app.py` and died at first start.
             && name[prefix.len()..]
                 .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit())
+                .all(|c| c.is_ascii_digit() || c == '.')
+            && name[prefix.len()..].starts_with(|c: char| c.is_ascii_digit())
         {
             out.push(path);
         }
@@ -455,6 +462,33 @@ mod tests {
         }
         assert_eq!(extract_version("command not found"), None);
         assert_eq!(extract_version(""), None);
+    }
+
+    /// A helper script whose name carries a real version.
+    ///
+    /// Found on a live Ubuntu 24.04 server: `python3.12-config` sits next to
+    /// `python3.12` and passed the first-character check, because the character
+    /// after `python3.` is the digit `1`. The panel offered `3.12` as a version
+    /// to pin an application to, and the unit that produced would have run
+    /// `python3.12-config app.py` and died at first start.
+    #[test]
+    fn a_helper_script_with_a_version_in_its_name_is_not_an_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "python3.12",
+            "python3.11",
+            "python3.12-config",
+            "python3-config",
+            "python3.12t",
+        ] {
+            std::fs::write(tmp.path().join(name), "").unwrap();
+        }
+        let found = versioned_binaries(Runtime::Python, tmp.path(), "python3.");
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["python3.11", "python3.12"], "got {names:?}");
     }
 
     /// `phpize` and `php-config` sit next to `php8.3` in /usr/bin and are not

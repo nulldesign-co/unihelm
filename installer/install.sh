@@ -1169,6 +1169,23 @@ main() {
 }
 
 if [ "$piped" -eq 0 ]; then
+  # A downloaded-then-executed install.sh is the careful operator's path: fetch
+  # it, read it, run it. It is also the one that used to die here with bash's
+  # own "No such file or directory", because preflight.sh lives beside this file
+  # in the source tree and the release tarball, and downloading one file alone
+  # brings neither. Say what happened and how to get out of it.
+  if [ ! -f "$here/preflight.sh" ]; then
+    printf 'unihelm: this script needs preflight.sh beside it, and there is none in\n' >&2
+    printf '%s.\n\n' "$here" >&2
+    printf 'You have install.sh on its own. Either pipe it, which fetches and verifies\n' >&2
+    printf 'a signed release and runs the installer out of that:\n\n' >&2
+    printf '    curl -fsSL https://raw.githubusercontent.com/%s/main/installer/install.sh | sudo bash\n\n' \
+      "$UNIHELM_REPO" >&2
+    printf 'or clone the repository and run it from there:\n\n' >&2
+    printf '    git clone https://github.com/%s.git\n' "$UNIHELM_REPO" >&2
+    printf '    sudo unihelm/installer/install.sh\n' >&2
+    exit 1
+  fi
   # shellcheck source-path=SCRIPTDIR
   # shellcheck source=installer/preflight.sh
   . "$here/preflight.sh"

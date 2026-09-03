@@ -12,6 +12,14 @@ use crate::{Db, DbError, Result, from_sql_time, now, to_sql_time};
 #[serde(rename_all = "snake_case")]
 pub enum ComponentStatus {
     Absent,
+    /// On the machine, but not put there by this panel.
+    ///
+    /// The distinction is not pedantry: `absent` invites an operator to press
+    /// install, and pressing install on a running nginx adds a repository and
+    /// replaces a working configuration. A panel whose whole claim is that it
+    /// fits around what is already there has to be able to say "that is here,
+    /// and it is not mine".
+    Unmanaged,
     Installing,
     Installed,
     Failed,
@@ -22,6 +30,7 @@ impl ComponentStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             ComponentStatus::Absent => "absent",
+            ComponentStatus::Unmanaged => "unmanaged",
             ComponentStatus::Installing => "installing",
             ComponentStatus::Installed => "installed",
             ComponentStatus::Failed => "failed",
@@ -32,6 +41,7 @@ impl ComponentStatus {
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s {
             "absent" => ComponentStatus::Absent,
+            "unmanaged" => ComponentStatus::Unmanaged,
             "installing" => ComponentStatus::Installing,
             "installed" => ComponentStatus::Installed,
             "failed" => ComponentStatus::Failed,
@@ -381,5 +391,40 @@ mod tests {
         let all = db.components().await.unwrap();
         assert_eq!(all.len(), 4);
         assert_eq!(all[0].slug, "mariadb", "listing is sorted");
+    }
+}
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// Every status must survive a round trip, or a row written by one release
+    /// becomes a corrupt-database error in the next.
+    #[test]
+    fn every_status_round_trips_through_the_database() {
+        for status in [
+            ComponentStatus::Absent,
+            ComponentStatus::Unmanaged,
+            ComponentStatus::Installing,
+            ComponentStatus::Installed,
+            ComponentStatus::Failed,
+            ComponentStatus::Removing,
+        ] {
+            let text = status.as_str();
+            assert_eq!(
+                ComponentStatus::parse(text).unwrap(),
+                status,
+                "`{text}` did not round-trip"
+            );
+        }
+    }
+
+    /// `unmanaged` is not `absent`, and the difference is what stops an operator
+    /// pressing install on an nginx that is already serving their sites.
+    #[test]
+    fn unmanaged_is_distinct_from_absent() {
+        assert_ne!(
+            ComponentStatus::Unmanaged.as_str(),
+            ComponentStatus::Absent.as_str()
+        );
     }
 }

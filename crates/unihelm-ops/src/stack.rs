@@ -215,9 +215,21 @@ impl TypedOperation for Status {
             components.push(ComponentView {
                 slug,
                 display_name: candidate.display_name(),
+                // The database only knows what this panel installed. A
+                // component put there by hand — nginx serving a dozen sites
+                // before Unihelm existed — has no row, and reporting that as
+                // `absent` is the same kind of lie the comment above warns
+                // about, only in the other direction: it invites an operator to
+                // press install on something that is already running.
                 status: row
                     .map(|c| c.status.as_str().to_string())
-                    .unwrap_or_else(|| ComponentStatus::Absent.as_str().to_string()),
+                    .unwrap_or_else(|| {
+                        if unit_status.as_ref().is_some_and(|s| s.is_installed()) {
+                            ComponentStatus::Unmanaged.as_str().to_string()
+                        } else {
+                            ComponentStatus::Absent.as_str().to_string()
+                        }
+                    }),
                 installed_version: row.and_then(|c| c.installed_version.clone()),
                 last_error: row.and_then(|c| c.last_error.clone()),
                 unit_state: unit_status

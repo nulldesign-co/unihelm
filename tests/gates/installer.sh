@@ -671,6 +671,25 @@ fi
 
 # Silence is the failure mode worth naming: a piped run that neither installs
 # nor explains itself looks like success to every caller.
+# install.sh on its own, executed rather than piped — the careful operator's
+# path: fetch it, read it, run it. It used to die on bash's own "No such file or
+# directory" for preflight.sh, which lives beside it in the tree and in the
+# release tarball but not in a single downloaded file.
+lone_dir="$(mktemp -d)"
+cp installer/install.sh "$lone_dir/"
+lone_out="$(bash "$lone_dir/install.sh" 2>&1 || true)"
+rm -rf "$lone_dir"
+if printf '%s' "$lone_out" | grep -q 'needs preflight.sh beside it'; then
+  ok "install.sh alone explains itself instead of dying on a missing file"
+else
+  fail "install.sh alone did not explain itself: ${lone_out:-<nothing>}"
+fi
+if printf '%s' "$lone_out" | grep -q 'curl -fsSL' && printf '%s' "$lone_out" | grep -q 'git clone'; then
+  ok "and names both ways out"
+else
+  fail "the message must give a way forward: ${lone_out:-<nothing>}"
+fi
+
 # shellcheck disable=SC2002
 piped_bare="$(cat installer/install.sh | bash 2>&1 || true)"
 if [ -n "$piped_bare" ]; then
