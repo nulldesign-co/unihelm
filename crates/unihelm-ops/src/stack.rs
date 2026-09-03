@@ -455,6 +455,12 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
     set_mode(&paths::acme_webroot(), 0o755)?;
     set_mode(&challenge_dir, 0o755)?;
 
+    // The maintenance page, for the same reason and read by the same workers:
+    // a suspended tenant's vhost and a site in maintenance mode both answer 503
+    // through an internal redirect to `maintenance.html`, so a missing file
+    // turns the branded page the panel promises into a bare 404.
+    write_maintenance_page_in(&paths::maintenance_root())?;
+
     std::fs::create_dir_all(paths::site_log_root())
         .map_err(|e| UnihelmError::internal(format!("could not create the log directory: {e}")))?;
 
@@ -834,12 +840,65 @@ fn set_mode(path: &std::path::Path, mode: u32) -> Result<()> {
         .map_err(|e| UnihelmError::internal(format!("could not chmod {}: {e}", path.display())))
 }
 
+/// The page every 503 lands on until an operator replaces it.
+///
+/// Self-contained on purpose: it is served while the site behind it is down, so
+/// a stylesheet, a font or an image would be one more request to a vhost that
+/// is answering 503 to everything.
+const DEFAULT_MAINTENANCE_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Temporarily unavailable</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #f6f7f9; color: #1f2430;
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 32rem; padding: 2rem; text-align: center; }
+  h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+  p { margin: 0; color: #5b6472; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Temporarily unavailable</h1>
+  <p>This site is down for maintenance. Please try again shortly.</p>
+</main>
+</body>
+</html>
+"#;
+
+/// Create the maintenance root and seed the page nginx redirects 503s to.
+///
+/// Split out so the tests can work in a temporary directory: `paths::set_root`
+/// is a process-wide `OnceLock`, which a parallel test binary cannot use to give
+/// each test its own tree.
+///
+/// An existing page is never overwritten — replacing `maintenance.html` is how
+/// an operator brands it, and bootstrap runs again on every nginx install.
+fn write_maintenance_page_in(root: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(root).map_err(|e| {
+        UnihelmError::internal(format!("could not create the maintenance directory: {e}"))
+    })?;
+
+    let page = root.join("maintenance.html");
+    if !page.exists() {
+        std::fs::write(&page, DEFAULT_MAINTENANCE_PAGE).map_err(|e| {
+            UnihelmError::internal(format!("could not write the maintenance page: {e}"))
+        })?;
+        set_mode(&page, 0o644)?;
+    }
+    set_mode(root, 0o755)?;
+    Ok(())
+}
+
 /// Download a repository's signing key.
 ///
 /// Bounded and short-timeout: this runs inside a task the user is watching, and
 /// a vendor whose key server is down should produce a clear failure rather than
 /// a hung install.
-async fn fetch_key(url: &str) -> Result<Vec<u8>> {
+pub(crate) async fn fetch_key(url: &str) -> Result<Vec<u8>> {
     /// No vendor's keyring is anywhere near this large.
     const MAX_KEY_BYTES: usize = 1024 * 1024;
 
@@ -925,6 +984,47 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o755
+        );
+    }
+
+    #[test]
+    fn a_maintenance_mode_site_has_a_page_to_serve() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("maintenance");
+
+        write_maintenance_page_in(&root).unwrap();
+
+        // The name and the location are the vhost template's contract:
+        // `root <maintenance_root>; rewrite ^ /maintenance.html break;`.
+        let page = root.join("maintenance.html");
+        assert!(page.is_file(), "nginx would answer 404 instead of the page");
+        assert!(std::fs::read_to_string(&page).unwrap().contains("<html"));
+        // Read by a worker running as `nginx`, not by the panel.
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn a_branded_maintenance_page_survives_the_next_bootstrap() {
+        // Replacing the file is how an operator brands it, and bootstrap_nginx
+        // runs again on every nginx install.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("maintenance");
+        write_maintenance_page_in(&root).unwrap();
+        std::fs::write(root.join("maintenance.html"), "<h1>back soon</h1>").unwrap();
+
+        write_maintenance_page_in(&root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("maintenance.html")).unwrap(),
+            "<h1>back soon</h1>"
         );
     }
 

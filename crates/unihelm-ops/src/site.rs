@@ -8,6 +8,8 @@
 //! at the last hurdle, the server is exactly as it was and the site row says
 //! why.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_config::apply::ApplyRequest;
@@ -19,6 +21,7 @@ use unihelm_core::{
 };
 use unihelm_db::sites::{NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPolicy};
 
+use crate::nginx_survey;
 use crate::provision;
 use crate::registry::{Execution, OpContext, TypedOperation};
 use crate::services::{FpmValidator, NginxValidator, UnitReloader};
@@ -273,7 +276,10 @@ impl TypedOperation for Create {
                     .await
                     .map_err(UnihelmError::from)?
             }
-            None => db.create_site(wanted).await.map_err(UnihelmError::from)?,
+            None => {
+                refuse_foreign_vhost(&input.domain, input.with_www)?;
+                db.create_site(wanted).await.map_err(UnihelmError::from)?
+            }
         };
 
         if input.with_www
@@ -499,6 +505,64 @@ async fn retryable_site(
             format!("`{domain}` is already a site; delete it first if you want to recreate it"),
         )),
     }
+}
+
+/// Refuse a domain that a vhost outside the panel already answers for.
+///
+/// A duplicate `server_name` is a warning to nginx, not an error, so `nginx -t`
+/// passes and nothing is said — but our blocks come in from
+/// `conf.d/unihelm.conf`, which stock `nginx.conf` reads before `sites-enabled`,
+/// so the panel's brand-new placeholder wins the name and the operator's live
+/// site goes dark while the panel reports a successful creation.
+///
+/// The way past it is to disable the hand-written vhost, not a flag: whichever
+/// of the two files stays, only one of them may serve the name.
+fn refuse_foreign_vhost(domain: &Domain, with_www: bool) -> Result<()> {
+    let mut wanted = vec![domain.as_str().to_string()];
+    if with_www && let Ok(www) = domain.with_www() {
+        wanted.push(www.as_str().to_string());
+    }
+
+    let Some((taken, file)) = foreign_server_name(&nginx_survey::discover_sites(), &wanted) else {
+        return Ok(());
+    };
+
+    Err(UnihelmError::new(
+        ErrorCode::Conflict,
+        format!(
+            "`{taken}` is already served by `{file}`, an nginx vhost this panel did not \
+             write. Creating the site would shadow it and take it offline; disable that \
+             vhost first."
+        ),
+    )
+    .with_field("domain"))
+}
+
+/// The first of `wanted` a foreign vhost already declares, and the file that
+/// declares it.
+///
+/// Read through `discover_sites` rather than `survey`, whose `server_names` are
+/// a flat set gathered line by line. Two reasons, and the second is the one that
+/// matters: a flat set cannot name the file the operator has to go and edit, and
+/// a line scan misses `server { listen 80; server_name x; }` written on one line
+/// entirely — which is a guard against a silent outage failing silently.
+/// `sites.discover` reads the same way, so what this refuses and what the
+/// operator is shown are the same vhosts.
+///
+/// Exact names only. A foreign `*.example.com` is left alone deliberately:
+/// nginx prefers an exact `server_name` over a wildcard, so the panel's block
+/// takes only the one name it was asked for rather than shadowing the vhost.
+fn foreign_server_name(
+    vhosts: &[nginx_survey::DiscoveredSite],
+    wanted: &[String],
+) -> Option<(String, String)> {
+    vhosts.iter().find_map(|vhost| {
+        vhost
+            .server_names
+            .iter()
+            .find(|name| wanted.iter().any(|w| w.eq_ignore_ascii_case(name)))
+            .map(|name| (name.clone(), vhost.config_file.clone()))
+    })
 }
 
 /// Render and activate a site's nginx vhost.
@@ -821,6 +885,22 @@ impl TypedOperation for Update {
             )
             .with_field("custom_nginx_snippet"));
         }
+        // A setting nothing renders is worse than a setting that is missing.
+        //
+        // `www_policy` was stored, echoed back by `site.list` and offered as a
+        // choice in the UI, and no part of it ever reached nginx: `SiteContext`
+        // has no www field and `site.conf` emits no redirect. An operator who
+        // chose "strip www" got a success, a reload, and www.example.com serving
+        // duplicate content for as long as they never checked. Until the vhost
+        // renders it, say so.
+        if input.www_policy.is_some() {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "the www policy is not implemented: nothing renders it into the vhost. \
+                 Add or remove the `www.` alias instead",
+            )
+            .with_field("www_policy"));
+        }
         if let Some(snippet) = input.custom_nginx_snippet.as_ref().and_then(|s| s.as_ref()) {
             check_snippet(snippet)?;
         }
@@ -856,21 +936,23 @@ impl TypedOperation for Update {
             .ok_or_else(|| UnihelmError::internal("the site's subscription is missing"))?;
         let linux_user = unihelm_core::LinuxUser::parse(&subscription.linux_user)?;
 
-        // A PHP version change needs the new pool in place before the vhost
-        // points at its socket, and the old pool removed only afterwards.
-        if let Some(new_version) = input.php_version
-            && before.php_version != Some(new_version)
-        {
-            render_pool(ctx, &site, &linux_user, new_version).await?;
-            render_vhost(ctx, &site, &linux_user).await?;
-            if let Some(old) = before.php_version {
-                remove_pool(ctx, &before, old).await;
+        // The row is already written, so a render that nginx or FPM refuses has
+        // to be undone here.
+        //
+        // The config engine restores the file it replaced and reports
+        // `ValidationFailed`, which leaves disk right and the database wrong:
+        // a snippet `nginx -t` rejected stays stored, and every later render of
+        // this site — a certificate renewal, a suspension, an unsuspension —
+        // builds the same rejected file and fails the same way. The value the
+        // server never accepted must not survive the operation that proposed it.
+        if let Err(e) = apply_settings(ctx, &site, &before, &linux_user, input.php_version).await {
+            if let Err(revert) = repo.update(id, revert_to(&before)).await {
+                ctx.log(format!(
+                    "could not put {}'s settings back after the failed render: {revert}",
+                    site.domain
+                ));
             }
-        } else {
-            if let Some(version) = site.php_version {
-                render_pool(ctx, &site, &linux_user, version).await?;
-            }
-            render_vhost(ctx, &site, &linux_user).await?;
+            return Err(e);
         }
 
         Ok(UpdateOutput {
@@ -878,6 +960,54 @@ impl TypedOperation for Update {
             domain: site.domain,
             reloaded: true,
         })
+    }
+}
+
+/// Put the stored settings on disk: the pool, then the vhost that points at it.
+async fn apply_settings(
+    ctx: &OpContext,
+    site: &Site,
+    before: &Site,
+    linux_user: &unihelm_core::LinuxUser,
+    requested_version: Option<PhpVersion>,
+) -> Result<()> {
+    // A PHP version change needs the new pool in place before the vhost points
+    // at its socket, and the old pool removed only afterwards.
+    if let Some(new_version) = requested_version
+        && before.php_version != Some(new_version)
+    {
+        render_pool(ctx, site, linux_user, new_version).await?;
+        render_vhost(ctx, site, linux_user).await?;
+        if let Some(old) = before.php_version {
+            remove_pool(ctx, before, old).await;
+        }
+    } else {
+        if let Some(version) = site.php_version {
+            render_pool(ctx, site, linux_user, version).await?;
+        }
+        render_vhost(ctx, site, linux_user).await?;
+    }
+    Ok(())
+}
+
+/// The update that puts a site's settings back the way they were.
+///
+/// Every field `UpdateInput` can change is named here. One that is missed is a
+/// value that survives its own rejection, which is the defect this exists to
+/// undo — so the test next to it asserts the whole set, not a sample.
+fn revert_to(before: &Site) -> SiteUpdate {
+    SiteUpdate {
+        php_version: before.php_version,
+        www_policy: Some(before.www_policy),
+        force_https: Some(before.force_https),
+        http3: Some(before.http3),
+        maintenance_mode: Some(before.maintenance_mode),
+        client_max_body_size: Some(before.client_max_body_size.clone()),
+        custom_nginx_snippet: Some(before.custom_nginx_snippet.clone()),
+        php_ini_overrides: Some(before.php_ini_overrides.clone()),
+        rate_limit_enabled: Some(before.rate_limit_enabled),
+        proxy_port: None,
+        redirect_target: None,
     }
 }
 
@@ -1051,6 +1181,9 @@ impl TypedOperation for Delete {
             let _ = db.forget_revisions(&path.to_string_lossy()).await;
         }
 
+        // The certificate, now that nothing points at it any more.
+        remove_certificate(ctx, &site.domain).await;
+
         if input.purge_files {
             provision::remove_site_dirs(&linux_user, &domain).await?;
             ctx.log("removed the site's files");
@@ -1083,6 +1216,52 @@ impl TypedOperation for Delete {
             domain: site.domain,
             files_removed: input.purge_files,
         })
+    }
+}
+
+/// Take the deleted site's certificate off the disk.
+///
+/// Nothing else did. The `certificates` row cascades away with the site, but
+/// `cert_dir` is keyed on the domain and outlived it — and `render_vhost_mode`
+/// decides TLS purely from what is on disk. So the next site created for the
+/// same domain came up on HTTPS with the previous one's key and chain: working
+/// today, absent from `cert.list`, renewed by nobody, expired without a word.
+///
+/// Left in place when the panel itself answers on this domain: `panel.tls.issue`
+/// writes into `cert_dir(domain)` too and `01-panel.conf` points straight at it,
+/// so a site somebody created for the panel's own name would otherwise take the
+/// panel's TLS down on its way out.
+async fn remove_certificate(ctx: &OpContext, domain: &str) {
+    let panel_domain: Option<String> = ctx
+        .db()
+        .get_setting(unihelm_db::panel::DOMAIN_KEY)
+        .await
+        .ok()
+        .flatten();
+    if panel_domain.as_deref() == Some(domain) {
+        ctx.log("left the certificate in place: the panel is served on this domain");
+        return;
+    }
+
+    match remove_certificate_dir(&paths::cert_dir(domain)) {
+        Ok(true) => ctx.log("removed the certificate"),
+        Ok(false) => {}
+        // Untidy, not fatal: the same reasoning as the pool below. A delete that
+        // fails here would leave a site half-removed, which is worse.
+        Err(e) => ctx.log(format!("could not remove the certificate: {e}")),
+    }
+}
+
+/// The same, against an explicit directory.
+///
+/// Split out so the tests can work in a temporary directory: `paths::set_root`
+/// is a process-wide `OnceLock`, which a parallel test binary cannot use to give
+/// each test its own tree.
+fn remove_certificate_dir(dir: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -1233,6 +1412,175 @@ mod tests {
     fn a_site_type_cannot_be_an_arbitrary_string() {
         assert!(serde_json::from_str::<SiteTypeInput>("\"php\"").is_ok());
         assert!(serde_json::from_str::<SiteTypeInput>("\"wordpress\"").is_err());
+    }
+
+    /// The certificate outlived the site it belonged to, and `render_vhost_mode`
+    /// reads TLS off the disk — so the next site on the domain came up on HTTPS
+    /// with material no row knew about and nothing would ever renew.
+    #[test]
+    fn a_deleted_sites_certificate_does_not_wait_on_disk_for_the_next_site() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("example.com");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fullchain.pem"), "chain").unwrap();
+        std::fs::write(dir.join("privkey.pem"), "key").unwrap();
+        assert!(crate::tls::certificate_present(&dir));
+
+        assert!(remove_certificate_dir(&dir).unwrap());
+        assert!(
+            !crate::tls::certificate_present(&dir),
+            "a recreated site would have picked this certificate up"
+        );
+
+        // A site that never had one is not a failed delete.
+        assert!(!remove_certificate_dir(&dir).unwrap());
+    }
+
+    /// nginx resolves a duplicate `server_name` by parse order and only warns,
+    /// so shadowing somebody's hand-written vhost is a silent outage.
+    #[test]
+    fn a_domain_an_unmanaged_vhost_already_serves_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("shop.conf"),
+            "server {\n    listen 80;\n    server_name Shop.example.com;\n    root /srv/shop;\n}\n",
+        )
+        .unwrap();
+        let vhosts = nginx_survey::discover_sites_in(&[dir.path().to_path_buf()]);
+
+        // Case-insensitively: a `server_name` is a hostname, not a string.
+        let (name, file) = foreign_server_name(&vhosts, &["shop.example.com".to_string()]).unwrap();
+        assert_eq!(name, "Shop.example.com");
+        assert!(
+            file.ends_with("shop.conf"),
+            "the refusal has to say which file to go and edit, not just that one exists: {file}"
+        );
+        assert!(foreign_server_name(&vhosts, &["other.example.com".to_string()]).is_none());
+    }
+
+    /// nginx does not care where the newlines are, and people do write a whole
+    /// vhost on one line. A guard against a silent outage that only sees the
+    /// tidy spelling of a config file is a guard that fails silently itself.
+    #[test]
+    fn a_vhost_written_on_one_line_is_found_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("shop.conf"),
+            "server { listen 80; server_name shop.example.com; root /srv/shop; }\n",
+        )
+        .unwrap();
+        let vhosts = nginx_survey::discover_sites_in(&[dir.path().to_path_buf()]);
+
+        assert!(foreign_server_name(&vhosts, &["shop.example.com".to_string()]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use crate::registry::testing::{auth_for, registry};
+    use serde_json::json;
+    use unihelm_core::{Role, TenantScope};
+    use unihelm_db::sites::NewSite;
+
+    /// A rejected render must not leave its value behind: every later render of
+    /// the site — a renewal, a suspension, an unsuspension — builds the vhost
+    /// from the stored row and would fail on it again.
+    #[tokio::test]
+    async fn a_rejected_update_puts_back_every_setting_it_could_have_changed() {
+        let (reg, _admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let before = db
+            .create_site(NewSite {
+                subscription_id: sub.id,
+                domain: Domain::parse("example.com").unwrap(),
+                site_type: SiteType::Php,
+                php_version: Some(PhpVersion::V83),
+                root_dir: format!("/home/{}/sites/example.com/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+
+        let repo = db.sites(&TenantScope::Global);
+        let proposed = repo
+            .update(
+                before.id,
+                SiteUpdate {
+                    php_version: Some(PhpVersion::V82),
+                    www_policy: Some(WwwPolicy::Strip),
+                    force_https: Some(!before.force_https),
+                    http3: Some(!before.http3),
+                    maintenance_mode: Some(!before.maintenance_mode),
+                    client_max_body_size: Some("512m".into()),
+                    custom_nginx_snippet: Some(Some("bogus_directive foo;".into())),
+                    php_ini_overrides: Some(Some("open_basedir=/".into())),
+                    rate_limit_enabled: Some(!before.rate_limit_enabled),
+                    proxy_port: None,
+                    redirect_target: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(proposed.custom_nginx_snippet, before.custom_nginx_snippet);
+
+        let after = repo.update(before.id, revert_to(&before)).await.unwrap();
+
+        assert_eq!(after.php_version, before.php_version);
+        assert_eq!(after.www_policy, before.www_policy);
+        assert_eq!(after.force_https, before.force_https);
+        assert_eq!(after.http3, before.http3);
+        assert_eq!(after.maintenance_mode, before.maintenance_mode);
+        assert_eq!(after.client_max_body_size, before.client_max_body_size);
+        assert_eq!(after.custom_nginx_snippet, before.custom_nginx_snippet);
+        assert_eq!(after.php_ini_overrides, before.php_ini_overrides);
+        assert_eq!(after.rate_limit_enabled, before.rate_limit_enabled);
+    }
+
+    /// It was accepted, stored, echoed back and reported as reloaded, and no
+    /// part of it ever reached nginx.
+    #[tokio::test]
+    async fn a_www_policy_is_refused_rather_than_stored_and_forgotten() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = db
+            .create_site(NewSite {
+                subscription_id: sub.id,
+                domain: Domain::parse("example.com").unwrap(),
+                site_type: SiteType::Static,
+                php_version: None,
+                root_dir: format!("/home/{}/sites/example.com/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+
+        let err = reg
+            .dispatch(
+                "site.update",
+                &auth_for(admin, Role::Admin),
+                json!({ "site_id": site.id.get(), "www_policy": "strip" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("www_policy"));
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .by_id(site.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .www_policy,
+            WwwPolicy::None,
+            "a setting the panel cannot honour must not be stored either"
+        );
     }
 }
 #[cfg(test)]

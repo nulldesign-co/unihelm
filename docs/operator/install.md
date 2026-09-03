@@ -174,12 +174,45 @@ backup repository passwords. Back it up somewhere other than this server.
 
 ## Uninstalling
 
+Removing the panel is not the same as removing what it rendered. The nginx
+includes, the PHP-FPM pool files and the logrotate files stay behind, and they
+name the certificates, the WAF rules and the log directories that live under
+`/var/lib/unihelm` and `/var/log/unihelm`. nginx opens all of those at
+configuration load, so deleting them under a running nginx changes nothing until
+the next reload, reboot or package upgrade — and then every site on the server
+fails to come back, with the panel that could have explained it already gone.
+So the rendered configuration comes out first, and only then the state.
+
 ```bash
 sudo systemctl disable --now unihelm-web unihelm-agentd
 sudo rm -f /etc/systemd/system/unihelm-{web,agentd}.service
 sudo systemctl daemon-reload
 sudo rm -rf /usr/local/unihelm /usr/local/bin/unihelm
-# Keep these until you are certain: they hold every account and setting.
+```
+
+Now the serving path. After this nginx and PHP-FPM know nothing about Unihelm,
+and the sites it was serving are gone with it:
+
+```bash
+sudo rm -f /etc/nginx/conf.d/unihelm.conf
+sudo rm -f /etc/nginx/unihelm.d/*.conf
+sudo rm -f /etc/logrotate.d/unihelm-*
+sudo rm -f /etc/php/*/fpm/pool.d/unihelm-*.conf         # Debian, Ubuntu
+sudo rm -f /etc/opt/remi/php*/php-fpm.d/unihelm-*.conf  # AlmaLinux, Rocky
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Reload the PHP-FPM unit for each PHP version you had installed as well —
+`php8.3-fpm` on Debian and Ubuntu, `php83-php-fpm` on AlmaLinux and Rocky.
+
+Once `nginx -t` passes with those files gone, nothing on the server references
+what is left:
+
+```bash
+# Only when you are certain. This is every account and setting, every
+# certificate the panel ever issued together with the ACME account keys that
+# would have renewed them, and the log directories the configuration above was
+# writing into.
 # sudo rm -rf /etc/unihelm /var/lib/unihelm /var/log/unihelm
 # sudo userdel unihelm
 ```

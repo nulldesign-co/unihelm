@@ -1130,6 +1130,20 @@ main() {
     WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/unihelm-install.XXXXXX")"
     download_and_verify_release "$WORKDIR"
     SOURCE_DIR="$STAGED_BIN_DIR"
+
+    # The binaries now come from the release; the units, the tmpfiles fragment
+    # and config.toml.example must come from it too. They are read from `$here`,
+    # which on the documented `sudo installer/install.sh` is a clone — and
+    # re-running the installer is the only upgrade path there is, so that clone
+    # can be many releases behind while the binaries beside it are current.
+    # Support files a daemon does not match are the kind of mismatch that shows
+    # up on the next reboot, not on the install. Every one of them is in the
+    # tarball the signature just vouched for.
+    here="$(locate_installer_root "$WORKDIR/unpacked")" ||
+      die "the verified $RELEASE_VERSION tarball carries no installer — no install.sh,
+    preflight.sh, config.toml.example and systemd units together in one place.
+    Download it from $(release_base_url), unpack it, and run ./install.sh --from ./bin,
+    or pin a release that has one with UNIHELM_VERSION."
   fi
 
   create_service_account

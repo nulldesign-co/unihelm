@@ -27,6 +27,7 @@ pub mod panel_tls;
 pub mod plans;
 pub mod plugins;
 pub mod quota;
+pub mod runtimes;
 pub mod server;
 pub mod sites;
 pub mod stack;
@@ -37,9 +38,20 @@ pub mod webhooks;
 pub mod wordpress;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 
 use crate::state::SharedState;
+
+/// Cap on a `PUT /api/branding/settings` body.
+///
+/// The login background may be 2 MiB (`unihelm_ops::branding::max_bytes`), and
+/// the UI offers exactly that number to the operator — but the bytes ride
+/// base64 inside the JSON, so 2 MiB of image is ~2.7 MiB of body and the
+/// panel-wide 2 MiB default refused the upload the API advertises, with a bare
+/// 413 that is not even a panel error envelope. 4 MiB covers the inflation and
+/// still sits under `main`'s outer `RequestBodyLimitLayer`.
+const BRANDING_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Routes that require a session.
 fn protected() -> Router<SharedState> {
@@ -48,6 +60,10 @@ fn protected() -> Router<SharedState> {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/server/overview", get(server::overview))
         .route("/api/server/services", get(server::services))
+        .route("/api/runtimes", get(runtimes::list))
+        .route("/api/runtimes/install", post(runtimes::install))
+        .route("/api/server/docker", get(runtimes::docker))
+        .route("/api/sites/discover", get(runtimes::discover))
         .route("/api/stack", get(stack::status))
         .route("/api/stack/install", post(stack::install))
         .route("/api/stack/remove", post(stack::remove))
@@ -223,12 +239,19 @@ fn protected() -> Router<SharedState> {
         .route("/api/plugins/{slug}/disable", post(plugins::disable))
         .route("/api/mail/relay", get(mail::relay_get).put(mail::relay_set))
         .route("/api/mail/relay/test", post(mail::relay_test))
+        .route("/api/mail/dns/publish", post(mail::dns_publish))
         // The *authenticated* half of branding. `GET /api/branding` and the
         // asset route are in `public()`: the login page renders before there
-        // is a session (spec §11.19).
-        .route(
-            "/api/branding/settings",
-            get(branding::settings_get).put(branding::settings_set),
+        // is a session (spec §11.19). Merged rather than chained so the image
+        // bytes get their own body limit — an inner `DefaultBodyLimit` wins
+        // over the panel-wide default, the same way `files::router` does.
+        .merge(
+            Router::new()
+                .route(
+                    "/api/branding/settings",
+                    get(branding::settings_get).put(branding::settings_set),
+                )
+                .layer(DefaultBodyLimit::max(BRANDING_BODY_BYTES)),
         )
 }
 
@@ -250,4 +273,74 @@ fn public() -> Router<SharedState> {
 
 pub fn api() -> Router<SharedState> {
     public().merge(protected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::connect_info::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tower::ServiceExt as _;
+    use unihelm_core::{Email, Role, TenantScope, Username};
+    use unihelm_db::Db;
+    use unihelm_db::users::NewUser;
+
+    /// `unihelm_ops::branding::max_bytes(AssetKind::LoginBackground)`, which
+    /// the UI shows the operator as the allowed size. Duplicated because
+    /// `unihelm-ops` is the agent's crate and the panel does not link it.
+    const LOGIN_BACKGROUND_MAX: usize = 2 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_login_background_at_the_size_the_api_advertises_reaches_the_handler() {
+        let db = Db::open_memory().await.unwrap();
+        let user = db
+            .users(&TenantScope::Global)
+            .create(NewUser {
+                role: Role::Admin,
+                email: Email::parse("admin@example.com").unwrap(),
+                username: Username::parse("admin").unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+        let issued = db
+            .create_session(user.id, None, None, unihelm_db::sessions::DEFAULT_TTL, None)
+            .await
+            .unwrap();
+
+        let mut config = unihelm_core::UnihelmConfig::default();
+        // No agent: a request that got past the body limit fails 503 at the
+        // socket, which is what makes "the limit let it through" observable.
+        config.agent.socket = std::path::PathBuf::from("/nonexistent/unihelm-agent.sock");
+        let state: SharedState = Arc::new(crate::state::AppState::new(db, config));
+        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let app = api()
+            .layer(axum::Extension(ConnectInfo(peer)))
+            .with_state(state);
+
+        // Base64 inflates by 4/3, so the largest image the API accepts is a
+        // body of roughly 2.7 MiB — over the panel-wide 2 MiB default.
+        let b64 = "A".repeat(LOGIN_BACKGROUND_MAX.div_ceil(3) * 4);
+        let body = format!(r#"{{"login_background":{{"action":"set","content_b64":"{b64}"}}}}"#);
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/branding/settings")
+            .header(
+                "cookie",
+                format!("{}={}", crate::auth::SESSION_COOKIE, issued.token),
+            )
+            .header(crate::auth::CSRF_HEADER, &issued.csrf)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

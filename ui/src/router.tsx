@@ -23,6 +23,10 @@ import { FirewallPage } from "@/routes/firewall";
 import { LoginPage } from "@/routes/login";
 import { MailPage } from "@/routes/mail";
 import { PlansPage } from "@/routes/plans";
+import { DiscoverPage } from "@/routes/discover";
+import { DockerPage } from "@/routes/docker";
+import { RuntimesPage } from "@/routes/runtimes";
+import { SettingsPage } from "@/routes/settings";
 import { SiteDetailPage } from "@/routes/site-detail";
 import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
@@ -187,6 +191,30 @@ const terminalRoute = createRoute({
   component: TerminalPage,
 });
 
+const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings",
+  component: SettingsPage,
+});
+
+const runtimesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/runtimes",
+  component: RuntimesPage,
+});
+
+const dockerRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/docker",
+  component: DockerPage,
+});
+
+const discoverRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/discover",
+  component: DiscoverPage,
+});
+
 const alertsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/alerts",
@@ -211,6 +239,10 @@ const routeTree = rootRoute.addChildren([
   brandingRoute,
   tasksRoute,
   terminalRoute,
+  settingsRoute,
+  runtimesRoute,
+  dockerRoute,
+  discoverRoute,
 ]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });

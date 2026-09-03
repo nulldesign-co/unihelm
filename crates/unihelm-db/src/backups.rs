@@ -625,6 +625,31 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Close out runs left mid-flight by an agent restart.
+    ///
+    /// The counterpart to [`Db::reconcile_components`], and needed for the same
+    /// reason: [`Db::finish_backup_run`] is reachable only from the in-process
+    /// future that started the run, so a reboot during a backup leaves a row
+    /// `running` for good. Nothing else ever revisits it — the backups page
+    /// goes on showing a backup in progress (and polling for it), and the
+    /// `backup.failed` an integrator is waiting for never comes.
+    ///
+    /// Safe to run unconditionally at start-up: nothing is in flight yet, so
+    /// every `running` row belongs to the process that died.
+    pub async fn reconcile_backup_runs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE backup_runs
+             SET status = 'failed',
+                 finished_at = ?1,
+                 error = 'the agent restarted while this backup was running'
+             WHERE status = 'running'",
+        )
+        .bind(to_sql_time(now()))
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 impl BackupRepoQuery<'_> {
@@ -897,6 +922,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NotFound { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_run_interrupted_by_a_restart_is_not_left_reported_as_in_progress() {
+        let db = db().await;
+        let r = db.create_backup_repo(repo("nightly")).await.unwrap();
+        let interrupted = db
+            .start_backup_run(None, r.id, BackupScope::Panel, None)
+            .await
+            .unwrap();
+        let finished = db
+            .start_backup_run(None, r.id, BackupScope::Panel, None)
+            .await
+            .unwrap();
+        db.finish_backup_run(
+            finished,
+            RunOutcome::Ok {
+                snapshot_id: Some("abc123".into()),
+                bytes: Some(4096),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.reconcile_backup_runs().await.unwrap(), 1);
+
+        let runs = db.backups(&TenantScope::Global).runs(10, 0).await.unwrap();
+        let reconciled = runs.iter().find(|r| r.id == interrupted).unwrap();
+        assert_eq!(reconciled.status, RunStatus::Failed);
+        assert!(reconciled.finished_at.is_some());
+        assert!(
+            reconciled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("restarted"),
+            "{:?}",
+            reconciled.error
+        );
+
+        // A run that ended properly is history, not something to rewrite.
+        let untouched = runs.iter().find(|r| r.id == finished).unwrap();
+        assert_eq!(untouched.status, RunStatus::Ok);
+        assert_eq!(untouched.snapshot_id.as_deref(), Some("abc123"));
     }
 
     #[tokio::test]

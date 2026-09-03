@@ -172,10 +172,9 @@ impl TypedOperation for Issue {
         // The domain is recorded before the attempt: it is what the status
         // endpoint reports and what the renewal scheduler reads, and a failed
         // first issuance should read as "panel.example.com — issuance failed",
-        // not as "no domain configured".
-        db.set_setting(unihelm_db::panel::DOMAIN_KEY, &domain)
-            .await
-            .map_err(UnihelmError::from)?;
+        // not as "no domain configured". An attempt that ends with the panel
+        // still on its old name hands it back (see `release_domain`).
+        let previous_domain = claim_domain(&db, &domain).await?;
 
         let directory = if input.staging {
             Directory::Staging
@@ -215,15 +214,89 @@ impl TypedOperation for Issue {
             Ok(issued) => issued,
             Err(e) => {
                 let _ = db.certificate_failed(record.id, &e.detail).await;
+                release_domain(&db, previous_domain).await;
                 return Err(e);
             }
         };
 
-        // Files first, then the row, then the vhost — nginx must never be
-        // pointed at a certificate that is not on disk yet.
-        acme::write_certificate(&cert_dir, &issued)?;
+        let days_valid = (issued.not_after - unihelm_db::now()).whole_days();
+
+        // Files first — nginx must never be pointed at a certificate that is
+        // not on disk yet.
+        if !crate::cert::write_issued(&cert_dir, &issued, directory)? {
+            release_domain(&db, previous_domain).await;
+            ctx.log(format!(
+                "the staging order for {} succeeded, valid until {}; \
+                 nothing was installed and the panel keeps serving what it had",
+                domain.as_str(),
+                issued.not_after.date()
+            ));
+            return Ok(IssueOutput {
+                certificate_id: record.id,
+                domain,
+                issuer: issued.issuer,
+                not_after: issued.not_after,
+                days_valid,
+            });
+        }
         ctx.log(format!("certificate written to {}", cert_dir.display()));
 
+        // The vhost, through the config engine: render → nginx -t → activate
+        // → reload, with rollback on failure (spec §10.4). On a renewal the
+        // engine correctly reports "nothing to do" — same paths, same
+        // upstream — which is why the explicit reload below exists.
+        //
+        // The rollback is why the domain goes back on failure: the panel is
+        // left answering on the name it had, and the new certificate never
+        // becomes the row of record (that write is below the reload), so a
+        // setting still naming the new domain is the mismatch `renew_panel`
+        // reads as a completed re-point.
+        let applied = ctx
+            .config()
+            .apply(ApplyRequest {
+                file: ManagedFile::nginx(paths::nginx_panel()),
+                template: "nginx/panel.conf",
+                context: vhost_context(&domain, &panel_upstream()),
+                service: "nginx",
+                validator: &NginxValidator,
+                reloader: &UnitReloader::nginx(ctx.distro()),
+                post_check: None,
+                force: false,
+                task_id: ctx.task_id().map(|t| t.to_string()),
+            })
+            .await;
+        if let Err(e) = applied {
+            release_domain(&db, previous_domain).await;
+            return Err(e.into());
+        }
+
+        // nginx holds certificates in memory from the moment it loads them,
+        // so replacing the files on disk changes nothing until it is told to
+        // look again — and the unchanged vhost means the apply above skipped
+        // its reload. Without this line every panel renewal would appear to
+        // succeed while the expiring certificate stayed live, the failure
+        // that only shows up ninety days later (the cert.rs lesson).
+        {
+            use unihelm_config::apply::Reloader;
+            let reloader = UnitReloader::nginx(ctx.distro());
+            if let Err(e) = reloader.reload().await {
+                // Same reasoning as the apply above: nginx is still serving the
+                // certificate it had, so the domain of record has to be too.
+                release_domain(&db, previous_domain).await;
+                return Err(UnihelmError::new(
+                    ErrorCode::ConfigRollback,
+                    format!("the certificate is on disk but nginx would not reload: {e}"),
+                ));
+            }
+            ctx.log("nginx reloaded onto the new certificate");
+        }
+
+        // The row last, once the certificate is actually being served.
+        // `certificate_issued` clears the failure count, resets the backoff and
+        // retires what this replaces; done before the reload, a reload that
+        // fails leaves the scheduler writing its retry bookkeeping onto a
+        // superseded row it no longer looks at, while nginx serves the old
+        // certificate from memory until it expires.
         db.certificate_issued(
             record.id,
             &issued.issuer,
@@ -243,43 +316,6 @@ impl TypedOperation for Issue {
             .await
             .map_err(UnihelmError::from)?;
 
-        // The vhost, through the config engine: render → nginx -t → activate
-        // → reload, with rollback on failure (spec §10.4). On a renewal the
-        // engine correctly reports "nothing to do" — same paths, same
-        // upstream — which is why the explicit reload below exists.
-        ctx.config()
-            .apply(ApplyRequest {
-                file: ManagedFile::nginx(paths::nginx_panel()),
-                template: "nginx/panel.conf",
-                context: vhost_context(&domain, &panel_upstream()),
-                service: "nginx",
-                validator: &NginxValidator,
-                reloader: &UnitReloader::nginx(ctx.distro()),
-                post_check: None,
-                force: false,
-                task_id: ctx.task_id().map(|t| t.to_string()),
-            })
-            .await?;
-
-        // nginx holds certificates in memory from the moment it loads them,
-        // so replacing the files on disk changes nothing until it is told to
-        // look again — and the unchanged vhost means the apply above skipped
-        // its reload. Without this line every panel renewal would appear to
-        // succeed while the expiring certificate stayed live, the failure
-        // that only shows up ninety days later (the cert.rs lesson).
-        {
-            use unihelm_config::apply::Reloader;
-            let reloader = UnitReloader::nginx(ctx.distro());
-            reloader.reload().await.map_err(|e| {
-                UnihelmError::new(
-                    ErrorCode::ConfigRollback,
-                    format!("the certificate is on disk but nginx would not reload: {e}"),
-                )
-            })?;
-            ctx.log("nginx reloaded onto the new certificate");
-        }
-
-        let days_valid = (issued.not_after - unihelm_db::now()).whole_days();
         ctx.log(format!(
             "the panel is now served at https://{}",
             domain.as_str()
@@ -292,6 +328,46 @@ impl TypedOperation for Issue {
             not_after: issued.not_after,
             days_valid,
         })
+    }
+}
+
+/// Make `domain` the panel's domain of record, handing back the one it replaced.
+async fn claim_domain(db: &unihelm_db::Db, domain: &Domain) -> Result<Option<String>> {
+    let previous: Option<String> = db
+        .get_setting(unihelm_db::panel::DOMAIN_KEY)
+        .await
+        .map_err(UnihelmError::from)?;
+    db.set_setting(unihelm_db::panel::DOMAIN_KEY, domain)
+        .await
+        .map_err(UnihelmError::from)?;
+    Ok(previous)
+}
+
+/// Give the domain of record back after an order that left the panel on the
+/// name it already had.
+///
+/// The renewal scheduler treats a setting that disagrees with the panel
+/// certificate's own name as "the operator re-pointed the panel" and retires
+/// that certificate from auto-renewal. So a re-point that *failed* — the panel
+/// still answering on the old name, on the old certificate — would end
+/// unattended renewal of the certificate the panel is actually serving, and
+/// nothing turns auto-renewal back on.
+///
+/// `None` deliberately leaves the attempted domain in place: that is the first
+/// issuance, where there is no working panel certificate to protect and the
+/// status page should read "panel.example.com — issuance failed" rather than
+/// "no domain configured".
+async fn release_domain(db: &unihelm_db::Db, previous: Option<String>) {
+    let Some(previous) = previous else { return };
+    if let Err(e) = db
+        .set_setting(unihelm_db::panel::DOMAIN_KEY, &previous)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            panel_domain = %previous,
+            "could not restore the panel domain of record"
+        );
     }
 }
 
@@ -489,6 +565,54 @@ mod tests {
         // Garbage falls back rather than failing the whole issuance.
         std::fs::write(&path, "listen = = =").unwrap();
         assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
+    }
+
+    async fn domain_of_record(db: &unihelm_db::Db) -> Option<String> {
+        db.get_setting(unihelm_db::panel::DOMAIN_KEY).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_repoint_leaves_the_working_panel_domain_of_record() {
+        // The scheduler retires a panel certificate whose name disagrees with
+        // the setting, on the assumption that the new name has a certificate of
+        // its own. After a failed re-point it has not, and the panel is still
+        // answering on the old one — which must go on renewing.
+        let db = unihelm_db::Db::open_memory().await.unwrap();
+        let old = Domain::parse("panel.example.com").unwrap();
+        let new = Domain::parse("new.example.com").unwrap();
+
+        assert_eq!(claim_domain(&db, &old).await.unwrap(), None);
+
+        let previous = claim_domain(&db, &new).await.unwrap();
+        assert_eq!(previous.as_deref(), Some("panel.example.com"));
+        assert_eq!(
+            domain_of_record(&db).await.as_deref(),
+            Some("new.example.com")
+        );
+
+        release_domain(&db, previous).await;
+        assert_eq!(
+            domain_of_record(&db).await.as_deref(),
+            Some("panel.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_issuance_still_names_the_domain_it_tried() {
+        // There is no working certificate to protect here, and the status page
+        // should read "panel.example.com — issuance failed" rather than "no
+        // domain configured".
+        let db = unihelm_db::Db::open_memory().await.unwrap();
+        let domain = Domain::parse("panel.example.com").unwrap();
+
+        let previous = claim_domain(&db, &domain).await.unwrap();
+        assert_eq!(previous, None);
+
+        release_domain(&db, previous).await;
+        assert_eq!(
+            domain_of_record(&db).await.as_deref(),
+            Some("panel.example.com")
+        );
     }
 
     #[tokio::test]

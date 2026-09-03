@@ -256,9 +256,10 @@ impl FirewalldBackend {
 
     /// Create the ban ipsets and the rule that drops anything in them.
     ///
-    /// Idempotent, and called before every ban rather than at start-up, so a
-    /// firewalld that was reinstalled underneath us heals on the next ban
-    /// instead of silently dropping nothing.
+    /// Idempotent, and reached from the ban path rather than from start-up, so
+    /// a firewalld that was reinstalled underneath us heals on the next ban
+    /// instead of silently dropping nothing. It ends in a reload, so it runs
+    /// only when [`Self::ban_set_present`] says the sets are actually gone.
     async fn ensure_ban_sets(&self) -> Result<()> {
         for (set, family) in [(BAN_SET_V4, "inet"), (BAN_SET_V6, "inet6")] {
             self.run_tolerating(
@@ -287,6 +288,19 @@ impl FirewalldBackend {
             .await?;
         }
         self.reload().await
+    }
+
+    /// Is the ban ipset already there?
+    ///
+    /// `--get-entries` on a missing set exits non-zero, and a firewalld that is
+    /// not answering at all is equally a reason to take the repair path.
+    async fn ban_set_present(&self, set: &str) -> bool {
+        self.cmd()
+            .args([&format!("--ipset={set}"), "--get-entries"])
+            .run()
+            .await
+            .map(|out| out.success())
+            .unwrap_or(false)
     }
 
     fn ban_set_for(ip: IpAddr) -> &'static str {
@@ -385,8 +399,15 @@ impl FwBackend for FirewalldBackend {
     }
 
     async fn ban_ip(&self, ip: IpAddr, ttl_seconds: Option<u32>) -> Result<()> {
-        self.ensure_ban_sets().await?;
         let set = Self::ban_set_for(ip);
+        // `ensure_ban_sets` ends in `firewall-cmd --reload`, which replaces the
+        // runtime configuration with the permanent one — discarding every
+        // runtime-only entry, which is every ban taken so far. Creating the sets
+        // only when they are genuinely missing keeps the healing without each
+        // ban silently lifting the ones before it.
+        if !self.ban_set_present(set).await {
+            self.ensure_ban_sets().await?;
+        }
         let mut cmd = self
             .cmd()
             .args([&format!("--ipset={set}"), &format!("--add-entry={ip}")]);
@@ -790,19 +811,7 @@ impl NftablesBackend {
             .args(["-a", "list", "chain", "inet", NFT_TABLE, "input"])
             .run_checked()
             .await?;
-        let want = rule.marked_comment();
-        for line in listing.stdout.lines() {
-            if !line.contains(&want) {
-                continue;
-            }
-            if let Some(at) = line.find("# handle ") {
-                let rest = &line[at + "# handle ".len()..];
-                if let Ok(handle) = rest.trim().parse::<u64>() {
-                    return Ok(Some(handle));
-                }
-            }
-        }
-        Ok(None)
+        Ok(nft_handle_for(&listing.stdout, rule))
     }
 
     fn ban_set_for(ip: IpAddr) -> &'static str {
@@ -992,6 +1001,34 @@ fn parse_nft_rules(text: &str) -> Vec<PortRule> {
         }
     }
     rules
+}
+
+/// The handle of the line in `nft -a list chain` that *is* `rule`.
+///
+/// A rule's identity here is its match — protocol, port and source — never its
+/// comment. The comment is caller-supplied and the close path substitutes an
+/// empty one when the request carried none, so matching on `"unihelm: "` alone
+/// matched every managed rule in the chain: closing one port deleted whichever
+/// rule nftables happened to list first, and opening a second port with a blank
+/// comment found the first one and reported success without adding anything.
+fn nft_handle_for(listing: &str, rule: &PortRule) -> Option<u64> {
+    for line in listing.lines() {
+        // Reusing the listing parser is what keeps deletion and `list_rules`
+        // agreeing on which lines are ours at all.
+        let Some(parsed) = parse_nft_rules(line).into_iter().next() else {
+            continue;
+        };
+        if parsed.port != rule.port || parsed.proto != rule.proto || parsed.source != rule.source {
+            continue;
+        }
+        let Some(at) = line.find("# handle ") else {
+            continue;
+        };
+        if let Ok(handle) = line[at + "# handle ".len()..].trim().parse::<u64>() {
+            return Some(handle);
+        }
+    }
+    None
 }
 
 /// Pull addresses out of `nft list set`, whose elements block looks like
@@ -1227,6 +1264,74 @@ table inet unihelm {
         assert_eq!(rules[1].port, 3306);
         assert_eq!(rules[1].source.as_deref(), Some("10.0.0.0/8"));
         assert_eq!(rules[1].comment, "remote mysql");
+    }
+
+    /// `nft -a list chain inet unihelm input` on a host with a few open ports.
+    const NFT_LISTING_WITH_HANDLES: &str = r#"
+table inet unihelm {
+  chain input { # handle 1
+    type filter hook input priority -5; policy accept;
+    ip saddr @unihelm_bans drop # handle 4
+    tcp dport 80 accept comment "unihelm: http" # handle 5
+    tcp dport 443 accept comment "unihelm: https" # handle 6
+    ip saddr 10.0.0.0/8 tcp dport 3306 accept comment "unihelm: remote mysql" # handle 7
+    tcp dport 9999 accept comment "mine, not yours" # handle 8
+  }
+}
+"#;
+
+    #[test]
+    fn closing_a_port_finds_that_ports_rule_and_never_a_neighbours() {
+        // The close request carries no comment: the wire fills in an empty one,
+        // so a rule identified by its comment would be every rule we ever
+        // wrote, and closing 443 would delete 80.
+        let close = PortRule {
+            port: 443,
+            proto: Proto::Tcp,
+            source: None,
+            comment: String::new(),
+        };
+        assert_eq!(nft_handle_for(NFT_LISTING_WITH_HANDLES, &close), Some(6));
+
+        let never_opened = PortRule {
+            port: 8443,
+            proto: Proto::Tcp,
+            source: None,
+            comment: String::new(),
+        };
+        assert_eq!(
+            nft_handle_for(NFT_LISTING_WITH_HANDLES, &never_opened),
+            None
+        );
+
+        // The operator's own rule is not ours to hand a handle back for.
+        let theirs = PortRule {
+            port: 9999,
+            proto: Proto::Tcp,
+            source: None,
+            comment: String::new(),
+        };
+        assert_eq!(nft_handle_for(NFT_LISTING_WITH_HANDLES, &theirs), None);
+    }
+
+    #[test]
+    fn a_port_open_to_one_network_is_a_different_rule_from_the_same_port_open_to_all() {
+        let restricted = rule(Some("10.0.0.0/8"));
+        assert_eq!(
+            nft_handle_for(NFT_LISTING_WITH_HANDLES, &restricted),
+            Some(7)
+        );
+
+        // Opening 3306 to the world must not find the /8 rule: closing would
+        // delete a rule nobody asked to close, and opening would report a hole
+        // that is not there.
+        let anywhere = rule(None);
+        assert_eq!(nft_handle_for(NFT_LISTING_WITH_HANDLES, &anywhere), None);
+
+        // Same port and source, different protocol.
+        let mut udp = rule(Some("10.0.0.0/8"));
+        udp.proto = Proto::Udp;
+        assert_eq!(nft_handle_for(NFT_LISTING_WITH_HANDLES, &udp), None);
     }
 
     #[test]

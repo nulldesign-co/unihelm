@@ -159,11 +159,15 @@ impl Db {
         // Truncating here rather than at the source keeps one runaway command
         // from filling the disk with a single log row.
         const MAX_LINE: usize = 8 * 1024;
-        let line = if line.len() > MAX_LINE {
-            &line[..MAX_LINE]
-        } else {
-            line
-        };
+        // The cap is in bytes but the cut has to land on a character boundary:
+        // slicing through a multi-byte character panics, and this runs on the
+        // task's log pump, where a panic silently swallows the rest of the
+        // task's output and leaves the row `running`.
+        let mut end = MAX_LINE.min(line.len());
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        let line = &line[..end];
 
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO task_logs (task_id, seq, at, line)
@@ -178,30 +182,34 @@ impl Db {
         Ok(row.0)
     }
 
-    /// Re-queue or fail tasks that were running when the agent died.
+    /// Fail the tasks the agent was carrying when it died.
     ///
     /// This is what makes the crash-only design honest: after a restart no task
     /// is left claiming to be running (spec §5.5).
+    ///
+    /// Idempotent work used to be re-queued here instead, which promised a
+    /// second run nothing delivers: `next_queued_task` has no consumer, so a
+    /// task only ever executes from the request that created it. A row parked
+    /// in `queued` therefore waits forever, and since `queued` is not terminal
+    /// it also cannot be retried or cancelled from the panel — it just counts
+    /// as active until someone edits the database. A terminal failure at least
+    /// hands the operator the reason and the retry button. Re-queueing belongs
+    /// back here the day a worker pool actually drains the queue.
+    ///
+    /// Returns `(requeued, failed)`; the first is 0 for that reason.
     pub async fn reconcile_interrupted_tasks(&self) -> Result<(u64, u64)> {
         let ts = to_sql_time(now());
 
-        // Idempotent work is safe to run again.
-        let requeued = sqlx::query(
-            "UPDATE tasks SET status = 'queued', started_at = NULL, progress = 0
-             WHERE status = 'running' AND idempotent = 1",
-        )
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-
-        // Everything else ends with a reason, rather than being silently retried.
+        // `queued` is included deliberately: nothing is in flight at agent
+        // start, so a row caught between create_task and start_task is as dead
+        // as one that was running.
         let failed = sqlx::query(
             "UPDATE tasks
              SET status = 'failed',
                  error_code = ?1,
-                 error_detail = 'the agent restarted while this task was running',
+                 error_detail = 'the agent restarted before this task finished',
                  finished_at = ?2
-             WHERE status = 'running'",
+             WHERE status IN ('queued', 'running')",
         )
         .bind(ErrorCode::TaskFailed.code())
         .bind(&ts)
@@ -209,7 +217,7 @@ impl Db {
         .await?
         .rows_affected();
 
-        Ok((requeued, failed))
+        Ok((0, failed))
     }
 
     /// Oldest queued task, for the worker pool.
@@ -775,7 +783,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_tasks_are_reconciled_on_restart() {
+    async fn a_long_log_line_of_non_ascii_text_is_truncated_not_panicked_on() {
+        let (db, alice, _) = seed().await;
+        let t = db
+            .create_task(new_task(alice, "php.install"))
+            .await
+            .unwrap();
+        // Three bytes per character, so no character starts at byte 8192 and a
+        // byte-wise cut would land inside one.
+        db.append_task_log(t.id, &"€".repeat(4_000)).await.unwrap();
+        let logs = db
+            .tasks(&TenantScope::Global)
+            .logs(t.id, 0, 10)
+            .await
+            .unwrap();
+        // Backing up to the boundary costs at most one character; a shorter
+        // line would mean the cut gave up on the output rather than trimmed it.
+        assert!((8 * 1024 - 3..=8 * 1024).contains(&logs[0].line.len()));
+        assert!(logs[0].line.chars().all(|c| c == '€'));
+    }
+
+    #[tokio::test]
+    async fn no_task_survives_a_restart_in_a_state_the_panel_cannot_leave() {
+        // An idempotent task used to be re-queued instead of failed, but no
+        // worker drains the queue: it stayed active in the drawer forever, and
+        // `queued` is not terminal so the retry button refused it too.
         let (db, alice, _) = seed().await;
         let plain = db
             .create_task(new_task(alice, "site.create"))
@@ -784,21 +816,25 @@ mod tests {
         let mut spec = new_task(alice, "metrics.rollup");
         spec.idempotent = true;
         let idempotent = db.create_task(spec).await.unwrap();
+        // Created in the window before start_task, so equally abandoned.
+        let never_started = db
+            .create_task(new_task(alice, "php.install"))
+            .await
+            .unwrap();
 
         db.start_task(plain.id).await.unwrap();
         db.start_task(idempotent.id).await.unwrap();
 
         let (requeued, failed) = db.reconcile_interrupted_tasks().await.unwrap();
-        assert_eq!((requeued, failed), (1, 1));
+        assert_eq!((requeued, failed), (0, 3));
 
         let repo = db.tasks(&TenantScope::Global);
-        assert_eq!(
-            repo.by_id(idempotent.id).await.unwrap().unwrap().status,
-            TaskStatus::Queued
-        );
-        let dead = repo.by_id(plain.id).await.unwrap().unwrap();
-        assert_eq!(dead.status, TaskStatus::Failed);
-        assert!(dead.error_detail.unwrap().contains("agent restarted"));
+        for id in [plain.id, idempotent.id, never_started.id] {
+            let row = repo.by_id(id).await.unwrap().unwrap();
+            assert_eq!(row.status, TaskStatus::Failed);
+            assert!(row.error_detail.unwrap().contains("agent restarted"));
+        }
+        assert_eq!(repo.count_active().await.unwrap(), 0);
     }
 
     #[tokio::test]

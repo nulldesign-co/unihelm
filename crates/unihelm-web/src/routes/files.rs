@@ -240,6 +240,11 @@ pub struct FromToRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ChmodRequest {
+    /// Never the home itself. An empty path with `recursive` set is a
+    /// `chmod -R 0777` starting at the tenant home, and the home's 0710
+    /// tenant:nginx mode is precisely what stops other uids traversing into it
+    /// (`unihelm_ops::provision::apply_home_permissions`).
+    #[serde(deserialize_with = "file_path")]
     pub path: TenantPath,
     pub mode: u32,
     #[serde(default)]
@@ -279,6 +284,19 @@ pub struct ExtractRequest {
     pub archive: TenantPath,
     #[serde(default = "TenantPath::root", deserialize_with = "path_or_root")]
     pub dest: TenantPath,
+    #[serde(default)]
+    pub subscription_id: Option<i64>,
+}
+
+/// A recycle-bin entry, addressed the way `fs.trash.list` reports it.
+///
+/// Not a [`TenantPath`]: `.trash` is not browsable and an entry's location is
+/// encoded in its own name (`<deleted-at>-<original name>`), so the op takes a
+/// bare name and works out where it came from. Sending a path here is what made
+/// every Restore click fail.
+#[derive(Debug, Deserialize)]
+pub struct TrashRestoreRequest {
+    pub name: String,
     #[serde(default)]
     pub subscription_id: Option<i64>,
 }
@@ -1168,24 +1186,37 @@ pub async fn extract(
     .await
 }
 
+/// The input `fs.trash.restore` declares.
+///
+/// Its own function so the key is pinned by a test: the op requires `name` and
+/// has no `path` field at all, and forwarding the wrong one is invisible here —
+/// it fails in the agent, at the end of a round trip.
+fn trash_restore_input(body: &TrashRestoreRequest) -> Value {
+    json!({ "name": body.name, "subscription_id": body.subscription_id })
+}
+
 pub async fn trash_restore(
     State(state): State<SharedState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     current: CurrentUser,
-    Json(body): Json<PathRequest>,
+    Json(body): Json<TrashRestoreRequest>,
 ) -> ApiResult<Response> {
     current
         .auth
         .require(Permission::FileManage)
         .map_err(ApiError::from)?;
+    // A bin entry is a plain name inside `.trash`, exactly like an archive
+    // entry: refusing separators here keeps a hand-built request from reaching
+    // the privileged process at all.
+    validate_archive_entry(&body.name).map_err(|e| ApiError::new(e.with_field("name")))?;
     audit(
         &state,
         &current,
         &headers,
         &peer,
         "file.trash.restore",
-        body.path.as_str(),
+        &body.name,
         json!({}),
     )
     .await?;
@@ -1193,7 +1224,7 @@ pub async fn trash_restore(
         &state,
         &current.auth,
         "fs.trash.restore",
-        json!({ "path": body.path.as_str(), "subscription_id": body.subscription_id }),
+        trash_restore_input(&body),
     )
     .await
 }
@@ -1771,7 +1802,10 @@ mod tests {
                 "/api/files/extract",
                 r#"{"archive":"a.zip","dest":"../.."}"#,
             ),
-            ("/api/files/trash/restore", r#"{"path":"a\\b"}"#),
+            // Restore takes a bin entry's name, not a path — the traversal
+            // shapes it has to refuse are the archive-entry ones.
+            ("/api/files/trash/restore", r#"{"name":"a\\b"}"#),
+            ("/api/files/trash/restore", r#"{"name":"../notes.txt"}"#),
         ] {
             let resp = p
                 .app
@@ -1914,6 +1948,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn chmod_cannot_be_aimed_at_the_home_directory_itself() {
+        // An empty path is the home, and `TenantPath` accepts it — so a
+        // hand-built `{"path":"","mode":511,"recursive":true}` used to walk
+        // the whole home to 0777, undoing the 0710 that keeps other uids out.
+        // No agent is running, so anything but a 503 means it never became an
+        // op call.
+        let p = panel().await;
+        for body in [
+            r#"{"path":"","mode":511,"recursive":true}"#,
+            r#"{"path":"","mode":493}"#,
+        ] {
+            let resp = p
+                .app
+                .clone()
+                .oneshot(post_json(&p, "/api/files/chmod", body))
+                .await
+                .unwrap();
+            assert!(
+                resp.status() == StatusCode::BAD_REQUEST
+                    || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
+                "{body} gave {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restoring_from_the_bin_addresses_the_entry_by_name() {
+        // `fs.trash.list` reports a `name` and no path, and `fs.trash.restore`
+        // requires that same `name`. This route used to declare `path` and
+        // forward it, so a correct client was rejected here and an incorrect
+        // one was rejected by the agent — Restore could not succeed either way.
+        let p = panel().await;
+        let resp = p
+            .app
+            .clone()
+            .oneshot(post_json(
+                &p,
+                "/api/files/trash/restore",
+                r#"{"name":"1700000000-notes.txt"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // ...and what it forwards is the key the op declares. `fs.trash.list`
+        // reports no path, so `path` was a field nothing could ever fill.
+        let sent = trash_restore_input(&TrashRestoreRequest {
+            name: "1700000000-notes.txt".into(),
+            subscription_id: Some(4),
+        });
+        assert_eq!(sent["name"], "1700000000-notes.txt");
+        assert_eq!(sent["subscription_id"], 4);
+        assert!(sent.get("path").is_none(), "{sent}");
+
+        // And the old shape is now the one that does not deserialize.
+        let resp = p
+            .app
+            .clone()
+            .oneshot(post_json(
+                &p,
+                "/api/files/trash/restore",
+                r#"{"path":"1700000000-notes.txt"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

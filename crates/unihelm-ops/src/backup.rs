@@ -106,6 +106,15 @@ const RESTIC_PACKAGE: &str = "restic";
 /// Tag on every snapshot the panel writes for the whole-server scope.
 const PANEL_TAG: &str = "unihelm-panel";
 
+/// restic's exit code for "the snapshot was written, but some source data could
+/// not be read" (restic ≥ 0.17).
+///
+/// Not a failure: the snapshot exists and restores. Treating it as one would
+/// skip retention and tell an operator their backups are broken every night a
+/// tenant's session file vanished mid-scan. An older restic reports the same
+/// situation as 1 and there is nothing here that can tell it apart.
+const RESTIC_INCOMPLETE: i32 = 3;
+
 /// How long one restic call may take.
 ///
 /// A backup of a busy server is measured in hours, not in [`Cmd`]'s default
@@ -1591,11 +1600,21 @@ async fn collect_and_back_up(
         })
         .await?;
 
-    if !out.success() {
+    if !out.success() && out.status != RESTIC_INCOMPLETE {
         return Err(UnihelmError::new(
             ErrorCode::CommandFailed,
             format!("restic backup failed: {}", out.failure_text()),
         ));
+    }
+    if out.status == RESTIC_INCOMPLETE {
+        // A tenant home churns while it is being read — PHP sessions, temp
+        // uploads — so this is the ordinary state of a busy box rather than a
+        // fault. Said out loud because the run is about to be recorded
+        // successful and it is not a complete copy of what was asked for.
+        ctx.log(
+            "restic could not read every source file, so this snapshot is missing the files \
+             named above. The snapshot itself was written and is restorable.",
+        );
     }
 
     let summary = parse_backup_summary(&out.stdout).unwrap_or_default();
@@ -2205,6 +2224,7 @@ pub async fn scheduler_tick(ctx: &OpContext) -> std::result::Result<String, Stri
                 failed += 1;
                 tracing::warn!(schedule = schedule.id, error = %e.detail,
                     "a scheduled backup could not open its repository");
+                record_early_failure(ctx, &schedule, &e.detail).await;
                 continue;
             }
         };
@@ -2213,6 +2233,7 @@ pub async fn scheduler_tick(ctx: &OpContext) -> std::result::Result<String, Stri
             failed += 1;
             tracing::warn!(schedule = schedule.id, error = %e.detail,
                 "a scheduled backup cannot run without restic");
+            record_early_failure(ctx, &schedule, &e.detail).await;
             continue;
         }
 
@@ -2245,6 +2266,65 @@ pub async fn scheduler_tick(ctx: &OpContext) -> std::result::Result<String, Stri
         (s, 0) => Ok(format!("{s} backup(s) ran")),
         (s, f) => Err(format!("{s} backup(s) ran, {f} failed — see backup_runs")),
     }
+}
+
+/// Record a scheduled backup that failed before restic was ever reached.
+///
+/// `run_backup` reports its own failures into `backup_runs` and emits
+/// `backup.failed`; a pass that gives up earlier — an unopenable repository, a
+/// missing restic — would otherwise leave nothing but a `tracing::warn!`. The
+/// backups page reads run rows and the failure summary this pass returns lands
+/// on `scheduler_jobs`, which nothing in the panel displays, so without a row
+/// the operator is simply never told the nightly backup did not happen.
+///
+/// Best-effort by construction: this is the error path, and a failure to write
+/// the evidence must not stop the pass from trying the next schedule.
+async fn record_early_failure(
+    ctx: &OpContext,
+    schedule: &unihelm_db::backups::BackupSchedule,
+    error: &str,
+) {
+    let subscription = schedule.subscription_id.map(SubscriptionId);
+    let run_id = match ctx
+        .db()
+        .start_backup_run(
+            Some(schedule.id),
+            schedule.repo_id,
+            schedule.scope,
+            subscription,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(schedule = schedule.id, error = %e,
+                "could not record a failed scheduled backup");
+            return;
+        }
+    };
+
+    let _ = ctx
+        .db()
+        .finish_backup_run(
+            run_id,
+            RunOutcome::Failed {
+                error: error.to_string(),
+            },
+        )
+        .await;
+
+    crate::webhook::emit(
+        ctx,
+        "backup.failed",
+        serde_json::json!({
+            "run_id": run_id,
+            "repo_id": schedule.repo_id,
+            "scope": schedule.scope,
+            "subscription_id": schedule.subscription_id,
+            "error": error,
+        }),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2962,6 +3042,147 @@ mod tests {
         assert_eq!(runs[0].status, RunStatus::Failed);
         assert!(runs[0].error.is_some());
         assert!(runs[0].finished_at.is_some());
+    }
+
+    /// A stand-in restic that prints a summary line and exits with `code`.
+    ///
+    /// The exit code is the behaviour under test and neither `echo` nor `false`
+    /// can produce one that is neither 0 nor 1.
+    fn restic_exiting(dir: &Path, code: i32) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("restic-stub");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 echo '{{\"message_type\":\"summary\",\"snapshot_id\":\"snap-partial\",\
+                 \"total_bytes_processed\":128}}'\n\
+                 exit {code}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_restic_wrote_without_reading_every_file_is_still_a_backup_that_happened() {
+        // Exit 3 on restic >= 0.17: the snapshot is written and restorable, some
+        // source files could not be read. A tenant's PHP session files vanish
+        // mid-scan on any busy box, so calling this a failed run would skip
+        // retention and report broken backups every night.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let (reg, ctx, rec, _) = file_backed_context(db_dir.path()).await;
+        let repo = init_local_repo(&ctx, dir.path(), "nightly").await;
+
+        let out = Run::for_test(&restic_exiting(dir.path(), 3), state.path().to_path_buf())
+            .run(
+                &ctx,
+                RunInput {
+                    repo_id: repo.repo_id,
+                    scope: BackupScope::Panel,
+                    subscription_id: None,
+                },
+            )
+            .await
+            .expect("an incomplete snapshot is not a failed run");
+        assert_eq!(out.snapshot_id.as_deref(), Some("snap-partial"));
+
+        let runs = reg
+            .services()
+            .db
+            .backups(&TenantScope::Global)
+            .runs(10, 0)
+            .await
+            .unwrap();
+        assert_eq!(runs[0].status, RunStatus::Ok);
+        assert_eq!(runs[0].snapshot_id.as_deref(), Some("snap-partial"));
+
+        // …and the operator is told the copy is not complete.
+        let log = log_text(&rec);
+        assert!(
+            log.contains("could not read every source file"),
+            "the incompleteness must be said out loud:\n{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restic_that_fails_outright_is_still_a_failed_run() {
+        // The other half of accepting exit 3: every other non-zero status must
+        // keep failing the run.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let (_reg, ctx, _rec, _) = file_backed_context(db_dir.path()).await;
+        let repo = init_local_repo(&ctx, dir.path(), "nightly").await;
+
+        let err = Run::for_test(&restic_exiting(dir.path(), 2), state.path().to_path_buf())
+            .run(
+                &ctx,
+                RunInput {
+                    repo_id: repo.repo_id,
+                    scope: BackupScope::Panel,
+                    subscription_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::CommandFailed);
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_backup_that_never_reached_restic_is_recorded_as_a_failed_run() {
+        // The evidence an operator has is the backups page, which reads
+        // `backup_runs`; the pass's own failure text lands on `scheduler_jobs`,
+        // which nothing displays. A repository whose sealed password will not
+        // open must therefore leave a row behind, not only a journal line.
+        let (reg, ctx, _rec, _) = context().await;
+        let db = &reg.services().db;
+        let repo = db
+            .create_backup_repo(NewBackupRepo {
+                kind: RepoKind::Local,
+                label: "nightly".into(),
+                path_or_url: "/srv/backups".into(),
+                // Not ciphertext this panel's master key can open — what an
+                // operator is left with after restoring a database without
+                // /etc/unihelm/secret.key.
+                password_sealed: "deadbeef".into(),
+                credentials_sealed: None,
+            })
+            .await
+            .unwrap();
+        db.create_backup_schedule(NewBackupSchedule {
+            repo_id: repo.id,
+            scope: BackupScope::Panel,
+            subscription_id: None,
+            cron: "* * * * *".into(),
+            keep_daily: 7,
+            keep_weekly: 4,
+            keep_monthly: 6,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+
+        let summary = scheduler_tick(&ctx).await.unwrap_err();
+        assert!(summary.contains("failed"), "{summary}");
+
+        let runs = db.backups(&TenantScope::Global).runs(10, 0).await.unwrap();
+        assert_eq!(runs.len(), 1, "the failure must be visible in the history");
+        assert_eq!(runs[0].status, RunStatus::Failed);
+        assert!(runs[0].finished_at.is_some());
+        assert!(
+            runs[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be opened"),
+            "{:?}",
+            runs[0].error
+        );
     }
 
     #[tokio::test]

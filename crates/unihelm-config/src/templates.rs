@@ -265,6 +265,84 @@ mod tests {
         }
     }
 
+    /// The `location` block nginx would pick for an HTTPS request for `path`,
+    /// by its own rule: prefix matches, longest wins, whatever order they
+    /// appear in.
+    ///
+    /// Scoped to the TLS server first, because this file has two and both
+    /// declare `location /`. A matcher blind to that would report the port-80
+    /// redirect when the 443 server has no better match — and would accept a
+    /// directive found on the plain-HTTP side as if it applied to the tunnel.
+    fn tls_location_serving(rendered: &str, path: &str) -> String {
+        let tls = rendered
+            .split("\nserver {")
+            .find(|block| block.contains("listen 443"))
+            .expect("the panel vhost has no TLS server");
+
+        let mut best: Option<(usize, String)> = None;
+        let mut lines = tls.lines();
+        while let Some(line) = lines.next() {
+            let Some(rest) = line.trim().strip_prefix("location ") else {
+                continue;
+            };
+            let Some(prefix) = rest.strip_suffix(" {") else {
+                continue;
+            };
+            let prefix = prefix.trim_start_matches("^~ ").trim();
+            let mut body = String::new();
+            for inner in lines.by_ref() {
+                if inner.trim() == "}" {
+                    break;
+                }
+                body.push_str(inner);
+                body.push('\n');
+            }
+            let longer = match &best {
+                Some((len, _)) => prefix.len() > *len,
+                None => true,
+            };
+            if path.starts_with(prefix) && longer {
+                best = Some((prefix.len(), body));
+            }
+        }
+        best.unwrap_or_else(|| panic!("no location in the panel's TLS server matches {path}"))
+            .1
+    }
+
+    /// A web terminal is idle whenever the operator is reading rather than
+    /// typing, and nginx's default `proxy_read_timeout` of 60s is the gap it
+    /// allows between reads on an upgraded connection. Neither end of this
+    /// tunnel pings, so the location that carries it has to say otherwise or a
+    /// quiet minute of a build takes the live view away.
+    #[test]
+    fn an_idle_web_terminal_is_not_dropped_by_the_default_read_timeout() {
+        let set = TemplateSet::load().unwrap();
+        let rendered = set
+            .render(
+                "nginx/panel.conf",
+                &json!({
+                    "panel_domain": "panel.example.com",
+                    "acme_webroot": "/var/lib/unihelm/acme",
+                    "cert_path": "/var/lib/unihelm/state/certs/panel.example.com/fullchain.pem",
+                    "key_path": "/var/lib/unihelm/state/certs/panel.example.com/privkey.pem",
+                    "max_body_size": "512m",
+                    "upstream": "127.0.0.1:8088",
+                    "upstream_scheme": "http",
+                }),
+            )
+            .unwrap();
+
+        let block = tls_location_serving(&rendered, "/api/terminal/ws");
+        assert!(
+            block.contains("proxy_set_header Upgrade $http_upgrade;"),
+            "the terminal is a WebSocket and still needs its upgrade headers:\n{block}"
+        );
+        assert!(
+            block.contains("proxy_read_timeout 24h;"),
+            "an idle PTY must outlive nginx's 60s default:\n{block}"
+        );
+    }
+
     #[test]
     fn an_undefined_variable_is_an_error_not_an_empty_string() {
         // The failure this prevents: `server_name ;` silently becoming a

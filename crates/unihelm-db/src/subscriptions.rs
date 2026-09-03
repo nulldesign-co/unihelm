@@ -5,7 +5,7 @@
 //! subscription's Linux user.
 
 use serde::Serialize;
-use unihelm_core::{LinuxUser, SubscriptionId, TenantScope, UserId};
+use unihelm_core::{LinuxUser, Role, SubscriptionId, TenantScope, UnihelmError, UserId};
 
 use crate::scope::ScopeFilter;
 use crate::{Db, DbError, Result, from_sql_time, now, to_sql_time};
@@ -170,6 +170,8 @@ impl Db {
     /// Phase 1 has no UI for managing subscriptions, so a site created by an
     /// admin lands in an implicit one. Phase 2 replaces this with a real
     /// provisioning flow; the shape of the row does not change.
+    ///
+    /// A reseller is refused rather than given one; the comment below says why.
     pub async fn default_subscription_for(&self, customer_id: UserId) -> Result<Subscription> {
         let existing = sqlx::query_as::<_, SubscriptionRow>(
             "SELECT * FROM subscriptions WHERE customer_id = ?1 AND status = 'active'
@@ -179,10 +181,34 @@ impl Db {
         .fetch_optional(self.pool())
         .await?;
 
-        match existing {
-            Some(row) => Subscription::try_from(row),
-            None => self.create_subscription(customer_id).await,
+        if let Some(row) = existing {
+            return Subscription::try_from(row);
         }
+
+        // A reseller owns customers, not an account of its own. A subscription
+        // inserted against the reseller's own users row has `reseller_id` NULL,
+        // and every reseller-scoped read joins `users.reseller_id` — so the row
+        // is invisible to the reseller that caused it: the site it holds is
+        // provisioned and served, but omitted from the list, answered
+        // `not_found` on update and delete, and its domain is taken globally so
+        // it cannot be recreated either. Only an admin can clean that up. Make
+        // the caller name a real subscription instead.
+        if self.user_role(customer_id).await? == Some(Role::Reseller) {
+            return Err(DbError::Domain(
+                UnihelmError::invalid("name the subscription this belongs to")
+                    .with_field("subscription_id"),
+            ));
+        }
+
+        self.create_subscription(customer_id).await
+    }
+
+    async fn user_role(&self, user_id: UserId) -> Result<Option<Role>> {
+        Ok(self
+            .users(&TenantScope::Global)
+            .by_id(user_id)
+            .await?
+            .map(|user| user.role))
     }
 
     pub async fn set_subscription_status(
@@ -326,7 +352,7 @@ fn generate_linux_user() -> String {
 mod tests {
     use super::*;
     use crate::users::NewUser;
-    use unihelm_core::{Email, Role, Username};
+    use unihelm_core::{Email, ErrorCode, Role, Username};
 
     async fn seed() -> (Db, UserId, UserId) {
         let db = Db::open_memory().await.unwrap();
@@ -382,6 +408,46 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reseller_is_never_given_an_implicit_subscription_it_cannot_see() {
+        let (db, _alice, _bobby) = seed().await;
+        let reseller = db
+            .users(&TenantScope::Global)
+            .create(NewUser {
+                role: Role::Reseller,
+                email: Email::parse("reseller@example.com").unwrap(),
+                username: Username::parse("reseller").unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+
+        let err = db.default_subscription_for(reseller.id).await.unwrap_err();
+        match err {
+            DbError::Domain(e) => {
+                assert_eq!(e.code, ErrorCode::InvalidInput);
+                // The field is the half the panel acts on: it points the form
+                // at the input the operator has to fill in, so a refusal
+                // without it is a dead end rather than a correction.
+                assert_eq!(e.field.as_deref(), Some("subscription_id"));
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // The point of refusing: a row created here would be owned by nobody
+        // the reseller can reach, so the site it holds would be stranded.
+        assert!(
+            db.subscriptions(&TenantScope::Global)
+                .list(100, 0)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

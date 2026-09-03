@@ -1,6 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronRight, Copy, Mail, Send, ShieldAlert } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  Check,
+  ChevronRight,
+  Copy,
+  ListChecks,
+  Mail,
+  Send,
+  ShieldAlert,
+  UploadCloud,
+} from "lucide-react";
+import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TaskNotice } from "@/components/task-notice";
@@ -17,12 +26,16 @@ import { Switch } from "@/components/ui/switch";
 import {
   ApiError,
   endpoints,
+  type MailDnsPublishReport,
   type MailDnsRecord,
+  type MailPublishedRecord,
+  type MailPublishOutcome,
   type MailRelayResponse,
   type MailTestReport,
   type TlsMode,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
+import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
 
 /**
@@ -44,11 +57,28 @@ import { cn } from "@/lib/utils";
  *    result panel renders the stage prominently, because "which step failed"
  *    is the entire difference between a wrong password and a wrong sender
  *    domain.
+ * 4. **Publishing is a plan before it is a write.** `mail.dns.publish` is a dry
+ *    run unless it is asked twice, so this page never has a button that puts
+ *    something in a live zone on one click: the first shows what would go in,
+ *    and the second — which only exists once there is a plan on screen to
+ *    agree with — commits it. The operation also never overwrites, and that is
+ *    said before the write rather than discovered afterwards, because an
+ *    operator who expects a merge and gets "already there" would otherwise go
+ *    and add the second SPF record by hand, which is the permanent error this
+ *    is avoiding.
  *
- * SPF, DKIM and DMARC are shown as records to copy and are explicitly *not*
- * managed. The DKIM row has no value because only the relay provider knows the
- * selector; showing an empty value with an explanation is the truthful version
- * of that row.
+ * SPF, DKIM and DMARC are shown as records to copy and are still not *managed*:
+ * publishing writes them once and nothing afterwards keeps them in step, so the
+ * "not managed by Unihelm" badge stays on a row that was just created. The
+ * outcomes annotate those same rows instead of arriving as a second list that
+ * repeats every name — an operator whose DNS lives somewhere this panel cannot
+ * reach reads exactly one list and copies from it, which is the path that has
+ * to keep working.
+ *
+ * The DKIM row has no value because only the relay provider knows the selector;
+ * showing an empty value with an explanation is the truthful version of that
+ * row, and publishing skips it for the same reason rather than putting a
+ * placeholder where a public key belongs.
  */
 export function MailPage() {
   const { t } = useTranslation();
@@ -114,7 +144,13 @@ function MailSkeleton() {
         <Skeleton className="mt-6 h-9 w-32" />
       </Card>
       <Card className="p-5">
-        <Skeleton className="h-4 w-40" />
+        {/* The DNS card's header carries a button on the right, so the ghost
+            does too — a heading that is alone for a second and then shunted
+            left by an arriving control is the jump this file is avoiding. */}
+        <div className="flex items-start justify-between gap-4">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-8 w-44" />
+        </div>
         <div className="mt-4 space-y-3">
           <Skeleton className="h-16" />
           <Skeleton className="h-16" />
@@ -483,14 +519,77 @@ function TestReport({ report }: { report: MailTestReport }) {
 }
 
 // ---------------------------------------------------------------------------
-// SPF / DKIM / DMARC — guidance, never management
+// SPF / DKIM / DMARC — guidance, and a plan before a write
 // ---------------------------------------------------------------------------
+
+/** A record is the same thing in the advisory and in the report. */
+function recordKey(record: { record_type: string; name: string }): string {
+  return `${record.record_type}-${record.name}`;
+}
 
 function DnsCard({ dns }: { dns: { records: MailDnsRecord[]; advice: string } }) {
   const { t } = useTranslation();
+  const { user } = useSession();
+  // `mail.dns.publish` requires `server.manage` and the agent re-checks it.
+  // Hiding the button from everyone else stops a customer from building a plan
+  // they will never be allowed to commit; the copy path below is untouched,
+  // because reading these records is not the same permission as writing them.
+  const canPublish = user?.permissions.includes("server_manage") ?? false;
+
+  const [report, setReport] = useState<MailDnsPublishReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Saving the relay changes which records are needed — a different sender
+  // domain is a different SPF name — so a plan made against the old list is not
+  // about this list any more. Compared as names rather than by the object's
+  // identity, which a refetch replaces every time whether anything moved or not.
+  const listed = dns.records.map(recordKey).join("|");
+  useEffect(() => {
+    setReport(null);
+    setError(null);
+  }, [listed]);
+
+  const publish = useMutation({
+    mutationFn: (apply: boolean) => endpoints.publishMailDns(apply),
+    onSuccess: (result) => {
+      setError(null);
+      setReport(result);
+    },
+    // The plan on screen is left standing. A request that failed before it
+    // reached the zone did not change the zone, so what it said would happen is
+    // still true — clearing it would make the operator run the dry run again to
+    // learn nothing new.
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  // `variables` is the `apply` flag of the call in flight, which is what tells
+  // the two buttons apart: only the one that was pressed should spin.
+  const applying = publish.isPending && publish.variables === true;
+  const planning = publish.isPending && publish.variables === false;
+
+  const outcomes = new Map<string, MailPublishedRecord>(
+    report?.results.map((result) => [recordKey(result), result] as const) ?? [],
+  );
+
   return (
     <Card>
-      <CardHeader title={t("mail.dns.title")} description={t("mail.dns.hint")} />
+      <CardHeader
+        title={t("mail.dns.title")}
+        description={t("mail.dns.hint")}
+        action={
+          canPublish && dns.records.length > 0 ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={planning}
+              onClick={() => publish.mutate(false)}
+            >
+              <ListChecks className="h-4 w-4" aria-hidden />
+              {t("mail.dns.publish.button")}
+            </Button>
+          ) : null
+        }
+      />
       <CardBody>
         <p className="mb-3 text-sm text-ink-muted">{dns.advice}</p>
         {dns.records.length === 0 ? (
@@ -501,24 +600,154 @@ function DnsCard({ dns }: { dns: { records: MailDnsRecord[]; advice: string } })
             className="py-10"
           />
         ) : (
-          <ul className="divide-y divide-border">
-            {dns.records.map((record, index) => (
-              <li
-                key={`${record.record_type}-${record.name}`}
-                className="stagger animate-rise-in py-4 first:pt-0 last:pb-0"
-                style={staggerStyle(index)}
-              >
-                <RecordRow record={record} />
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="divide-y divide-border">
+              {dns.records.map((record, index) => (
+                <li
+                  key={recordKey(record)}
+                  className="stagger animate-rise-in py-4 first:pt-0 last:pb-0"
+                  style={staggerStyle(index)}
+                >
+                  <RecordRow record={record} outcome={outcomes.get(recordKey(record))} />
+                </li>
+              ))}
+            </ul>
+
+            {error ? (
+              <Callout tone="danger" className="mt-4">
+                {error}
+              </Callout>
+            ) : null}
+
+            {canPublish ? (
+              report ? (
+                <PublishVerdict
+                  report={report}
+                  applying={applying}
+                  onApply={() => publish.mutate(true)}
+                />
+              ) : (
+                // Said before the first click rather than in the dialog after
+                // it: an operator deciding whether to press a button in a
+                // hosting panel wants to know what it does beforehand.
+                <p className="mt-4 border-t border-border pt-3 text-xs text-ink-muted">
+                  {t("mail.dns.publish.dryRunNote")}
+                </p>
+              )
+            ) : null}
+          </>
         )}
       </CardBody>
     </Card>
   );
 }
 
-function RecordRow({ record }: { record: MailDnsRecord }) {
+/**
+ * What the run did, or would do, taken as a whole.
+ *
+ * The per-record outcomes are on the rows above, so this is only the part that
+ * needs a decision or a verdict: whether to write, and what "written" turned
+ * out to mean. The tone follows the worst outcome rather than the fact that the
+ * request succeeded — an operation that answered 200 with three failures is not
+ * a success, and tinting it green is how an operator stops reading.
+ */
+function PublishVerdict({
+  report,
+  applying,
+  onApply,
+}: {
+  report: MailDnsPublishReport;
+  applying: boolean;
+  onApply: () => void;
+}) {
+  const { t } = useTranslation();
+  const count = (outcome: MailPublishOutcome) =>
+    report.results.filter((result) => result.outcome === outcome).length;
+
+  if (!report.applied) {
+    const planned = count("would-create");
+    // A plan with nothing in it still gets a panel. "The button did nothing"
+    // is the reading of a button that answers silently.
+    if (planned === 0) {
+      return (
+        <Callout tone="info" title={t("mail.dns.publish.nothingTitle")} className="mt-4">
+          {t("mail.dns.publish.nothing")}
+        </Callout>
+      );
+    }
+
+    return (
+      <Callout
+        tone="info"
+        title={t("mail.dns.publish.previewTitle")}
+        className="mt-4"
+        // The commit lives here rather than in the header, so the only way to
+        // reach it is past the sentence that says what it will not do.
+        action={
+          <Button variant="primary" loading={applying} onClick={onApply}>
+            <UploadCloud className="h-4 w-4" aria-hidden />
+            {t("mail.dns.publish.apply", { count: planned })}
+          </Button>
+        }
+      >
+        <p>{t("mail.dns.publish.wouldCreate", { count: planned })}</p>
+        <p className="mt-1">{t("mail.dns.publish.neverOverwrites")}</p>
+        <p className="mt-1 text-xs text-ink-subtle">{t("mail.dns.publish.previewIsLocal")}</p>
+      </Callout>
+    );
+  }
+
+  const created = count("created");
+  const failed = count("failed");
+
+  return (
+    <Callout
+      tone={failed > 0 ? "danger" : created > 0 ? "success" : "info"}
+      title={
+        failed > 0
+          ? t("mail.dns.publish.partialTitle")
+          : created > 0
+            ? t("mail.dns.publish.appliedTitle")
+            : t("mail.dns.publish.unchangedTitle")
+      }
+      className="mt-4"
+    >
+      {/* A run that wrote nothing says so in words. "0 records were created"
+          is a count where the operator wanted an answer, and it is the reading
+          of every record having already been on its name. */}
+      <p>
+        {created === 0 && failed === 0
+          ? t("mail.dns.publish.createdNone")
+          : t("mail.dns.publish.created", { count: created })}
+      </p>
+      <p className="mt-1">
+        {failed > 0 ? t("mail.dns.publish.failedHint") : t("mail.dns.publish.stillNotManaged")}
+      </p>
+    </Callout>
+  );
+}
+
+/**
+ * `exists` is neutral on purpose: it is the operation working, not failing.
+ * `skipped` is the one that wants attention — it is the row that stays the
+ * operator's job — so it is the warmer of the two.
+ */
+const OUTCOME_TONE: Record<MailPublishOutcome, ComponentProps<typeof Badge>["tone"]> = {
+  "would-create": "accent",
+  created: "success",
+  exists: "neutral",
+  skipped: "warning",
+  failed: "danger",
+};
+
+function RecordRow({
+  record,
+  outcome,
+}: {
+  record: MailDnsRecord;
+  /** Absent until a plan or a write has said something about this row. */
+  outcome?: MailPublishedRecord;
+}) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
@@ -537,13 +766,20 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
 
   return (
     <div>
-      {/* The two badges share a row of their own and the name gets the next
-          one. A long TXT name used to push the `ms-auto` badge onto a second
-          line at 375px, which read as two unrelated fragments. */}
-      <div className="flex items-center gap-2">
+      {/* The badges share a row of their own and the name gets the next one. A
+          long TXT name used to push the `ms-auto` badge onto a second line at
+          375px, which read as two unrelated fragments. They wrap among
+          themselves because an outcome makes three of them, and three badges do
+          not fit a phone on one line. */}
+      <div className="flex flex-wrap items-center gap-2">
         <Badge tone="accent">{record.record_type}</Badge>
-        {/* Stated on every row, not once at the top: this is the difference
-            between a panel that manages DNS and one that suggests records. */}
+        {outcome ? (
+          <Badge tone={OUTCOME_TONE[outcome.outcome]} dot>
+            {t(`mail.dns.publish.outcome.${outcome.outcome}`)}
+          </Badge>
+        ) : null}
+        {/* Stated on every row, not once at the top, and it stays on a row that
+            was just created: writing a record once is not managing it. */}
         <Badge tone="neutral" className="ms-auto">
           {t("mail.dns.notManaged")}
         </Badge>
@@ -596,6 +832,21 @@ function RecordRow({ record }: { record: MailDnsRecord }) {
       )}
 
       <p className="mt-1.5 text-xs text-ink-muted">{record.purpose}</p>
+
+      {/* The operation's own words for why this row was left alone, next to the
+          row it is about. A skip reason is prose and reads as prose; a failure
+          is tinted as well as badged, because the badge is at the top of the
+          row and the reason is at the bottom of it. */}
+      {outcome?.detail ? (
+        <p
+          className={cn(
+            "mt-1.5 text-xs",
+            outcome.outcome === "failed" ? "text-danger" : "text-ink-muted",
+          )}
+        >
+          {outcome.detail}
+        </p>
+      ) : null}
     </div>
   );
 }

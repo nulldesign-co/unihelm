@@ -9,7 +9,8 @@
 //! certificate the panel issues expires ninety days later, silently, and the
 //! first anyone hears about it is a browser warning.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use time::Duration;
@@ -30,6 +31,22 @@ use crate::tasks::TaskBus;
 /// collector's 1% budget applies to the whole agent, not just to metrics.
 const TICK: StdDuration = StdDuration::from_secs(30);
 
+/// How long a shutdown waits for the passes that are already running.
+///
+/// Passes run in tasks of their own, and a task is dropped — killing whatever
+/// child it was waiting on, `Cmd` sets `kill_on_drop` — the moment the runtime
+/// goes away. Without a wait here, every `systemctl restart` would cut short an
+/// ACME order or a webhook flush that was about to finish, which the old
+/// inline loop never did. A nightly restic run will not finish inside this and
+/// is not meant to: it dies at `systemctl stop` either way, and the deadline is
+/// what stops the agent from spending the unit's whole stop timeout finding
+/// that out and being SIGKILLed anyway.
+const SHUTDOWN_DRAIN: StdDuration = StdDuration::from_secs(20);
+
+/// How often the drain looks again. Short enough that a pass finishing does not
+/// then wait on this, long enough to be free.
+const DRAIN_POLL: StdDuration = StdDuration::from_millis(100);
+
 /// A certificate is renewed once it is inside this window.
 const RENEW_WINDOW: Duration = Duration::days(30);
 
@@ -42,9 +59,12 @@ const RENEWALS_PER_TICK: i64 = 5;
 /// Jitter matters more than it looks: a hundred panels installed from the same
 /// image would otherwise hit Let's Encrypt in the same second every day.
 const JOBS: &[(&str, Duration, Duration)] = &[
-    // Twice a day is plenty for a thirty-day window, and cheap when nothing is
-    // due.
-    ("cert.renew", Duration::hours(12), Duration::hours(1)),
+    // Hourly, because `RENEWALS_PER_TICK` is a hard ceiling and not a target:
+    // twice a day capped the whole panel at ten renewals a day, which a
+    // six-hundred-site box needs *all* of just to stand still and which no
+    // amount of bulk provisioning can ever catch up from. The pass is cheap
+    // when nothing is due — one indexed query that returns nothing.
+    ("cert.renew", Duration::hours(1), Duration::hours(1)),
     // So the dashboard stops calling an expired certificate active.
     (
         "cert.expire-stale",
@@ -97,14 +117,78 @@ const JOBS: &[(&str, Duration, Duration)] = &[
     ),
 ];
 
+/// The jobs that are running in a task of their own right now.
+///
+/// `finish_job` is what moves a job's `next_run_at`, and it only runs when the
+/// pass ends — so a pass that outlives a tick is still due on the next one.
+/// Without this a nightly backup would be started again every thirty seconds
+/// for as long as the first one took, each new pass racing the last over the
+/// same restic repository.
+#[derive(Clone, Default)]
+struct InFlight(Arc<Mutex<HashSet<String>>>);
+
+impl InFlight {
+    /// Claim `name`, or `None` while an earlier pass still holds it. The claim
+    /// is released when the returned guard is dropped — including when the task
+    /// holding it is dropped at shutdown, so a restart never inherits a latch.
+    fn claim(&self, name: &str) -> Option<Claim> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(name.to_string())
+            .then(|| Claim {
+                jobs: self.clone(),
+                name: name.to_string(),
+            })
+    }
+
+    /// Wait for the passes still running to end, or `budget` to expire.
+    ///
+    /// Returns the names of whatever was still running when it gave up, so the
+    /// caller can say what it is about to cut short.
+    async fn drain(&self, budget: StdDuration) -> Vec<String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let running = self.running();
+            if running.is_empty() || Instant::now() >= deadline {
+                return running;
+            }
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+
+    fn running(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.0.lock().unwrap().iter().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
+struct Claim {
+    jobs: InFlight,
+    name: String,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.jobs.0.lock().unwrap().remove(&self.name);
+    }
+}
+
+#[derive(Clone)]
 pub struct Scheduler {
     registry: Arc<OpRegistry>,
     bus: TaskBus,
+    in_flight: InFlight,
 }
 
 impl Scheduler {
     pub fn new(registry: Arc<OpRegistry>, bus: TaskBus) -> Self {
-        Self { registry, bus }
+        Self {
+            registry,
+            bus,
+            in_flight: InFlight::default(),
+        }
     }
 
     fn db(&self) -> &Db {
@@ -143,6 +227,13 @@ impl Scheduler {
                 _ = ticker.tick() => self.tick().await,
             }
         }
+
+        let abandoned = self.in_flight.drain(SHUTDOWN_DRAIN).await;
+        if !abandoned.is_empty() {
+            // Worth a line at warn: a restic run cut off here leaves a lock in
+            // the repository that the next backup has to be told to break.
+            tracing::warn!(jobs = ?abandoned, "exiting with scheduled passes still running");
+        }
     }
 
     async fn tick(&self) {
@@ -155,27 +246,51 @@ impl Scheduler {
         };
 
         for job in due {
-            let started = Instant::now();
-            let outcome = self.run_job(&job).await;
-            let elapsed = started.elapsed();
+            let Some(claim) = self.in_flight.claim(&job.name) else {
+                tracing::debug!(
+                    job = %job.name,
+                    "still running from an earlier tick; not starting a second pass"
+                );
+                continue;
+            };
 
-            match &outcome {
-                Ok(summary) if !summary.is_empty() => {
-                    tracing::info!(job = %job.name, ?elapsed, summary, "scheduled job finished");
-                }
-                Ok(_) => tracing::debug!(job = %job.name, "scheduled job had nothing to do"),
-                Err(e) => tracing::warn!(job = %job.name, error = %e, "scheduled job failed"),
-            }
+            // Its own task, never awaited here: a pass is allowed to be slow —
+            // a nightly restic run is permitted twelve hours, and five ACME
+            // orders are minutes each. Awaited inline that is time in which
+            // Sentinel does not scan for a brute force and alerts are not
+            // evaluated, and, because the loop polls the shutdown future only
+            // between ticks, `systemctl stop` hangs until systemd gives up and
+            // SIGKILLs the agent in the middle of the backup.
+            let scheduler = self.clone();
+            tokio::spawn(async move {
+                let _claim = claim;
+                scheduler.run_to_completion(&job).await;
+            });
+        }
+    }
 
-            // Record and reschedule whatever happened. A job that stops
-            // rescheduling after one bad day is a job that stops forever.
-            if let Err(e) = self
-                .db()
-                .finish_job(&job.name, outcome.clone().map(|_| ()), elapsed)
-                .await
-            {
-                tracing::error!(job = %job.name, error = %e, "could not record a job result");
+    /// Run one job and record what it did.
+    async fn run_to_completion(&self, job: &ScheduledJob) {
+        let started = Instant::now();
+        let outcome = self.run_job(job).await;
+        let elapsed = started.elapsed();
+
+        match &outcome {
+            Ok(summary) if !summary.is_empty() => {
+                tracing::info!(job = %job.name, ?elapsed, summary, "scheduled job finished");
             }
+            Ok(_) => tracing::debug!(job = %job.name, "scheduled job had nothing to do"),
+            Err(e) => tracing::warn!(job = %job.name, error = %e, "scheduled job failed"),
+        }
+
+        // Record and reschedule whatever happened. A job that stops
+        // rescheduling after one bad day is a job that stops forever.
+        if let Err(e) = self
+            .db()
+            .finish_job(&job.name, outcome.clone().map(|_| ()), elapsed)
+            .await
+        {
+            tracing::error!(job = %job.name, error = %e, "could not record a job result");
         }
     }
 
@@ -241,7 +356,13 @@ impl Scheduler {
                 "renewing"
             );
 
-            match self.issue(site_id, &certificate.domains).await {
+            let attempt = if covers_a_wildcard(&certificate.domains) {
+                self.issue_wildcard(site_id, &certificate.domains).await
+            } else {
+                self.issue(site_id, &certificate.domains).await
+            };
+
+            match attempt {
                 Ok(()) => renewed += 1,
                 Err(e) => {
                     failed += 1;
@@ -311,6 +432,81 @@ impl Scheduler {
             .run(
                 &ctx,
                 unihelm_ops::cert::IssueInput {
+                    site_id: site_id.get(),
+                    staging: false,
+                    contact_email: None,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _ = db.finish_task_ok(task_id).await;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = db.finish_task_failed(task_id, &e).await;
+                Err(e.detail)
+            }
+        }
+    }
+
+    /// Renew a wildcard certificate through DNS-01, as a real Task under the
+    /// system identity.
+    ///
+    /// A separate path from [`Scheduler::issue`] because `cert.issue` cannot
+    /// produce this certificate: it rebuilds its names from the site's
+    /// `server_names`, and no alias can hold a `*` label. Renewing a wildcard
+    /// through it therefore replaces `*.example.com` with a certificate for the
+    /// apex alone, reloads nginx onto it, and reports success — every host under
+    /// the wildcard then fails on a name mismatch.
+    ///
+    /// A missing DNS credential is a failed renewal like any other, with the
+    /// usual backoff. Falling back to `cert.issue` would be exactly the silent
+    /// downgrade this exists to prevent.
+    async fn issue_wildcard(
+        &self,
+        site_id: unihelm_core::SiteId,
+        domains: &[String],
+    ) -> Result<(), String> {
+        let db = self.db().clone();
+        let task_id = TaskId::new();
+
+        db.create_task(NewTask {
+            id: task_id,
+            op: "cert.issue_wildcard".into(),
+            input: serde_json::json!({ "site_id": site_id.get(), "renewal": true }),
+            // No user did this; the audit trail says so.
+            actor_user_id: None,
+            subscription_id: None,
+            cancellable: false,
+            // Not re-run on its own after a crash, matching what the operation
+            // declares: DNS-01 publishes a TXT record in a zone the panel does
+            // not own and takes it down again on the way out.
+            idempotent: false,
+            request_id: Some(format!("scheduler-renew-wildcard-{}", domains.join(","))),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        db.start_task(task_id).await.map_err(|e| e.to_string())?;
+
+        let log: Arc<dyn LogSink> = Arc::new(TaskLog {
+            db: db.clone(),
+            task_id,
+            bus: self.bus.clone(),
+        });
+
+        let ctx = OpContext::new(
+            self.registry.services().clone(),
+            AuthContext::system("cert.renew"),
+        )
+        .with_task(task_id, log);
+
+        let result = unihelm_ops::dns::IssueWildcard
+            .run(
+                &ctx,
+                unihelm_ops::dns::IssueWildcardInput {
                     site_id: site_id.get(),
                     staging: false,
                     contact_email: None,
@@ -641,6 +837,15 @@ impl Scheduler {
     }
 }
 
+/// Does this certificate cover a wildcard name?
+///
+/// It decides which operation renews the row, and the two are not
+/// interchangeable: only `cert.issue_wildcard` can ask for `*.example.com`,
+/// because it is the only one that proves the name over DNS-01.
+fn covers_a_wildcard(domains: &[String]) -> bool {
+    domains.iter().any(|d| d.starts_with("*."))
+}
+
 /// Persists a scheduled task's output and pushes it to anyone watching.
 ///
 /// The same two destinations a user-initiated task writes to, so a renewal that
@@ -665,5 +870,109 @@ impl LogSink for TaskLog {
                 bus.publish(EventFrame::new(EventKind::TaskLog { task_id, seq, line }));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(name: &str) -> (Duration, Duration) {
+        let (_, interval, jitter) = JOBS
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .unwrap_or_else(|| panic!("`{name}` is not in the built-in schedule"));
+        (*interval, *jitter)
+    }
+
+    #[test]
+    fn a_slow_pass_is_not_started_a_second_time_while_the_first_is_still_running() {
+        // The backup job stays due until it finishes, because `finish_job` is
+        // what moves `next_run_at` — so every tick during a ten-minute backup
+        // offers it again.
+        let jobs = InFlight::default();
+        let running = jobs.claim("backup.scheduler").expect("the first pass runs");
+        assert!(
+            jobs.claim("backup.scheduler").is_none(),
+            "a second pass would race the first over the same restic repository"
+        );
+        // A different job is unaffected: one slow backup must not stop Sentinel.
+        assert!(jobs.claim("sentinel.scan").is_some());
+
+        drop(running);
+        assert!(
+            jobs.claim("backup.scheduler").is_some(),
+            "the next tick after a pass ends must be able to start one"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_running_pass_but_not_for_a_backup() {
+        // Passes run in their own task now, and a task is killed outright when
+        // the runtime goes away — so without a wait, every upgrade would cut
+        // off an ACME order or a webhook flush that was one second from done,
+        // which the old inline loop never did. The wait has to be bounded, or
+        // the nightly backup puts the hang straight back.
+        let jobs = InFlight::default();
+        let finishing = jobs.claim("webhook.deliver").expect("the pass runs");
+        tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            drop(finishing);
+        });
+        assert!(
+            jobs.drain(StdDuration::from_secs(30)).await.is_empty(),
+            "a pass that ends must be waited for, not killed"
+        );
+
+        let _backup = jobs.claim("backup.scheduler").expect("the pass runs");
+        let started = Instant::now();
+        assert_eq!(
+            jobs.drain(StdDuration::from_millis(200)).await,
+            vec!["backup.scheduler".to_string()],
+            "a pass that outlasts the budget is reported, not waited on"
+        );
+        assert!(
+            started.elapsed() < StdDuration::from_secs(5),
+            "the wait must be bounded: systemd SIGKILLs the agent if it is not"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_certificate_is_renewed_through_dns_and_not_as_a_plain_one() {
+        // `cert.issue` rebuilds its names from the site's server_names, which
+        // can never hold a `*` label — so sending this row there replaces the
+        // wildcard with a certificate that matches none of the hosts it covered.
+        assert!(covers_a_wildcard(&[
+            "example.com".into(),
+            "*.example.com".into()
+        ]));
+        assert!(!covers_a_wildcard(&[
+            "example.com".into(),
+            "www.example.com".into()
+        ]));
+        assert!(!covers_a_wildcard(&[]));
+    }
+
+    #[test]
+    fn renewals_keep_up_with_the_estate_the_panel_is_sold_for() {
+        let (interval, jitter) = job("cert.renew");
+        // Worst case the jitter always lands at its maximum.
+        let slowest = interval + jitter;
+        let per_day =
+            RENEWALS_PER_TICK * (Duration::days(1).whole_seconds() / slowest.whole_seconds());
+
+        // A Let's Encrypt certificate lives ninety days and is renewed once it
+        // is inside the window, so each one comes back every sixty days: an
+        // estate of this size costs SITES/60 renewals a day just to stand
+        // still, and several times that to drain the backlog a bulk
+        // provisioning leaves behind before the oldest of them lapses.
+        const SITES: i64 = 600;
+        const LIFETIME: Duration = Duration::days(90);
+        let standing_still = SITES / (LIFETIME - RENEW_WINDOW).whole_days();
+        assert!(
+            per_day >= standing_still * 4,
+            "{per_day} renewals a day cannot carry {SITES} certificates: \
+             standing still already costs {standing_still} a day"
+        );
     }
 }

@@ -158,19 +158,27 @@ impl TypedOperation for Issue {
             }
         };
 
-        // Files first, then the row, then the vhost: nginx must never be
-        // pointed at a certificate that is not on disk yet.
-        acme::write_certificate(&cert_dir, &issued)?;
-        ctx.log(format!("certificate written to {}", cert_dir.display()));
+        let days_valid = (issued.not_after - unihelm_db::now()).whole_days();
 
-        db.certificate_issued(
-            record.id,
-            &issued.issuer,
-            issued.not_before,
-            issued.not_after,
-        )
-        .await
-        .map_err(UnihelmError::from)?;
+        // Files first: nginx must never be pointed at a certificate that is not
+        // on disk yet.
+        if !write_issued(&cert_dir, &issued, directory)? {
+            ctx.log(format!(
+                "the staging order for {} succeeded, valid until {}; \
+                 nothing was installed and {} keeps serving what it had",
+                names.join(", "),
+                issued.not_after.date(),
+                site.domain
+            ));
+            return Ok(IssueOutput {
+                certificate_id: record.id,
+                domains: names,
+                issuer: issued.issuer,
+                not_after: issued.not_after,
+                days_valid,
+            });
+        }
+        ctx.log(format!("certificate written to {}", cert_dir.display()));
 
         // Re-render the vhost, which now finds a certificate and turns TLS on.
         let subscription = db
@@ -201,7 +209,21 @@ impl TypedOperation for Issue {
             ctx.log("nginx reloaded onto the new certificate");
         }
 
-        let days_valid = (issued.not_after - unihelm_db::now()).whole_days();
+        // The row last, once the certificate is actually being served.
+        // `certificate_issued` clears the failure count, resets the backoff and
+        // retires the row this one replaces; done before the reload, a reload
+        // that fails leaves the scheduler writing its retry bookkeeping onto a
+        // superseded row it no longer looks at, while nginx serves the old
+        // certificate from memory until it expires.
+        db.certificate_issued(
+            record.id,
+            &issued.issuer,
+            issued.not_before,
+            issued.not_after,
+        )
+        .await
+        .map_err(UnihelmError::from)?;
+
         ctx.log(format!("{} is now served over HTTPS", site.domain));
 
         // Spec §14 Phase 6. Emitted for a first issuance as well as a renewal:
@@ -230,6 +252,32 @@ impl TypedOperation for Issue {
             days_valid,
         })
     }
+}
+
+/// Put an issued certificate on disk, unless the order was a rehearsal.
+/// `Ok(false)` means nothing was written.
+///
+/// The staging directory's root is in no browser's trust store, so installing
+/// its output replaces a working certificate with one every visitor is warned
+/// about — `staging: true` is there to prove the flow without spending
+/// rate-limit budget, and a rehearsal that changes what visitors are served is
+/// not a rehearsal. The caller must also leave the row alone: a staging order
+/// that never reached the disk has not superseded anything and must not be
+/// reported as the certificate the site is serving.
+///
+/// Takes `cert_dir` rather than deriving it, so the tests can work in a
+/// temporary directory: `paths::set_root` is a process-wide `OnceLock` a
+/// parallel test cannot claim.
+pub(crate) fn write_issued(
+    cert_dir: &std::path::Path,
+    issued: &acme::Issued,
+    directory: Directory,
+) -> Result<bool> {
+    if matches!(directory, Directory::Staging) {
+        return Ok(false);
+    }
+    acme::write_certificate(cert_dir, issued)?;
+    Ok(true)
 }
 
 /// Restore the panel's ACME account for a directory, registering one if this is
@@ -337,6 +385,36 @@ mod tests {
             attempts_per_hour <= 4,
             "{attempts_per_hour} attempts per hour is too many"
         );
+    }
+
+    fn issued() -> acme::Issued {
+        acme::Issued {
+            chain_pem: "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n".into(),
+            key_pem: "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n".into(),
+            not_before: unihelm_db::now(),
+            not_after: unihelm_db::now() + time::Duration::days(90),
+            issuer: "Test CA".into(),
+        }
+    }
+
+    #[test]
+    fn a_staging_certificate_is_never_put_on_the_site() {
+        // Nothing trusts the staging root, so installing its output over a
+        // working certificate turns a rehearsal into an outage for every
+        // visitor — and `staging: true` sits next to the issue button in the
+        // UI, one checkbox away from a live site.
+        let dir = tempfile::tempdir().unwrap();
+        let cert_dir = dir.path().join("example.com");
+
+        assert!(!write_issued(&cert_dir, &issued(), Directory::Staging).unwrap());
+        assert!(
+            !cert_dir.exists(),
+            "a staging order must not even create the certificate directory"
+        );
+
+        assert!(write_issued(&cert_dir, &issued(), Directory::Production).unwrap());
+        assert!(cert_dir.join("fullchain.pem").exists());
+        assert!(cert_dir.join("privkey.pem").exists());
     }
 
     #[tokio::test]

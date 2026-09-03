@@ -27,6 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_core::{DbName, ErrorCode, Permission, Result, SubscriptionId, UnihelmError};
+use unihelm_db::Db;
 use unihelm_db::databases::{Database, DbEngine, DbUser, NewDatabase, NewDbUser};
 use unihelm_db::subscriptions::Subscription;
 use unihelm_distro::svc::ManagedUnit;
@@ -469,6 +470,39 @@ async fn require_engine_ready(ctx: &OpContext, engine: DbEngine) -> Result<()> {
     .with_field("engine"))
 }
 
+/// Refuse a database creation that would exceed the subscription's plan.
+///
+/// The counterpart of `plan::enforce_site_limit`, and it lives here for the
+/// reason that module's header gives: enforcement belongs at the point the
+/// resource is created, so no other path can forget it. A subscription with no
+/// plan is unlimited, and the refusal names the plan and both numbers, because
+/// "quota exceeded" alone tells an operator nothing about which knob to turn
+/// (spec §10.5).
+async fn enforce_db_limit(db: &Db, subscription: &Subscription) -> Result<()> {
+    let Some(plan) = db
+        .plan_of_subscription(subscription.id)
+        .await
+        .map_err(UnihelmError::from)?
+    else {
+        return Ok(());
+    };
+
+    let used = db
+        .quota_db_count(subscription.id)
+        .await
+        .map_err(UnihelmError::from)?;
+    if used >= plan.max_dbs {
+        return Err(UnihelmError::new(
+            ErrorCode::QuotaExceeded,
+            format!(
+                "plan `{}` allows {} database(s) and this subscription already has {}",
+                plan.name, plan.max_dbs, used
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Which subscription owns the object — the caller's own by default, or a
 /// named one the caller's scope can actually see (same contract as
 /// `site.create`). Suspended subscriptions cannot gain resources.
@@ -578,6 +612,7 @@ impl TypedOperation for Create {
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let db = ctx.db().clone();
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
+        enforce_db_limit(&db, &subscription).await?;
         require_engine_ready(ctx, input.engine).await?;
 
         // An owner must already exist, in the same subscription and engine —
@@ -1321,6 +1356,67 @@ mod tests {
         assert_eq!(jobs[0].argv, postgres_argv(true));
         assert_eq!(jobs[1].argv, postgres_argv(false));
         assert_eq!(jobs[1].sql, "CREATE DATABASE \"warehouse\";\n");
+    }
+
+    #[tokio::test]
+    async fn a_subscription_at_its_database_limit_is_refused_by_name() {
+        use unihelm_db::plans::NewPlan;
+
+        let (reg, _, customer, sh) = setup().await;
+        let db = &reg.services().db;
+        let plan = db
+            .plans(&unihelm_core::TenantScope::Global)
+            .create(NewPlan {
+                owner_user_id: None,
+                name: "Solo".into(),
+                max_sites: 1,
+                max_dbs: 1,
+                storage_mb: 1024,
+                can_ssh: false,
+                can_cron: true,
+                can_node_apps: false,
+            })
+            .await
+            .unwrap();
+        // The same subscription `db.create` resolves for a customer who names none.
+        let sub = db.default_subscription_for(customer).await.unwrap();
+        db.assign_plan(sub.id, plan.id).await.unwrap();
+
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "first_db", "engine": "mysql" }),
+        )
+        .await
+        .unwrap();
+
+        // The refusal names the plan and both numbers so the operator knows
+        // which knob to turn (spec §10.5), and lands before anything runs.
+        let err = dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "second_db", "engine": "mysql" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::QuotaExceeded);
+        assert!(err.detail.contains("Solo"), "{}", err.detail);
+        assert_eq!(
+            sh.recorded().len(),
+            2,
+            "the refused create must not reach the engine"
+        );
+        assert!(
+            db.database_by_name_global("second_db")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused create must leave no metadata claim behind"
+        );
     }
 
     #[tokio::test]

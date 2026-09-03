@@ -4,6 +4,8 @@ import {
   BellRing,
   Boxes,
   Clock,
+  Compass,
+  Container,
   Database,
   FolderOpen,
   Gauge,
@@ -18,6 +20,7 @@ import {
   Network,
   Palette,
   Search,
+  Settings,
   ShieldCheck,
   Sun,
   TerminalSquare,
@@ -88,6 +91,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         label: t("nav.groupHosting"),
         items: [
           { to: "/sites", label: t("nav.sites"), icon: Globe },
+          { to: "/discover", label: t("nav.discover"), icon: Compass },
           { to: "/apps", label: t("nav.apps"), icon: Boxes },
           { to: "/databases", label: t("nav.databases"), icon: Database },
           { to: "/files", label: t("nav.files"), icon: FolderOpen },
@@ -103,6 +107,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           { to: "/tasks", label: t("nav.tasks"), icon: ListChecks },
           { to: "/terminal", label: t("nav.terminal"), icon: TerminalSquare },
           { to: "/stack", label: t("nav.stack"), icon: Layers },
+          { to: "/runtimes", label: t("nav.runtimes"), icon: Boxes },
+          { to: "/docker", label: t("nav.docker"), icon: Container },
         ],
       },
       {
@@ -117,6 +123,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         items: [
           { to: "/plans", label: t("nav.plans"), icon: Wallet },
           { to: "/branding", label: t("nav.branding"), icon: Palette },
+          { to: "/settings", label: t("nav.settings"), icon: Settings },
         ],
       },
     ],

@@ -38,7 +38,15 @@ OOMScoreAdjust=-500
 RuntimeDirectory=unihelm
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
-LogsDirectory=unihelm
+
+# LogsDirectory= is deliberately NOT set here, and that is the mirror of the
+# rule above. systemd recursively chowns an exec directory whose top-level owner
+# does not match the unit's user, and /var/log/unihelm belongs to `unihelm` —
+# the installer creates it that way and `unihelm-web` declares it. Claiming it
+# as root rewrote the whole tree on every start: the per-site log directories
+# lost the tenant group that lets a customer read their own access log, and the
+# WAF audit log landed in the lap of the internet-facing account it is walled
+# off from. Nothing failed to start either way, which is what made it survive.
 
 # This process is root by design (spec §5.1), so the hardening here is about
 # reducing what "root" reaches, not pretending it is unprivileged.

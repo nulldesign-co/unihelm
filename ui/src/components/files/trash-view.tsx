@@ -88,7 +88,7 @@ export function TrashView() {
   };
 
   const restore = useMutation({
-    mutationFn: (path: string) => filesApi.trashRestore(path),
+    mutationFn: (name: string) => filesApi.trashRestore(name),
     onSuccess: refresh,
     onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
   });
@@ -131,7 +131,7 @@ export function TrashView() {
           <tbody>
             {entries.map((entry, index) => (
               <Tr
-                key={entry.path}
+                key={entry.name}
                 className="animate-rise-in stagger"
                 style={staggerStyle(index)}
               >
@@ -155,10 +155,10 @@ export function TrashView() {
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={() => restore.mutate(entry.path)}
+                    onClick={() => restore.mutate(entry.name)}
                     // Every row waits while one restores, but only the row
                     // that was clicked shows the spinner.
-                    loading={restore.isPending && restore.variables === entry.path}
+                    loading={restore.isPending && restore.variables === entry.name}
                     disabled={restore.isPending}
                   >
                     <ArchiveRestore className="h-3.5 w-3.5" aria-hidden />

@@ -25,6 +25,12 @@
 //! access" belongs to the slice, SFTP and cron modules, which read the same
 //! subscription status — that seam is theirs, not duplicated here.
 //!
+//! Node app units are the exception to that, and [`switch_all_apps`] does stop
+//! them: unlike an FPM pool, a Node app is a long-running process of the
+//! tenant's own that does not need nginx to keep burning the box's RAM and CPU
+//! and to keep making outbound connections. A maintenance page in front of it
+//! changes nothing about that.
+//!
 //! Panel *login* blocking is separate on purpose: it keys off `users.status`
 //! (see `sessions.rs` and the agent's `verify_auth`), not the subscription. A
 //! customer whose subscription is suspended for non-payment must still be able
@@ -36,7 +42,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_core::{
-    ErrorCode, LinuxUser, Permission, PlanId, Result, SubscriptionId, TenantScope, UnihelmError,
+    AppName, ErrorCode, LinuxUser, Permission, PlanId, Result, SubscriptionId, TenantScope,
+    UnihelmError,
 };
 use unihelm_db::plans::NewPlan;
 use unihelm_db::sites::{Site, SiteStatus};
@@ -634,6 +641,78 @@ async fn switch_all_vhosts(
     Ok(switched)
 }
 
+/// Take the subscription's Node app units down with it, or bring them back.
+///
+/// `switch_all_vhosts` reaches nginx and nothing else, and a Node app does not
+/// need nginx to go on running (module docs). Spec §6.4 asks for the tenant's
+/// processes to stop, not just their vhosts.
+///
+/// `disable`/`enable`, not `stop`/`start`: a reboot must not resurrect a
+/// suspended tenant's app. And the *apps* rather than `unihelm-<user>.slice`,
+/// even though the slice is what the spec names — the slice also holds the
+/// tenant's FPM workers and cron jobs, and killing pool workers out from under
+/// the php-fpm master is a worse outcome than the bug this closes.
+///
+/// Best effort per unit, and deliberately not fallible: both callers are
+/// idempotent, so a re-run converges, and a unit systemd never loaded must not
+/// be able to fail a suspension that has already been written to the database.
+async fn switch_all_apps(ctx: &OpContext, subscription: &Subscription, running: bool) {
+    let user = match LinuxUser::parse(&subscription.linux_user) {
+        Ok(user) => user,
+        Err(e) => {
+            ctx.log(format!("could not read the subscription's Linux user: {e}"));
+            return;
+        }
+    };
+    // The subscription's own scope, for the same reason `switch_all_vhosts`
+    // uses it: these must be exactly its apps, however wide the caller sees.
+    let scope = TenantScope::Subscription {
+        subscription_id: subscription.id,
+        customer_id: subscription.customer_id,
+    };
+    let apps = match ctx.db().node_apps(&scope).list(500, 0).await {
+        Ok(apps) => apps,
+        Err(e) => {
+            ctx.log(format!("could not list the subscription's apps: {e}"));
+            return;
+        }
+    };
+
+    for app in apps {
+        // `enabled` is the row's record of whether the app is meant to run at
+        // all. Suspension does not rewrite it — the same reasoning as the
+        // site flags `switch_all_vhosts` leaves alone — so reinstating a
+        // tenant must not start an app the row says is down.
+        if running && !app.enabled {
+            continue;
+        }
+        let name = match AppName::parse(&app.name) {
+            Ok(name) => name,
+            Err(e) => {
+                ctx.log(format!("app {}: unusable name ({e}); skipped", app.id));
+                continue;
+            }
+        };
+        let unit = crate::nodeapp::app_unit_name(&user, &name);
+        let outcome = if running {
+            ctx.distro().svc.enable(&unit, true).await
+        } else {
+            ctx.distro().svc.disable(&unit, true).await
+        };
+        match outcome {
+            Ok(()) => ctx.log(format!(
+                "{unit}: {}",
+                if running {
+                    "running again"
+                } else {
+                    "stopped and disabled"
+                }
+            )),
+            Err(e) => ctx.log(format!("{unit}: could not be switched ({e}); continuing")),
+        }
+    }
+}
+
 pub struct Suspend {
     vhosts: Arc<dyn VhostSwitcher>,
 }
@@ -706,6 +785,12 @@ impl TypedOperation for Suspend {
             "subscription {} suspended: {reason}",
             subscription.id
         ));
+
+        // Before the vhosts, for the same reason the status write comes before
+        // both: `switch_all_vhosts` reports a failed render by returning, and
+        // a tenant whose nginx render fails must still have their processes
+        // stopped.
+        switch_all_apps(ctx, &subscription, false).await;
 
         let sites_switched =
             switch_all_vhosts(ctx, self.vhosts.as_ref(), &subscription, true).await?;
@@ -780,6 +865,10 @@ impl TypedOperation for Unsuspend {
             .await
             .map_err(UnihelmError::from)?;
         ctx.log(format!("subscription {} reinstated", subscription.id));
+
+        // Apps before vhosts on the way up: a proxy vhost pointed at a port
+        // nothing is listening on 502s for as long as the start takes.
+        switch_all_apps(ctx, &subscription, true).await;
 
         // force_maintenance = false: each vhost renders from the site's own
         // stored flags, so a site the tenant had put in maintenance themselves
@@ -1252,6 +1341,64 @@ mod tests {
         )
         .await
         .expect("a customer with a suspended subscription can still use the panel");
+    }
+
+    #[tokio::test]
+    async fn suspension_stops_the_tenants_node_apps_and_reinstatement_starts_them() {
+        // A maintenance page only closes the nginx door. A Node app is the
+        // tenant's own long-running process: left up, a suspended tenant keeps
+        // the box's RAM and CPU and keeps making outbound connections
+        // (spec §6.4 stops the tenant's processes, not just their vhosts).
+        use unihelm_db::node_apps::{NewNodeApp, NodeEnv};
+        use unihelm_distro::svc::SvcAction;
+
+        let (reg, admin, customer) = registry().await;
+        let db = db_of(&reg);
+        let sub = db.create_subscription(customer).await.unwrap();
+        db.create_node_app(NewNodeApp {
+            subscription_id: sub.id,
+            name: AppName::parse("blog").unwrap(),
+            entry: unihelm_core::TenantPath::parse("apps/blog/server.js").unwrap(),
+            node_env: NodeEnv::Production,
+            runtime_version: None,
+        })
+        .await
+        .unwrap();
+
+        let unit = crate::nodeapp::app_unit_name(
+            &LinuxUser::parse(&sub.linux_user).unwrap(),
+            &AppName::parse("blog").unwrap(),
+        );
+        let svc = &reg.services().distro.svc;
+        svc.action(&unit, SvcAction::Start).await.unwrap();
+        assert!(svc.status(&unit).await.unwrap().is_active());
+
+        let auth = auth_for(admin, Role::Admin);
+        reg.dispatch(
+            "subscription.suspend",
+            &auth,
+            json!({ "subscription_id": sub.id.get(), "reason": "unpaid" }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !svc.status(&unit).await.unwrap().is_active(),
+            "a suspended tenant's app must not keep running"
+        );
+
+        reg.dispatch(
+            "subscription.unsuspend",
+            &auth,
+            json!({ "subscription_id": sub.id.get() }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            svc.status(&unit).await.unwrap().is_active(),
+            "reinstating a tenant must bring their app back, not leave it down"
+        );
     }
 
     #[tokio::test]

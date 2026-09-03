@@ -260,6 +260,70 @@ pub async fn relay_test(
     Ok(Json(data))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DnsPublishRequest {
+    /// Write the records. Without it the call reports what it would do.
+    #[serde(default)]
+    pub apply: bool,
+}
+
+/// Publish the mail DNS records into the configured provider's zone.
+#[utoipa::path(
+    post,
+    path = "/api/mail/dns/publish",
+    tag = "mail",
+    request_body = DnsPublishRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "What was written, or would be", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.manage`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn dns_publish(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<DnsPublishRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+
+    // Audited only when it writes. A dry run reads the relay row and the zone
+    // and changes nothing, and an audit log that cannot be told apart from a
+    // real one is a log nobody can answer "who changed my DNS" from.
+    if body.apply {
+        state
+            .db
+            .record_audit(NewAuditEntry {
+                actor_user_id: Some(current.user.id),
+                actor_username: current.user.username.as_str().to_string(),
+                impersonator_id: current.session.impersonator_id,
+                ip: Some(client_ip(Some(&peer), &headers)),
+                action: "mail.dns.publish".into(),
+                target: None,
+                detail: json!({}),
+                request_id: Some(current.auth.request_id.clone()),
+                subscription_id: current.auth.tenant_scope.subscription_id(),
+            })
+            .await
+            .map_err(ApiError::from)?;
+    }
+
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "mail.dns.publish",
+        json!({ "apply": body.apply }),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

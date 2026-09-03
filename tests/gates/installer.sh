@@ -91,6 +91,28 @@ else
   fail "$web_unit should drop all capabilities"
 fi
 
+# Same lesson as RuntimeDirectory=, learned the other way round. systemd
+# recursively chowns an exec directory it finds owned by somebody other than the
+# unit's user, and /var/log/unihelm is created for `unihelm` by create_layout.
+# With both units declaring it, the root agent rewrote the whole tree on every
+# start and the web process rewrote it back: the per-site log directories lost
+# the tenant group that lets a customer read their own access log, and the WAF
+# audit log ended up owned by the internet-facing account. Nothing fails to
+# start, which is why only an assertion catches it.
+if grep -qE '^LogsDirectory=' "$agent_unit"; then
+  fail "$agent_unit claims /var/log/unihelm as root; every start then chowns
+  the site log directories and the WAF audit log away from their owners"
+else
+  ok "the agent leaves /var/log/unihelm to the account that owns it"
+fi
+
+if grep -qE '^LogsDirectory=unihelm$' "$web_unit"; then
+  ok "the web unit still guarantees /var/log/unihelm exists for its ReadWritePaths"
+else
+  fail "$web_unit lists /var/log/unihelm in ReadWritePaths= without a \`-\`, so
+  something has to create it: keep LogsDirectory=unihelm here"
+fi
+
 # --- 4. both scripts parse --------------------------------------------------
 for script in installer/preflight.sh installer/install.sh tests/gates/*.sh; do
   if bash -n "$script"; then ok "$script parses"; else fail "$script has a syntax error"; fi
@@ -106,6 +128,51 @@ for check in cleanup parse_args; do
     fail "install.sh: $check returns non-zero — under \`set -e\` this kills the installer silently"
   fi
 done
+
+# --- 5b. the release path installs the files that came with the binaries -----
+# `write_configuration` and `install_units` read config.toml.example, the two
+# units and the tmpfiles fragment from `$here` — the directory the script was
+# run from. On the documented `sudo installer/install.sh` that is a clone, and
+# re-running the installer is the only upgrade path there is, so the clone can
+# be many releases behind while the binaries it just downloaded are current.
+# Every one of those files is inside the verified tarball too, so `here` has to
+# move there once the release is on disk.
+#
+# Everything main() does to the machine is replaced; `install_units` reports the
+# directory the units would have come from and installs nothing. The answer is
+# picked out by its marker rather than by position, because what main prints
+# after it is not this assertion's business.
+# shellcheck disable=SC2030,SC2031,SC2329
+release_here="$(
+  . installer/install.sh
+  run_preflight() { :; }
+  create_service_account() { :; }
+  install_binaries() { :; }
+  create_layout() { :; }
+  write_configuration() { :; }
+  install_units() { printf 'units-from %s\n' "$here"; }
+  open_panel_port() { :; }
+  create_first_admin() { :; }
+  print_summary() { :; }
+  download_and_verify_release() {
+    local root="$1/unpacked/unihelm-0.0.0-gate"
+    mkdir -p "$root/systemd" "$root/bin"
+    touch "$root/install.sh" "$root/preflight.sh" "$root/config.toml.example" \
+      "$root/systemd/unihelm-agentd.service" "$root/systemd/unihelm-web.service"
+    STAGED_BIN_DIR="$root/bin"
+  }
+  main 2>/dev/null || true
+)"
+release_here="$(printf '%s\n' "$release_here" | sed -n 's/^units-from //p')"
+case "$release_here" in
+  */unpacked/unihelm-0.0.0-gate)
+    ok "the release path takes its units and config template from the verified tarball" ;;
+  "")
+    fail "the release path never reached install_units" ;;
+  *)
+    fail "the release path would install units from '$release_here' — files that
+  came with whatever checkout ran the installer, not with the binaries it verified" ;;
+esac
 
 # --- 6. release identity: architecture and version --------------------------
 # `uname -m` says amd64 on some images and arm64 on others. Getting this wrong
@@ -604,6 +671,51 @@ if printf '%s' "$piped_loop" | grep -q 'refusing to loop'; then
   ok "the bootstrap refuses to re-enter itself"
 else
   fail "a re-entered bootstrap was not refused: ${piped_loop:-<nothing>}"
+fi
+
+# --- 10. the documented uninstall -------------------------------------------
+# The uninstall in docs/operator/install.md offered to delete /var/lib/unihelm
+# and /var/log/unihelm while leaving the nginx includes, the PHP-FPM pools and
+# the logrotate files that name those trees on disk. nginx opens certificates,
+# ModSecurity rules and log files at configuration load, so the server kept
+# serving and only fell over at the next reload or reboot — by which time the
+# panel that could have explained it was gone. The rendered configuration has to
+# come out first, which is an ordering claim, so it is asserted as one.
+uninstall_doc=docs/operator/install.md
+uninstall="$(awk '/^## Uninstalling/,0' "$uninstall_doc")"
+
+if [ -z "$uninstall" ]; then
+  fail "$uninstall_doc no longer has an Uninstalling section"
+else
+  for leftover in \
+    '/etc/nginx/conf.d/unihelm.conf' \
+    '/etc/nginx/unihelm.d/' \
+    '/etc/logrotate.d/unihelm-' \
+    'pool.d/unihelm-'
+  do
+    if printf '%s\n' "$uninstall" | grep -qF "$leftover"; then
+      ok "the documented uninstall removes $leftover"
+    else
+      fail "the documented uninstall leaves $leftover on the server, still naming
+  the certificates and log directories it tells the operator to delete"
+    fi
+  done
+
+  if printf '%s\n' "$uninstall" | grep -qF 'nginx -t'; then
+    ok "the documented uninstall checks nginx before walking away"
+  else
+    fail "the documented uninstall never runs \`nginx -t\`, so a server left
+  unable to reload is not discovered until it reboots"
+  fi
+
+  footprint="$(printf '%s\n' "$uninstall" | grep -nF '/etc/nginx/unihelm.d/' | head -n 1 | cut -d: -f1)"
+  state="$(printf '%s\n' "$uninstall" | grep -nF 'rm -rf /etc/unihelm' | head -n 1 | cut -d: -f1)"
+  if [ -n "$footprint" ] && [ -n "$state" ] && [ "$footprint" -lt "$state" ]; then
+    ok "the rendered configuration comes out before the state it points at"
+  else
+    fail "the documented uninstall deletes /var/lib/unihelm and /var/log/unihelm
+  before removing the nginx configuration that references them"
+  fi
 fi
 
 echo

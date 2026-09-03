@@ -57,8 +57,7 @@ export interface SearchResponse {
 }
 
 export interface TrashEntry {
-  /** Path of the item inside the recycle bin — what restore/purge act on. */
-  path: string;
+  /** The entry's name inside the bin — what restore addresses it by. */
   name: string;
   kind: FileKind;
   size: number;
@@ -169,7 +168,7 @@ export const filesApi = {
   extract: (archive: string, dest: string) =>
     api.post<Partial<TaskAccepted>>("/api/files/extract", { archive, dest }),
   trash: () => api.get<TrashResponse>("/api/files/trash"),
-  trashRestore: (path: string) => api.post<unknown>("/api/files/trash/restore", { path }),
+  trashRestore: (name: string) => api.post<unknown>("/api/files/trash/restore", { name }),
   trashPurge: (olderThanDays: number) =>
     api.post<unknown>("/api/files/trash/purge", { older_than_days: olderThanDays }),
 };

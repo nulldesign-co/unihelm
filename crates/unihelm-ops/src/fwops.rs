@@ -32,8 +32,10 @@
 //! default false). A fresh install has no allowlist, may be reached through a
 //! NAT that makes an entire office look like one address, and belongs to
 //! somebody who has not yet read this page. Banning on such a server is a
-//! coin-flip on locking out its owner, so the scheduled tick returns
-//! immediately — before it reads a single log line — unless the switch is on.
+//! coin-flip on locking out its owner, so the scheduled tick bans nobody —
+//! and reads no log line at all — unless the switch is on. It still lifts the
+//! bans whose time has passed, because switching the defence off must not be
+//! the thing that makes its bans permanent.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -387,10 +389,30 @@ pub struct AuthFailure {
 
 /// The argv for one journal read.
 ///
-/// `+` is journalctl's OR between match groups, so both the Debian (`ssh`) and
-/// RHEL (`sshd`) unit names are covered by one call — the alternative, running
-/// journalctl twice, doubles the cost on every tick for a unit that exists on
-/// only one family.
+/// `+` is journalctl's OR between match groups, so one call covers every shape
+/// an sshd authentication record arrives in — the alternative, running
+/// journalctl once per shape, multiplies the cost of every tick.
+///
+/// It takes four groups because the unit names alone do not find the records on
+/// a current distribution. Debian 13 and Ubuntu 24.04 socket-activate sshd, so
+/// the connection that fails a password is logged under a per-connection
+/// `ssh@N-<addr>.service`, which matches neither `ssh.service` nor `sshd.service`;
+/// and OpenSSH 10 splits the authenticating half into `sshd-session`, which
+/// carries its own syslog identifier. Missing them is silent by construction —
+/// no matches is not an error, so Sentinel simply reported nothing to do while
+/// the SSH jail defended nothing.
+///
+/// The identifier groups pair with `_UID=0`, which is what keeps them from
+/// turning Sentinel into a weapon. `SYSLOG_IDENTIFIER` is whatever the sender
+/// claimed, so on a panel host — which by design has unprivileged system users
+/// for the sites it hosts — `logger -t sshd "Failed password for root from
+/// <victim> port 22 ssh2"` repeated past the threshold would ban an address of
+/// the forger's choosing. `_UID` is journald's own, taken from the socket
+/// credentials and unforgeable, and OpenSSH relays every pre-auth log line
+/// through its privileged monitor precisely because the chrooted child cannot
+/// reach `/dev/log` — so a genuine failure is always uid 0. Matches for
+/// different fields are ANDed within a group, which is what makes the pairing
+/// hold.
 ///
 /// The timestamp is absolute and explicitly UTC. journalctl reads a bare
 /// timestamp in the host's local zone, and a panel that quietly asked for the
@@ -402,6 +424,12 @@ pub fn journal_argv(since: OffsetDateTime) -> Vec<String> {
         "json".into(),
         "--since".into(),
         format_journal_since(since),
+        "SYSLOG_IDENTIFIER=sshd".into(),
+        "_UID=0".into(),
+        "+".into(),
+        "SYSLOG_IDENTIFIER=sshd-session".into(),
+        "_UID=0".into(),
+        "+".into(),
         "_SYSTEMD_UNIT=sshd.service".into(),
         "+".into(),
         "_SYSTEMD_UNIT=ssh.service".into(),
@@ -1159,12 +1187,16 @@ impl TypedOperation for SettingsSet {
 /// Returns a one-line summary for the scheduler's log, empty when there was
 /// nothing to do — the same contract the other scheduled jobs use.
 ///
-/// **It is a no-op while `sentinel.enabled` is false, and that check comes
-/// first, before a single log line is read.** A fresh install has no
-/// allowlist, may sit behind a NAT that makes a whole office look like one
-/// address, and belongs to an operator who has not configured anything yet.
-/// Banning under those conditions is a coin-flip on locking the owner out of
-/// their own server, so the tick simply returns (spec §11.9).
+/// **It bans nothing while `sentinel.enabled` is false, and that check comes
+/// before a single log line is read.** A fresh install has no allowlist, may
+/// sit behind a NAT that makes a whole office look like one address, and
+/// belongs to an operator who has not configured anything yet. Banning under
+/// those conditions is a coin-flip on locking the owner out of their own
+/// server, so the tick simply returns (spec §11.9).
+///
+/// It still releases the bans it already took, because turning the defence off
+/// must not be what makes its bans permanent: ufw has no expiry of its own, so
+/// this reaper is the only thing that ever lifts a ufw ban.
 pub async fn sentinel_tick(ctx: &OpContext) -> Result<String> {
     sentinel_tick_with(ctx, &SystemJournal).await
 }
@@ -1174,15 +1206,17 @@ pub async fn sentinel_tick(ctx: &OpContext) -> Result<String> {
 pub async fn sentinel_tick_with(ctx: &OpContext, journal: &dyn JournalReader) -> Result<String> {
     let db = ctx.db();
     let settings = SentinelSettings::load(db).await;
-    if !settings.enabled {
-        return Ok(String::new());
-    }
 
     let mut notes = Vec::new();
 
     // 1. Catch the bookkeeping up with the kernel. The firewalld and nftables
     //    backends expire their own set entries, so this mostly closes rows;
     //    for ufw, which has no expiry, it is what actually ends the ban.
+    //
+    //    Ahead of the `enabled` check on purpose: switching Sentinel off is not
+    //    a decision to keep its bans forever, and on ufw nothing else lifts
+    //    them, so the operator would be left unbanning by hand, one address at
+    //    a time, for as long as the rows lived.
     let expired = db.expired_bans().await.map_err(UnihelmError::from)?;
     let mut lifted = 0usize;
     for ban in &expired {
@@ -1200,6 +1234,10 @@ pub async fn sentinel_tick_with(ctx: &OpContext, journal: &dyn JournalReader) ->
     }
     if lifted > 0 {
         notes.push(format!("lifted {lifted} expired ban(s)"));
+    }
+
+    if !settings.enabled {
+        return Ok(notes.join(", "));
     }
 
     // 2. Collect failures from both jails the spec asks for: sshd via the
@@ -1499,7 +1537,16 @@ not json at all
     }
 
     #[test]
-    fn the_journal_argv_is_a_single_or_matched_utc_query() {
+    fn the_journal_query_finds_sshd_however_the_host_runs_it() {
+        // The unit names alone miss the two shapes current distributions ship:
+        // socket-activated sshd logs under `ssh@N-<addr>.service`, and OpenSSH 10
+        // authenticates in `sshd-session`. Both carry a syslog identifier, so
+        // the identifier groups are what keep the SSH jail seeing anything on
+        // Debian 13 and Ubuntu 24.04.
+        //
+        // Each of those groups is pinned to `_UID=0` as well: an identifier is
+        // whatever the sender claimed, so without it any local user could
+        // `logger -t sshd` a burst of failures and pick who gets banned.
         let since = OffsetDateTime::from_unix_timestamp(1_756_209_600).unwrap();
         assert_eq!(
             journal_argv(since),
@@ -1509,6 +1556,12 @@ not json at all
                 "json",
                 "--since",
                 "2025-08-26 12:00:00 UTC",
+                "SYSLOG_IDENTIFIER=sshd",
+                "_UID=0",
+                "+",
+                "SYSLOG_IDENTIFIER=sshd-session",
+                "_UID=0",
+                "+",
                 "_SYSTEMD_UNIT=sshd.service",
                 "+",
                 "_SYSTEMD_UNIT=ssh.service",
@@ -1960,7 +2013,7 @@ not json at all
     }
 
     #[tokio::test]
-    async fn the_scan_does_nothing_at_all_while_sentinel_is_disabled() {
+    async fn a_disabled_sentinel_never_reads_the_journal_or_bans_anyone() {
         // Not "reads the journal and declines to ban" — it must not even look,
         // because a fresh install is exactly the server most likely to have an
         // operator behind an address that looks like an attacker.
@@ -1971,6 +2024,39 @@ not json at all
         assert_eq!(sentinel_tick_with(&ctx, &journal).await.unwrap(), "");
         assert_eq!(journal.reads(), 0, "the journal must not be read at all");
         assert!(reg.services().db.recent_bans(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_sentinel_still_releases_the_bans_it_already_took() {
+        // Turning the defence off is not a decision to keep its bans forever,
+        // and on ufw — the Debian default — this reaper is the only thing that
+        // ever ends one, so skipping it made every live ban permanent.
+        let (reg, ..) = registry().await;
+        let db = &reg.services().db;
+        db.record_ban(
+            "198.51.100.9",
+            "ssh",
+            Some(unihelm_db::now() - Duration::minutes(1)),
+        )
+        .await
+        .unwrap();
+
+        let journal = FakeJournal::new(journal_with("203.0.113.5", 20));
+        let ctx = context(&reg).await;
+        let summary = sentinel_tick_with(&ctx, &journal).await.unwrap();
+
+        assert!(summary.contains("lifted 1"), "{summary}");
+        assert!(db.active_bans().await.unwrap().is_empty());
+        assert_eq!(
+            journal.reads(),
+            0,
+            "releasing what it took is not licence to go looking for more"
+        );
+        assert_eq!(
+            db.recent_bans(10).await.unwrap().len(),
+            1,
+            "a disabled tick must not add a ban of its own"
+        );
     }
 
     async fn enable(reg: &crate::OpRegistry, settings: SentinelSettings) {

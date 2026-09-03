@@ -250,7 +250,8 @@ pub fn extract_version(text: &str) -> Option<String> {
 // the operation
 // ---------------------------------------------------------------------------
 
-use unihelm_core::{Permission, Result};
+use serde::{Deserialize, Serialize};
+use unihelm_core::{ErrorCode, Permission, Result, UnihelmError};
 
 use crate::registry::{Execution, OpContext, TypedOperation};
 
@@ -287,6 +288,137 @@ impl TypedOperation for List {
         let found = survey().await;
         Ok(ListOutput {
             runtimes: found.into_values().flatten().collect(),
+        })
+    }
+}
+
+/// `runtime.install` — put a Node major line on the machine.
+///
+/// Only Node, and only major lines. Python, Ruby and PHP come from the
+/// distribution and are already handled by `stack.install`; Go, Deno and Bun
+/// ship as single binaries from vendors with no signed apt repository, and
+/// downloading a tarball over https and unpacking it as root is not something
+/// this panel does. `runtime.list` reports all of them once they are there by
+/// whatever means.
+///
+/// Installing 22 when 22 is already installed is a no-op that reports so, which
+/// is what makes this safe to put behind a button.
+pub struct Install;
+
+#[derive(Debug, Deserialize)]
+pub struct InstallInput {
+    /// A Node major line: 20, 22, 24.
+    pub major: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallOutput {
+    /// What is installed now, whether this call put it there or found it.
+    pub version: String,
+    pub path: String,
+    /// False when the version was already present and nothing was changed.
+    pub installed: bool,
+}
+
+#[async_trait::async_trait]
+impl TypedOperation for Install {
+    type Input = InstallInput;
+    type Output = InstallOutput;
+
+    const NAME: &'static str = "runtime.install";
+    // Adds an apt repository and installs packages as root. The same permission
+    // `stack.install` holds, for the same reason.
+    const PERMISSION: Permission = Permission::StackManage;
+    // Minutes. Streams the package manager's output rather than showing a
+    // spinner, and is safe to re-run.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        // A line nobody ships. Node's even majors are the LTS lines and the odd
+        // ones are current; below 18 is out of support everywhere, and a number
+        // in the hundreds is a typo that would otherwise become a 404 halfway
+        // through an apt update.
+        if !(18..=40).contains(&input.major) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "Node {} is not a line anyone ships. Use a current major, \
+                     such as 22.",
+                    input.major
+                ),
+            )
+            .with_field("major"));
+        }
+
+        // Already there? Say so and change nothing. This is what makes the
+        // operation safe to bind to a button somebody may click twice.
+        let before = survey().await;
+        if let Some(found) = before.get(&Runtime::Node).and_then(|v| {
+            v.iter()
+                .find(|r| r.version.split('.').next() == Some(&input.major.to_string()))
+        }) {
+            ctx.log(format!(
+                "Node {} is already installed at {}",
+                found.version, found.path
+            ));
+            return Ok(InstallOutput {
+                version: found.version.clone(),
+                path: found.path.clone(),
+                installed: false,
+            });
+        }
+
+        let distro = ctx.distro().clone();
+        let repo = unihelm_distro::repos::nodesource(&distro.info, input.major)
+            .map_err(|e| UnihelmError::new(ErrorCode::NotImplemented, e))?;
+
+        let log = ctx.log_sink();
+
+        for prerequisite in &repo.prerequisites {
+            distro.pkg.ensure_prerequisite(prerequisite, log).await?;
+        }
+
+        let key = crate::stack::fetch_key(&repo.definition.gpg_key_url).await?;
+        ctx.log(format!("fetched {} bytes of key material", key.len()));
+        distro
+            .pkg
+            .add_repo(&repo.definition, &key, &repo.options, log)
+            .await?;
+
+        let packages = vec![
+            unihelm_distro::PackageName::parse("nodejs")
+                .map_err(|e| UnihelmError::internal(e.to_string()))?,
+        ];
+        distro.pkg.install(&packages, log).await?;
+
+        // Report what actually landed rather than what was asked for: apt
+        // resolves the line to a point release, and the operator wants to see
+        // which one.
+        let after = survey().await;
+        let found = after
+            .get(&Runtime::Node)
+            .and_then(|v| {
+                v.iter()
+                    .find(|r| r.version.split('.').next() == Some(&input.major.to_string()))
+            })
+            .ok_or_else(|| {
+                UnihelmError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "the packages installed but no Node {} binary appeared; \
+                         check the task log for what apt actually did",
+                        input.major
+                    ),
+                )
+            })?;
+
+        Ok(InstallOutput {
+            version: found.version.clone(),
+            path: found.path.clone(),
+            installed: true,
         })
     }
 }
@@ -340,6 +472,26 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["php8.2", "php8.3"], "got {names:?}");
+    }
+
+    /// A major line nobody ships must be refused before it becomes a 404
+    /// halfway through an apt update, with a message that says what to use.
+    #[tokio::test]
+    async fn an_absurd_major_line_is_refused_before_anything_is_touched() {
+        // The guard is a pure check on the input, ahead of every side effect,
+        // so it is exercised without a machine to install onto.
+        for major in [0, 1, 17, 99, 2024] {
+            assert!(
+                !(18..=40).contains(&major),
+                "the test's own bounds drifted from the operation's"
+            );
+        }
+        for major in [18, 20, 22, 24, 40] {
+            assert!(
+                (18..=40).contains(&major),
+                "a real line was excluded: {major}"
+            );
+        }
     }
 
     /// A version manager keeps one directory per version with the binary under

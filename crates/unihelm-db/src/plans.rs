@@ -140,6 +140,19 @@ impl Db {
         Ok(count)
     }
 
+    /// How many databases count against a subscription's `max_dbs`.
+    ///
+    /// Database users are not counted: `max_dbs` is a count of databases, and
+    /// the panel routinely creates several users per database.
+    pub async fn quota_db_count(&self, id: SubscriptionId) -> Result<i64> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM dbs WHERE subscription_id = ?1")
+                .bind(id.get())
+                .fetch_one(self.pool())
+                .await?;
+        Ok(count)
+    }
+
     /// How many subscriptions are on a plan — the delete-refusal number.
     pub async fn subscriptions_on_plan(&self, id: PlanId) -> Result<i64> {
         let (count,): (i64,) =

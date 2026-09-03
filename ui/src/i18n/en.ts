@@ -34,6 +34,10 @@ export const en = {
     hidePassword: "Hide password",
   },
   nav: {
+    runtimes: "Runtimes",
+    docker: "Docker",
+    discover: "Discovered sites",
+    settings: "Settings",
     dashboard: "Dashboard",
     stack: "Stack",
     sites: "Sites",
@@ -232,6 +236,53 @@ export const en = {
       removing: "Removing",
     },
   },
+  runtimes: {
+    title: "Runtimes",
+    subtitle: "What this server can run, and which version a bare command gets.",
+    scope:
+      "This page reads the machine. Node is the only runtime it installs, and PHP is the only other one Unihelm installs anywhere — from the Stack page. Python and Ruby are distribution packages no page here has a button for, and Go, Deno and Bun ship as single binaries from vendors with no signed repository, so those five have to reach this server by other means. Everything installed is listed here, whatever put it there.",
+    scopeStack: "Open the Stack page",
+    listTitle: "Installed",
+    defaultHint:
+      "The version marked on its row is the one a bare command name resolves to — what a cron line saying node runs, and what an app created without a pinned version gets. Every other version is reachable only by the absolute path beside it.",
+    runtime: "Runtime",
+    version: "Version",
+    path: "Path",
+    resolvesHere: "{{command}} resolves here",
+    emptyTitle: "No runtimes found",
+    empty:
+      "Not one of the seven interpreters the panel looks for is on this server. Install a Node line above, or PHP from the Stack page.",
+    missingTitle: "Not on this server",
+    missingHint: "The panel looked for these and found no version of any of them.",
+    name: {
+      node: "Node.js",
+      python: "Python",
+      php: "PHP",
+      ruby: "Ruby",
+      go: "Go",
+      deno: "Deno",
+      bun: "Bun",
+    },
+    origin: {
+      node: "Installs from the card above, from NodeSource.",
+      python: "A distribution package, and one Unihelm has no button for on any page. Install it from the distribution yourself and it will be listed here.",
+      php: "A distribution package. The Stack page installs it, not this one.",
+      ruby: "A distribution package, and one Unihelm has no button for on any page. Install it from the distribution yourself and it will be listed here.",
+      go: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
+      deno: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
+      bun: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
+    },
+    install: {
+      title: "Install a Node line",
+      hint: "One major line at a time, from NodeSource, with the signing key pinned by fingerprint.",
+      major: "Major line",
+      line: "Node {{major}}",
+      submit: "Install",
+      already:
+        "Node {{major}} is already installed, at {{version}}. Installing it again reports that and changes nothing.",
+      note: "One repository per major line, never one that tracks the latest: an app pinned to 20 has to keep getting 20. apt resolves a line to a point release and the log below names the one that landed. Debian and Ubuntu only — the RPM side of NodeSource is not wired up here, so on a Red Hat family server the install refuses outright rather than half-working.",
+    },
+  },
   sites: {
     title: "Sites",
     subtitle: "Everything this server hosts.",
@@ -279,6 +330,95 @@ export const en = {
       active: "Live",
       suspended: "Suspended",
       failed: "Failed",
+    },
+  },
+  docker: {
+    title: "Docker",
+    subtitle: "Containers, images and volumes on this server.",
+    refresh: "Refresh",
+
+    readOnlyTitle: "Read-only",
+    readOnly:
+      "Unihelm reports what Docker has; it does not start or stop containers. A container with the daemon socket mounted is root on this machine, and keeping that from happening is the panel's job.",
+
+    absentTitle: "Docker is not installed",
+    absentHint:
+      "Nothing here until Docker is on this server. The Stack page can install it.",
+
+    daemonDownTitle: "The Docker daemon is not responding",
+    daemonDownHint:
+      "Docker is installed, but its daemon is not answering, so there is nothing to report.",
+    daemonDownNote: "systemctl status docker will say why.",
+
+    emptyTitle: "Docker has nothing yet",
+    emptyHint:
+      "The daemon is running and healthy, with no containers, images or volumes on it.",
+
+    containersTitle: "Containers",
+    containersHint: "Running and stopped. A stopped container still holds its disk.",
+    container: "Container",
+    status: "Status",
+    ports: "Ports",
+    noPorts: "None published",
+    running: "Running",
+    stopped: "Stopped",
+    runningOf: "{{running}} of {{total}} running",
+    noContainers: "No containers",
+    noContainersHint: "Nothing has been created on this daemon yet.",
+
+    imagesTitle: "Images",
+    imagesHint: "What is pulled or built on this server.",
+    image: "Image",
+    repository: "Repository",
+    tag: "Tag",
+    size: "Size",
+    noImages: "No images",
+    noImagesHint: "Nothing has been pulled or built here.",
+
+    volumesTitle: "Volumes",
+    volumesHint: "Where containers keep data that outlives them.",
+    volume: "Volume",
+    driver: "Driver",
+    noVolumes: "No volumes",
+    noVolumesHint: "No container on this server has been given one.",
+  },
+  discover: {
+    title: "Already on this server",
+    subtitle: "The sites nginx is serving that Unihelm did not create.",
+    rescan: "Read again",
+    readOnlyTitle: "This page only reads",
+    readOnly:
+      "The panel did not write any of these and does not manage them. Adopting one is not possible yet, so every row carries the file it came from — that file, not this page, is where the site is configured.",
+    foundTitle: "{{count}} site is already being served here",
+    foundTitle_other: "{{count}} sites are already being served here",
+    foundHint:
+      "Read just now from /etc/nginx/conf.d and /etc/nginx/sites-enabled, not from anything the panel stores. No include is followed, so a vhost kept anywhere else is not counted here.",
+    nginxVersion: "nginx {{version}}",
+    emptyTitle: "Nothing here that Unihelm did not write",
+    emptyHint:
+      "No vhost in /etc/nginx/conf.d or /etc/nginx/sites-enabled outside the panel's own. A server that has not hosted anything before looks exactly like this.",
+    emptyNoNginx:
+      "nginx did not answer when asked for its version, which usually means it is not installed yet. Install it from the Stack page, and anything already configured will appear here.",
+    alsoAnswers: "Also answers for",
+    root: "Document root",
+    upstream: "Upstream",
+    fpm: "PHP-FPM",
+    certificate: "Certificate",
+    configFile: "Configured in",
+    tls: "Terminates TLS",
+    noTls: "No TLS",
+    unknownHint:
+      "This is a scan and not an nginx parser, and it could not tell what this vhost does. The file above is the authority.",
+    defaultServerTitle: "Something else already claims the default server",
+    defaultServer:
+      "nginx allows one default_server per listening address, so Unihelm's catchall leaves it alone rather than failing nginx -t and rolling back the stack install. Requests for a name nothing else matches keep going wherever they go today.",
+    defaultServerFiles: "Declared in:",
+    kind: {
+      php: "PHP",
+      static: "Static",
+      proxy: "Reverse proxy",
+      redirect: "Redirect",
+      unknown: "Unclassified",
     },
   },
   apps: {
@@ -1333,7 +1473,7 @@ export const en = {
     },
     dns: {
       title: "SPF, DKIM and DMARC",
-      hint: "The records the configured relay needs. Unihelm shows them; it does not publish or check them.",
+      hint: "The records the configured relay needs. Unihelm can put them in your zone once, if you ask; it does not keep them in step afterwards or check that they are still right.",
       noneTitle: "No records to publish yet",
       none: "Configure the relay first — which records are needed depends on which provider it is.",
       notManaged: "Not managed by Unihelm",
@@ -1341,6 +1481,41 @@ export const en = {
         "Only the relay provider can supply this. Copy the selector and value from their dashboard.",
       copy: "Copy",
       copied: "Copied",
+      publish: {
+        button: "Show what would change",
+        dryRunNote:
+          "Unihelm can write these into the zone your DNS provider holds. The button above only shows what it would write; nothing goes into the zone until you ask a second time.",
+        previewTitle: "Nothing has been written",
+        wouldCreate: "{{count}} record would be created.",
+        wouldCreate_other: "{{count}} records would be created.",
+        neverOverwrites:
+          "A record already on that name is reported and left exactly as it is. Two SPF records on one name is a permanent error rather than a merge, so an existing one is yours to correct at your provider.",
+        previewIsLocal:
+          "This plan was made without contacting your provider. A name Unihelm cannot find a zone for says so at the moment you publish, not before.",
+        apply: "Publish {{count}} record",
+        apply_other: "Publish {{count}} records",
+        nothingTitle: "Nothing here to publish",
+        nothing:
+          "None of these is a record Unihelm can write: each is either a value only your provider can supply or one that belongs to a sending domain rather than to this server. The rows above say which, and those are the ones to copy across by hand.",
+        appliedTitle: "Written into your zone",
+        partialTitle: "Some records were not written",
+        unchangedTitle: "Nothing needed writing",
+        created: "{{count}} record was created.",
+        created_other: "{{count}} records were created.",
+        createdNone:
+          "Nothing was written. Every record was either already on its name or one only your provider can supply — the rows above say which.",
+        stillNotManaged:
+          "Publishing is a write, not a subscription. Nothing keeps these in step afterwards, so come back here if you change the relay.",
+        failedHint:
+          "Each one says why on its row. Nothing was overwritten and nothing was half-written, so fixing the cause and publishing again is safe.",
+        outcome: {
+          "would-create": "Would create",
+          created: "Created",
+          exists: "Already there",
+          skipped: "Skipped",
+          failed: "Not written",
+        },
+      },
     },
   },
   branding: {
@@ -1381,6 +1556,68 @@ export const en = {
     save: "Save branding",
     saved: "Saved",
     noRestart: "Applies immediately — nothing restarts.",
+  },
+  settings: {
+    title: "Settings",
+    subtitle: "How the panel itself is reached, and how it looks.",
+    domain: {
+      title: "Panel domain",
+      hint: "Serve the panel on a name of your own, with a certificate from Let's Encrypt.",
+      noneTitle: "The panel has no domain",
+      noneHint:
+        "It is answering on this server's address, behind a certificate no browser trusts. Attaching a domain gives it a real one and puts its vhost live.",
+      open: "Open it",
+      daysLeft: "{{count}} day left on the certificate",
+      daysLeft_other: "{{count}} days left on the certificate",
+      expiredAgo: "The certificate has expired.",
+      lastError: "Last attempt:",
+      status: {
+        pending: "Issuing",
+        active: "Active",
+        superseded: "Superseded",
+        expired: "Expired",
+        failed: "Failed",
+        revoked: "Revoked",
+      },
+      beforeTitle: "Two things happen outside this panel",
+      beforeDns:
+        "The domain has to point at this server before you start. Let's Encrypt fetches a challenge from wherever the name resolves, so if that is not this machine the order fails, nothing is installed, and the panel keeps serving what it had.",
+      beforeMove:
+        "The panel's own address changes when this succeeds. nginx begins serving it on the new name, and the tab you are reading this in stays on the old one until you move it yourself.",
+      stagingTitle: "Nothing will be installed",
+      beforeStaging:
+        "A staging order is a rehearsal. The certificate it returns is never written to disk, the panel's vhost is not touched and nginx is not reloaded, so the address you are on now is the address you keep. Turn this off to actually move the panel.",
+      domainLabel: "Domain",
+      contactLabel: "Contact email",
+      contactHint:
+        "One name, not a wildcard — www is not added for you. The contact is where the CA sends expiry warnings; left empty, the panel gives it admin@ the domain above.",
+      required: "Enter the domain the panel should answer on.",
+      staging: "Use the staging directory",
+      stagingHint:
+        "Runs the whole order against Let's Encrypt's test directory, which proves DNS and the challenge work without spending rate-limit budget. Its root is not publicly trusted, so what comes back is thrown away rather than served.",
+      submit: "Attach domain",
+      reissue: "Re-issue certificate",
+      confirmTitle: "Move the panel to {{domain}}?",
+      confirmMove:
+        "As soon as the certificate is installed, nginx serves the panel here instead. This tab will still be talking to the old address; open the new one to carry on.",
+      confirmDns:
+        "Nothing checks DNS first. If {{domain}} does not already resolve to this server, the order fails and the panel goes on serving what it has.",
+      confirm: "Attach it",
+    },
+    theme: {
+      title: "Theme",
+      hint: "Stored in this browser, not on the server, so it does not follow you to another machine.",
+      legend: "Panel theme",
+      preview: "Preview",
+      light: "Light",
+      lightHint: "Always the light palette.",
+      dark: "Dark",
+      darkHint: "Always the dark palette.",
+      system: "System",
+      systemHint: "Follows this device, and changes when it does.",
+      systemNow: "Your device is asking for the {{mode}} theme right now.",
+      showing: "Showing the {{mode}} theme.",
+    },
   },
   error: {
     title: "Something went wrong",

@@ -105,6 +105,13 @@ const DOCKER_RPM_KEY: &str = "060A61C51B558A7F742B77AAC52FEB6B621E9F35";
 /// deb.sury.org. Surý extends this key rather than rotating it, so the
 /// fingerprint has been stable since 2019 — but the key *blob* changes on each
 /// renewal, which is exactly why we pin the fingerprint and not a file hash.
+/// NodeSource's signing key.
+///
+/// Published in NodeSource's own installation instructions, which is the only
+/// place it appears — the project does not cross-publish it anywhere a second
+/// source could corroborate, hence `SingleSource`.
+const NODESOURCE_KEY: &str = "6F71F525282841EEDAF851B42F59B5F99B1BE0B4";
+
 const SURY_KEY: &str = "15058500A0235D97F5D10063B188E2B695BD4743";
 
 /// Remi's key is chosen per EL major version, not per repository.
@@ -549,6 +556,45 @@ pub fn pgdg(info: &DistroInfo) -> Result<ResolvedRepo, String> {
 }
 
 /// Every repository Unihelm knows how to add on this machine.
+/// NodeSource, for a specific Node major line.
+///
+/// One repository per major version rather than one that tracks "latest": an
+/// application pinned to 20 must keep getting 20, and a repository that moved
+/// it to 22 under an unattended upgrade would be the panel breaking a tenant's
+/// site on its own schedule.
+///
+/// Debian family only. NodeSource's RPM repositories exist but are laid out per
+/// distribution release in a way that needs its own handling, and offering a
+/// half-supported path is worse than saying plainly that it is not here.
+pub fn nodesource(info: &DistroInfo, major: u32) -> Result<ResolvedRepo, String> {
+    match info.family {
+        Family::Debian => Ok(ResolvedRepo {
+            definition: RepoDefinition {
+                id: format!("nodesource-{major}"),
+                display_name: format!("NodeSource Node.js {major}.x"),
+                base_url: format!("https://deb.nodesource.com/node_{major}.x"),
+                // NodeSource publishes a single `nodistro` suite that serves
+                // every Debian and Ubuntu release, rather than one per codename.
+                suite: Some("nodistro".into()),
+                components: vec!["main".into()],
+                gpg_key_url: "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key".into(),
+                accepted_fingerprints: vec![NODESOURCE_KEY.to_string()],
+            },
+            provenance: Provenance::SingleSource,
+            source: "NodeSource's own installation instructions, the only place the \
+                     fingerprint is published"
+                .into(),
+            options: Vec::new(),
+            prerequisites: Vec::new(),
+        }),
+        Family::Rhel => Err(format!(
+            "NodeSource packages for {} are not set up here; install Node from the \
+             distribution's own repository, or use a version already on the machine",
+            info.pretty_name
+        )),
+    }
+}
+
 pub fn catalogue(info: &DistroInfo) -> Vec<ResolvedRepo> {
     [
         nginx(info),
@@ -1089,5 +1135,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One repository per major line, not one that tracks "latest".
+    ///
+    /// An application pinned to Node 20 must keep getting 20. A repository that
+    /// moved it to 22 under an unattended upgrade would be the panel breaking a
+    /// tenant's site on its own schedule.
+    #[test]
+    fn nodesource_pins_the_major_line_it_was_asked_for() {
+        let info = debian("bookworm", "debian", "12");
+        for major in [20, 22, 24] {
+            let repo = nodesource(&info, major).unwrap();
+            assert!(
+                repo.definition
+                    .base_url
+                    .ends_with(&format!("node_{major}.x")),
+                "major {major} resolved to {}",
+                repo.definition.base_url
+            );
+            assert_eq!(repo.definition.id, format!("nodesource-{major}"));
+            assert_eq!(repo.definition.accepted_fingerprints, vec![NODESOURCE_KEY]);
+        }
+    }
+
+    /// NodeSource serves every Debian and Ubuntu release from one suite, so the
+    /// codename must not be interpolated into it.
+    #[test]
+    fn nodesource_uses_one_suite_across_debian_and_ubuntu() {
+        for (codename, id, version) in [
+            ("bookworm", "debian", "12"),
+            ("noble", "ubuntu", "24.04"),
+            ("jammy", "ubuntu", "22.04"),
+        ] {
+            let repo = nodesource(&debian(codename, id, version), 22).unwrap();
+            assert_eq!(repo.definition.suite.as_deref(), Some("nodistro"));
+        }
+    }
+
+    /// Saying plainly that a path is not supported beats half-supporting it.
+    #[test]
+    fn nodesource_refuses_rhel_with_a_reason() {
+        let err = nodesource(&rhel("9", Arch::X86_64), 22).unwrap_err();
+        assert!(err.contains("distribution's own repository"), "{err}");
     }
 }

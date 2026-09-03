@@ -232,7 +232,15 @@ fn environment_lines(env: &[EnvVar]) -> Result<Vec<String>> {
 /// One validated pair, formatted the way systemd parses it.
 fn environment_line(key: &str, value: &str) -> String {
     let escaped = value.replace('%', "%%");
-    if escaped.chars().any(char::is_whitespace) {
+    // A single quote has to force the quoting too. systemd unquotes each
+    // assignment with `extract_first_word`, which treats `'` as a quote
+    // character wherever it appears: an odd one makes the whole line invalid
+    // syntax and systemd drops it, and a matched pair is stripped, so
+    // `pa'ss'wd` would reach the app as `passwd`. Either way the variable is
+    // silently wrong while `app.create` reports success. Inside the double
+    // quotes it is just a character — and `"` and `\` are already refused
+    // outright, so nothing can unbalance them.
+    if escaped.chars().any(|c| c.is_whitespace() || c == '\'') {
         // The quotes wrap the whole `KEY=value` assignment, not just the
         // value — that is systemd's form, and quoting only the value would
         // leave the `=` outside and the assignment malformed.
@@ -888,18 +896,30 @@ async fn tenant_home_of(ctx: &OpContext, user: &LinuxUser) -> Result<String> {
 /// home is already `0710`, so nothing outside the group could reach it anyway.
 async fn ensure_app_dir(ctx: &OpContext, user: &LinuxUser, name: &AppName) -> Result<()> {
     let dir = paths::app_dir(user.as_str(), name.as_str());
-    for argv in app_dir_argv(user, name) {
-        let mut cmd = Cmd::new(argv[0].clone());
-        for arg in &argv[1..] {
-            cmd = cmd.arg(arg);
+
+    // Each directory is inspected immediately before its own commands rather
+    // than both up front, which is why the steps are grouped by path: the
+    // parent's `chown` is what hands it to the tenant, so a leaf checked
+    // before that ran was checked while the tenant still could not write to
+    // the directory holding it. Checking it afterwards is the difference
+    // between a window three root subprocesses wide and one the `chown -h`
+    // covers the ownership half of.
+    for (path, argvs) in app_dir_steps(user, name) {
+        check_app_dir_target(&path)?;
+        for argv in argvs {
+            let mut cmd = Cmd::new(argv[0].clone());
+            for arg in &argv[1..] {
+                cmd = cmd.arg(arg);
+            }
+            cmd.run_checked().await?;
         }
-        cmd.run_checked().await?;
     }
     ctx.log(format!("created {}", dir.display()));
     Ok(())
 }
 
-/// The exact argv arrays [`ensure_app_dir`] runs, as data.
+/// The exact argv arrays [`ensure_app_dir`] runs, as data, grouped by the
+/// directory each group creates and hands over.
 ///
 /// Split out from the running of them so a test can read them: these are the
 /// only commands in this module that touch the filesystem as root, and the
@@ -907,31 +927,80 @@ async fn ensure_app_dir(ctx: &OpContext, user: &LinuxUser, name: &AppName) -> Re
 /// named `-R` (which no [`AppName`] can produce, but [`LinuxUser`] very nearly
 /// can) would be read as an option by `chown` and `chmod`. Spec §12 rule 2:
 /// argv arrays, never a shell string, so nothing here needs quoting either.
-fn app_dir_argv(user: &LinuxUser, name: &AppName) -> Vec<Vec<String>> {
-    let dir = paths::app_dir(user.as_str(), name.as_str());
+fn app_dir_steps(user: &LinuxUser, name: &AppName) -> [(PathBuf, [Vec<String>; 3]); 2] {
     let owner = format!("{}:{}", user.as_str(), user.as_str());
-    let mut argv = Vec::with_capacity(6);
+    app_dir_chain(user, name).map(|path| {
+        let arg = path.to_string_lossy().into_owned();
+        let argvs = [
+            vec!["mkdir".into(), "-p".into(), "--".into(), arg.clone()],
+            vec![
+                "chown".into(),
+                // `-h` (no-dereference), belt-and-braces behind
+                // `check_app_dir_target`: the check and the chown are two
+                // syscalls apart, and the tenant owns the directory in
+                // between.
+                "-h".into(),
+                owner.clone(),
+                "--".into(),
+                arg.clone(),
+            ],
+            vec!["chmod".into(), "0750".into(), "--".into(), arg],
+        ];
+        (path, argvs)
+    })
+}
 
-    // `<home>/apps` first, then `<home>/apps/<name>`: `mkdir -p` would create
-    // both, but only the leaf would then be chowned, leaving the parent owned
-    // by root and unwritable to the tenant that has to deploy into it.
-    for path in [
+/// The two directories [`ensure_app_dir`] takes ownership of, parent first.
+///
+/// `<home>/apps` before `<home>/apps/<name>`: `mkdir -p` would create both, but
+/// only the leaf would then be chowned, leaving the parent owned by root and
+/// unwritable to the tenant that has to deploy into it.
+fn app_dir_chain(user: &LinuxUser, name: &AppName) -> [PathBuf; 2] {
+    let dir = paths::app_dir(user.as_str(), name.as_str());
+    [
         dir.parent()
             .expect("an app dir always has a parent")
             .to_path_buf(),
-        dir.clone(),
-    ] {
-        let path = path.to_string_lossy().into_owned();
-        argv.push(vec!["mkdir".into(), "-p".into(), "--".into(), path.clone()]);
-        argv.push(vec![
-            "chown".into(),
-            owner.clone(),
-            "--".into(),
-            path.clone(),
-        ]);
-        argv.push(vec!["chmod".into(), "0750".into(), "--".into(), path]);
+        dir,
+    ]
+}
+
+/// Refuse to chown or chmod anything the tenant could have swapped underneath
+/// us.
+///
+/// The default home layout is the tenant's: `apply_home_permissions` leaves it
+/// `<tenant>:<nginx> 0710`, and that stays true for every tenant who never
+/// enabled SFTP — so `<home>/apps` is an entry the tenant can replace with a
+/// symlink. `mkdir -p` succeeds silently on a path that resolves through one
+/// to an existing directory, and both `chown` and `chmod` dereference, so the
+/// root agent would otherwise hand a tenant ownership of whatever they pointed
+/// at. Same refusal, for the same reason, as [`crate::sftp`]'s `subdir_steps`.
+fn check_app_dir_target(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        // Nothing there yet is the ordinary first create.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(UnihelmError::internal(format!(
+            "could not inspect {}: {e}",
+            path.display()
+        ))),
+        Ok(md) if md.file_type().is_symlink() => Err(UnihelmError::new(
+            ErrorCode::InvalidPath,
+            format!(
+                "{} is a symlink; refusing to change ownership through it",
+                path.display()
+            ),
+        )),
+        // A real directory has to keep working: `<home>/apps` is shared by
+        // every app the tenant owns, so only their first one ever finds it
+        // missing, and a create that rolled back leaves both behind. `mkdir
+        // -p` is then a no-op and the chown/chmod re-assert what should
+        // already hold.
+        Ok(md) if md.is_dir() => Ok(()),
+        Ok(_) => Err(UnihelmError::new(
+            ErrorCode::InvalidPath,
+            format!("{} exists but is not a directory", path.display()),
+        )),
     }
-    argv
 }
 
 /// Publish the app behind a domain.
@@ -1347,16 +1416,31 @@ mod tests {
     #[test]
     fn the_app_directory_is_created_and_handed_over_argv_by_argv() {
         // A snapshot, because these are the only commands in this module that
-        // run as root against a path: the `--` guards, the parent-before-leaf
-        // order (a leaf-only chown leaves `<home>/apps` owned by root) and the
-        // 0750 mode are each a separate way to get tenant isolation wrong.
-        let argv = app_dir_argv(&user(), &name());
+        // run as root against a path: the `--` guards, the `-h`, the
+        // parent-before-leaf order (a leaf-only chown leaves `<home>/apps`
+        // owned by root) and the 0750 mode are each a separate way to get
+        // tenant isolation wrong. The grouping is asserted too: each group is
+        // what one `check_app_dir_target` stands in front of.
+        let steps = app_dir_steps(&user(), &name());
+        assert_eq!(
+            steps.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![
+                &PathBuf::from("/home/uh_abc12345/apps"),
+                &PathBuf::from("/home/uh_abc12345/apps/blog"),
+            ]
+        );
+
+        let argv: Vec<Vec<String>> = steps
+            .iter()
+            .flat_map(|(_, argvs)| argvs.iter().cloned())
+            .collect();
         assert_eq!(
             argv,
             vec![
                 vec!["mkdir", "-p", "--", "/home/uh_abc12345/apps"],
                 vec![
                     "chown",
+                    "-h",
                     "uh_abc12345:uh_abc12345",
                     "--",
                     "/home/uh_abc12345/apps"
@@ -1365,6 +1449,7 @@ mod tests {
                 vec!["mkdir", "-p", "--", "/home/uh_abc12345/apps/blog"],
                 vec![
                     "chown",
+                    "-h",
                     "uh_abc12345:uh_abc12345",
                     "--",
                     "/home/uh_abc12345/apps/blog"
@@ -1383,6 +1468,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_app_directory_is_refused_instead_of_chowned_through() {
+        // The attack: the tenant's home is `0710 <tenant>:<nginx>` unless SFTP
+        // was enabled, so a tenant with any code execution can plant
+        // `<home>/apps -> /etc` and wait for an admin to run `app.create`.
+        // Root would then chown /etc to them and 0750 it.
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("apps");
+        std::os::unix::fs::symlink("/etc", &planted).unwrap();
+
+        let err = check_app_dir_target(&planted).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPath);
+        assert!(err.detail.contains("symlink"), "{}", err.detail);
+    }
+
+    #[test]
+    fn a_file_where_the_app_directory_belongs_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("apps");
+        std::fs::write(&planted, b"not a dir").unwrap();
+
+        let err = check_app_dir_target(&planted).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidPath);
+    }
+
+    #[test]
+    fn an_absent_or_already_created_app_directory_both_pass_the_guard() {
+        // `<home>/apps` outlives any one app, so only the tenant's first ever
+        // finds it missing — the guard must not turn "it is already there"
+        // into a refusal.
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("apps");
+        assert!(check_app_dir_target(&apps).is_ok());
+        assert!(check_app_dir_target(&apps.join("blog")).is_ok());
+
+        std::fs::create_dir_all(apps.join("blog")).unwrap();
+        assert!(check_app_dir_target(&apps).is_ok());
+        assert!(check_app_dir_target(&apps.join("blog")).is_ok());
     }
 
     #[test]
@@ -1420,6 +1546,29 @@ mod tests {
         assert!(
             body.contains("Environment=\"GREETING=Unihelm Panel v1\"\n"),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn a_value_with_a_single_quote_survives_systemds_unquoting() {
+        // Unquoted, systemd's own unquoting eats it: an odd `'` makes the
+        // assignment invalid syntax and the variable never reaches the app at
+        // all, while a matched pair is stripped and `pa'ss'wd` arrives as
+        // `passwd`. Both look like the tenant mistyped their own password.
+        let lines = environment_lines(&[
+            EnvVar {
+                key: "DB_PASSWORD".into(),
+                value: "abc'def".into(),
+            },
+            EnvVar {
+                key: "PAIRED".into(),
+                value: "pa'ss'wd".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec![r#""DB_PASSWORD=abc'def""#, r#""PAIRED=pa'ss'wd""#]
         );
     }
 

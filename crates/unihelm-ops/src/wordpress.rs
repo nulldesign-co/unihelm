@@ -1326,6 +1326,20 @@ impl TypedOperation for Install {
         let admin_user = unihelm_core::Username::parse(&input.admin_user)
             .map_err(|e| e.with_field("admin_user"))?;
 
+        // Nothing consumes the flag: the agent's schedule has no WordPress job,
+        // and `wp_installs_with_auto_update` has no caller — so accepting it
+        // stored and reported a promise the panel does not keep, and the flag
+        // cannot even be turned off again. Refuse it until there is a job that
+        // honours it. WordPress's own background updater is unaffected and
+        // keeps applying minor and security releases.
+        if input.auto_update {
+            return Err(UnihelmError::new(
+                ErrorCode::NotImplemented,
+                "the panel does not run unattended WordPress core updates yet",
+            )
+            .with_field("auto_update"));
+        }
+
         let target = target_for_site(ctx, site_id, input.subdirectory.as_ref()).await?;
 
         // Refuse to install over an existing one. Both halves matter: the row
@@ -1897,6 +1911,40 @@ impl TypedOperation for Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::testing::{auth_for, registry};
+    use unihelm_core::Role;
+
+    // -- wp.install --------------------------------------------------------
+
+    /// A stored flag that nothing acts on is worse than no flag at all: the
+    /// agent's schedule has no WordPress job, `wp_installs_with_auto_update`
+    /// has no caller, and there is no operation that turns it off again — so an
+    /// operator who asked for this was told the panel would keep their core
+    /// current, and it never would.
+    #[tokio::test]
+    async fn asking_for_unattended_core_updates_is_refused_while_nothing_performs_them() {
+        let (registry, admin, _) = registry().await;
+        let ctx = OpContext::new(registry.services().clone(), auth_for(admin, Role::Admin));
+
+        let err = Install::live()
+            .run(
+                &ctx,
+                InstallInput {
+                    site_id: 1,
+                    subdirectory: None,
+                    locale: WpLocale::default(),
+                    title: "Blog".into(),
+                    admin_user: "editor".into(),
+                    admin_email: Email::parse("editor@example.com").unwrap(),
+                    auto_update: true,
+                },
+            )
+            .await
+            .expect_err("the panel must not accept a promise it does not keep");
+
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert_eq!(err.field.as_deref(), Some("auto_update"));
+    }
 
     // -- the passthrough's refusals ----------------------------------------
 

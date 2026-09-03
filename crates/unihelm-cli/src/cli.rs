@@ -63,6 +63,9 @@ pub enum Command {
     /// Language runtimes installed on this server.
     #[command(subcommand)]
     Runtime(RuntimeCommand),
+    /// Docker containers, images and volumes.
+    #[command(subcommand)]
+    Docker(DockerCommand),
     /// PHP versions.
     #[command(subcommand)]
     Php(PhpCommand),
@@ -205,11 +208,26 @@ pub enum OpsCommand {
 // sites
 // ---------------------------------------------------------------------------
 
+/// Docker containers, images and volumes.
+#[derive(Subcommand, Debug)]
+pub enum DockerCommand {
+    /// Everything Docker has on this server.
+    List,
+}
+
 /// Language runtimes installed on this server.
 #[derive(Subcommand, Debug)]
 pub enum RuntimeCommand {
     /// Every runtime found, with each version and where it lives.
     List,
+    /// Install a Node major line from NodeSource.
+    ///
+    /// Installing a line that is already there reports so and changes nothing.
+    Install {
+        /// The major line: 20, 22, 24.
+        #[arg(long)]
+        major: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -130,8 +130,12 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Status => call("metrics.snapshot", json!({})),
 
         Command::Site(cmd) => site(cmd)?,
+        Command::Docker(cmd) => match cmd {
+            DockerCommand::List => call("docker.list", json!({})),
+        },
         Command::Runtime(cmd) => match cmd {
             RuntimeCommand::List => call("runtime.list", json!({})),
+            RuntimeCommand::Install { major } => call("runtime.install", json!({ "major": major })),
         },
         Command::Php(cmd) => php(cmd),
         Command::Stack(cmd) => stack(cmd)?,

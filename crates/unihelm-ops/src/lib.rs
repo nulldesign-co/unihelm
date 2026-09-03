@@ -32,6 +32,7 @@ pub mod cert;
 pub mod cron;
 pub mod db;
 pub mod dns;
+pub mod docker;
 pub mod fpm;
 pub mod fsops;
 pub mod fwops;

@@ -25,6 +25,12 @@
 //! app on the other end is a different HTTP server that will answer 404 — no
 //! data crosses, and the alternative (never reusing) breaks the panel outright
 //! once the range is walked.
+//!
+//! A *proxy vhost* left pointing at a freed port is not that harmless case,
+//! though, which is why allocation excludes `sites.proxy_port` too: nginx
+//! would go on routing that domain's requests, on that domain's certificate,
+//! straight into whoever got the port next. A number is free when no app holds
+//! it **and** no vhost still names it.
 
 use serde::{Deserialize, Serialize};
 use unihelm_core::{AppName, SiteId, SubscriptionId, TenantPath, TenantScope};
@@ -193,6 +199,17 @@ impl Db {
                 // Smallest free port at or above `min_port`. The seed row in
                 // the UNION covers both the empty table and the case where the
                 // lowest port itself was freed by a deleted app.
+                //
+                // `sites.proxy_port` is consulted as well as `node_apps.port`:
+                // deleting an app can leave its proxy vhost behind (the
+                // operator is told, not overruled), and that vhost keeps
+                // sending its domain's traffic — on its own certificate — to
+                // the number it was rendered with. Handing that number to the
+                // next tenant's app is a cross-tenant leak, so a port a vhost
+                // still names is not free. Both halves have to know it: a
+                // candidate excluded by the WHERE but never generated as a
+                // successor makes MIN() NULL, which reports the range as
+                // exhausted.
                 "INSERT INTO node_apps
                      (subscription_id, site_id, name, entry, port, node_env,
                       runtime_version, enabled, created_at, updated_at)
@@ -200,8 +217,12 @@ impl Db {
                      SELECT ?6 AS candidate
                      UNION ALL
                      SELECT port + 1 FROM node_apps WHERE port >= ?6
+                     UNION ALL
+                     SELECT proxy_port + 1 FROM sites WHERE proxy_port >= ?6
                  )
                  WHERE candidate NOT IN (SELECT port FROM node_apps)
+                   AND candidate NOT IN
+                       (SELECT proxy_port FROM sites WHERE proxy_port IS NOT NULL)
                    AND candidate <= ?7
                  RETURNING *",
             )
@@ -489,6 +510,63 @@ mod tests {
         // And the still-live app keeps its own.
         let fourth = db.create_node_app(app(sub, "four")).await.unwrap();
         assert_eq!(fourth.port, second.port + 1);
+    }
+
+    #[tokio::test]
+    async fn a_port_still_named_by_a_proxy_vhost_is_not_handed_to_the_next_app() {
+        // Deleting an app leaves its proxy site standing. That vhost keeps
+        // `proxy_pass`-ing its own domain, on its own certificate, at the
+        // number it was rendered with — so reissuing the number would put a
+        // second tenant's process behind the first tenant's domain.
+        use crate::sites::{NewSite, SiteType};
+        let (db, mine, theirs, ..) = seed().await;
+
+        // A site with no proxy_port at all must not disturb the allocator: a
+        // NULL inside the exclusion set would make it match nothing.
+        db.create_site(NewSite {
+            subscription_id: mine,
+            domain: unihelm_core::Domain::parse("plain.example.com").unwrap(),
+            site_type: SiteType::Static,
+            php_version: None,
+            root_dir: "/home/uh_alice/public_html".into(),
+            proxy_port: None,
+            redirect_target: None,
+        })
+        .await
+        .unwrap();
+
+        let first = db.create_node_app(app(mine, "one")).await.unwrap();
+        let site = db
+            .create_site(NewSite {
+                subscription_id: mine,
+                domain: unihelm_core::Domain::parse("app.example.com").unwrap(),
+                site_type: SiteType::Proxy,
+                php_version: None,
+                root_dir: "/home/uh_alice/apps/one".into(),
+                proxy_port: Some(first.port as u16),
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+        db.set_node_app_site(first.id, Some(site.id)).await.unwrap();
+
+        db.node_apps(&TenantScope::Global)
+            .delete(first.id)
+            .await
+            .unwrap();
+
+        // No app row holds the port any more, and the orphaned vhost is the
+        // only thing standing between the next tenant and it.
+        let next = db.create_node_app(app(theirs, "two")).await.unwrap();
+        assert_ne!(
+            next.port, first.port,
+            "a vhost still pointing at the port means the port is not free"
+        );
+        assert_eq!(
+            next.port,
+            first.port + 1,
+            "and skipping it must not read as an exhausted range"
+        );
     }
 
     #[tokio::test]

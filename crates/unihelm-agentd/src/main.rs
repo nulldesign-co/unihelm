@@ -159,9 +159,7 @@ async fn run(args: Args, config: UnihelmConfig) -> Result<()> {
     }
     tracing::info!(path = %config.panel.database.display(), "panel database ready");
 
-    // Anything that was mid-flight when we died gets a verdict before we accept
-    // new work (spec §5.5).
-    tasks::reconcile_on_start(&db).await;
+    reconcile_interrupted_work(&db).await;
 
     let master_key = load_master_key(&args)?;
 
@@ -272,6 +270,30 @@ async fn run(args: Args, config: UnihelmConfig) -> Result<()> {
     let _ = terminal_sweep.await;
     watchdog.abort();
     Ok(())
+}
+
+/// Give everything that was mid-flight when we died a verdict, before we accept
+/// new work (spec §5.5).
+///
+/// Two latches, not one. The task rows are the obvious half; stack components
+/// carry a second, independent one, because `claim_component` refuses while a
+/// row says `installing` or `removing` and the only writers that clear those
+/// are the success and failure arms of the operation that set them. A reboot
+/// during a multi-minute `apt install` therefore leaves that component both
+/// uninstallable and unremovable, with no route back from the CLI, the API or
+/// the UI — and re-running the interrupted task does not help, because it
+/// claims nothing and returns a conflict.
+async fn reconcile_interrupted_work(db: &Db) {
+    tasks::reconcile_on_start(db).await;
+
+    match db.reconcile_components().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            components = n,
+            "released stack components interrupted by an agent restart"
+        ),
+        Err(e) => tracing::error!(error = %e, "stack component reconciliation failed"),
+    }
 }
 
 /// Load the key that seals secrets at rest (spec §12 rule 6).
@@ -1201,5 +1223,29 @@ mod tests {
         ] {
             assert!(parse_wp_helper_args(&argv(args)).is_err(), "{args:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_component_left_installing_by_a_crash_is_released_when_the_agent_starts() {
+        // The hazard is a reboot in the middle of a multi-minute `apt install`.
+        // `claim_component` refuses while the row says `installing`, and only
+        // the operation that set it ever clears it — so without this the stack
+        // page's install *and* remove buttons are dead for that component until
+        // somebody edits panel.db by hand.
+        let db = Db::open_memory().await.unwrap();
+        assert!(
+            db.claim_component("nginx", unihelm_db::ComponentStatus::Installing, "task-1")
+                .await
+                .unwrap()
+        );
+
+        reconcile_interrupted_work(&db).await;
+
+        assert!(
+            db.claim_component("nginx", unihelm_db::ComponentStatus::Installing, "task-2")
+                .await
+                .unwrap(),
+            "the restart must hand the component back, not latch it forever"
+        );
     }
 }

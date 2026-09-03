@@ -252,6 +252,14 @@ impl AptBackend {
         Cmd::new("apt-get")
             .env("DEBIAN_FRONTEND", "noninteractive")
             .env("NEEDRESTART_MODE", "a")
+            // Wait for the dpkg lock instead of dying on it. apt-get's default
+            // is to fail immediately, and package work does overlap: two stack
+            // components installed at once, an install that meets the backup
+            // pass installing restic, or simply an operator running apt in
+            // their own ssh session. Every one of those used to fail a task for
+            // a package that was perfectly installable. Ten minutes is well
+            // inside the command's own half-hour ceiling.
+            .args(["-o", "DPkg::Lock::Timeout=600"])
             .timeout(self.timeout)
     }
 }
@@ -784,6 +792,16 @@ mod tests {
             gpg_key_url: "https://nginx.org/keys/nginx_signing.key".into(),
             accepted_fingerprints: fingerprints.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn an_apt_invocation_waits_for_the_dpkg_lock_rather_than_failing_on_it() {
+        // Two package operations at once are normal on this panel — the stack
+        // page, the scheduler's `ensure_restic`, an operator's own ssh session
+        // — and without this the second one dies on "Could not get lock
+        // /var/lib/dpkg/lock-frontend" and the task is recorded as failed.
+        let line = AptBackend::new().apt().display();
+        assert!(line.contains("DPkg::Lock::Timeout=600"), "{line}");
     }
 
     #[test]

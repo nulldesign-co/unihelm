@@ -324,7 +324,11 @@ impl Db {
     /// * `kind = 'le'` — we cannot renew a certificate we did not issue.
     /// * `status` — a superseded row is history, not work (see
     ///   [`Db::certificate_issued`]); an expired one is the most urgent case
-    ///   there is, so it stays in.
+    ///   there is, so it stays in, and so does a failed one. `failed` is where
+    ///   [`Db::certificate_failed`] puts a row that was not active when the
+    ///   renewal failed — leaving it out meant one bad night on an
+    ///   already-lapsed certificate ended its auto-renewal for good, since
+    ///   nothing in the panel ever moves a row back out of `failed`.
     /// * `next_attempt_at` — a failing certificate must wait out its backoff.
     ///   Let's Encrypt allows five failed validations per identifier per hour,
     ///   so a site with a broken DNS record retrying every tick would spend the
@@ -340,7 +344,7 @@ impl Db {
             "SELECT * FROM certificates
              WHERE auto_renew = 1
                AND kind = 'le'
-               AND status IN ('active', 'expired')
+               AND status IN ('active', 'expired', 'failed')
                AND not_after IS NOT NULL
                AND not_after <= ?1
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?2)
@@ -882,6 +886,36 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_renewal_of_a_lapsed_certificate_is_tried_again_after_its_backoff() {
+        // Nothing in the panel ever moves a row out of `failed`, so dropping it
+        // here meant one transient failure — a DNS blip, a rate limit — ended
+        // auto-renewal for that site permanently, with the operator's fix to
+        // the underlying cause achieving nothing.
+        let (db, site) = seed().await;
+        let cert = db
+            .create_certificate(
+                Some(site),
+                CertKind::Le,
+                &["example.com".into()],
+                "/certs/e",
+            )
+            .await
+            .unwrap();
+        issue(&db, cert.id, -5).await;
+        db.expire_stale_certificates().await.unwrap();
+        db.certificate_failed(cert.id, "rate limited")
+            .await
+            .unwrap();
+
+        let due = db
+            .certificates_to_renew(Duration::days(30), 10)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1, "a failed renewal is a retry, not a verdict");
+        assert_eq!(due[0].id, cert.id);
     }
 
     #[tokio::test]

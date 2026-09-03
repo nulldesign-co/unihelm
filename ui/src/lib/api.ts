@@ -878,6 +878,11 @@ export const endpoints = {
   // not an error, and the stage is what makes it actionable.
   testMailRelay: (to?: string) =>
     api.post<MailTestReport>("/api/mail/relay/test", to ? { to } : {}),
+  // A dry run unless `apply` is true: the operation reports what it would put
+  // in the zone and writes nothing. `apply` is always sent explicitly rather
+  // than left to the server's default, so a caller cannot write by omission.
+  publishMailDns: (apply: boolean) =>
+    api.post<MailDnsPublishReport>("/api/mail/dns/publish", { apply }),
 
   // The authenticated half. `GET /api/branding` is public and is fetched by the
   // login page before there is a session; see lib/branding.ts.
@@ -952,6 +957,33 @@ export type MailStage =
   | "data"
   | "body"
   | "quit";
+
+/**
+ * What publishing did, or would do, to one advisory record.
+ *
+ * `would-create` is what a dry run answers and is the only outcome that means
+ * nothing happened yet. `exists` is deliberately not an error: the operation
+ * never overwrites, because merging two SPF policies is not something to guess
+ * at, and a record the operator wrote by hand was meant.
+ */
+export type MailPublishOutcome = "would-create" | "created" | "exists" | "skipped" | "failed";
+
+export interface MailPublishedRecord {
+  name: string;
+  record_type: string;
+  value: string | null;
+  outcome: MailPublishOutcome;
+  /** Why it was skipped, or what the provider said when it failed. */
+  detail: string | null;
+}
+
+/** The result of `mail.dns.publish`. Immediate, so this is the whole answer. */
+export interface MailDnsPublishReport {
+  /** False for a dry run — the default, and what an unconfirmed click gets. */
+  applied: boolean;
+  results: MailPublishedRecord[];
+  advice: string;
+}
 
 /** The SMTP conversation's outcome. A failure is data, not an error. */
 export interface MailTestReport {

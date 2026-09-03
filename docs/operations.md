@@ -176,6 +176,56 @@ The advisory itself stays advisory. `AdvisoryRecord::managed` is still always
 false and nothing keeps a published record in step afterwards; this is the
 operator saying "yes, put those in", once.
 
+### `docker.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Every container (running or stopped), image and volume Docker has on this
+server.
+
+Read-only, deliberately. The panel's security model is that a tenant reaches
+their own files and nothing else, held up by Linux users, directory modes and
+per-tenant FPM pools. Docker sits outside all of it — a container started with
+`-v /:/host`, or with the daemon socket mounted, is root on the machine — so an
+operation that starts an arbitrary container is one that hands somebody root
+through a panel whose whole job is to prevent that. Start, stop and run wait on
+a considered answer to the socket question; see `docs/roadmap-multi-stack.md`.
+
+A machine without Docker reports `installed: false` and an empty list rather
+than an error, and one whose daemon is not answering says that instead — an
+operator debugging one of those does not want to be told the other.
+
+### `runtime.install`
+
+| | |
+|---|---|
+| Permission | `stack_manage` |
+| Execution | task |
+| Input | `major` *(u32 — a Node major line: 20, 22, 24)* |
+
+Adds the NodeSource repository for one Node major line and installs it, pinning
+the key by full fingerprint like every other repository this panel adds.
+
+One repository per major line rather than one that tracks "latest": an
+application pinned to 20 must keep getting 20, and a repository that moved it to
+22 under an unattended upgrade would be the panel breaking a tenant's site on its
+own schedule.
+
+Installing a line that is already present reports so and changes nothing, which
+is what makes it safe behind a button somebody may click twice. The output names
+the point release apt actually resolved to, not the line that was asked for.
+
+Node only. Python, Ruby and PHP come from the distribution and `stack.install`
+already handles them; Go, Deno and Bun ship as single binaries from vendors with
+no signed apt repository, and this panel does not download a tarball over https
+and unpack it as root. `runtime.list` reports all of them once they are there by
+any means. Debian and Ubuntu only — NodeSource's RPM layout needs its own
+handling, and the operation says so rather than half-supporting it.
+
 ### `runtime.list`
 
 | | |
