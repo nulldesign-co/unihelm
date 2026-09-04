@@ -521,11 +521,25 @@ mod tests {
     }
 }
 
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct EnableRequest {
+    /// Open the SSH port first, rather than refusing.
+    ///
+    /// The refusal is the whole safety of this operation, so the override has to
+    /// travel with the request. This handler used to send `{}` and drop the
+    /// field, which meant the second press of "Allow SSH and start" sent exactly
+    /// what the first one had and came back with exactly the same refusal —
+    /// from the user's side, a button that does nothing.
+    #[serde(default)]
+    pub allow_ssh: bool,
+}
+
 /// Start enforcing the rules.
 #[utoipa::path(
     post,
     path = "/api/firewall/enable",
     tag = "firewall",
+    request_body = EnableRequest,
     security(("session_cookie" = [], "csrf_header" = [])),
     responses(
         (status = 200, description = "The firewall is enforcing", body = serde_json::Value),
@@ -538,12 +552,19 @@ mod tests {
 pub async fn enable(
     State(state): State<SharedState>,
     current: CurrentUser,
+    Json(body): Json<EnableRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     current
         .auth
         .require(Permission::FirewallManage)
         .map_err(ApiError::from)?;
-    let data = ops::invoke_now(&state, &current.auth, "fw.enable", json!({})).await?;
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "fw.enable",
+        json!({ "allow_ssh": body.allow_ssh }),
+    )
+    .await?;
     Ok(Json(data))
 }
 
@@ -570,4 +591,28 @@ pub async fn disable(
         .map_err(ApiError::from)?;
     let data = ops::invoke_now(&state, &current.auth, "fw.disable", json!({})).await?;
     Ok(Json(data))
+}
+
+#[cfg(test)]
+mod enable_body_tests {
+    use super::*;
+
+    /// The override has to survive the web layer.
+    ///
+    /// `fw.enable` refuses when SSH is not allowed, and `allow_ssh` is the
+    /// operator answering that refusal. The handler used to build `json!({})`
+    /// and drop the field, so pressing "Allow SSH and start" sent exactly what
+    /// the plain press had sent and came back with exactly the same refusal.
+    /// From the user's side: a button that does nothing.
+    #[test]
+    fn allow_ssh_survives_deserialisation() {
+        let asked: EnableRequest = serde_json::from_value(json!({ "allow_ssh": true })).unwrap();
+        assert!(asked.allow_ssh);
+
+        let plain: EnableRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            !plain.allow_ssh,
+            "an empty body must mean the safe answer, not the override"
+        );
+    }
 }

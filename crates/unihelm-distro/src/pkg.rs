@@ -147,11 +147,21 @@ impl RepoDefinition {
                 self.id
             )));
         }
+        // apt resolves a suite to `<uri>/dists/<suite>/`, and not every vendor
+        // puts a bare codename there: MongoDB nests the server series under it,
+        // as `noble/mongodb-org/8.0`. So `/` and `.` are allowed — but every
+        // segment has to be a real directory name, because an empty, `.` or `..`
+        // segment climbs back out of `dists/`, and the byte set keeps the value
+        // from carrying a newline into the deb822 file below and inventing a
+        // field of its own.
         if let Some(suite) = &self.suite
             && (suite.is_empty()
-                || !suite
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+                || suite
+                    .split('/')
+                    .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+                || !suite.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b'/')
+                }))
         {
             return Err(DistroError::InvalidName(format!(
                 "repo `{}` has an implausible suite `{suite}`",
@@ -883,6 +893,33 @@ mod tests {
         let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
         r.suite = Some("../../..".into());
         assert!(r.validate().is_err());
+
+        // A suite may carry path segments — MongoDB's is `noble/mongodb-org/8.0`
+        // — so the check is per segment rather than "no slashes at all".
+        for good in ["bookworm", "trixie-pgdg", "noble/mongodb-org/8.0"] {
+            let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
+            r.suite = Some(good.into());
+            assert!(r.validate().is_ok(), "`{good}` should be a valid suite");
+        }
+        for bad in [
+            "",
+            "/noble",
+            "noble/",
+            "a//b",
+            "noble/../etc",
+            "noble/./x",
+            // A newline would end `Suites:` and start a deb822 field of the
+            // attacker's choosing, `Signed-By` included.
+            "noble\nSigned-By: /tmp/theirs.asc",
+            "noble mongodb-org",
+        ] {
+            let mut r = repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]);
+            r.suite = Some(bad.into());
+            assert!(
+                r.validate().is_err(),
+                "`{bad}` should be refused as a suite"
+            );
+        }
 
         assert_eq!(
             repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]).file_stem(),

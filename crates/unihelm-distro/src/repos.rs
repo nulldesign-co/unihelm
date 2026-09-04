@@ -112,6 +112,24 @@ const DOCKER_RPM_KEY: &str = "060A61C51B558A7F742B77AAC52FEB6B621E9F35";
 /// source could corroborate, hence `SingleSource`.
 const NODESOURCE_KEY: &str = "6F71F525282841EEDAF851B42F59B5F99B1BE0B4";
 
+/// MongoDB's server signing keys, one per major series.
+///
+/// Read from the key material MongoDB serves at pgp.mongodb.com/server-<major>.asc
+/// on 2026-09-04. MongoDB rotates this per series, so a single constant would go
+/// stale the moment a new one shipped.
+const MONGODB_80_KEY: &str = "4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05";
+const MONGODB_70_KEY: &str = "E58830201F7DD82CD808AA84160D26BB1785BA38";
+
+/// OpenLiteSpeed's repository signing key.
+///
+/// LiteSpeed serves two keys at rpms.litespeedtech.com/debian/ — `lst_repo.gpg`
+/// and `lst_debian_repo.gpg` — with nothing on the page saying which signs what.
+/// This is the first, and it is the one that verifies: against the live
+/// dists/noble/Release.gpg and Release, `gpgv` accepts under this key and
+/// rejects under the other. Pinning the wrong one refuses every install for
+/// good, and nothing surfaces the mistake until somebody tries.
+const LITESPEED_KEY: &str = "3E892522DB44E1B063D366C5011AA62DEDA1F085";
+
 const SURY_KEY: &str = "15058500A0235D97F5D10063B188E2B695BD4743";
 
 /// Remi's key is chosen per EL major version, not per repository.
@@ -590,6 +608,102 @@ pub fn nodesource(info: &DistroInfo, major: u32) -> Result<ResolvedRepo, String>
         Family::Rhel => Err(format!(
             "NodeSource packages for {} are not set up here; install Node from the \
              distribution's own repository, or use a version already on the machine",
+            info.pretty_name
+        )),
+    }
+}
+
+/// MongoDB, from its own repository.
+///
+/// The only engine in the catalogue with no distribution package anywhere:
+/// Debian and Ubuntu dropped MongoDB when it left the OSI-approved licences, so
+/// the vendor repository is not a preference here, it is the only route.
+pub fn mongodb(info: &DistroInfo, series: &str) -> Result<ResolvedRepo, String> {
+    let (key, key_series) = match series {
+        "8.0" => (MONGODB_80_KEY, "8.0"),
+        "7.0" => (MONGODB_70_KEY, "7.0"),
+        other => {
+            return Err(format!(
+                "MongoDB {other} is not a series this panel has a pinned key for; \
+                 8.0 and 7.0 are"
+            ));
+        }
+    };
+
+    match info.family {
+        Family::Debian => {
+            let path = if info.id == "ubuntu" {
+                "ubuntu"
+            } else {
+                "debian"
+            };
+            let codename = require_codename(info)?;
+            Ok(ResolvedRepo {
+                definition: RepoDefinition {
+                    // The dot is not allowed in a repo id, and the id becomes a
+                    // filename under /etc/apt/sources.list.d — so `8.0` becomes
+                    // `80`, the way `nodesource-22` carries its line.
+                    id: format!("mongodb-{}", key_series.replace('.', "")),
+                    display_name: format!("MongoDB {key_series}"),
+                    base_url: format!("https://repo.mongodb.org/apt/{path}"),
+                    // MongoDB nests the series inside the suite rather than
+                    // using components for it, which is why this is not simply
+                    // the codename.
+                    suite: Some(format!("{codename}/mongodb-org/{key_series}")),
+                    components: vec![if info.id == "ubuntu" {
+                        "multiverse".into()
+                    } else {
+                        "main".into()
+                    }],
+                    gpg_key_url: format!("https://pgp.mongodb.com/server-{key_series}.asc"),
+                    accepted_fingerprints: vec![key.to_string()],
+                },
+                provenance: Provenance::SingleSource,
+                source: format!(
+                    "the key material MongoDB serves at pgp.mongodb.com/server-{key_series}.asc"
+                ),
+                options: Vec::new(),
+                prerequisites: Vec::new(),
+            })
+        }
+        Family::Rhel => Err(format!(
+            "MongoDB's RPM repositories are laid out per release in a way this panel \
+             does not handle yet; install it on {} from MongoDB's own instructions",
+            info.pretty_name
+        )),
+    }
+}
+
+/// OpenLiteSpeed, from LiteSpeed's own repository.
+///
+/// Debian and Ubuntu do not package it, so there is no distribution route to
+/// prefer — unlike Apache, MySQL or Redis, where there is and this panel takes
+/// it. The open-source edition only: LiteSpeed Enterprise wants a licence key,
+/// which is not a secret a control panel should be holding.
+pub fn litespeed(info: &DistroInfo) -> Result<ResolvedRepo, String> {
+    match info.family {
+        Family::Debian => Ok(ResolvedRepo {
+            definition: RepoDefinition {
+                id: "litespeed".into(),
+                display_name: "LiteSpeed".into(),
+                base_url: "https://rpms.litespeedtech.com/debian".into(),
+                suite: Some(require_codename(info)?),
+                components: vec!["main".into()],
+                gpg_key_url: "https://rpms.litespeedtech.com/debian/lst_repo.gpg".into(),
+                accepted_fingerprints: vec![LITESPEED_KEY.to_string()],
+            },
+            provenance: Provenance::SingleSource,
+            source: "the key LiteSpeed serves at /debian/lst_repo.gpg, confirmed by \
+                     verifying the live dists/<codename>/Release.gpg under it — the \
+                     other key served alongside it does not verify"
+                .into(),
+            options: Vec::new(),
+            prerequisites: Vec::new(),
+        }),
+        Family::Rhel => Err(format!(
+            "the LiteSpeed repository for {} is laid out per release in a way this \
+             panel does not handle yet; install OpenLiteSpeed from LiteSpeed's own \
+             instructions",
             info.pretty_name
         )),
     }
@@ -1142,6 +1256,77 @@ mod tests {
     /// An application pinned to Node 20 must keep getting 20. A repository that
     /// moved it to 22 under an unattended upgrade would be the panel breaking a
     /// tenant's site on its own schedule.
+    /// LiteSpeed serves two keys and says which signs what nowhere.
+    ///
+    /// `lst_repo.gpg` verifies the live Release;
+    /// `lst_debian_repo.gpg` (42259994257E19EB6A91CA853F6F627083084D0E) does
+    /// not. Pinning the second refuses every install for good, and nothing
+    /// surfaces the mistake until an operator tries — so the value is held here
+    /// as well as in the constant.
+    #[test]
+    fn litespeed_pins_the_key_that_signs_the_release() {
+        let repo = litespeed(&debian("noble", "ubuntu", "24.04")).unwrap();
+        assert_eq!(
+            repo.definition.accepted_fingerprints,
+            vec!["3E892522DB44E1B063D366C5011AA62DEDA1F085"]
+        );
+        assert_ne!(
+            repo.definition.accepted_fingerprints[0], "42259994257E19EB6A91CA853F6F627083084D0E",
+            "that is the other key the vendor serves, which does not verify"
+        );
+        assert!(repo.definition.gpg_key_url.ends_with("lst_repo.gpg"));
+    }
+
+    /// MongoDB rotates its signing key per major series, so a series has to
+    /// bring its own — one constant would go stale the moment a new one shipped.
+    #[test]
+    fn each_mongodb_series_carries_its_own_key() {
+        let info = debian("noble", "ubuntu", "24.04");
+        let eight = mongodb(&info, "8.0").unwrap();
+        let seven = mongodb(&info, "7.0").unwrap();
+
+        assert_eq!(
+            eight.definition.accepted_fingerprints,
+            vec!["4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05"]
+        );
+        assert_eq!(
+            seven.definition.accepted_fingerprints,
+            vec!["E58830201F7DD82CD808AA84160D26BB1785BA38"]
+        );
+        assert_ne!(
+            eight.definition.accepted_fingerprints,
+            seven.definition.accepted_fingerprints
+        );
+        assert!(eight.definition.gpg_key_url.ends_with("server-8.0.asc"));
+    }
+
+    /// MongoDB nests the series inside the suite rather than using a component
+    /// for it, which is unlike every other repository here and easy to get wrong.
+    #[test]
+    fn mongodb_puts_the_series_in_the_suite() {
+        let repo = mongodb(&debian("noble", "ubuntu", "24.04"), "8.0").unwrap();
+        assert_eq!(
+            repo.definition.suite.as_deref(),
+            Some("noble/mongodb-org/8.0")
+        );
+        assert_eq!(repo.definition.components, vec!["multiverse"]);
+
+        // Debian uses `main` where Ubuntu uses `multiverse`.
+        let deb = mongodb(&debian("bookworm", "debian", "12"), "8.0").unwrap();
+        assert_eq!(deb.definition.components, vec!["main"]);
+        assert!(deb.definition.base_url.ends_with("/debian"));
+    }
+
+    /// A series with no pinned key must be refused rather than resolved with
+    /// somebody else's.
+    #[test]
+    fn an_unpinned_mongodb_series_is_refused() {
+        let info = debian("noble", "ubuntu", "24.04");
+        for series in ["6.0", "9.0", "", "8"] {
+            assert!(mongodb(&info, series).is_err(), "accepted `{series}`");
+        }
+    }
+
     #[test]
     fn nodesource_pins_the_major_line_it_was_asked_for() {
         let info = debian("bookworm", "debian", "12");

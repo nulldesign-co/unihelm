@@ -7,7 +7,7 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
-use unihelm_core::{Permission, PhpVersion};
+use unihelm_core::Permission;
 use unihelm_db::audit::NewAuditEntry;
 use utoipa::ToSchema;
 
@@ -41,39 +41,43 @@ pub async fn status(
     Ok(Json(data))
 }
 
+/// A catalogue slug and one of its versions.
+///
+/// This used to be an enum with four variants, and the comment beside it said
+/// the web layer re-states the whitelist so an unknown component dies before it
+/// crosses the IPC boundary. That was true and it was also why the panel could
+/// install four things: the list lived in three places — here, the CLI, and the
+/// agent — and all three had to be edited in step.
+///
+/// The whitelist has not gone away, it has moved to where it is data:
+/// `unihelm_ops::catalogue`. The agent looks the pair up there and refuses
+/// anything absent, so nothing reaches a package manager that is not in that
+/// table. What this layer no longer does is keep a second copy that can drift
+/// from it.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "component", rename_all = "snake_case")]
-pub enum ComponentRequest {
-    Nginx,
-    Php {
-        #[schema(value_type = String, example = "8.3")]
-        version: PhpVersion,
-    },
-    // The database engines (spec §11.4). Mirrors `StackComponent` in
-    // unihelm-ops: the web layer re-states the whitelist so a request for an
-    // unknown component dies here, before it ever crosses the IPC boundary.
-    Mariadb,
-    Postgres,
+pub struct ComponentRequest {
+    /// Any slug the catalogue offers: `nginx`, `php`, `mariadb`, `redis`, …
+    pub component: String,
+    /// Which version. Omitted means the catalogue's recommended one.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 impl ComponentRequest {
     fn as_input(&self) -> serde_json::Value {
-        match self {
-            ComponentRequest::Nginx => json!({ "component": "nginx" }),
-            ComponentRequest::Php { version } => {
-                json!({ "component": "php", "version": version.as_str() })
-            }
-            ComponentRequest::Mariadb => json!({ "component": "mariadb" }),
-            ComponentRequest::Postgres => json!({ "component": "postgres" }),
+        let mut m = serde_json::Map::new();
+        m.insert("component".into(), json!(self.component));
+        if let Some(v) = &self.version {
+            m.insert("version".into(), json!(v));
         }
+        serde_json::Value::Object(m)
     }
 
+    /// What the audit row records.
     fn describe(&self) -> String {
-        match self {
-            ComponentRequest::Nginx => "nginx".into(),
-            ComponentRequest::Php { version } => format!("php{}", version.as_str()),
-            ComponentRequest::Mariadb => "mariadb".into(),
-            ComponentRequest::Postgres => "postgres".into(),
+        match &self.version {
+            Some(v) => format!("{} {v}", self.component),
+            None => self.component.clone(),
         }
     }
 }

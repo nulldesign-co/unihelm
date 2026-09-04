@@ -411,9 +411,9 @@ pub enum StackCommand {
     /// Install a component from its vendor's repository.
     Install {
         /// Which component to install.
-        #[arg(value_enum)]
-        component: StackComponentArg,
-        /// Required for `php`: the dotted version, e.g. `8.3`.
+        /// What to install: any slug the Stack page lists.
+        component: String,
+        /// Which version, e.g. `8.3` or `11.4`. Defaults to the recommended one.
         #[arg(long)]
         version: Option<String>,
         /// Extensions to add to the default set. Repeat or comma-separate.
@@ -423,21 +423,12 @@ pub enum StackCommand {
     /// Remove a component.
     Remove {
         /// Which component to remove.
-        #[arg(value_enum)]
-        component: StackComponentArg,
-        /// Required for `php`: the dotted version, e.g. `8.3`.
+        /// What to install: any slug the Stack page lists.
+        component: String,
+        /// Which version, e.g. `8.3` or `11.4`. Defaults to the recommended one.
         #[arg(long)]
         version: Option<String>,
     },
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-#[value(rename_all = "snake_case")]
-pub enum StackComponentArg {
-    Nginx,
-    Php,
-    Mariadb,
-    Postgres,
 }
 
 // ---------------------------------------------------------------------------

@@ -113,6 +113,22 @@ pub struct Secrets {
 // the planner
 // ---------------------------------------------------------------------------
 
+/// `{"component": "mariadb", "version": "11.4"}`, with the version left out when
+/// the caller has no opinion.
+///
+/// No whitelist here on purpose. It used to be a `ValueEnum` of four names,
+/// which is why the CLI could install four things; the catalogue in the agent is
+/// the list now, and it refuses anything not in it — one place to add an engine
+/// rather than three that have to agree.
+fn component_value(component: &str, version: Option<&str>) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("component".into(), json!(component));
+    if let Some(v) = version {
+        m.insert("version".into(), json!(v));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Map a parsed command onto the operation it invokes.
 pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
     let action = match command {
@@ -305,7 +321,7 @@ fn stack(cmd: &StackCommand) -> Result<Action> {
             version,
             extensions,
         } => {
-            let mut input = component_value(*component, version.as_deref())?;
+            let mut input = component_value(component, version.as_deref());
             if let Some(map) = input.as_object_mut() {
                 map.insert("extensions".into(), json!(extensions));
             }
@@ -313,22 +329,8 @@ fn stack(cmd: &StackCommand) -> Result<Action> {
         }
         StackCommand::Remove { component, version } => call(
             "stack.remove",
-            component_value(*component, version.as_deref())?,
+            component_value(component, version.as_deref()),
         ),
-    })
-}
-
-/// `StackComponent` is an internally tagged enum, so the version rides in the
-/// same object as the tag.
-fn component_value(component: StackComponentArg, version: Option<&str>) -> Result<Value> {
-    Ok(match component {
-        StackComponentArg::Nginx => json!({ "component": "nginx" }),
-        StackComponentArg::Mariadb => json!({ "component": "mariadb" }),
-        StackComponentArg::Postgres => json!({ "component": "postgres" }),
-        StackComponentArg::Php => {
-            let version = version.context("`php` needs --version, e.g. --version 8.3")?;
-            json!({ "component": "php", "version": version })
-        }
     })
 }
 
@@ -1394,10 +1396,32 @@ mod tests {
         assert_eq!(inv.input["extensions"], json!(["redis", "imagick"]));
     }
 
+    /// A version is optional now, for every slug.
+    ///
+    /// This used to refuse `stack install php` and demand `--version`, because
+    /// the CLI held its own copy of what could be installed and knew PHP was the
+    /// one with versions. The catalogue holds that now and every entry has
+    /// versions, so an omitted one means "the recommended one" rather than a
+    /// mistake — and the agent, which has the list, is what decides.
     #[test]
-    fn a_php_component_without_a_version_is_refused_before_the_agent_is_told() {
-        let err = plan_argv(&["unihelm", "stack", "install", "php"]).unwrap_err();
-        assert!(err.to_string().contains("--version"), "{err}");
+    fn an_omitted_version_is_left_for_the_catalogue_to_fill_in() {
+        let inv = invocation(&["unihelm", "stack", "install", "php"]);
+        assert_eq!(inv.op, "stack.install");
+        assert_eq!(inv.input["component"], "php");
+        assert!(
+            inv.input.get("version").is_none(),
+            "an absent version must stay absent rather than being guessed here: {}",
+            inv.input
+        );
+    }
+
+    /// And a slug the CLI has never heard of still travels, because the CLI is
+    /// no longer the thing that knows. The agent refuses it against the
+    /// catalogue, which is the one list.
+    #[test]
+    fn an_unknown_slug_is_the_agents_to_refuse() {
+        let inv = invocation(&["unihelm", "stack", "install", "redis"]);
+        assert_eq!(inv.input["component"], "redis");
     }
 
     #[test]

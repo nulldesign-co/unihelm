@@ -263,11 +263,52 @@ export interface TaskLogLine {
 // --- stack ------------------------------------------------------------------
 
 /** What /api/stack/{install,remove} take. Mirrors StackComponent on the agent. */
-export type StackComponentRequest =
-  | { component: "nginx" }
-  | { component: "mariadb" }
-  | { component: "postgres" }
-  | { component: "php"; version: string };
+/**
+ * What /api/stack/{install,remove} take: a catalogue slug and one of its
+ * versions.
+ *
+ * Both are plain strings and neither is trusted. The agent looks the pair up in
+ * `unihelm_ops::catalogue` and refuses anything not in it — the same whitelist
+ * the closed union here used to be, moved to where it is data rather than a
+ * shape this file must be widened for every time the panel learns to install
+ * something.
+ */
+export interface StackComponentRequest {
+  component: string;
+  /** Omitted means the catalogue's recommended version for that slug. */
+  version?: string;
+}
+
+/** Where an entry belongs on the Stack page. Mirrors `catalogue::Category`. */
+export type StackCategory = "web_server" | "language" | "database" | "cache" | "container";
+
+/**
+ * Where a version's packages come from.
+ *
+ * A distribution package adds no repository and its security updates arrive
+ * with the rest of the system; a vendor one means a signing key the panel pins
+ * by fingerprint. They are different promises and the page says which.
+ */
+export type VersionSource = "distro" | "vendor";
+
+export interface CatalogueVersion {
+  version: string;
+  /** Shown beside it. Empty when the version speaks for itself. */
+  note: string;
+  source: VersionSource;
+  eol: boolean;
+  recommended: boolean;
+}
+
+export interface CatalogueEntry {
+  slug: string;
+  display_name: string;
+  category: StackCategory;
+  summary: string;
+  versions: CatalogueVersion[];
+  /** Whether more than one version can be installed at once. PHP and Node can. */
+  side_by_side: boolean;
+}
 
 export type ComponentState =
   | "absent"
@@ -280,6 +321,16 @@ export type ComponentState =
 
 export interface StackComponentView {
   slug: string;
+  /**
+   * The catalogue entry this row belongs to: `php`, `mariadb`, `nginx`.
+   *
+   * Distinct from `slug`, which carries the version for the entries that run
+   * several at once — `php8.3` is a row, `php` is what it is a version of.
+   */
+  component: string;
+  /** Which of that entry's versions this row is: `8.3`, `11.8`, `stable`. */
+  version: string;
+  category: StackCategory;
   display_name: string;
   status: ComponentState;
   installed_version: string | null;
@@ -289,6 +340,8 @@ export interface StackComponentView {
 }
 
 export interface StackResponse {
+  /** Everything the panel can install, in the order the page shows it. */
+  catalogue: CatalogueEntry[];
   components: StackComponentView[];
   unverified_pins: string[];
 }

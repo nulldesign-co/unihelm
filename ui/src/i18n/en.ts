@@ -211,6 +211,47 @@ export const en = {
     addFailed: "That key was not accepted.",
   },
   stack: {
+    emptyTitle: "Nothing to install",
+    empty:
+      "The agent sent no catalogue. Check that it is running, and that it and this panel are the same version.",
+    source: {
+      distro:
+        "From this server's own distribution: no repository is added, and security updates arrive with the rest of the system.",
+      vendor:
+        "From the vendor's own repository, which the panel adds with the signing key pinned by fingerprint.",
+    },
+    replace: "Replace",
+    installAria: "Install {{name}} {{version}}",
+    replaceAria: "Replace {{name}} {{current}} with {{version}}",
+    loadFailed: "The catalogue could not be read",
+    category: {
+      web_server: "Web servers",
+      language: "Languages and runtimes",
+      database: "Databases",
+      cache: "Caches and key-value stores",
+      container: "Containers",
+    },
+    categoryHint: {
+      web_server: "One of these has to be running before a site is served.",
+      language:
+        "What your applications are written in. PHP and Node.js keep several versions at once; each site or app picks its own.",
+      database:
+        "An engine has to be on the server before the Databases page can create anything in it.",
+      cache: "In-memory stores, for sessions, queues and caches.",
+      container: "The container runtime behind the Docker page.",
+    },
+    allInstalled: "Every version this panel offers is already installed.",
+    chooseVersion: "Version",
+    distroVersion: "Distribution package",
+    eolTitle: "This version no longer receives security fixes",
+    eolWarning: "{{name}} {{version}} is past its upstream support date. It is offered so an application can be moved off it, not so a new one can be built on it.",
+    notInstalled: "Not installed",
+    packageVersion: "Installed version",
+    recommended: "recommended",
+    removeAria: "Remove {{name}} {{version}}",
+    replaceTitle: "This replaces the version that is running",
+    replaceWarning: "{{name}} runs one version at a time — they want the same port and the same data directory. Installing another replaces what is there.",
+    unmanagedHint: "Installed outside Unihelm. The panel will neither install over it nor remove it: it did not put it there and cannot say how it is configured.",
     databases: "Databases",
     databasesHint:
       "A database engine has to be on the server before the Databases page can create anything in it.",

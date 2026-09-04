@@ -28,6 +28,7 @@ pub mod adminer;
 pub mod alerts;
 pub mod backup;
 pub mod branding;
+pub mod catalogue;
 pub mod cert;
 pub mod cron;
 pub mod db;

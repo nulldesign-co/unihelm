@@ -746,7 +746,7 @@ pub fn site_context(site: &Site, linux_user: &unihelm_core::LinuxUser) -> Result
 /// The vhost would render, nginx would reload, and every request would 502 —
 /// with nothing in the panel explaining why.
 async fn require_php_installed(ctx: &OpContext, version: PhpVersion) -> Result<()> {
-    let slug = crate::stack::StackComponent::Php { version }.slug();
+    let slug = crate::stack::StackComponent::resolve("php", Some(version.as_str()))?.slug();
     let component = ctx
         .db()
         .component(&slug)
