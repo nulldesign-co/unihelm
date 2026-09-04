@@ -42,11 +42,28 @@ impl Db {
     /// This is the one legitimate unscoped user query: at login time there is no
     /// session yet, so there is no scope to apply. It is a method on `Db` rather
     /// than on the repository precisely so it stands out in review.
-    pub async fn find_user_for_login(&self, username: &str) -> Result<Option<User>> {
-        let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = ?1")
-            .bind(username)
-            .fetch_optional(self.pool())
-            .await?;
+    /// The account behind a login attempt, by username **or** email address.
+    ///
+    /// Both, because the installer prints the address it generated far more
+    /// prominently than the username, so typing the address into a field
+    /// labelled "Username" is the obvious mistake — and each attempt spends one
+    /// of the five the throttle allows before it locks the account for fifteen
+    /// minutes. People were being shut out of a panel they had just installed.
+    ///
+    /// Email is matched case-insensitively; usernames are stored lower-case
+    /// already. `username` is matched first: it is unique by constraint, and an
+    /// address can only ever be the second interpretation of a string.
+    pub async fn find_user_for_login(&self, identifier: &str) -> Result<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>(
+            "SELECT * FROM users
+              WHERE username = ?1
+                 OR lower(email) = lower(?1)
+              ORDER BY (username = ?1) DESC
+              LIMIT 1",
+        )
+        .bind(identifier)
+        .fetch_optional(self.pool())
+        .await?;
         row.map(User::try_from).transpose()
     }
 

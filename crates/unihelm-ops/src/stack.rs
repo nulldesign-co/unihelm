@@ -408,6 +408,25 @@ async fn install_component(
     // 4. Start it, and make it come back after a reboot.
     let unit = component.unit().unit_name(distro.info.family);
     distro.svc.enable(&unit, true).await?;
+
+    // `enable --now` succeeding means systemd accepted the request, not that the
+    // service is running. A PHP-FPM with no pool exits immediately afterwards,
+    // and the install used to report `ok` with the unit dead — an operator told
+    // the component installed, and every PHP site on the machine answering 502.
+    let state = distro.svc.status(&unit).await.ok();
+    if !state.as_ref().is_some_and(|s| s.is_active()) {
+        return Err(UnihelmError::new(
+            ErrorCode::ServiceUnavailable,
+            format!(
+                "{unit} was installed and enabled but is not running \
+                 ({}). `systemctl status {unit}` and `journalctl -xeu {unit}` \
+                 say why.",
+                state
+                    .map(|s| format!("{:?}", s.state).to_lowercase())
+                    .unwrap_or_else(|| "state unknown".into())
+            ),
+        ));
+    }
     ctx.log(format!("{unit} enabled and started"));
 
     // 4b. For a database, "started" is not "ready": both engines accept the

@@ -237,9 +237,18 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
             by_account,
             "login refused by rate limit"
         );
+        // Name the actual number. "A few minutes" against a fifteen-minute
+        // window means somebody waits two, fails again, and concludes their
+        // password is wrong — which is what happened to the first person to
+        // mistype a username on a fresh install.
         return Err(ApiError::code(
             ErrorCode::RateLimited,
-            "too many failed attempts; try again in a few minutes",
+            format!(
+                "too many failed attempts; this account is locked for {} minutes. \
+                 A correct password will not work until then. \
+                 `unihelm user unlock <name>` clears it from the server.",
+                FAILURE_WINDOW.whole_minutes()
+            ),
         ));
     }
     Ok(())

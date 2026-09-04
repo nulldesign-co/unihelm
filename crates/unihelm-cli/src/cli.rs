@@ -186,6 +186,16 @@ pub enum UserCommand {
     /// The generated one is printed once at install and stored only as a hash,
     /// so without this an operator who lost that line is locked out of their own
     /// panel with no way back in — there is no account page in the UI either.
+    /// Lift the lock a burst of failed logins put on an account.
+    ///
+    /// Five wrong passwords in fifteen minutes refuses every attempt after them,
+    /// the correct one included. Changing the password does not help — the count
+    /// is on attempts, not on the credential — so without this the only cure is
+    /// to wait, from a root shell on the machine, locked out of the panel.
+    Unlock {
+        /// The account to unlock. Its username or its email address.
+        username: String,
+    },
     Passwd {
         /// The account to change.
         username: String,

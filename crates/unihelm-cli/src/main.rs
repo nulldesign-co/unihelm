@@ -601,6 +601,20 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
             }
         }
 
+        UserCommand::Unlock { username } => {
+            let Some(user) = db.find_user_for_login(username).await? else {
+                db.close().await;
+                anyhow::bail!("no account named `{username}` — `unihelm user list` shows them all");
+            };
+            let cleared = db.clear_login_failures(user.username.as_str()).await?;
+            db.close().await;
+            println!(
+                "cleared {cleared} failed login attempt(s) for `{}`; it can sign in again now",
+                user.username.as_str()
+            );
+            return Ok(());
+        }
+
         UserCommand::Passwd {
             username,
             password_stdin,

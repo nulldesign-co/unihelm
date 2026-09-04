@@ -87,6 +87,7 @@ readonly BINARIES=(unihelm-agentd unihelm-web unihelm)
 SOURCE_DIR=""
 FROM_SOURCE=0
 ADMIN_USER="admin"
+ADMIN_PASSWORD=""
 ADMIN_EMAIL=""
 LISTEN=""
 SKIP_PREFLIGHT=0
@@ -944,9 +945,15 @@ create_first_admin() {
   # `notadmin@example.com`, read as "an administrator exists" and the real one
   # was never created, leaving an install nobody could log in to. Let the binary
   # answer, and treat its refusal as the "already done" case it is.
+  local admin_out="${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.out"
   if "$BIN_DIR/unihelm" user create-admin \
-       --username "$ADMIN_USER" --email "$ADMIN_EMAIL" 2>"${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err"; then
-    :
+       --username "$ADMIN_USER" --email "$ADMIN_EMAIL" \
+       >"$admin_out" 2>"${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err"; then
+    cat "$admin_out"
+    # Kept for the summary. The password is printed once and stored only as a
+    # hash, and it used to scroll off the top of a long install — the operator
+    # then had the panel's address in front of them and no way in.
+    ADMIN_PASSWORD="$(sed -n 's/^[[:space:]]*password:[[:space:]]*//p' "$admin_out" | head -1)"
   elif grep -q "an account already exists" "${WORKDIR:-${TMPDIR:-/tmp}}/create-admin.err"; then
     info "an account already exists; skipping"
   else
@@ -1054,6 +1061,12 @@ $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
   and then visit ${scheme}://127.0.0.1:${port} in your browser.
 
+  Username  $(printf '\033[1m')${ADMIN_USER}$(printf '\033[0m')
+  Email     ${ADMIN_EMAIL}${ADMIN_PASSWORD:+
+  Password  $(printf '\033[1m')${ADMIN_PASSWORD}$(printf '\033[0m')  (shown once — store it now)}
+
+  Sign in with the username or the email address; either works.
+
   Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
 DONE
@@ -1064,8 +1077,13 @@ DONE
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
   Panel     $(printf '\033[1m')${scheme}://${hint:-<this server>}:${port}$(printf '\033[0m')
+  Username  $(printf '\033[1m')${ADMIN_USER}$(printf '\033[0m')
+  Email     ${ADMIN_EMAIL}${ADMIN_PASSWORD:+
+  Password  $(printf '\033[1m')${ADMIN_PASSWORD}$(printf '\033[0m')  (shown once — store it now)}
   Health    sudo unihelm doctor
   Logs      journalctl -u unihelm-agentd -u unihelm-web -f
+
+  Sign in with the username or the email address; either works.
 DONE
       if [ "$scheme" = "https" ]; then
         cat <<DONE

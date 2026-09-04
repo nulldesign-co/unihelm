@@ -194,6 +194,42 @@ impl Db {
     }
 
     /// Failed attempts against one account inside `window`.
+    /// Forget an account's failed logins, and the failures from the addresses
+    /// they came from.
+    ///
+    /// The throttle is what locks somebody out, and until this existed there was
+    /// no way to lift it — not even from a root shell on the server. Resetting
+    /// the password does not help, because the count is on attempts rather than
+    /// on the credential. Fifteen minutes of waiting was the only cure, and the
+    /// message did not say fifteen.
+    ///
+    /// The IP rows go too: whoever is locked out has usually spent some of that
+    /// budget as well, and clearing only half leaves them still refused for a
+    /// reason the command said it had fixed.
+    pub async fn clear_login_failures(&self, username: &str) -> Result<u64> {
+        let ips = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT ip FROM login_attempts WHERE username = ?1 AND success = 0",
+        )
+        .bind(username)
+        .fetch_all(self.pool())
+        .await?;
+
+        let mut cleared = sqlx::query("DELETE FROM login_attempts WHERE username = ?1")
+            .bind(username)
+            .execute(self.pool())
+            .await?
+            .rows_affected();
+
+        for ip in ips {
+            cleared += sqlx::query("DELETE FROM login_attempts WHERE ip = ?1 AND success = 0")
+                .bind(&ip)
+                .execute(self.pool())
+                .await?
+                .rows_affected();
+        }
+        Ok(cleared)
+    }
+
     pub async fn recent_failures_for_username(
         &self,
         username: &str,

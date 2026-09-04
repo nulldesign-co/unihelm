@@ -56,6 +56,14 @@ pub enum StockPool {
     RemovedDuplicate,
     /// The operator asked us to leave it.
     KeptOnRequest,
+    /// Left in place because it is the only pool there is.
+    ///
+    /// FPM refuses to start with no pool at all, so retiring the last one does
+    /// not harden a server — it takes every PHP site on it offline. On a machine
+    /// where PHP was serving sites before the panel arrived, that is exactly what
+    /// happened: `www.conf` moved aside, `php-fpm` failed with "No pool defined",
+    /// and the sites answered 502.
+    KeptAsOnlyPool,
 }
 
 /// Where the distribution's stock pool lives for a PHP version.
@@ -89,6 +97,18 @@ pub fn retire_stock_pool_in(pool_dir: &Path) -> Result<StockPool> {
         return Ok(StockPool::KeptOnRequest);
     }
 
+    // Never leave FPM with nothing to run.
+    //
+    // The point of retiring the stock pool is that it runs as the web server
+    // user with no open_basedir, and every site Unihelm creates gets its own
+    // pool instead. Until at least one of those exists, moving this one aside
+    // stops FPM dead — and a stopped FPM is not a hardened server, it is a
+    // server whose PHP sites all return 502. It is retired on the next site
+    // creation, which is when there is something to take over from it.
+    if !another_pool_exists(pool_dir) {
+        return Ok(StockPool::KeptAsOnlyPool);
+    }
+
     if disabled.exists() {
         // A copy is already preserved. The file that just reappeared is the
         // package's pristine default — rpm and dpkg leave a `.rpmnew`/`.dpkg-dist`
@@ -110,6 +130,21 @@ pub fn retire_stock_pool_in(pool_dir: &Path) -> Result<StockPool> {
         ))
     })?;
     Ok(StockPool::Retired)
+}
+
+/// Whether any pool other than the stock `www.conf` is configured.
+///
+/// FPM includes `*.conf` from the pool directory, so that glob is the question:
+/// a `.unihelm-disabled` file is not matched by it and does not count.
+fn another_pool_exists(pool_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(pool_dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let path = e.path();
+        path.extension().is_some_and(|x| x == "conf")
+            && path.file_name().is_some_and(|n| n != "www.conf")
+    })
 }
 
 fn pool_is_marked_keep(path: &Path) -> bool {
@@ -154,6 +189,16 @@ pub async fn retire_and_log(ctx: &OpContext, version: PhpVersion) {
             "a package upgrade restored the stock PHP {php} `www` pool; removed \
              it again (the original is still at www.conf{DISABLED_SUFFIX})"
         )),
+        Ok(StockPool::KeptAsOnlyPool) => {
+            ctx.log(format!(
+                "leaving the stock PHP {php} `www` pool in place — it is the only \
+                 pool configured, and FPM will not start without one. It runs as \
+                 the web server user without open_basedir, so anything served \
+                 through it is not isolated; it is retired automatically once a \
+                 site of your own has a pool to take over from it."
+            ));
+            return;
+        }
         Ok(StockPool::KeptOnRequest) => {
             ctx.log(format!(
                 "leaving the stock PHP {php} `www` pool alone — it is marked \
@@ -199,7 +244,19 @@ mod tests {
     }
 
     impl Pool {
+        /// A pool directory that already holds a site's own pool.
+        ///
+        /// Which is the state every one of these tests means: the stock pool is
+        /// only retired when something else can serve, because FPM will not
+        /// start with no pool at all. `bare()` is for the tests about *that*.
         fn new() -> Self {
+            let pool = Self::bare();
+            std::fs::write(pool.path.join("uh_tenant.conf"), "[uh_tenant]\n").unwrap();
+            pool
+        }
+
+        /// Nothing but whatever the test writes itself.
+        fn bare() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().to_path_buf();
             Self { _dir: dir, path }
@@ -301,6 +358,73 @@ mod tests {
                 .ends_with("etc/php/8.3/fpm/pool.d/www.conf"),
             "{:?}",
             stock_pool_path(Family::Debian, PhpVersion::V83)
+        );
+    }
+}
+#[cfg(test)]
+mod only_pool_tests {
+    use super::*;
+
+    fn pool_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    /// The stock pool is the only one: leave it.
+    ///
+    /// This is a live server that had PHP before the panel arrived. Retiring
+    /// `www.conf` left FPM with no pool at all, so it failed to start with "No
+    /// pool defined" and every PHP site on the machine answered 502. A stopped
+    /// FPM is not a hardened server.
+    #[test]
+    fn the_last_pool_is_never_retired() {
+        let dir = pool_dir();
+        std::fs::write(dir.path().join("www.conf"), "[www]\n").unwrap();
+
+        assert_eq!(
+            retire_stock_pool_in(dir.path()).unwrap(),
+            StockPool::KeptAsOnlyPool
+        );
+        assert!(
+            dir.path().join("www.conf").exists(),
+            "the only pool was moved aside; FPM cannot start"
+        );
+    }
+
+    /// Once a site has a pool of its own, the stock one goes as designed.
+    #[test]
+    fn the_stock_pool_retires_once_something_can_take_over() {
+        let dir = pool_dir();
+        std::fs::write(dir.path().join("www.conf"), "[www]\n").unwrap();
+        std::fs::write(dir.path().join("uh_abc123.conf"), "[uh_abc123]\n").unwrap();
+
+        assert_eq!(
+            retire_stock_pool_in(dir.path()).unwrap(),
+            StockPool::Retired
+        );
+        assert!(!dir.path().join("www.conf").exists());
+        assert!(
+            dir.path()
+                .join(format!("www.conf{DISABLED_SUFFIX}"))
+                .exists()
+        );
+    }
+
+    /// An already-disabled copy is not a pool FPM can run, so it does not count
+    /// as "something else is configured".
+    #[test]
+    fn a_disabled_copy_does_not_count_as_another_pool() {
+        let dir = pool_dir();
+        std::fs::write(dir.path().join("www.conf"), "[www]\n").unwrap();
+        std::fs::write(
+            dir.path().join(format!("old.conf{DISABLED_SUFFIX}")),
+            "[old]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            retire_stock_pool_in(dir.path()).unwrap(),
+            StockPool::KeptAsOnlyPool,
+            "FPM does not include .unihelm-disabled files"
         );
     }
 }
