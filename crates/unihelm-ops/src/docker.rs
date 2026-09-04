@@ -818,6 +818,330 @@ async fn volumes(docker: &str) -> Vec<Volume> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// creating one
+// ---------------------------------------------------------------------------
+
+/// An image reference: `nginx`, `redis:7`, `registry.example.com:5000/team/app`.
+///
+/// Validated rather than passed through, because this is the one field that
+/// names something the server will fetch and execute. The grammar is Docker's
+/// own, minus anything that could be read as an option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ImageRef(String);
+
+impl ImageRef {
+    pub fn parse(input: &str) -> Result<Self> {
+        let s = input.trim();
+        if s.is_empty() || s.len() > 255 {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "image must be 1-255 characters",
+            )
+            .with_field("image"));
+        }
+        // A leading `-` would be read as an option by `docker run`, whatever the
+        // argument order; the rest of the set is what a registry, a repository,
+        // a tag and a digest are made of.
+        if !s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric()) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "image must start with a letter or a digit",
+            )
+            .with_field("image"));
+        }
+        if !s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':' | b'@')
+        }) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "image may contain letters, digits and . - _ / : @ only",
+            )
+            .with_field("image"));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ImageRef {
+    type Error = UnihelmError;
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(&value)
+    }
+}
+
+/// One published port: a host port, a container port, and TCP or UDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMap {
+    pub host: u16,
+    pub container: u16,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+/// What `docker.create` accepts, and by omission what it refuses.
+///
+/// **There is no field for arbitrary flags, and that is the design.** The
+/// argument this module opened with still holds: `-v /:/host`, the daemon
+/// socket, `--privileged`, `--pid=host`, `--network=host`, `--cap-add` — each
+/// one turns a container into root on the machine, and a form that accepted a
+/// free-text argument list would be a root shell with a nicer font. What is here
+/// is the shape of a container somebody actually wants from a control panel:
+/// an image, a name, some ports, some environment, a named volume or two, and a
+/// restart policy.
+///
+/// Anything beyond that is still `docker run` over SSH, deliberately.
+#[derive(Debug, Deserialize)]
+pub struct CreateInput {
+    pub image: ImageRef,
+    /// What to call it. Docker generates one if this is omitted, but a panel
+    /// that lists containers by name should not be making up names.
+    pub name: ContainerRef,
+    #[serde(default)]
+    pub ports: Vec<PortMap>,
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Named volumes only, mounted at a path inside the container.
+    ///
+    /// A named volume is Docker's own storage; a bind mount is a path on the
+    /// host, and the difference is the whole security boundary. `/:/host` is a
+    /// bind mount. There is no field for one.
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+    /// `no`, `on-failure`, `always`, `unless-stopped`. Docker's own set.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvVar {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VolumeMount {
+    /// The name of a Docker volume. Not a path.
+    pub volume: String,
+    /// Where it appears inside the container. Absolute.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    OnFailure,
+    Always,
+    UnlessStopped,
+}
+
+impl RestartPolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            RestartPolicy::No => "no",
+            RestartPolicy::OnFailure => "on-failure",
+            RestartPolicy::Always => "always",
+            RestartPolicy::UnlessStopped => "unless-stopped",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateOutput {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub running: bool,
+}
+
+/// `docker.create` — start a container from an image already chosen.
+pub struct Create;
+
+#[async_trait::async_trait]
+impl TypedOperation for Create {
+    type Input = CreateInput;
+    type Output = CreateOutput;
+
+    const NAME: &'static str = "docker.create";
+    const PERMISSION: Permission = Permission::ServerManage;
+    // Pulling an image is minutes on a slow link, and the operator should see
+    // the pull rather than a spinner.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: false,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let docker = docker_program()?;
+
+        // A name already in use fails at `docker run` with a message about a
+        // conflict; saying it here means the operator learns before the image is
+        // pulled rather than after.
+        if inspect(&docker, &input.name).await.is_ok() {
+            return Err(UnihelmError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "a container called `{}` already exists. Remove it first, or \
+                     choose another name.",
+                    input.name.as_str()
+                ),
+            )
+            .with_field("name"));
+        }
+
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "--detach".into(),
+            "--name".into(),
+            input.name.as_str().to_string(),
+            "--restart".into(),
+            input.restart.as_str().to_string(),
+        ];
+
+        for p in &input.ports {
+            // Bound to every interface, as `docker run -p` does by default. The
+            // firewall is where an operator decides who reaches it, and the
+            // panel has a page for that; quietly binding to loopback here would
+            // make a published port that nothing can reach.
+            args.push("--publish".into());
+            args.push(format!(
+                "{}:{}{}",
+                p.host,
+                p.container,
+                if p.udp { "/udp" } else { "" }
+            ));
+        }
+
+        for e in &input.env {
+            validate_env_key(&e.key)?;
+            args.push("--env".into());
+            args.push(format!("{}={}", e.key, e.value));
+        }
+
+        for v in &input.volumes {
+            validate_volume(v)?;
+            args.push("--volume".into());
+            args.push(format!("{}:{}", v.volume, v.path));
+        }
+
+        args.push(input.image.as_str().to_string());
+
+        ctx.log(format!(
+            "docker run --detach --name {} {}",
+            input.name.as_str(),
+            input.image.as_str()
+        ));
+
+        let out = unihelm_distro::Cmd::new(&docker)
+            .args(args.iter().map(String::as_str))
+            // A pull over a slow link, and Docker gives no progress this can
+            // stream, so the ceiling is generous rather than tight.
+            .timeout(std::time::Duration::from_secs(600))
+            .run()
+            .await
+            .map_err(|e| UnihelmError::internal(e.to_string()))?;
+
+        if !out.success() {
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                format!("docker run failed: {}", out.failure_text()),
+            ));
+        }
+
+        let id = out.trimmed_stdout().to_string();
+        // Read the state back rather than assuming: a container can exit the
+        // instant it starts — a bad command, a missing environment variable —
+        // and reporting `running: true` from a successful `docker run` would be
+        // the same lie the stack installer used to tell about systemd.
+        let running = inspect(&docker, &input.name)
+            .await
+            .map(|found| found.running)
+            .unwrap_or(false);
+
+        Ok(CreateOutput {
+            id: if id.is_empty() {
+                input.name.as_str().to_string()
+            } else {
+                id
+            },
+            name: input.name.as_str().to_string(),
+            image: input.image.as_str().to_string(),
+            running,
+        })
+    }
+}
+
+/// An environment key that cannot smuggle a second variable in.
+fn validate_env_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            "an environment key must be 1-128 bytes",
+        )
+        .with_field("env"));
+    }
+    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!("`{key}` is not an environment variable name"),
+        )
+        .with_field("env"));
+    }
+    Ok(())
+}
+
+/// A named volume at an absolute path, and nothing that is a bind mount.
+///
+/// This is the check that keeps `docker.create` from being a way to hand a
+/// container the host filesystem. A Docker volume name has the same grammar as
+/// a container name; anything containing a `/` in the source position is a path,
+/// which is to say a bind mount, which is the thing this operation does not do.
+fn validate_volume(v: &VolumeMount) -> Result<()> {
+    if v.volume.is_empty() || v.volume.len() > 128 {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            "a volume name must be 1-128 bytes",
+        )
+        .with_field("volumes"));
+    }
+    if !v
+        .volume
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        || !v
+            .volume
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "`{}` is not a volume name. This creates containers with named \
+                 volumes; a path here would be a bind mount, which would give the \
+                 container part of this server's filesystem.",
+                v.volume
+            ),
+        )
+        .with_field("volumes"));
+    }
+    if !v.path.starts_with('/') || v.path.contains("..") || v.path.len() > 255 {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            "the mount path must be absolute and free of `..`",
+        )
+        .with_field("volumes"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1166,5 +1490,130 @@ mod tests {
         assert_eq!(tail_lines(Some(50)), 50);
         assert_eq!(tail_lines(Some(u32::MAX)), MAX_LOG_LINES);
         assert_eq!(logs_argv(&cref("web"), tail_lines(Some(0)))[3], "1");
+    }
+}
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+
+    fn mount(volume: &str, path: &str) -> VolumeMount {
+        VolumeMount {
+            volume: volume.into(),
+            path: path.into(),
+        }
+    }
+
+    /// The line this operation exists behind.
+    ///
+    /// A bind mount is a path on the host handed to a container; a named volume
+    /// is Docker's own storage. `-v /:/host` is the first and it is root on the
+    /// machine. The input has no field for a bind mount, and the volume name is
+    /// checked so a path cannot be smuggled through the field that does exist.
+    #[test]
+    fn a_path_is_never_accepted_where_a_volume_name_belongs() {
+        for attempt in [
+            "/",
+            "/etc",
+            "/var/run/docker.sock",
+            "../../etc",
+            "./data",
+            "/home/uh_abc123",
+        ] {
+            let err = validate_volume(&mount(attempt, "/data"))
+                .expect_err("a path was accepted as a volume name");
+            assert!(
+                err.to_string().contains("bind mount"),
+                "the refusal should say why: {err}"
+            );
+        }
+        // A real volume name still works.
+        assert!(validate_volume(&mount("app_data", "/var/lib/app")).is_ok());
+        assert!(validate_volume(&mount("pg-16.data", "/var/lib/postgresql")).is_ok());
+    }
+
+    /// The mount point is inside the container, but `..` in it is still somebody
+    /// probing, and an absolute path is what Docker requires anyway.
+    #[test]
+    fn the_mount_path_must_be_absolute_and_plain() {
+        for bad in ["data", "", "../etc", "/var/../.."] {
+            assert!(
+                validate_volume(&mount("app_data", bad)).is_err(),
+                "accepted `{bad}` as a mount path"
+            );
+        }
+    }
+
+    /// An image reference reaches a command line and names something the server
+    /// will fetch and execute, so a leading `-` must never survive: whatever the
+    /// argument order, `docker run` would read it as an option.
+    #[test]
+    fn an_image_cannot_begin_with_a_dash_or_carry_shell_syntax() {
+        for bad in [
+            "-v",
+            "--privileged",
+            "",
+            "nginx; rm -rf /",
+            "nginx && curl evil",
+            "nginx$(whoami)",
+            "nginx`id`",
+            "nginx|sh",
+        ] {
+            assert!(ImageRef::parse(bad).is_err(), "accepted image `{bad}`");
+        }
+
+        for good in [
+            "nginx",
+            "redis:7",
+            "mongo:8.3.1",
+            "registry.example.com:5000/team/app:v1.2.3",
+            "ghcr.io/owner/image@sha256:aaaa",
+        ] {
+            assert!(ImageRef::parse(good).is_ok(), "refused image `{good}`");
+        }
+    }
+
+    /// `FOO=bar BAZ=qux` in one key would put a second variable into the
+    /// container through a field that promised one.
+    #[test]
+    fn an_environment_key_cannot_carry_a_second_variable() {
+        for bad in ["FOO=bar", "FOO BAR", "", "FOO;BAR", "FOO\nBAR"] {
+            assert!(validate_env_key(bad).is_err(), "accepted key `{bad}`");
+        }
+        for good in ["NODE_ENV", "DATABASE_URL", "PORT", "_PRIVATE", "X1"] {
+            assert!(validate_env_key(good).is_ok(), "refused key `{good}`");
+        }
+    }
+
+    /// Docker's own set, spelled Docker's way — `unless-stopped`, not
+    /// `unlessStopped`, because it goes straight to `--restart`.
+    #[test]
+    fn restart_policies_are_dockers_own_spelling() {
+        assert_eq!(RestartPolicy::No.as_str(), "no");
+        assert_eq!(RestartPolicy::OnFailure.as_str(), "on-failure");
+        assert_eq!(RestartPolicy::Always.as_str(), "always");
+        assert_eq!(RestartPolicy::UnlessStopped.as_str(), "unless-stopped");
+        assert_eq!(RestartPolicy::default(), RestartPolicy::No);
+    }
+
+    /// There is no field for a raw flag, and there must not be one. This test is
+    /// a tripwire: it fails if somebody adds one, which is the moment the
+    /// operation stops being a form and becomes a root shell.
+    #[test]
+    fn the_input_has_no_field_for_arbitrary_flags() {
+        let json = serde_json::json!({
+            "image": "nginx",
+            "name": "web",
+            "args": ["--privileged"],
+            "flags": ["-v", "/:/host"],
+            "privileged": true,
+            "network": "host",
+        });
+        let parsed: CreateInput =
+            serde_json::from_value(json).expect("unknown fields are ignored, not accepted");
+        // Nothing of the above survives into anything the operation uses.
+        assert_eq!(parsed.image.as_str(), "nginx");
+        assert!(parsed.ports.is_empty());
+        assert!(parsed.volumes.is_empty());
+        assert_eq!(parsed.restart, RestartPolicy::No);
     }
 }

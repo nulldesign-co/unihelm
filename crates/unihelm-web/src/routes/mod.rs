@@ -150,6 +150,10 @@ fn protected() -> Router<SharedState> {
         .route("/api/firewall/enable", post(firewall::enable))
         .route("/api/firewall/disable", post(firewall::disable))
         .route(
+            "/api/server/docker/containers",
+            post(runtimes::docker_create),
+        )
+        .route(
             "/api/server/docker/containers/{id}/start",
             post(runtimes::docker_start),
         )

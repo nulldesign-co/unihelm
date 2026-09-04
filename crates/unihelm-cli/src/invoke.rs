@@ -119,6 +119,43 @@ pub struct Secrets {
 /// No whitelist here on purpose. It used to be a `ValueEnum` of four names,
 /// which is why the CLI could install four things; the catalogue in the agent is
 /// the list now, and it refuses anything not in it — one place to add an engine
+/// `8080:80` or `5353:53/udp`.
+///
+/// Parsed here so a typo is a message about ports rather than a task that
+/// fails on the server minutes later.
+fn parse_port_maps(specs: &[String]) -> anyhow::Result<Vec<serde_json::Value>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (pair, udp) = match spec.strip_suffix("/udp") {
+                Some(rest) => (rest, true),
+                None => (spec.strip_suffix("/tcp").unwrap_or(spec), false),
+            };
+            let (host, container) = pair.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("`{spec}` is not a port mapping — use host:container")
+            })?;
+            Ok(json!({
+                "host": host.trim().parse::<u16>().map_err(|_| anyhow::anyhow!("`{host}` is not a port"))?,
+                "container": container.trim().parse::<u16>().map_err(|_| anyhow::anyhow!("`{container}` is not a port"))?,
+                "udp": udp,
+            }))
+        })
+        .collect()
+}
+
+/// `name:/path/in/container`, where `name` is a Docker volume and not a path.
+fn parse_volume_mounts(specs: &[String]) -> anyhow::Result<Vec<serde_json::Value>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (volume, path) = spec.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("`{spec}` is not a mount — use volume:/path/in/container")
+            })?;
+            Ok(json!({ "volume": volume.trim(), "path": path.trim() }))
+        })
+        .collect()
+}
+
 /// rather than three that have to agree.
 fn component_value(component: &str, version: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -148,6 +185,24 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Site(cmd) => site(cmd)?,
         Command::Docker(cmd) => match cmd {
             DockerCommand::List => call("docker.list", json!({})),
+            DockerCommand::Create {
+                image,
+                name,
+                ports,
+                env,
+                volumes,
+                restart,
+            } => call(
+                "docker.create",
+                json!({
+                    "image": image,
+                    "name": name,
+                    "ports": parse_port_maps(ports)?,
+                    "env": parse_env(env)?,
+                    "volumes": parse_volume_mounts(volumes)?,
+                    "restart": restart,
+                }),
+            ),
             DockerCommand::Start { container } => {
                 call("docker.start", json!({ "container": container }))
             }

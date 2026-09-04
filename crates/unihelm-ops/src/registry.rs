@@ -349,6 +349,7 @@ impl OpRegistry {
         registry.register(crate::docker::Restart);
         registry.register(crate::docker::Remove);
         registry.register(crate::docker::Logs);
+        registry.register(crate::docker::Create);
         registry.register(crate::runtime_default::SetDefault);
         registry.register(crate::webhook::List);
         registry.register(crate::webhook::Set);

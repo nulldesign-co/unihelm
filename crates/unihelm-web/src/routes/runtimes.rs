@@ -308,3 +308,34 @@ pub async fn docker_logs(
     let data = ops::invoke_now(&state, &current.auth, "docker.logs", input).await?;
     Ok(Json(data))
 }
+
+/// Create and start a container from an image.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/containers",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not an image, a name, a port, or a named volume", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: a container of that name exists", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_create(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // Forwarded as sent. Every field is validated by the operation's own typed
+    // input — the image reference, the volume names, the environment keys — and
+    // a second copy of those rules here would be a second thing to keep in step,
+    // which is the mistake the stack whitelist made three times over.
+    ops::invoke(&state, &current.auth, "docker.create", body).await
+}

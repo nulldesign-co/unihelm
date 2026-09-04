@@ -234,6 +234,31 @@ pub enum DockerCommand {
     Restart { container: String },
     /// Delete a container and its writable layer. A running one is refused.
     Remove { container: String },
+    /// Create and start a container from an image.
+    ///
+    /// A form, not `docker run`: an image, a name, ports, environment, named
+    /// volumes and a restart policy. There is no way to pass a raw flag, because
+    /// several of them (`--privileged`, `-v /:/host`, the daemon socket) are
+    /// root on this machine.
+    Create {
+        /// The image: `nginx`, `redis:7`, `registry.example.com/team/app:v1`.
+        image: String,
+        /// What to call the container.
+        #[arg(long)]
+        name: String,
+        /// Publish a port, as `host:container` or `host:container/udp`. Repeatable.
+        #[arg(long = "port")]
+        ports: Vec<String>,
+        /// Set an environment variable, as `KEY=value`. Repeatable.
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Mount a named volume, as `name:/path/in/container`. Repeatable.
+        #[arg(long = "volume")]
+        volumes: Vec<String>,
+        /// no, on-failure, always, unless-stopped.
+        #[arg(long, default_value = "no")]
+        restart: String,
+    },
     /// The last lines a container wrote, both streams merged.
     Logs {
         container: String,

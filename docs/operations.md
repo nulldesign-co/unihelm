@@ -41,6 +41,40 @@ Where an operation takes `subscription_id` as *(optional)*, omitting it means
 
 ## System
 
+### `docker.create`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task |
+| Input | `image`, `name`, `ports` *(optional)*, `env` *(optional)*, `volumes` *(optional)*, `restart` *(optional)* |
+
+Creates and starts a container from an image.
+
+**A form, not `docker run`.** There is no field for a raw flag and there must
+not be one: `--privileged`, `-v /:/host`, `--pid=host`, `--network=host`,
+`--cap-add`, or the daemon socket mounted into the container — each one is root
+on the machine, and an operation that accepted an arbitrary argument list would
+be a root shell with a nicer font. What is accepted is the shape of a container
+somebody actually wants from a control panel: an image, a name, published ports,
+environment variables, **named** volumes, and a restart policy. A test asserts
+that no field for arbitrary flags exists, so adding one fails the suite rather
+than quietly changing what this operation is.
+
+Named volumes only. A bind mount is a path on this server handed to a container;
+a named volume is Docker's own storage, and the difference is the boundary. The
+volume field is checked so a path cannot be smuggled through it, and the refusal
+says why.
+
+The image reference, the environment keys and the volume names are each
+validated before anything reaches a command line — an image cannot begin with
+`-`, an environment key cannot contain `=`, and a volume name cannot contain `/`.
+
+A name already in use is refused before the image is pulled, rather than after.
+The result reports whether the container is actually running, read back from
+Docker: a container can exit the instant it starts, and a successful `docker run`
+does not mean otherwise.
+
 ### `docker.logs`
 
 | | |
