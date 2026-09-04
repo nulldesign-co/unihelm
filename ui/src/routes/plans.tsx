@@ -11,7 +11,7 @@ import {
   Users,
   Wallet,
 } from "lucide-react";
-import { forwardRef, useState, type TextareaHTMLAttributes } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
@@ -20,7 +20,7 @@ import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Field, Input } from "@/components/ui/input";
+import { Field, Input, Textarea } from "@/components/ui/input";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
@@ -927,21 +927,6 @@ function AssignByIdDialog({
 // ---------------------------------------------------------------------------
 
 /** `ui/` has no textarea primitive yet, so this wears `Input`'s chrome exactly. */
-const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(
-  ({ className, ...props }, ref) => (
-    <textarea
-      ref={ref}
-      className={cn(
-        "w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-ink shadow-card",
-        "transition-[border-color,box-shadow] duration-150 placeholder:text-ink-subtle hover:border-border-strong",
-        "focus:border-accent focus:outline-none focus-visible:outline-2 focus-visible:outline-accent",
-        "aria-[invalid=true]:border-danger",
-        className,
-      )}
-      {...props}
-    />
-  ),
-);
 Textarea.displayName = "Textarea";
 
 /**

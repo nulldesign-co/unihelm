@@ -291,6 +291,22 @@ export type StackCategory = "web_server" | "language" | "database" | "cache" | "
  */
 export type VersionSource = "distro" | "vendor";
 
+export interface ContainerPortMap {
+  host: number;
+  container: number;
+  udp: boolean;
+}
+
+export interface CreateContainerRequest {
+  image: string;
+  name: string;
+  ports?: ContainerPortMap[];
+  env?: { key: string; value: string }[];
+  /** Named Docker volumes only. A path here is refused by the agent. */
+  volumes?: { volume: string; path: string }[];
+  restart?: "no" | "on-failure" | "always" | "unless-stopped";
+}
+
 export interface CatalogueVersion {
   version: string;
   /** Shown beside it. Empty when the version speaks for itself. */
@@ -910,6 +926,15 @@ export const endpoints = {
     api.post<TaskAccepted>(`/api/sites/${id}/certificate`, { staging }),
 
   apps: () => api.get<AppsResponse>("/api/apps"),
+  /**
+   * Create and start a container.
+   *
+   * A form, not an argument list: there is no field for a raw flag, because
+   * `--privileged`, `-v /:/host` and the daemon socket each make a container
+   * root on the server. The agent validates every field again.
+   */
+  createContainer: (body: CreateContainerRequest) =>
+    api.post<TaskAccepted>("/api/server/docker/containers", body),
   runtimes: () => api.get<RuntimeListResponse>("/api/runtimes"),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),

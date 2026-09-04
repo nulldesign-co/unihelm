@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Boxes, Download, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
@@ -239,22 +239,55 @@ export function StackPage() {
   // the menu pointing at something that is now on the machine.
   const [chosen, setChosen] = useState<Record<string, string>>({});
 
+  // True from the moment a button is pressed until the row it changed settles.
+  //
+  // The status the poll used to key on is written by the agent *after* the task
+  // starts, and the invalidate fired before that — so the refetch it triggered
+  // saw the old state, found nothing installing, and went back to sleep for
+  // twenty seconds. From the operator's side: press install, nothing happens,
+  // reload and it is suddenly underway. That reload was doing the work.
+  const [justActed, setJustActed] = useState(false);
+
   const stack = useQuery({
     queryKey: ["stack"],
     queryFn: endpoints.stack,
     // Installs take minutes; keep the page honest while one is running.
     refetchInterval: (query) =>
+      justActed ||
       query.state.data?.components.some((c) => c.status === "installing" || c.status === "removing")
-        ? 3_000
+        ? 2_000
         : 20_000,
   });
+
+  // Stop the fast poll once the agent's own status agrees something is happening
+  // — or has finished. Without this the page polls every two seconds forever
+  // after any click.
+  useEffect(() => {
+    if (!justActed) return;
+    const busy = stack.data?.components.some(
+      (c) => c.status === "installing" || c.status === "removing",
+    );
+    if (busy) {
+      setJustActed(false);
+      return;
+    }
+    // Nothing is running and nothing has started: give it a few seconds, then
+    // fall back to the slow poll rather than hammering forever if the task
+    // failed before it ever wrote a status.
+    const timer = setTimeout(() => setJustActed(false), 15_000);
+    return () => clearTimeout(timer);
+  }, [justActed, stack.data]);
 
   const settle = {
     onSuccess: () => {
       setError(null);
+      setJustActed(true);
       void queryClient.invalidateQueries({ queryKey: ["stack"] });
     },
-    onError: (e: unknown) => setError(e instanceof ApiError ? e.message : String(e)),
+    onError: (e: unknown) => {
+      setJustActed(false);
+      setError(e instanceof ApiError ? e.message : String(e));
+    },
   };
 
   const install = useMutation({ mutationFn: endpoints.installComponent, ...settle });

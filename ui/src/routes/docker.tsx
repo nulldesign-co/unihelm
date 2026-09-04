@@ -9,6 +9,7 @@ import {
   ScrollText,
   Square,
   Trash2,
+  Plus,
 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -18,12 +19,14 @@ import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Field, Input, Textarea } from "@/components/ui/input";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { SectionHeader } from "@/components/ui/section-header";
+import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { ApiError, api } from "@/lib/api";
+import { ApiError, api, endpoints, type CreateContainerRequest } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
@@ -71,6 +74,7 @@ import { cn } from "@/lib/utils";
  *    does not need and a dead one never gets the one it does.
  */
 export function DockerPage() {
+  const [creating, setCreating] = useState(false);
   const { t } = useTranslation();
 
   const list = useQuery({ queryKey: ["docker"], queryFn: fetchDockerInventory });
@@ -87,16 +91,26 @@ export function DockerPage() {
           // the list catches up with everything nobody here did. Deliberately
           // not a poll: a ten-second shell-out every few seconds is a cost the
           // operator did not ask for on a page they may leave open all day.
-          <Button variant="outline" loading={list.isFetching} onClick={() => void list.refetch()}>
-            <RotateCw className="h-4 w-4" aria-hidden />
-            {t("docker.refresh")}
-          </Button>
+          <>
+            <Button variant="outline" loading={list.isFetching} onClick={() => void list.refetch()}>
+              <RotateCw className="h-4 w-4" aria-hidden />
+              {t("docker.refresh")}
+            </Button>
+            {list.data?.daemon_running ? (
+              <Button onClick={() => setCreating(true)}>
+                <Plus className="h-4 w-4" aria-hidden />
+                {t("docker.create")}
+              </Button>
+            ) : null}
+          </>
         }
       />
 
       <Callout tone="info" title={t("docker.noRunTitle")}>
         {t("docker.noRun")}
       </Callout>
+
+      <CreateContainerDialog open={creating} onClose={() => setCreating(false)} />
 
       {list.isPending ? (
         <InventorySkeleton />
@@ -189,6 +203,143 @@ const fetchContainerLogs = (id: string) =>
 // ---------------------------------------------------------------------------
 // The three answers the operation can give
 // ---------------------------------------------------------------------------
+
+/**
+ * Create a container.
+ *
+ * A form rather than a command line, and the fields are the whole of what this
+ * panel will pass to Docker. There is no box for extra flags on purpose:
+ * `--privileged`, `-v /:/host` and the daemon socket each make a container root
+ * on this server, and no allow-list of flags is both short enough to be safe and
+ * long enough to be worth having. Anything past this is `docker run` over SSH.
+ *
+ * The lists are textareas of one entry per line rather than repeating field
+ * rows: somebody setting up a container usually has these in front of them
+ * already, in exactly this shape, from a compose file or a README.
+ */
+function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [image, setImage] = useState("");
+  const [name, setName] = useState("");
+  const [ports, setPorts] = useState("");
+  const [env, setEnv] = useState("");
+  const [volumes, setVolumes] = useState("");
+  const [restart, setRestart] = useState<CreateContainerRequest["restart"]>("unless-stopped");
+  const [error, setError] = useState<string | null>(null);
+
+  const lines = (text: string) =>
+    text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  const create = useMutation({
+    mutationFn: () =>
+      endpoints.createContainer({
+        image: image.trim(),
+        name: name.trim(),
+        ports: lines(ports).map((line) => {
+          const udp = line.endsWith("/udp");
+          const [host, container] = line.replace(/\/(udp|tcp)$/, "").split(":");
+          return {
+            host: Number(host),
+            container: Number(container),
+            udp,
+          };
+        }),
+        env: lines(env).map((line) => {
+          const at = line.indexOf("=");
+          return { key: line.slice(0, at), value: line.slice(at + 1) };
+        }),
+        volumes: lines(volumes).map((line) => {
+          const at = line.indexOf(":");
+          return { volume: line.slice(0, at), path: line.slice(at + 1) };
+        }),
+        restart,
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["docker"] });
+      onClose();
+      setImage("");
+      setName("");
+      setPorts("");
+      setEnv("");
+      setVolumes("");
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("docker.createTitle")}
+      description={t("docker.createHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            loading={create.isPending}
+            disabled={image.trim() === "" || name.trim() === ""}
+            onClick={() => {
+              setError(null);
+              create.mutate();
+            }}
+          >
+            {t("docker.createConfirm")}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {error}
+        </Callout>
+      ) : null}
+
+      <Field label={t("docker.imageField")} htmlFor="dk-image">
+        <Input id="dk-image" value={image} onChange={(e) => setImage(e.target.value)} placeholder="nginx:alpine" />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.imageHint")}</p>
+
+      <Field label={t("docker.containerName")} htmlFor="dk-name">
+        <Input id="dk-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="web" />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.containerNameHint")}</p>
+
+      <Field label={t("docker.portsLabel")} htmlFor="dk-ports">
+        <Textarea id="dk-ports" rows={2} value={ports} onChange={(e) => setPorts(e.target.value)} placeholder="8080:80" />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.portsHint")}</p>
+
+      <Field label={t("docker.envLabel")} htmlFor="dk-env">
+        <Textarea id="dk-env" rows={2} value={env} onChange={(e) => setEnv(e.target.value)} placeholder="NODE_ENV=production" />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.envHint")}</p>
+
+      <Field label={t("docker.volumesLabel")} htmlFor="dk-volumes">
+        <Textarea id="dk-volumes" rows={2} value={volumes} onChange={(e) => setVolumes(e.target.value)} placeholder="app_data:/var/lib/app" />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.volumesFieldHint")}</p>
+
+      <Field label={t("docker.restartLabel")} htmlFor="dk-restart">
+        <Select
+          id="dk-restart"
+          value={restart}
+          onChange={(e) => setRestart(e.target.value as CreateContainerRequest["restart"])}
+        >
+          <option value="unless-stopped">unless-stopped</option>
+          <option value="always">always</option>
+          <option value="on-failure">on-failure</option>
+          <option value="no">no</option>
+        </Select>
+      </Field>
+    </Dialog>
+  );
+}
 
 function Inventory({ inventory }: { inventory: DockerInventory }) {
   const { t } = useTranslation();
