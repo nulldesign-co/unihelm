@@ -52,6 +52,19 @@ impl Runtime {
         }
     }
 
+    /// How the runtime spells its own name, for a sentence an operator reads.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Runtime::Node => "Node.js",
+            Runtime::Python => "Python",
+            Runtime::Php => "PHP",
+            Runtime::Ruby => "Ruby",
+            Runtime::Go => "Go",
+            Runtime::Deno => "Deno",
+            Runtime::Bun => "Bun",
+        }
+    }
+
     /// Binary names to look for, most specific first.
     ///
     /// Versioned names matter more than the bare one: a machine with node 18 and
@@ -259,6 +272,7 @@ pub fn extract_version(text: &str) -> Option<String> {
 
 use serde::{Deserialize, Serialize};
 use unihelm_core::{ErrorCode, Permission, Result, UnihelmError};
+use unihelm_distro::Family;
 
 use crate::registry::{Execution, OpContext, TypedOperation};
 
@@ -299,32 +313,299 @@ impl TypedOperation for List {
     }
 }
 
-/// `runtime.install` — put a Node major line on the machine.
+/// `runtime.install` — put a language runtime on the machine.
 ///
-/// Only Node, and only major lines. Python, Ruby and PHP come from the
-/// distribution and are already handled by `stack.install`; Go, Deno and Bun
-/// ship as single binaries from vendors with no signed apt repository, and
-/// downloading a tarball over https and unpacking it as root is not something
-/// this panel does. `runtime.list` reports all of them once they are there by
-/// whatever means.
+/// Node comes from NodeSource, one repository per major line. Python, Go and
+/// Ruby come from the **distribution's own repositories**: Debian, Ubuntu and
+/// the RHEL rebuilds all ship the three, they are signed by a key the machine
+/// already trusts, and their security updates arrive with everything else's.
+/// Putting a third-party repository between an operator and packages their
+/// distribution already carries would be this panel taking on a supply chain it
+/// has no reason to own.
 ///
-/// Installing 22 when 22 is already installed is a no-op that reports so, which
-/// is what makes this safe to put behind a button.
+/// What that costs is versions, and the honest answer is to say so:
+///
+/// - Python ships one line per release, plus whatever extra `python3.X`
+///   packages the release carries. Asking for one it does not have is answered
+///   with what it does have, not with a PPA.
+/// - Go and Ruby ship exactly one that lands on `$PATH`. Debian's versioned
+///   `golang-1.24` installs under `/usr/lib/go-1.24` with no `go` anywhere a
+///   command or a unit would find it, so installing it would mean reporting
+///   success for something `runtime.list` cannot see. A pinned version of
+///   either is refused with that reason.
+///
+/// PHP belongs to `stack.install`, which also configures the FPM pool a site
+/// runs on. Deno and Bun are single vendor binaries fetched over https with no
+/// signed repository behind them, and this panel does not unpack a tarball as
+/// root — the operation says that rather than half-supporting them.
+/// `runtime.list` reports every one of them once they are there by any means.
+///
+/// Installing something that is already installed is a no-op that reports so,
+/// which is what makes this safe to put behind a button.
 pub struct Install;
 
 #[derive(Debug, Deserialize)]
 pub struct InstallInput {
-    /// A Node major line: 20, 22, 24.
-    pub major: u32,
+    /// Which runtime to install. Absent means Node.
+    #[serde(default)]
+    pub runtime: Option<Runtime>,
+    /// The version wanted, spelled the way that runtime spells it: `22` for
+    /// Node, `3.12` for Python. Absent means whatever the distribution's own
+    /// package provides, which for Go and Ruby is the only thing on offer.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Node's major line, the only field this operation used to take.
+    ///
+    /// Still accepted because none of the operation inputs can use
+    /// `deny_unknown_fields` (see `unihelm-cli::parity`): a caller left on the
+    /// old spelling would otherwise have its line dropped in silence and be
+    /// handed whatever `nodejs` the machine already had.
+    #[serde(default)]
+    pub major: Option<u32>,
+}
+
+impl InstallInput {
+    /// Which runtime and which version this is asking for.
+    fn resolve(&self) -> Result<(Runtime, Option<String>)> {
+        let runtime = self.runtime.unwrap_or(Runtime::Node);
+        let version = match (self.version.as_deref(), self.major) {
+            // Two spellings of the same field disagreeing is a caller bug, and
+            // guessing which one it meant would install a version nobody asked
+            // for.
+            (Some(version), Some(major)) if version != major.to_string() => {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "this asks for version `{version}` and major {major} at once; \
+                         send one of them"
+                    ),
+                )
+                .with_field("version"));
+            }
+            (Some(version), _) => Some(version.to_string()),
+            (None, Some(major)) => Some(major.to_string()),
+            (None, None) => None,
+        };
+        Ok((runtime, version))
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct InstallOutput {
+    /// Which runtime this is about — the caller may have asked by name only.
+    pub runtime: Runtime,
     /// What is installed now, whether this call put it there or found it.
     pub version: String,
     pub path: String,
     /// False when the version was already present and nothing was changed.
     pub installed: bool,
+}
+
+/// What an install would do, worked out before anything on the machine is
+/// touched.
+///
+/// Separate from [`Install::run`] so every refusal — a Node line nobody ships,
+/// a pinned Go, Bun at all — is a pure function of the request and the family,
+/// and can be tested without a server to install onto.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// Add the NodeSource repository for one major line, then install `nodejs`.
+    NodeSource { major: u32 },
+    /// Install from the repositories the distribution already has configured.
+    Distro {
+        /// Installed together. A name the distribution does not carry is an
+        /// error before apt is reached, not a wall of apt output.
+        packages: Vec<String>,
+        /// Installed as well *if* the package index has them, and skipped with
+        /// a log line if not.
+        companions: Vec<String>,
+    },
+}
+
+/// Work out what installing `runtime` at `version` would mean on this family.
+fn plan(runtime: Runtime, version: Option<&str>, family: Family) -> Result<Plan> {
+    match runtime {
+        Runtime::Node => {
+            let Some(version) = version else {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    "Node needs a major line — 20, 22 or 24. The distribution's own \
+                     `nodejs` is not what this installs.",
+                )
+                .with_field("version"));
+            };
+            let major: u32 = version.parse().map_err(|_| {
+                UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    format!("`{version}` is not a Node major line; use a number, such as 22."),
+                )
+                .with_field("version")
+            })?;
+            // A line nobody ships. Node's even majors are the LTS lines and the
+            // odd ones are current; below 18 is out of support everywhere, and a
+            // number in the hundreds is a typo that would otherwise become a 404
+            // halfway through an apt update.
+            if !(18..=40).contains(&major) {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "Node {major} is not a line anyone ships. Use a current major, \
+                         such as 22."
+                    ),
+                )
+                .with_field("version"));
+            }
+            Ok(Plan::NodeSource { major })
+        }
+
+        Runtime::Python => {
+            let package = python_package(version)?;
+            Ok(Plan::Distro {
+                companions: match family {
+                    // Debian and Ubuntu keep `venv` out of the interpreter
+                    // package, so a Python installed without it cannot make the
+                    // virtualenv an application is deployed into — and the
+                    // failure surfaces later, in somebody's deploy, not here.
+                    // A companion rather than a requirement because the name
+                    // tracks the interpreter (`python3.12-venv`) and a release
+                    // that has not split it out has no such package at all.
+                    Family::Debian => vec![format!("{package}-venv")],
+                    // EL builds `venv` into the interpreter package.
+                    Family::Rhel => Vec::new(),
+                },
+                packages: vec![package],
+            })
+        }
+
+        Runtime::Go | Runtime::Ruby => {
+            if let Some(version) = version {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "the distribution ships one {}, and this panel installs that one. \
+                         Its versioned packages install outside the path a command or a \
+                         unit searches, so asking for {version} here would report success \
+                         for something `runtime.list` cannot see.",
+                        runtime.display_name(),
+                    ),
+                )
+                .with_field("version"));
+            }
+            Ok(Plan::Distro {
+                packages: vec![
+                    match (runtime, family) {
+                        // `golang-go` is the one that puts /usr/bin/go there;
+                        // the `golang` metapackage on Debian pulls the docs and
+                        // the source tree with it.
+                        (Runtime::Go, Family::Debian) => "golang-go",
+                        (Runtime::Go, Family::Rhel) => "golang",
+                        // `ruby-full` is Debian's own name for a Ruby with the
+                        // headers gems with native extensions need; plain `ruby`
+                        // leaves `gem install` failing on a missing ruby.h.
+                        (Runtime::Ruby, Family::Debian) => "ruby-full",
+                        (Runtime::Ruby, Family::Rhel) => "ruby",
+                        _ => unreachable!("only Go and Ruby reach this arm"),
+                    }
+                    .to_string(),
+                ],
+                companions: match (runtime, family) {
+                    // EL splits the headers out under a name of its own.
+                    (Runtime::Ruby, Family::Rhel) => vec!["ruby-devel".to_string()],
+                    _ => Vec::new(),
+                },
+            })
+        }
+
+        Runtime::Php => Err(UnihelmError::new(
+            ErrorCode::NotImplemented,
+            "PHP is installed by `stack.install`, which also sets up the FPM pool a \
+             site runs on — installing the packages alone would leave a PHP nothing \
+             is serving with. Use the Stack page.",
+        )),
+
+        Runtime::Deno | Runtime::Bun => Err(UnihelmError::new(
+            ErrorCode::NotImplemented,
+            format!(
+                "{} is published as a single binary over https, with no signed \
+                 repository behind it. This panel installs from signed repositories \
+                 only and does not unpack a vendor tarball as root. Put it on the \
+                 server yourself and `runtime.list` will report it.",
+                runtime.display_name(),
+            ),
+        )),
+    }
+}
+
+/// The distribution's package for one Python line.
+fn python_package(version: Option<&str>) -> Result<String> {
+    let Some(version) = version else {
+        return Ok("python3".to_string());
+    };
+    // The version lands in a package name. Refuse anything that is not a
+    // version rather than trusting `PackageName` to be the only guard.
+    let plausible = !version.is_empty()
+        && version.len() <= 8
+        && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && !version.contains("..")
+        && !version.ends_with('.');
+    if !plausible {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!("`{version}` is not a Python version; ask for a line such as 3.12."),
+        )
+        .with_field("version"));
+    }
+    // Python 2 reached end of life in 2020 and no supported release ships it.
+    // Naming that is more use than an apt error about a package that has not
+    // existed for three releases.
+    if version == "2" || version.starts_with("2.") {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "Python {version} has been end of life since 2020 and no supported \
+                 distribution ships it. Ask for a 3.x line."
+            ),
+        )
+        .with_field("version"));
+    }
+    // `python3` is the interpreter package's name; `python3.12` is a specific
+    // line beside it. `3` alone means the former.
+    Ok(if version == "3" {
+        "python3".to_string()
+    } else {
+        format!("python{version}")
+    })
+}
+
+/// The installed version that satisfies a request, if there is one.
+///
+/// `None` for `wanted` means any version at all: for Go and Ruby the
+/// distribution offers one, so having it is the whole of the answer.
+fn satisfied_by<'a>(
+    found: &'a BTreeMap<Runtime, Vec<InstalledRuntime>>,
+    runtime: Runtime,
+    wanted: Option<&str>,
+) -> Option<&'a InstalledRuntime> {
+    let installed = found.get(&runtime)?;
+    match wanted {
+        None => installed
+            .iter()
+            .find(|r| r.is_default)
+            .or(installed.first()),
+        Some(wanted) => installed
+            .iter()
+            .find(|r| version_matches(&r.version, wanted)),
+    }
+}
+
+/// Whether an installed version is the one that was asked for.
+///
+/// Component-wise, so `3.12` matches `3.12.3` and not `3.1`. A string prefix
+/// would call `3.1` a match for `3.12.3`, and the operator who asked for 3.1
+/// would be told they already had it.
+fn version_matches(installed: &str, wanted: &str) -> bool {
+    let mut have = installed.split('.');
+    wanted.split('.').all(|part| have.next() == Some(part))
 }
 
 #[async_trait::async_trait]
@@ -344,90 +625,184 @@ impl TypedOperation for Install {
     };
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
-        // A line nobody ships. Node's even majors are the LTS lines and the odd
-        // ones are current; below 18 is out of support everywhere, and a number
-        // in the hundreds is a typo that would otherwise become a 404 halfway
-        // through an apt update.
-        if !(18..=40).contains(&input.major) {
-            return Err(UnihelmError::new(
-                ErrorCode::InvalidInput,
-                format!(
-                    "Node {} is not a line anyone ships. Use a current major, \
-                     such as 22.",
-                    input.major
-                ),
-            )
-            .with_field("major"));
-        }
+        let (runtime, wanted) = input.resolve()?;
+        let distro = ctx.distro().clone();
+        // Every refusal happens here, before the machine is read or touched.
+        let plan = plan(runtime, wanted.as_deref(), distro.info.family)?;
 
         // Already there? Say so and change nothing. This is what makes the
         // operation safe to bind to a button somebody may click twice.
         let before = survey().await;
-        if let Some(found) = before.get(&Runtime::Node).and_then(|v| {
-            v.iter()
-                .find(|r| r.version.split('.').next() == Some(&input.major.to_string()))
-        }) {
+        if let Some(found) = satisfied_by(&before, runtime, wanted.as_deref()) {
             ctx.log(format!(
-                "Node {} is already installed at {}",
-                found.version, found.path
+                "{} {} is already installed at {}",
+                runtime.display_name(),
+                found.version,
+                found.path
             ));
             return Ok(InstallOutput {
+                runtime,
                 version: found.version.clone(),
                 path: found.path.clone(),
                 installed: false,
             });
         }
 
-        let distro = ctx.distro().clone();
-        let repo = unihelm_distro::repos::nodesource(&distro.info, input.major)
-            .map_err(|e| UnihelmError::new(ErrorCode::NotImplemented, e))?;
-
         let log = ctx.log_sink();
 
-        for prerequisite in &repo.prerequisites {
-            distro.pkg.ensure_prerequisite(prerequisite, log).await?;
+        match &plan {
+            Plan::NodeSource { major } => {
+                let repo = unihelm_distro::repos::nodesource(&distro.info, *major)
+                    .map_err(|e| UnihelmError::new(ErrorCode::NotImplemented, e))?;
+
+                for prerequisite in &repo.prerequisites {
+                    distro.pkg.ensure_prerequisite(prerequisite, log).await?;
+                }
+
+                let key = crate::stack::fetch_key(&repo.definition.gpg_key_url).await?;
+                ctx.log(format!("fetched {} bytes of key material", key.len()));
+                distro
+                    .pkg
+                    .add_repo(&repo.definition, &key, &repo.options, log)
+                    .await?;
+
+                let packages = vec![
+                    unihelm_distro::PackageName::parse("nodejs")
+                        .map_err(|e| UnihelmError::internal(e.to_string()))?,
+                ];
+                distro.pkg.install(&packages, log).await?;
+            }
+
+            Plan::Distro {
+                packages,
+                companions,
+            } => {
+                // Nothing to add and no key to pin: these repositories are the
+                // ones the distribution configured and signed itself, and the
+                // panel adding its own copy of them would be inventing a supply
+                // chain where there already is one.
+                let names =
+                    distro_packages(&distro, log, packages, companions, runtime, &before).await?;
+                distro.pkg.install(&names, log).await?;
+            }
         }
 
-        let key = crate::stack::fetch_key(&repo.definition.gpg_key_url).await?;
-        ctx.log(format!("fetched {} bytes of key material", key.len()));
-        distro
-            .pkg
-            .add_repo(&repo.definition, &key, &repo.options, log)
-            .await?;
-
-        let packages = vec![
-            unihelm_distro::PackageName::parse("nodejs")
-                .map_err(|e| UnihelmError::internal(e.to_string()))?,
-        ];
-        distro.pkg.install(&packages, log).await?;
-
-        // Report what actually landed rather than what was asked for: apt
-        // resolves the line to a point release, and the operator wants to see
-        // which one.
+        // Report what actually landed rather than what was asked for: the
+        // package manager resolves a line to a point release, and the operator
+        // wants to see which one.
         let after = survey().await;
-        let found = after
-            .get(&Runtime::Node)
-            .and_then(|v| {
-                v.iter()
-                    .find(|r| r.version.split('.').next() == Some(&input.major.to_string()))
-            })
-            .ok_or_else(|| {
-                UnihelmError::new(
-                    ErrorCode::Internal,
-                    format!(
-                        "the packages installed but no Node {} binary appeared; \
-                         check the task log for what apt actually did",
-                        input.major
-                    ),
-                )
-            })?;
+        let found = satisfied_by(&after, runtime, wanted.as_deref()).ok_or_else(|| {
+            UnihelmError::new(
+                ErrorCode::Internal,
+                format!(
+                    "the packages installed but no {} binary appeared; check the task \
+                     log for what the package manager actually did",
+                    runtime.display_name()
+                ),
+            )
+        })?;
 
         Ok(InstallOutput {
+            runtime,
             version: found.version.clone(),
             path: found.path.clone(),
             installed: true,
         })
     }
+}
+
+fn parse_package(name: &str) -> Result<unihelm_distro::PackageName> {
+    unihelm_distro::PackageName::parse(name).map_err(|e| UnihelmError::internal(e.to_string()))
+}
+
+/// The packages to hand the package manager for a [`Plan::Distro`], with the
+/// package index refreshed before it is read.
+///
+/// The refresh is the whole reason this is a function. `apt-cache policy`
+/// answers out of `/var/lib/apt/lists`, and that directory is empty on a fresh
+/// image, empty after `apt clean`, and months out of date on a server nobody
+/// has touched — all of which are ordinary states for a machine this panel is
+/// installed onto. Querying it as it stands would let the refusal below say
+/// "this release has no `python3.13` package" about a release that ships one:
+/// a confident sentence about the server that is really a sentence about a
+/// stale file. The NodeSource path gets a refresh for free inside `add_repo`;
+/// this path adds no repository, so it asks for one itself.
+///
+/// The refresh is deliberately not checked for success, which is what the
+/// backend already does for `add_repo`. An inherited server with one broken
+/// entry in `sources.list.d` makes `apt update` exit non-zero every time, and
+/// refusing to install Python because somebody's unrelated PPA is 404ing would
+/// be the panel breaking on a mess it did not make. The failure is streamed to
+/// the task log, and a package that really is unreachable is caught below.
+async fn distro_packages(
+    distro: &unihelm_distro::Distro,
+    log: &dyn unihelm_distro::pkg::LogSink,
+    packages: &[String],
+    companions: &[String],
+    runtime: Runtime,
+    before: &BTreeMap<Runtime, Vec<InstalledRuntime>>,
+) -> Result<Vec<unihelm_distro::PackageName>> {
+    distro.pkg.update_index(log).await?;
+
+    let mut names = Vec::new();
+    for name in packages {
+        let package = parse_package(name)?;
+        // Asked before the install so a version this release does not carry is
+        // a sentence about this machine, rather than forty lines of apt ending
+        // in "Unable to locate package".
+        let status = distro.pkg.query(&package).await?;
+        if !status.installed && status.candidate_version.is_none() {
+            return Err(missing_package(distro, runtime, name, before));
+        }
+        names.push(package);
+    }
+    for name in companions {
+        let package = parse_package(name)?;
+        let status = distro.pkg.query(&package).await?;
+        if status.installed || status.candidate_version.is_some() {
+            names.push(package);
+        } else {
+            log.line(&format!(
+                "{} has no `{name}` package; installing without it",
+                distro.info.pretty_name
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// The distribution does not carry the package a request resolved to.
+///
+/// Names what this machine does have, because "no such package" on its own
+/// leaves an operator guessing whether they typed it wrong or whether their
+/// release simply never shipped that line.
+fn missing_package(
+    distro: &unihelm_distro::Distro,
+    runtime: Runtime,
+    package: &str,
+    before: &BTreeMap<Runtime, Vec<InstalledRuntime>>,
+) -> UnihelmError {
+    let here = match before.get(&runtime).and_then(|v| v.first()) {
+        Some(found) => format!(
+            " The {} on this machine is {} at {}.",
+            runtime.display_name(),
+            found.version,
+            found.path
+        ),
+        None => String::new(),
+    };
+    UnihelmError::new(
+        ErrorCode::InvalidInput,
+        format!(
+            "{} has no `{package}` package.{here} This panel installs {} from the \
+             distribution's own repositories and will not add a third-party one for a \
+             version yours does not ship — install it yourself and `runtime.list` will \
+             report it.",
+            distro.info.pretty_name,
+            runtime.display_name(),
+        ),
+    )
+    .with_field("version")
 }
 
 #[cfg(test)]
@@ -510,21 +885,290 @@ mod tests {
 
     /// A major line nobody ships must be refused before it becomes a 404
     /// halfway through an apt update, with a message that says what to use.
-    #[tokio::test]
-    async fn an_absurd_major_line_is_refused_before_anything_is_touched() {
-        // The guard is a pure check on the input, ahead of every side effect,
-        // so it is exercised without a machine to install onto.
-        for major in [0, 1, 17, 99, 2024] {
-            assert!(
-                !(18..=40).contains(&major),
-                "the test's own bounds drifted from the operation's"
+    #[test]
+    fn an_absurd_major_line_is_refused_before_anything_is_touched() {
+        for major in ["0", "1", "17", "99", "2024", "22.11", "latest"] {
+            let err =
+                plan(Runtime::Node, Some(major), Family::Debian).unwrap_err_or_panic("Node", major);
+            assert_eq!(err.code, ErrorCode::InvalidInput, "on {major}");
+            assert_eq!(err.field.as_deref(), Some("version"), "on {major}");
+        }
+        for major in ["18", "20", "22", "24", "40"] {
+            assert_eq!(
+                plan(Runtime::Node, Some(major), Family::Debian).unwrap(),
+                Plan::NodeSource {
+                    major: major.parse().unwrap()
+                }
             );
         }
-        for major in [18, 20, 22, 24, 40] {
-            assert!(
-                (18..=40).contains(&major),
-                "a real line was excluded: {major}"
+    }
+
+    /// Python, Go and Ruby come from the distribution, under the names the
+    /// distribution actually uses — which differ per family, and getting one
+    /// wrong is an install that fails on a package nobody has.
+    #[test]
+    fn the_distribution_s_own_package_names_are_asked_for() {
+        let cases = [
+            (
+                Runtime::Python,
+                None,
+                Family::Debian,
+                vec!["python3"],
+                vec!["python3-venv"],
+            ),
+            (
+                Runtime::Python,
+                Some("3.12"),
+                Family::Debian,
+                vec!["python3.12"],
+                vec!["python3.12-venv"],
+            ),
+            // EL builds venv into the interpreter package, so there is no
+            // companion to ask for.
+            (
+                Runtime::Python,
+                Some("3.12"),
+                Family::Rhel,
+                vec!["python3.12"],
+                vec![],
+            ),
+            (Runtime::Go, None, Family::Debian, vec!["golang-go"], vec![]),
+            (Runtime::Go, None, Family::Rhel, vec!["golang"], vec![]),
+            (
+                Runtime::Ruby,
+                None,
+                Family::Debian,
+                vec!["ruby-full"],
+                vec![],
+            ),
+            (
+                Runtime::Ruby,
+                None,
+                Family::Rhel,
+                vec!["ruby"],
+                vec!["ruby-devel"],
+            ),
+        ];
+        for (runtime, version, family, packages, companions) in cases {
+            let got = plan(runtime, version, family)
+                .unwrap_or_else(|e| panic!("{runtime:?} {version:?} on {family:?}: {}", e.detail));
+            assert_eq!(
+                got,
+                Plan::Distro {
+                    packages: packages.iter().map(|s| s.to_string()).collect(),
+                    companions: companions.iter().map(|s| s.to_string()).collect(),
+                },
+                "{runtime:?} {version:?} on {family:?}"
             );
+        }
+    }
+
+    /// Every package name this operation can produce has to be one the package
+    /// manager will accept, or the install dies on a name we built ourselves.
+    #[test]
+    fn every_planned_package_name_is_a_legal_one() {
+        for family in [Family::Debian, Family::Rhel] {
+            for (runtime, version) in [
+                (Runtime::Python, None),
+                (Runtime::Python, Some("3.12")),
+                (Runtime::Python, Some("3")),
+                (Runtime::Go, None),
+                (Runtime::Ruby, None),
+            ] {
+                let Plan::Distro {
+                    packages,
+                    companions,
+                } = plan(runtime, version, family).unwrap()
+                else {
+                    panic!("{runtime:?} is not a distribution package");
+                };
+                for name in packages.iter().chain(companions.iter()) {
+                    unihelm_distro::PackageName::parse(name)
+                        .unwrap_or_else(|e| panic!("`{name}` is not a package name: {e}"));
+                }
+            }
+        }
+    }
+
+    /// A version string reaches a package name, so anything that is not a
+    /// version has to be refused rather than passed along.
+    #[test]
+    fn a_python_version_that_is_not_one_never_reaches_a_package_name() {
+        for version in [
+            "3.12; rm -rf /",
+            "../../etc",
+            "3..12",
+            "3.",
+            "",
+            "3.12.4.5.6.7.8.9",
+            "latest",
+            // End of life since 2020, and worth its own sentence.
+            "2.7",
+        ] {
+            let err = python_package(Some(version)).unwrap_err_or_panic("Python", version);
+            assert_eq!(err.code, ErrorCode::InvalidInput, "on {version:?}");
+        }
+        assert_eq!(python_package(Some("3")).unwrap(), "python3");
+        assert_eq!(python_package(Some("3.13")).unwrap(), "python3.13");
+    }
+
+    /// Bun and Deno are single vendor binaries with no signed repository, and
+    /// PHP belongs to `stack.install`. Each has to say which it is: silence, or
+    /// a bare "unsupported", is what sends somebody to a curl-to-shell.
+    #[test]
+    fn a_runtime_this_panel_will_not_install_says_why() {
+        for (runtime, expected) in [
+            (Runtime::Deno, "single binary"),
+            (Runtime::Bun, "single binary"),
+            (Runtime::Php, "stack.install"),
+        ] {
+            let err = plan(runtime, None, Family::Debian)
+                .unwrap_err_or_panic("refusal", runtime.as_str());
+            assert_eq!(err.code, ErrorCode::NotImplemented, "for {runtime:?}");
+            assert!(
+                err.detail.contains(expected),
+                "{runtime:?} says {:?}, which does not mention {expected:?}",
+                err.detail
+            );
+        }
+    }
+
+    /// Debian ships `golang-1.24` under /usr/lib with no `go` on the path.
+    /// Installing it would report success for something `runtime.list` cannot
+    /// see and no app can be pinned to, so a pinned Go or Ruby is refused.
+    #[test]
+    fn a_pinned_go_or_ruby_is_refused_rather_than_installed_out_of_sight() {
+        for runtime in [Runtime::Go, Runtime::Ruby] {
+            let err =
+                plan(runtime, Some("1.24"), Family::Debian).unwrap_err_or_panic("pinned", "1.24");
+            assert_eq!(err.code, ErrorCode::InvalidInput);
+            assert_eq!(err.field.as_deref(), Some("version"));
+        }
+    }
+
+    /// `3.1` is not `3.12`. A string prefix says it is, and an operator who
+    /// asked for 3.1 would be told they already had it and given 3.12.
+    #[test]
+    fn a_version_matches_component_wise_and_not_by_prefix() {
+        assert!(version_matches("3.12.3", "3.12"));
+        assert!(version_matches("22.11.0", "22"));
+        assert!(version_matches("3.12.3", "3.12.3"));
+        assert!(!version_matches("3.12.3", "3.1"));
+        assert!(!version_matches("3.1.4", "3.12"));
+        assert!(!version_matches("22.11.0", "2"));
+        assert!(!version_matches("3.12.3", "3.12.4"));
+    }
+
+    /// The version somebody asked for decides whether anything is installed, so
+    /// "already installed" has to mean *that* version and not any version.
+    #[test]
+    fn an_install_is_a_no_op_only_for_the_version_asked_for() {
+        let found = BTreeMap::from([(
+            Runtime::Python,
+            vec![
+                InstalledRuntime {
+                    runtime: Runtime::Python,
+                    version: "3.11.2".into(),
+                    path: "/usr/bin/python3".into(),
+                    is_default: true,
+                },
+                InstalledRuntime {
+                    runtime: Runtime::Python,
+                    version: "3.13.1".into(),
+                    path: "/usr/bin/python3.13".into(),
+                    is_default: false,
+                },
+            ],
+        )]);
+
+        assert_eq!(
+            satisfied_by(&found, Runtime::Python, Some("3.13")).map(|r| r.path.as_str()),
+            Some("/usr/bin/python3.13")
+        );
+        // No version asked for means the distribution's own, which is the one a
+        // bare `python3` resolves to.
+        assert_eq!(
+            satisfied_by(&found, Runtime::Python, None).map(|r| r.path.as_str()),
+            Some("/usr/bin/python3")
+        );
+        assert!(satisfied_by(&found, Runtime::Python, Some("3.12")).is_none());
+        assert!(satisfied_by(&found, Runtime::Go, None).is_none());
+    }
+
+    /// `major` is what the CLI, the HTTP route and the page all sent before this
+    /// operation grew a second runtime. None of the operation inputs can use
+    /// `deny_unknown_fields`, so dropping the field would not fail a caller
+    /// still sending it — it would quietly install the wrong thing.
+    #[test]
+    fn the_field_this_operation_started_with_still_asks_for_a_node_line() {
+        let old: InstallInput = serde_json::from_value(serde_json::json!({ "major": 22 })).unwrap();
+        assert_eq!(old.resolve().unwrap(), (Runtime::Node, Some("22".into())));
+
+        let new: InstallInput =
+            serde_json::from_value(serde_json::json!({ "runtime": "python", "version": "3.12" }))
+                .unwrap();
+        assert_eq!(
+            new.resolve().unwrap(),
+            (Runtime::Python, Some("3.12".into()))
+        );
+
+        let bare: InstallInput =
+            serde_json::from_value(serde_json::json!({ "runtime": "go" })).unwrap();
+        assert_eq!(bare.resolve().unwrap(), (Runtime::Go, None));
+
+        // Both spellings, disagreeing: guessing would install a version nobody
+        // asked for.
+        let both: InstallInput =
+            serde_json::from_value(serde_json::json!({ "version": "20", "major": 22 })).unwrap();
+        assert_eq!(both.resolve().unwrap_err().code, ErrorCode::InvalidInput);
+    }
+
+    /// The refusal is decided from the package index, so the index has to be
+    /// fetched first.
+    ///
+    /// A server whose `/var/lib/apt/lists` is empty — a fresh image, anything
+    /// after `apt clean`, a machine nobody has updated in a month — answers
+    /// every `apt-cache policy` with no candidate. Without the refresh the
+    /// operation reads that and tells the operator their release has no
+    /// `python3.13`, which is a claim about a stale file dressed up as a claim
+    /// about their machine, and then the install that did get past it fetches
+    /// archive URLs that have since gone.
+    #[tokio::test]
+    async fn the_package_index_is_fetched_before_it_is_used_to_refuse() {
+        let (distro, recorder) = unihelm_distro::mock::mock_distro_with_recorder(Family::Debian);
+        let log = unihelm_distro::mock::RecordingLog(recorder.clone());
+
+        let names = distro_packages(
+            &distro,
+            &log,
+            &["python3.13".to_string()],
+            &["python3.13-venv".to_string()],
+            Runtime::Python,
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names.len(), 2, "got {names:?}");
+
+        let lines = recorder.lock().expect("recorder mutex").log_lines.clone();
+        assert!(
+            lines.iter().any(|l| l.contains("index updated")),
+            "the index was never refreshed: {lines:?}"
+        );
+    }
+
+    /// `unwrap_err`, with the panic naming what was being planned — the same
+    /// failure repeated over a table is otherwise unattributable.
+    trait UnwrapErrOrPanic {
+        fn unwrap_err_or_panic(self, what: &str, input: &str) -> UnihelmError;
+    }
+
+    impl<T: std::fmt::Debug> UnwrapErrOrPanic for Result<T> {
+        fn unwrap_err_or_panic(self, what: &str, input: &str) -> UnihelmError {
+            match self {
+                Err(e) => e,
+                Ok(planned) => panic!("{what} `{input}` was accepted: {planned:?}"),
+            }
         }
     }
 

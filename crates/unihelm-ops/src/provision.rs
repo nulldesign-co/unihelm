@@ -108,6 +108,58 @@ pub async fn ensure_tenant_user(
     Ok(())
 }
 
+/// Create a subscription's account the first time something has to *become*
+/// it, instead of waiting for the next site or app.
+///
+/// The two halves of a subscription are made in different places: the row by
+/// the database layer — which writes one lazily on first use and has neither an
+/// [`OpContext`] nor any way to run `useradd` — and the account by
+/// `site.create` and `app.create`. On a fresh install nobody has run either
+/// yet, so the file manager pointed at an account that had never been made and
+/// reported a generated name the operator had never seen and could not act on.
+///
+/// Cheap to call on a server that already has sites: [`ensure_tenant_user`] is
+/// idempotent, and the caller only reaches this after `getpwnam` has already
+/// said the account is absent.
+pub async fn ensure_tenant_user_on_demand(
+    ctx: &OpContext,
+    user: &LinuxUser,
+    home: &str,
+) -> Result<()> {
+    // No shell. Browsing files is not a decision to grant SSH; the plan grants
+    // that, through the paths that own it (spec §6.3).
+    ensure_tenant_user(ctx, user, home, false)
+        .await
+        .map_err(|cause| account_provisioning_failed(user, home, &cause))
+}
+
+/// Say why the account is still missing.
+///
+/// Without this the operator is told that `uh_xxxxxxxx` does not exist — a name
+/// nobody chose and nothing explains. What they can act on is the reason
+/// `useradd` (or the slice that follows it) refused, so that is what travels,
+/// under the cause's own code so "the command failed" does not arrive dressed
+/// as "we looked and it is not there".
+///
+/// "Provisioned", not "created": [`ensure_tenant_user`] also sets the home's
+/// ownership and applies the resource slice, and a refusal at either of those
+/// leaves an account that does exist. Telling the operator it could not be
+/// created would send them looking for the wrong thing.
+fn account_provisioning_failed(
+    user: &LinuxUser,
+    home: &str,
+    cause: &unihelm_core::UnihelmError,
+) -> unihelm_core::UnihelmError {
+    unihelm_core::UnihelmError::new(
+        cause.code,
+        format!(
+            "this subscription's Linux account `{user}` did not exist yet and could not be \
+             provisioned with home {home}: {}",
+            cause.detail
+        ),
+    )
+}
+
 /// Set the home directory's ownership and mode.
 ///
 /// Split out because it must also run when re-provisioning an account created
@@ -377,6 +429,32 @@ mod tests {
         let expected = unihelm_config::paths::tenant_home(user().as_str()).join("sites");
         assert!(root.starts_with(&expected));
         assert!(root.components().count() >= 5, "{root:?}");
+    }
+
+    #[test]
+    fn a_failed_account_creation_says_what_actually_failed() {
+        // The bug this replaces told the operator that `uh_abc12345` does not
+        // exist: a name they had never seen, about a machine where nothing was
+        // wrong except that nobody had made the account yet. What they can act
+        // on is the refusal underneath.
+        let cause = unihelm_core::UnihelmError::new(
+            unihelm_core::ErrorCode::CommandFailed,
+            "useradd: cannot lock /etc/passwd; try again later",
+        );
+        let err = account_provisioning_failed(&user(), "/home/uh_abc12345", &cause);
+
+        assert_eq!(
+            err.code,
+            unihelm_core::ErrorCode::CommandFailed,
+            "the category has to survive, or the UI reports a missing thing rather than a failure"
+        );
+        assert!(err.detail.contains("uh_abc12345"), "{}", err.detail);
+        assert!(err.detail.contains("/home/uh_abc12345"), "{}", err.detail);
+        assert!(
+            err.detail.contains("cannot lock /etc/passwd"),
+            "the reason must reach the operator: {}",
+            err.detail
+        );
     }
 
     #[test]

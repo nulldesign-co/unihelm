@@ -147,6 +147,28 @@ fn protected() -> Router<SharedState> {
             axum::routing::put(cron::update).delete(cron::delete),
         )
         .route("/api/firewall", get(firewall::rules))
+        .route("/api/firewall/enable", post(firewall::enable))
+        .route("/api/firewall/disable", post(firewall::disable))
+        .route(
+            "/api/server/docker/containers/{id}/start",
+            post(runtimes::docker_start),
+        )
+        .route(
+            "/api/server/docker/containers/{id}/stop",
+            post(runtimes::docker_stop),
+        )
+        .route(
+            "/api/server/docker/containers/{id}/restart",
+            post(runtimes::docker_restart),
+        )
+        .route(
+            "/api/server/docker/containers/{id}",
+            axum::routing::delete(runtimes::docker_remove),
+        )
+        .route(
+            "/api/server/docker/containers/{id}/logs",
+            get(runtimes::docker_logs),
+        )
         .route("/api/firewall/ports", post(firewall::port_open))
         .route("/api/firewall/ports/close", post(firewall::port_close))
         .route(

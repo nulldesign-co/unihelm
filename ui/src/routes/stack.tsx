@@ -15,6 +15,7 @@ import {
   PHP_VERSIONS,
   endpoints,
   type ComponentState,
+  type StackComponentRequest,
   type StackComponentView,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
@@ -25,19 +26,26 @@ const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> 
   removing: "accent",
   failed: "danger",
   absent: "neutral",
+  // Neutral, not success: it is there and working, but the panel did not put it
+  // there and cannot vouch for how it is configured.
+  unmanaged: "neutral",
 };
 
 /** What the install and remove endpoints take. */
-type ComponentRequest = { component: "nginx" } | { component: "php"; version: string };
+type ComponentRequest = StackComponentRequest;
 
 const requestFor = (slug: string): ComponentRequest =>
-  slug === "nginx"
-    ? { component: "nginx" }
+  slug === "nginx" || slug === "mariadb" || slug === "postgres"
+    ? { component: slug }
     : { component: "php", version: slug.replace("php", "") };
 
 /** The inverse, so a pending mutation can say which row it belongs to. */
 const slugFor = (request: ComponentRequest | undefined): string | null =>
-  request === undefined ? null : request.component === "nginx" ? "nginx" : `php${request.version}`;
+  request === undefined
+    ? null
+    : request.component === "php"
+      ? `php${request.version}`
+      : request.component;
 
 /**
  * The Stack Manager (spec §11.1).
@@ -97,6 +105,11 @@ export function StackPage() {
   const components = stack.data?.components ?? [];
   const nginx = components.find((c) => c.slug === "nginx");
   const php = components.filter((c) => c.slug.startsWith("php"));
+  // The agent has offered these since the beginning; this page simply never
+  // asked for them, so a database could not be installed from the panel at all
+  // — and `db.create` refuses with "install it from the Stack Manager first",
+  // pointing at a page that did not list it.
+  const databases = components.filter((c) => c.slug === "mariadb" || c.slug === "postgres");
   const busy = install.isPending || remove.isPending;
 
   // Only the row the operator clicked should spin. The rest are merely disabled,
@@ -159,6 +172,32 @@ export function StackPage() {
           </tbody>
         </Table>
       </section>
+
+      {databases.length > 0 ? (
+        <section aria-labelledby="stack-db" className="space-y-3">
+          <SectionHeading
+            id="stack-db"
+            title={t("stack.databases")}
+            hint={t("stack.databasesHint")}
+          />
+          <Table className="min-w-[560px]">
+            <ColumnHeadings />
+            <tbody>
+              {databases.map((component, index) => (
+                <ComponentRow
+                  key={component.slug}
+                  component={component}
+                  busy={busy}
+                  pending={acting === component.slug}
+                  index={index}
+                  onInstall={() => install.mutate(requestFor(component.slug))}
+                  onRemove={() => remove.mutate(requestFor(component.slug))}
+                />
+              ))}
+            </tbody>
+          </Table>
+        </section>
+      ) : null}
 
       {(stack.data?.unverified_pins.length ?? 0) > 0 ? (
         <Callout tone="warning" title={t("stack.pinsTitle")}>
@@ -257,6 +296,11 @@ function ComponentRow({
   const { t } = useTranslation();
   const inFlight = component.status === "installing" || component.status === "removing";
   const installed = component.status === "installed";
+  // On the machine, but this panel did not put it there. Offering "Install"
+  // invites an operator to add a vendor repository over a running nginx and
+  // replace a configuration that is serving their sites; offering "Remove" is
+  // worse. Neither is ours to press.
+  const unmanaged = component.status === "unmanaged";
   const working = inFlight || pending;
 
   // Our bookkeeping and systemd can disagree if somebody removed a package by
@@ -302,7 +346,9 @@ function ComponentRow({
         </Badge>
       </Td>
       <Td className="text-end whitespace-nowrap">
-        {installed ? (
+        {unmanaged ? (
+          <span className="text-xs text-ink-muted">{t("stack.unmanagedNote")}</span>
+        ) : installed ? (
           <Button variant="danger" size="sm" loading={working} disabled={busy} onClick={onRemove}>
             <Trash2 className="h-3.5 w-3.5" aria-hidden />
             {t("stack.remove")}

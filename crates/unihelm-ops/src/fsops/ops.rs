@@ -5,7 +5,9 @@
 //! caller can only ever reach a home their scope can see. The path *inside*
 //! the home arrives as a [`TenantPath`], which rejected `..`, absolute paths
 //! and control characters at deserialisation; the helper then re-resolves it
-//! under the tenant's own uid (spec §5.2 rule 3).
+//! under the tenant's own uid (spec §5.2 rule 3). If that account has never
+//! been made — a fresh install, where nobody has created a site yet — the
+//! first operation that needs it provisions it; see `tenant_fs`.
 //!
 //! File content crosses the operation JSON as base64, capped at
 //! [`MAX_CHUNK`] decoded bytes per call. Big transfers are *chunked*: reads
@@ -89,11 +91,55 @@ async fn tenant_fs(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Tena
             .map_err(UnihelmError::from)?,
     };
 
+    let user = LinuxUser::parse(&subscription.linux_user)?;
+
+    // A subscription's row and the Linux account behind it are written in
+    // different places — the row by the database layer, which cannot run
+    // `useradd`, the account by `site.create` and `app.create` — so on a server
+    // where nobody has made a site yet, the account does not exist. The file
+    // manager is usually the first thing opened on a fresh install, and it used
+    // to answer with a generated name the operator had never seen.
+    //
+    // Making it here, at the first operation that has to *become* it, is a side
+    // effect on a read, which is why the condition is this narrow: only when
+    // privileges are about to be dropped, and only when `getpwnam` has already
+    // missed. The alternative — creating it with the subscription — cannot
+    // hold, because the row is also created lazily from inside the database
+    // layer, and would leave every server installed before today broken anyway.
+    if must_create_account(
+        drops_privileges(),
+        passwd_entry(&subscription.linux_user).is_some(),
+    ) {
+        crate::provision::ensure_tenant_user_on_demand(ctx, &user, &subscription.home_dir).await?;
+    }
+
     Ok(TenantFs {
         home: PathBuf::from(&subscription.home_dir),
-        user: LinuxUser::parse(&subscription.linux_user)?,
+        user,
         runner: runner_for(&subscription.linux_user)?,
     })
+}
+
+/// Does this call have to make the tenant's account before it can run as it?
+///
+/// A predicate rather than an inline `&&` because the branch it guards — root
+/// agent, no such account, so run `useradd` — is the one branch no test process
+/// may execute: it cannot become root, and it must not add real accounts to
+/// whoever's machine it is running on. Taking the two facts as arguments is
+/// what lets that decision be pinned; see the tests below.
+fn must_create_account(drops_privileges: bool, account_exists: bool) -> bool {
+    drops_privileges && !account_exists
+}
+
+/// Will file operations have to drop to the tenant's uid — and so does the
+/// account have to exist at all?
+///
+/// Shared with [`runner_for`] rather than repeated, because the two answers
+/// drifting apart would either resurrect the missing-account failure or run
+/// `useradd` on a developer's laptop.
+fn drops_privileges() -> bool {
+    // SAFETY: `geteuid` reads process state and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// Pick how requests for this account get executed.
@@ -103,8 +149,7 @@ async fn tenant_fs(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Tena
 /// call, so there is no privilege to drop — and nothing to protect either,
 /// since a dev home is a scratch directory owned by the current user.
 pub(crate) fn runner_for(linux_user: &str) -> Result<FsRunner> {
-    // SAFETY: `geteuid` reads process state and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
+    if !drops_privileges() {
         return Ok(FsRunner::Local);
     }
 
@@ -1724,6 +1769,55 @@ mod tests {
         let trash = out["trash_bytes"].as_u64().unwrap();
         assert!(trash > 0, "the deleted file still costs quota");
         assert!(total >= trash);
+    }
+
+    #[tokio::test]
+    async fn a_home_whose_account_was_never_made_is_still_browsable_unprivileged() {
+        // The seeded subscription's `uh_` account exists in no passwd file
+        // anywhere — which is exactly the fresh-install shape. An unprivileged
+        // agent has no privilege to drop, so it must neither demand the account
+        // nor try to create one: `useradd` on a developer's laptop would be a
+        // worse bug than the one being fixed.
+        let (reg, user, _g, _home) = registry_with_home().await;
+        let db = reg.services().db.clone();
+        let subscription = db.default_subscription_for(user).await.unwrap();
+        assert!(
+            passwd_entry(&subscription.linux_user).is_none(),
+            "the fixture is only meaningful while `{}` is not a real account",
+            subscription.linux_user
+        );
+
+        run(&reg, user, "fs.list", serde_json::json!({}))
+            .await
+            .expect("an unprivileged agent needs no Linux account");
+    }
+
+    #[test]
+    fn only_a_root_agent_facing_a_missing_account_creates_one() {
+        // Each row is a way the fix can be got wrong. Row 1 is the defect
+        // itself: on a fresh install the panel had a subscription row and no
+        // account, and said so with a name the operator had never seen. Row 2
+        // keeps the cost on an established server at one `getpwnam`. Rows 3
+        // and 4 keep `useradd` off a machine where there is no privilege to
+        // drop and the home is a scratch directory — a developer's laptop, or
+        // this test process.
+        assert!(must_create_account(true, false));
+        assert!(!must_create_account(true, true));
+        assert!(!must_create_account(false, false));
+        assert!(!must_create_account(false, true));
+    }
+
+    #[test]
+    fn the_account_is_only_required_where_privileges_get_dropped() {
+        // The gate in `tenant_fs` and the choice in `runner_for` must agree:
+        // if they drift, either the account is demanded where it is never used
+        // or it is not created where it is. Whichever way this process is
+        // running, the two have to answer the same question the same way.
+        assert_eq!(
+            must_create_account(drops_privileges(), false),
+            runner_for("uh_nosuchacct").is_err(),
+            "an account `runner_for` insists on is exactly one `tenant_fs` must make"
+        );
     }
 
     #[test]

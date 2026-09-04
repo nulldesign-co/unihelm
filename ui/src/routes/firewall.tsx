@@ -3,13 +3,15 @@ import {
   AlertTriangle,
   Ban,
   MoreHorizontal,
+  Play,
   Plus,
+  Power,
   ShieldAlert,
   ShieldOff,
   Trash2,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { SectionHeader } from "@/components/ui/section-header";
@@ -189,9 +191,23 @@ function LoadError({ error }: { error: unknown }) {
 // backend state
 // ---------------------------------------------------------------------------
 
+/**
+ * The backends whose on/off switch the panel owns.
+ *
+ * ufw and firewalld each have one the panel can drive. nftables does not: its
+ * ruleset is the kernel's and Unihelm's `inet unihelm` table is only a part of
+ * it, so starting or stopping "the firewall" there would mean loading or
+ * flushing rules nobody here has read. The agent refuses that case by name, and
+ * this page must not offer a button that only ever produces the refusal.
+ */
+function isSwitchable(backend: FirewallBackend): boolean {
+  return backend === "ufw" || backend === "firewalld";
+}
+
 function BackendCard({ data }: { data: FirewallResponse }) {
   const { t } = useTranslation();
   const backendName = t(`firewall.backendName.${data.backend}`, { defaultValue: data.backend });
+  const switchable = isSwitchable(data.backend);
 
   // Three states, three different sentences. Collapsing "no firewall" into
   // "inactive" would hide the one case where installing something is the fix.
@@ -214,6 +230,10 @@ function BackendCard({ data }: { data: FirewallResponse }) {
         badge={t("dashboard.firewallInactive")}
         title={t("firewall.inactiveTitle", { backend: backendName })}
         body={t("firewall.inactiveBody")}
+        // "Start the service" is a dead end on a backend the panel cannot
+        // start, so that banner says who has to do it instead.
+        hint={switchable ? undefined : t("firewall.lifecycle.notSwitchable")}
+        action={switchable ? <StartControl backend={backendName} /> : undefined}
       />
     );
   }
@@ -224,6 +244,7 @@ function BackendCard({ data }: { data: FirewallResponse }) {
       badge={t("dashboard.firewallActive")}
       title={t("firewall.activeTitle", { backend: backendName })}
       body={t("firewall.activeBody", { count: data.rules.filter((r) => r.in_backend).length })}
+      action={switchable ? <StopControl data={data} backend={backendName} /> : undefined}
     />
   );
 }
@@ -242,6 +263,7 @@ function Notice({
   title,
   body,
   hint,
+  action,
 }: {
   tone: "danger" | "warning" | "success";
   /** The one-word state, next to the sentence — colour is never the only signal. */
@@ -249,6 +271,8 @@ function Notice({
   title: string;
   body: string;
   hint?: string;
+  /** The control that changes the state this banner describes, under it. */
+  action?: ReactNode;
 }) {
   return (
     <Callout
@@ -264,7 +288,172 @@ function Notice({
     >
       <p>{body}</p>
       {hint ? <p className="mt-1">{hint}</p> : null}
+      {action ? <div className="mt-3">{action}</div> : null}
     </Callout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// starting and stopping the firewall
+// ---------------------------------------------------------------------------
+
+/**
+ * Start the firewall, and let the agent's lockout refusal do the talking.
+ *
+ * The plain button never widens the ruleset. If nothing in the firewall would
+ * accept an SSH connection to the port sshd answers on, the agent refuses with
+ * `field: "allow_ssh"` and a sentence naming the port and how it knows — and
+ * only then is "open SSH and start" offered, in a dialog, as a second decision.
+ * Offering it up front would make opening a hole the default way to press a
+ * button, which is how a panel ends up widening a firewall nobody asked it to
+ * widen.
+ */
+function StartControl({ backend }: { backend: string }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+  const [sshRefusal, setSshRefusal] = useState<string | null>(null);
+
+  const start = useMutation({
+    mutationFn: (allowSsh: boolean) =>
+      endpoints.startFirewall(allowSsh ? { allow_ssh: true } : {}),
+    onSuccess: () => {
+      setError(null);
+      setSshRefusal(null);
+      void queryClient.invalidateQueries({ queryKey: ["firewall"] });
+      void queryClient.invalidateQueries({ queryKey: ["firewall-bans"] });
+    },
+    onError: (e) => {
+      // The refusal is shown verbatim: it carries the port, where that number
+      // came from, and the address the check was made against — three things
+      // the browser cannot work out for itself.
+      if (e instanceof ApiError && e.field === "allow_ssh") {
+        setError(null);
+        setSshRefusal(e.message);
+        return;
+      }
+      setSshRefusal(null);
+      setError(e instanceof ApiError ? e.message : String(e));
+    },
+  });
+
+  return (
+    <>
+      <Button
+        variant="primary"
+        size="sm"
+        onClick={() => start.mutate(false)}
+        loading={start.isPending}
+      >
+        <Play className="h-3.5 w-3.5" aria-hidden />
+        {t("firewall.lifecycle.start", { backend })}
+      </Button>
+
+      {error ? (
+        <p role="alert" className="mt-2 text-xs text-danger">
+          {error}
+        </p>
+      ) : null}
+
+      <Dialog
+        open={sshRefusal !== null}
+        onClose={() => setSshRefusal(null)}
+        title={t("firewall.lifecycle.sshTitle")}
+        description={t("firewall.lifecycle.sshDescription")}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setSshRefusal(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => start.mutate(true)}
+              loading={start.isPending}
+            >
+              {t("firewall.lifecycle.startWithSsh")}
+            </Button>
+          </>
+        }
+      >
+        <Callout tone="warning">{sshRefusal}</Callout>
+        <p className="mt-3 text-sm text-ink-muted">{t("firewall.lifecycle.sshOpensHint")}</p>
+      </Dialog>
+    </>
+  );
+}
+
+/**
+ * Stop the firewall, behind a dialog that says what stops being enforced.
+ *
+ * Stopping deletes nothing, and the counts are the point: an operator who is
+ * told "this stops enforcing 14 rules and releases every address the firewall
+ * is dropping" is making a different decision from one who clicked a button
+ * labelled "Stop".
+ */
+function StopControl({ data, backend }: { data: FirewallResponse; backend: string }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const enforced = data.rules.filter((rule) => rule.in_backend).length;
+
+  const stop = useMutation({
+    mutationFn: () => endpoints.stopFirewall(),
+    onSuccess: () => {
+      setError(null);
+      setConfirming(false);
+      void queryClient.invalidateQueries({ queryKey: ["firewall"] });
+      void queryClient.invalidateQueries({ queryKey: ["firewall-bans"] });
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <>
+      <Button variant="outline" size="sm" onClick={() => setConfirming(true)}>
+        <Power className="h-3.5 w-3.5" aria-hidden />
+        {t("firewall.lifecycle.stop", { backend })}
+      </Button>
+
+      {error && !confirming ? (
+        <p role="alert" className="mt-2 text-xs text-danger">
+          {error}
+        </p>
+      ) : null}
+
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title={t("firewall.lifecycle.stopTitle", { backend })}
+        description={t("firewall.lifecycle.stopDescription")}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setConfirming(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button variant="danger" onClick={() => stop.mutate()} loading={stop.isPending}>
+              {t("firewall.lifecycle.stopConfirm")}
+            </Button>
+          </>
+        }
+      >
+        <ul className="mb-3 list-disc space-y-1.5 ps-5 text-sm">
+          <li className="tnum">{t("firewall.lifecycle.stopRules", { count: enforced })}</li>
+          <li>{t("firewall.lifecycle.stopBans")}</li>
+          <li>{t("firewall.lifecycle.stopBoot")}</li>
+        </ul>
+        {/* The reassuring half, last and no less true: this is reversible, and
+            an operator who does not know that will leave a firewall running
+            that they needed to stop for ten minutes. */}
+        <p className="text-sm text-ink-muted">{t("firewall.lifecycle.stopReversible")}</p>
+
+        {error ? (
+          <Callout tone="danger" className="mt-3">
+            {error}
+          </Callout>
+        ) : null}
+      </Dialog>
+    </>
   );
 }
 

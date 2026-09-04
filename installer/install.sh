@@ -47,12 +47,15 @@
 # From there both paths run the same functions: create the unprivileged
 # `unihelm` account, install the binaries and the directory layout from spec
 # §4.3, write /etc/unihelm/config.toml and generate the master key, install and
-# start the two systemd units, and create the first administrator whose
-# password is printed exactly once.
+# start the two systemd units, create the first administrator whose password is
+# printed exactly once, and — when a domain was named — give the panel a real
+# certificate for it through the panel's own ACME path.
 #
-# It installs no stack components. Nginx, PHP, MariaDB and the rest arrive on
-# demand from the Stack Manager, which is what keeps a base install small
-# enough for a 1 GB VPS (spec §1.1).
+# It installs no stack components on its own. Nginx, PHP, MariaDB and the rest
+# arrive on demand from the Stack Manager, which is what keeps a base install
+# small enough for a 1 GB VPS (spec §1.1). The one exception is nginx, and only
+# when the operator asked for a certificate: nginx is what serves the panel on a
+# domain, so answering that question is asking for it.
 #
 # ---------------------------------------------------------------------------
 # Everything below the constants is a function, and `main` runs only when this
@@ -89,8 +92,15 @@ FROM_SOURCE=0
 ADMIN_USER="admin"
 ADMIN_PASSWORD=""
 ADMIN_EMAIL=""
+# 1 when the address was made up out of `hostname` rather than chosen. The CA's
+# expiry warnings go to a contact address, and admin@some-cloud-hostname.local
+# is a mailbox nobody will ever read.
+ADMIN_EMAIL_DERIVED=0
 LISTEN=""
 SKIP_PREFLIGHT=0
+PANEL_DOMAIN=""
+NO_DOMAIN=0
+TLS_ISSUED=0
 RELEASE_VERSION="${UNIHELM_VERSION:-}"
 STAGED_BIN_DIR=""
 WORKDIR=""
@@ -136,9 +146,18 @@ verifies its minisign signature and SHA-256 checksum, and installs it.
   --version TAG       Install this release instead of the latest (e.g. v0.1.4)
   --admin-user NAME   Username for the first administrator (default: admin)
   --admin-email MAIL  Email for the first administrator (default: admin@<hostname>)
+  --domain NAME       Serve the panel on this domain and issue a real
+                      certificate for it. The name must already resolve here.
+  --no-domain         This server has no domain: keep the self-signed
+                      certificate and do not ask.
   --listen ADDR:PORT  Panel listen address (default: 0.0.0.0:8088)
   --skip-preflight    Install anyway on an unsupported system. Not recommended.
   -h, --help          This text
+
+An interactive install asks for the domain. One that is piped, has no terminal,
+or names the administrator with --admin-email never asks: it installs with a
+self-signed certificate, exactly as it always has, and --domain is how a script
+says otherwise.
 
 Environment:
   UNIHELM_VERSION      Same as --version
@@ -157,6 +176,8 @@ parse_args() {
       --version) RELEASE_VERSION="${2:?--version needs a tag}"; shift 2 ;;
       --admin-user) ADMIN_USER="${2:?--admin-user needs a name}"; shift 2 ;;
       --admin-email) ADMIN_EMAIL="${2:?--admin-email needs an address}"; shift 2 ;;
+      --domain) PANEL_DOMAIN="${2:?--domain needs a domain name}"; shift 2 ;;
+      --no-domain) NO_DOMAIN=1; shift ;;
       --listen) LISTEN="${2:?--listen needs an address}"; shift 2 ;;
       --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
       -h | --help) usage; exit 0 ;;
@@ -166,6 +187,19 @@ parse_args() {
 
   if [ -n "$SOURCE_DIR" ] && [ "$FROM_SOURCE" -eq 1 ]; then
     die "--from and --from-source do the same job two different ways; pick one"
+  fi
+
+  if [ -n "$PANEL_DOMAIN" ] && [ "$NO_DOMAIN" -eq 1 ]; then
+    die "--domain and --no-domain say opposite things; pick one"
+  fi
+  # Checked here rather than an hour of downloading later: this is the same
+  # refusal `--version` gets, for the same reason. The name reaches an nginx
+  # `server_name` and a certificate order, and a value the panel would reject
+  # should stop while the operator is still holding the keyboard.
+  if [ -n "$PANEL_DOMAIN" ] && ! valid_domain "$PANEL_DOMAIN"; then
+    die "--domain $PANEL_DOMAIN is not a domain name the panel will accept:
+  letters, digits and hyphens, at least one dot, and not an IP address —
+  a certificate authority has nothing to vouch for on an address."
   fi
   return 0
 }
@@ -690,16 +724,30 @@ create_layout() {
   return 0
 }
 
+# Is there anybody at a terminal to answer a question?
+#
+# /dev/tty, never stdin: under `curl … | sudo bash` stdin is the script itself,
+# and after the bootstrap hands over it is /dev/null. Reading from it would
+# either swallow the rest of the installer or return nothing at all.
+#
+# Opened, not stat'ed. /dev/tty passes -r and -w in contexts where opening it
+# still fails with ENXIO — a process with no controlling terminal, which is what
+# a systemd unit, a CI runner and `ssh host 'curl … | bash'` all are.
+#
+# Every prompt in this file goes through here, and every one of them has an
+# answer for when it returns false. An installer that blocks on a question
+# nobody can see is an installer that hangs for ever in CI.
+have_tty() {
+  { : >/dev/tty; } 2>/dev/null && { : </dev/tty; } 2>/dev/null
+}
+
 # A yes/no question, on the terminal rather than stdin.
 #
-# Same reasoning as the administrator's address: under `curl … | sudo bash`
-# stdin is the script, and /dev/tty can pass -r and -w in contexts where opening
-# it still fails. With no terminal — CI, cloud-init, `ssh host '…'` — the answer
-# is no, because the question is only ever asked before doing something the
-# operator cannot easily undo.
+# With no terminal the answer is no, because the question is only ever asked
+# before doing something the operator cannot easily undo.
 ask_yes_no() {
   local prompt="$1" answer=""
-  if { : >/dev/tty; } 2>/dev/null && { : </dev/tty; } 2>/dev/null; then
+  if have_tty; then
     printf '    %s [Y/n]: ' "$prompt" >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
     case "$answer" in
@@ -895,13 +943,7 @@ resolve_admin_email() {
   candidate="admin@$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost)"
   valid_admin_email "$candidate" || candidate="admin@$(hostname 2>/dev/null || echo unihelm).local"
 
-  # /dev/tty, never stdin: under `curl … | sudo bash` stdin is the script itself,
-  # and after the bootstrap hands over it is /dev/null. Reading from it would
-  # either swallow the rest of the installer or return nothing at all.
-  # Opened, not stat'ed. `/dev/tty` passes -r and -w in contexts where opening it
-  # still fails with ENXIO — a process with no controlling terminal, which is
-  # what a systemd unit, a CI runner and `ssh host 'curl … | bash'` all are.
-  if { : >/dev/tty; } 2>/dev/null && { : </dev/tty; } 2>/dev/null; then
+  if have_tty; then
     printf '    Administrator email [%s]: ' "$candidate" >/dev/tty
     IFS= read -r answer </dev/tty || answer=""
     if [ -n "$answer" ]; then
@@ -922,6 +964,7 @@ resolve_admin_email() {
   fi
 
   ADMIN_EMAIL="$candidate"
+  ADMIN_EMAIL_DERIVED=1
   # Deliberately not "change it later in the panel": there is no account page and
   # `unihelm user` has only create-admin and list, so nothing can change it yet.
   info "using $ADMIN_EMAIL — pass --admin-email to set your own; it cannot be changed afterwards yet"
@@ -963,6 +1006,177 @@ create_first_admin() {
   return 0
 }
 
+# --- the panel's domain and its certificate --------------------------------
+# A name the panel will accept, checked before it reaches a command line.
+#
+# `Domain::parse` in crates/unihelm-core/src/newtypes.rs is the authority; this
+# is the half of it worth repeating here, so a typo is a sentence now rather
+# than `UNI-1400 invalid domain` after nginx has been installed for it.
+valid_domain() {
+  local candidate="${1:-}"
+  local label='[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?'
+  local pattern="^${label}(\\.${label})+$"
+
+  [ "${#candidate}" -le 253 ] || return 1
+  [[ $candidate =~ $pattern ]] || return 1
+
+  # An all-digit last label is an IP address wearing a domain's shape, and no
+  # certificate authority will issue for one. Catching it here is what keeps
+  # "the panel is at 203.0.113.10" from turning into a failed ACME order.
+  case "${candidate##*.}" in
+    *[!0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Does a domain point at this server?
+#
+# Asked once, before anything is downloaded, because the answer decides whether
+# nginx gets installed and because a question at the end of a five-minute
+# install is a question asked of somebody who has walked away.
+#
+# An empty answer is a real answer — it is what every install did before this
+# existed — so there is one correction and then it stops. A prompt loop in front
+# of an operator watching a progress log scroll past is its own kind of trap.
+ask_panel_domain() {
+  local answer=""
+  have_tty || return 0
+
+  printf '    A domain that already points at this server gets the panel a\n' >/dev/tty
+  printf '    trusted certificate, served by nginx. Empty keeps the self-signed\n' >/dev/tty
+  printf '    one, and "unihelm cert panel" does this later.\n' >/dev/tty
+  printf '    Panel domain [none]: ' >/dev/tty
+  IFS= read -r answer </dev/tty || answer=""
+  [ -n "$answer" ] || return 0
+
+  if valid_domain "$answer"; then
+    PANEL_DOMAIN="$answer"
+    return 0
+  fi
+  printf '    that needs to be a domain name, not an address, e.g. panel.example.com [none]: ' \
+    >/dev/tty
+  IFS= read -r answer </dev/tty || answer=""
+  if [ -n "$answer" ] && valid_domain "$answer"; then
+    PANEL_DOMAIN="$answer"
+  fi
+  return 0
+}
+
+# The one place this script runs the panel's own CLI on the way to a
+# certificate, and the seam tests/gates/installer.sh replaces — the same trick
+# `fetch_to` exists for. Everything below it is the code that runs on a real
+# server, so it is the code worth driving from a test.
+unihelm_cli() {
+  "$BIN_DIR/unihelm" "$@"
+}
+
+# Two questions with two different answers: whether nginx is here at all, and
+# whether the panel is the thing configuring it. `conf.d/unihelm.conf` is the
+# single include `stack install nginx` writes (crates/unihelm-config/src/paths.rs
+# `nginx_hook`), so its absence means the vhosts under /etc/nginx/unihelm.d are
+# read by nobody.
+nginx_is_managed() { [ -f /etc/nginx/conf.d/unihelm.conf ]; }
+nginx_present() { command -v nginx >/dev/null 2>&1 || [ -d /etc/nginx ]; }
+
+# Does the panel already answer on a domain of its own?
+#
+# `panel.tls.issue` renders exactly one file, `nginx_panel()` in
+# crates/unihelm-config/src/paths.rs, and the renewal scheduler keeps the
+# certificate behind it alive. Re-running this installer is the documented
+# upgrade path, so without this every upgrade would re-ask the question, and an
+# operator re-typing the domain they are already on would place another order
+# for a certificate they already hold — Let's Encrypt counts five duplicates a
+# week, and the fifth upgrade is the one that fails.
+panel_has_domain() { [ -f /etc/nginx/unihelm.d/01-panel.conf ]; }
+
+# Printed at the moment of failure and again in the summary, because an install
+# log scrolls and the retry is the only thing the operator still has to do.
+tls_retry_hint() {
+  info "when $PANEL_DOMAIN resolves to this server, run:"
+  info "    sudo unihelm cert panel $PANEL_DOMAIN"
+  return 0
+}
+
+# Give the panel a real certificate for $PANEL_DOMAIN.
+#
+# Never fatal, in any branch. The point of asking during the install is that the
+# operator does not have to come back afterwards — but DNS propagates when it
+# feels like it, and a CA that cannot fetch the challenge must not cost somebody
+# the administrator password this install is about to print. Every failure here
+# leaves a finished panel on its self-signed certificate and one command to run.
+configure_panel_tls() {
+  [ -n "$PANEL_DOMAIN" ] || return 0
+  step "Getting a certificate for $PANEL_DOMAIN"
+
+  # `unihelm cert panel` serves the panel *through* nginx: it renders a vhost
+  # into /etc/nginx/unihelm.d, which nothing reads until `stack install nginx`
+  # has written the conf.d hook that includes it — and the ACME challenge is
+  # answered by the catch-all server the same step installs. Issuing without
+  # either would report a certificate no server was ever pointed at.
+  if ! nginx_is_managed; then
+    if nginx_present; then
+      # nginx was here before we were, holding vhosts somebody wrote by hand.
+      # The panel knows how to adopt one (`stack install nginx` surveys the tree
+      # and yields `default_server` to whatever already claimed it), but doing
+      # that changes which server answers 443 on a machine that is already
+      # serving somebody's sites. That is a decision to take while watching it,
+      # not a side effect of an install that is otherwise purely additive.
+      warn "nginx is already installed here and Unihelm does not manage it yet, so
+    this is not touching it. The panel keeps its self-signed certificate."
+      info "to hand nginx to the panel and issue the certificate:"
+      info "    sudo unihelm stack install nginx"
+      info "    sudo unihelm cert panel $PANEL_DOMAIN"
+      return 0
+    fi
+
+    info "installing nginx, which is what serves the panel on a domain"
+    if ! unihelm_cli stack install nginx --follow; then
+      # Both commands, not just the certificate: nginx is still missing, so
+      # `cert panel` on its own would fail again for the same reason.
+      warn "nginx could not be installed, so nothing can serve $PANEL_DOMAIN yet.
+    The panel keeps its self-signed certificate and the install is complete."
+      info "when that is sorted out:"
+      info "    sudo unihelm stack install nginx"
+      info "    sudo unihelm cert panel $PANEL_DOMAIN"
+      return 0
+    fi
+  fi
+
+  # HTTP-01 means the CA fetches a challenge over port 80, and nginx answers the
+  # panel on 443. Both are shut on any image that ships ufw or firewalld enabled,
+  # and a closed 80 fails the order with an error that talks about DNS.
+  open_panel_port 80
+  open_panel_port 443
+
+  # `--follow` is load-bearing: `panel.tls.issue` is a task, and without it the
+  # CLI prints a task id and exits 0 the moment the order is queued. The install
+  # would announce https://$PANEL_DOMAIN while the order was still running, and
+  # a failure would never be seen at all.
+  #
+  # The contact address only goes with it when the operator chose one. Left to
+  # itself the operation uses admin@<domain>, a mailbox on the domain they just
+  # named — better than the admin@<hostname> this installer invents when nobody
+  # says otherwise, which is where the CA's expiry warnings would go to die.
+  local contact=()
+  if [ "$ADMIN_EMAIL_DERIVED" -eq 0 ] && [ -n "$ADMIN_EMAIL" ]; then
+    contact=(--contact-email "$ADMIN_EMAIL")
+  fi
+
+  # `${contact+…}` because bash before 4.4 treats an empty array under `set -u`
+  # as unbound and dies on the expansion — the same guard preflight_report uses
+  # on its own arrays, for the same reason.
+  if unihelm_cli cert panel "$PANEL_DOMAIN" \
+    ${contact+"${contact[@]}"} --follow; then
+    TLS_ISSUED=1
+    info "the panel is served at https://$PANEL_DOMAIN"
+  else
+    warn "no certificate was issued for $PANEL_DOMAIN; the panel keeps the
+    self-signed one it already has and the install is otherwise complete."
+    tls_retry_hint
+  fi
+  return 0
+}
+
 # The address this machine sees itself on.
 #
 # Deliberately NOT called "the address others reach you at": on AWS, GCP, Azure
@@ -992,11 +1206,14 @@ login_user() {
   printf '%s' "${SUDO_USER:-root}"
 }
 
-# Let the panel's port through a firewall that is already on.
+# Let one port the panel needs through a firewall that is already on.
 #
 # Binding all interfaces is only half of being reachable: on any image that ships
 # ufw or firewalld enabled, the port is still shut and the panel is exactly as
-# invisible as it was on loopback — with nothing in the output to say why.
+# invisible as it was on loopback — with nothing in the output to say why. The
+# same is true of 80 and 443 when a certificate is being issued: the CA fetches
+# the HTTP-01 challenge over 80, and a firewall that eats it produces an error
+# about DNS.
 #
 # Only a firewall that is already running is touched, and only this one port.
 # Turning a firewall *on* would be a decision of its own, and closing a port
@@ -1006,7 +1223,7 @@ open_panel_port() {
   [ -n "$port" ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
-    step "Opening the panel's port"
+    step "Opening port $port"
     if ufw allow "$port/tcp" >/dev/null 2>&1; then
       info "ufw: allowed $port/tcp"
     else
@@ -1016,7 +1233,7 @@ open_panel_port() {
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    step "Opening the panel's port"
+    step "Opening port $port"
     if firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 &&
       firewall-cmd --reload >/dev/null 2>&1; then
       info "firewalld: allowed $port/tcp"
@@ -1041,6 +1258,18 @@ print_summary() {
 
   local scheme="https"
   [ "$tls_mode" = "off" ] && scheme="http"
+
+  # With a certificate issued, nginx answers on the domain and that is the only
+  # address worth printing: the panel's own port is still there behind its
+  # self-signed certificate, and the address this machine sees itself on is
+  # still a guess. It also makes the ssh-forwarding advice below wrong even for
+  # a loopback panel — nginx reaches it over 127.0.0.1 so nobody needs a tunnel
+  # — which is why the host, not just the URL, changes here.
+  local panel_url="${scheme}://${hint:-<this server>}:${port}"
+  if [ "$TLS_ISSUED" -eq 1 ]; then
+    panel_url="https://${PANEL_DOMAIN}"
+    host="$PANEL_DOMAIN"
+  fi
 
   # `unihelm doctor` needs sudo: /var/lib/unihelm is 0750 unihelm:unihelm, so as
   # the ordinary cloud user it cannot stat the database and reports a healthy
@@ -1076,7 +1305,7 @@ DONE
 
 $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
-  Panel     $(printf '\033[1m')${scheme}://${hint:-<this server>}:${port}$(printf '\033[0m')
+  Panel     $(printf '\033[1m')${panel_url}$(printf '\033[0m')
   Username  $(printf '\033[1m')${ADMIN_USER}$(printf '\033[0m')
   Email     ${ADMIN_EMAIL}${ADMIN_PASSWORD:+
   Password  $(printf '\033[1m')${ADMIN_PASSWORD}$(printf '\033[0m')  (shown once — store it now)}
@@ -1085,7 +1314,61 @@ $(printf '\033[1m')Unihelm is installed.$(printf '\033[0m')
 
   Sign in with the username or the email address; either works.
 DONE
-      if [ "$scheme" = "https" ]; then
+      if [ "$TLS_ISSUED" -eq 1 ]; then
+        cat <<DONE
+
+The certificate for ${PANEL_DOMAIN} is a real one and renews itself. nginx
+terminates it and proxies to the panel. Ports 80 and 443 were let through this
+server's own firewall, if it is running one; a cloud provider's security group
+is a separate thing and this cannot see it.
+
+The panel is also still answering on port ${port} with its self-signed
+certificate. Use the domain.
+DONE
+      elif [ "$scheme" = "https" ] && [ -n "$PANEL_DOMAIN" ]; then
+        # A domain was named and the certificate did not happen. Saying "a
+        # server with no domain has nothing a CA can vouch for" here would be a
+        # lie about the one thing the operator already told us.
+        cat <<DONE
+
+Your browser will warn that the certificate is not trusted: no certificate was
+issued for ${PANEL_DOMAIN}, so the panel is still on the self-signed one it
+generated. The connection is encrypted either way, which is what stops your
+password crossing the network in the clear. Click through the warning.
+
+Almost always this is DNS that has not propagated yet, or port 80 shut to the
+internet — a cloud provider's security group is a separate thing from this
+server's own firewall, and this cannot see it. When ${PANEL_DOMAIN} resolves
+here and port 80 answers from outside, run:
+DONE
+        # Both commands when nginx is still not the panel's, because `cert panel`
+        # alone would fail again for the reason it failed the first time — and
+        # this summary is the copy that survives; the warning printed at the
+        # moment of failure has scrolled off by now.
+        if nginx_is_managed; then
+          printf '\n    sudo unihelm cert panel %s\n' "$PANEL_DOMAIN"
+        else
+          printf '\n    sudo unihelm stack install nginx\n    sudo unihelm cert panel %s\n' \
+            "$PANEL_DOMAIN"
+        fi
+      elif [ "$scheme" = "https" ] && panel_has_domain; then
+        # An upgrade of a panel that already answers on a domain. "A server with
+        # no domain has nothing a CA can vouch for" is the sentence below, and
+        # here it would be flatly untrue — the panel has one, nginx terminates a
+        # real certificate for it, and this install deliberately did not touch
+        # either. Reporting only what this run put on the machine is the defect
+        # this panel keeps being caught by.
+        cat <<DONE
+
+This panel already answers on a domain of its own, and nothing here changed
+that. nginx terminates a real certificate in front of it and the panel renews
+it; \`sudo unihelm cert list\` shows which name and when it expires, and
+\`sudo unihelm cert panel <domain>\` is how that name changes.
+
+The address above is the panel's own port, still behind the self-signed
+certificate it generated. Use the domain.
+DONE
+      elif [ "$scheme" = "https" ]; then
         cat <<DONE
 
 Your browser will warn that the certificate is not trusted. That is expected and
@@ -1105,9 +1388,10 @@ DONE
         # Single quotes on purpose: this is a command for the reader to type,
         # not an expression for the shell to expand.
         # shellcheck disable=SC2016
-        printf 'TLS in front of it with `sudo unihelm cert panel <domain>`.\n'
+        printf 'TLS in front of it with `sudo unihelm cert panel %s`.\n' \
+          "${PANEL_DOMAIN:-<domain>}"
       fi
-      if [ -n "$hint" ]; then
+      if [ -n "$hint" ] && [ "$TLS_ISSUED" -eq 0 ]; then
         cat <<DONE
 
 If that address does not answer, it is the one this machine sees itself on — on
@@ -1118,11 +1402,36 @@ DONE
       ;;
   esac
 
-  cat <<'DONE'
+  # Only true when it is true: the certificate path installs nginx, and telling
+  # an operator nothing is installed is the shape of defect this panel keeps
+  # getting caught by — reporting what it wishes were on the machine rather than
+  # what is.
+  #
+  # The third case is the one that matters most on somebody's existing server:
+  # "no stack components are installed" is read as "the machine is empty", and
+  # the obvious next click — install nginx from the panel — is the very takeover
+  # this installer just declined to perform unattended. Say what is there.
+  if nginx_is_managed; then
+    cat <<'DONE'
+
+nginx is installed and managed by the panel. PHP and a database are not — add
+them from the panel when you are ready.
+DONE
+  elif nginx_present; then
+    cat <<'DONE'
+
+nginx is already installed here and the panel does not manage it, so nothing
+about your existing configuration was touched. Handing it over is a deliberate
+step — `sudo unihelm stack install nginx` surveys what is there and yields the
+default server to whatever already claims it. Do it while you can watch.
+DONE
+  else
+    cat <<'DONE'
 
 No stack components are installed yet — add nginx, PHP and a database from the
 panel when you are ready.
 DONE
+  fi
   return 0
 }
 
@@ -1141,6 +1450,24 @@ cleanup() {
 main() {
   parse_args "$@"
   run_preflight
+
+  # Before the download, because the answer decides whether nginx is installed
+  # and because an operator watching a five-minute install has walked away by
+  # the end of it.
+  #
+  # An empty ADMIN_EMAIL is what makes this safe to gate on: `resolve_admin_email`
+  # runs far below, so the only thing that can have filled it in by now is
+  # --admin-email — and an install that names the administrator on the command
+  # line is a scripted one with nobody at a keyboard to answer anything.
+  #
+  # A panel that already has a domain is not asked again: this is an upgrade,
+  # and changing which name the panel answers on is a thing to do deliberately
+  # with `unihelm cert panel`, not by half-answering a question during one.
+  # `--domain` still overrides, because that is somebody saying it on purpose.
+  if [ -z "$PANEL_DOMAIN" ] && [ "$NO_DOMAIN" -eq 0 ] && [ -z "$ADMIN_EMAIL" ] &&
+    ! panel_has_domain; then
+    ask_panel_domain
+  fi
 
   if [ -n "$SOURCE_DIR" ]; then
     info "installing binaries from $SOURCE_DIR"
@@ -1183,6 +1510,12 @@ main() {
   esac
 
   create_first_admin
+
+  # After the administrator exists, because the CLI this uses needs an account
+  # to act as, and because a certificate order that hangs on somebody's DNS must
+  # never be what stands between the operator and the password printed above.
+  configure_panel_tls
+
   print_summary
 }
 

@@ -41,6 +41,156 @@ Where an operation takes `subscription_id` as *(optional)*, omitting it means
 
 ## System
 
+### `docker.logs`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `container` *(id or name)*, `lines` *(optional u32, clamped 1..=2000, default 200)* |
+
+The tail of one container's output.
+
+Both streams, in one order. Docker keeps a container's stdout and its stderr
+apart and most server software — nginx's error log, anything using a stock
+logging library — writes to stderr, so a tail that read only stdout showed an
+empty log for a container that was logging fine. `--timestamps` is what makes
+the two sortable back into a single sequence; a line with no timestamp of its
+own is a continuation and stays under the line it belongs to, so a stack trace
+arrives in one piece.
+
+### `docker.remove`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `container` *(id or name)* |
+
+Deletes a container and its writable layer.
+
+**A running container is refused, not forced.** `docker rm -f` is a SIGKILL: no
+graceful shutdown, no flush, and a database mid-write finds out on next boot. An
+operator who means it stops the container first, which is two deliberate
+presses rather than one that silently escalated.
+
+Volumes are left alone — no `--volumes` — because an anonymous volume outlives
+its container on purpose and is where a containerised database keeps its data.
+
+The name is resolved to a full id before the removal, so a `docker rename` or a
+compose recreate between the running check and the delete cannot land it on a
+different container.
+
+### `docker.restart`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `container` *(id or name)* |
+
+Docker's own single-step restart, with the same ten-second grace period as
+`docker.stop`. There are a few seconds of connection refused in the middle.
+
+### `docker.start`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `container` *(id or name)* |
+
+Starts a container that is already on this server. Starting one that is already
+running succeeds and changes nothing, which is what makes it safe behind a
+button somebody may press twice. The answer carries the container's state read
+back from Docker, so a caller does not have to poll to find out whether it
+worked.
+
+`server_manage`, not `docker_apps`: these containers were mostly not created by
+the panel, and one of them may be an nginx serving somebody's production site.
+
+### `docker.stop`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `container` *(id or name)* |
+
+SIGTERM, then ten seconds, then Docker's own SIGKILL — the grace period is
+passed explicitly rather than left to Docker's default so the operation's
+timeout can be derived from it. Stopping an already-stopped container succeeds
+and changes nothing.
+
+### `fw.disable`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | none |
+
+Stops the firewall, and stays stopped across a reboot. Nothing is deleted: every
+rule and ban stays recorded and `fw.rules` starts labelling them as drift, which
+is the truth. `rules_unenforced` and `bans_unenforced` are counted **before** the
+stop and returned, so the confirmation an operator sees names what they are
+giving up — including the addresses Sentinel is holding, which the host stops
+dropping immediately.
+
+### `fw.enable`
+
+| | |
+|---|---|
+| Permission | `firewall_manage` |
+| Execution | immediate |
+| Input | `allow_ssh` — optional, default false; `client_ip` — filled by the web layer, never by a client |
+
+Starts the firewall: `ufw enable` for ufw, `systemctl enable --now firewalld` for
+firewalld. nftables and a host with no firewall are refused by name — an
+nftables ruleset is the kernel's and Unihelm owns only part of it, so starting
+or stopping it here would load or flush rules the panel has never read.
+
+Before it starts anything it checks that an SSH connection would still be
+accepted: the port comes from `sshd -T`, or from `sshd_config` and its drop-ins,
+or from OpenSSH's default, and the answer says which. A source-restricted rule
+counts only when the caller's address is inside it. If nothing would accept the
+connection the operation refuses with `conflict` and `field: allow_ssh` rather
+than turning a stopped firewall into a lockout; `allow_ssh` has it open that
+port from anywhere first and reports it in `opened`. When it cannot work out
+which port sshd uses it refuses even with `allow_ssh`, because a guess there
+costs the operator their server.
+
+`active` is read back from the backend afterwards rather than inferred from an
+exit code.
+
+### `runtime.default.set`
+
+| | |
+|---|---|
+| Permission | `stack_manage` |
+| Execution | immediate |
+| Input | `runtime` *(only `php` today)*, `version` *(`8.3` or `8.3.6`)* |
+
+Points a bare command name at one installed version, through Debian's
+`update-alternatives`.
+
+**It does not change what any site runs.** Each site names its own PHP version
+and gets its own FPM pool — that is the point of running versions side by side,
+and a global default that silently moved sites between them would be the
+opposite. This is what `php` resolves to on the command line: a deploy script, a
+cron line, a colleague's muscle memory.
+
+PHP only. Every PHP the distribution installs registers itself with
+`update-alternatives`; Node from NodeSource is a single binary at
+`/usr/local/bin/node` with no alternatives entry, so "set the default Node" would
+mean moving somebody else's file rather than choosing between registered
+candidates. Asking for one says so.
+
+The version is accepted as either the series or the point release, because
+`runtime.list` reports the point release and the alternatives entry is named for
+the series — an operator copying what the panel showed them should not be told
+that version is not installed.
+
 ### `sys.ping`
 
 | | |

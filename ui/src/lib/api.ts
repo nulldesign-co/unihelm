@@ -262,8 +262,17 @@ export interface TaskLogLine {
 
 // --- stack ------------------------------------------------------------------
 
+/** What /api/stack/{install,remove} take. Mirrors StackComponent on the agent. */
+export type StackComponentRequest =
+  | { component: "nginx" }
+  | { component: "mariadb" }
+  | { component: "postgres" }
+  | { component: "php"; version: string };
+
 export type ComponentState =
   | "absent"
+  // On the machine, but installed by somebody other than this panel.
+  | "unmanaged"
   | "installing"
   | "installed"
   | "failed"
@@ -486,6 +495,22 @@ export interface FirewallRule {
   in_panel: boolean;
   in_backend: boolean;
   drift: RuleDrift | null;
+}
+
+/** What `fw.enable` did, read back from the backend rather than assumed. */
+export interface FirewallStartResult {
+  backend: string;
+  active: boolean;
+  /** True when the call added an SSH rule to avoid locking the caller out. */
+  ssh_allowed?: boolean;
+}
+
+/** What `fw.disable` stopped enforcing. Nothing is deleted. */
+export interface FirewallStopResult {
+  backend: string;
+  active: boolean;
+  /** How many rules are still recorded but no longer in force. */
+  rules_no_longer_enforced?: number;
 }
 
 export interface FirewallResponse {
@@ -816,9 +841,9 @@ export const endpoints = {
   retryTask: (id: string) => api.post<TaskAccepted>(`/api/tasks/${id}/retry`),
 
   stack: () => api.get<StackResponse>("/api/stack"),
-  installComponent: (component: { component: "nginx" } | { component: "php"; version: string }) =>
+  installComponent: (component: StackComponentRequest) =>
     api.post<TaskAccepted>("/api/stack/install", component),
-  removeComponent: (component: { component: "nginx" } | { component: "php"; version: string }) =>
+  removeComponent: (component: StackComponentRequest) =>
     api.post<TaskAccepted>("/api/stack/remove", component),
 
   sites: () => api.get<SitesResponse>("/api/sites"),
@@ -888,6 +913,17 @@ export const endpoints = {
   // Firewall + Sentinel. Every one of these is an immediate operation, so they
   // answer 200 with data rather than a task receipt.
   firewall: () => api.get<FirewallResponse>("/api/firewall"),
+  /**
+   * Start enforcing.
+   *
+   * `allow_ssh` is the operator answering the refusal this can come back with:
+   * enabling a default-deny firewall with no rule for SSH cuts the connection
+   * they are working over, so the agent checks first and says no. Sending it
+   * again with the flag means "add that rule, then enable".
+   */
+  startFirewall: (body: { allow_ssh?: boolean }) =>
+    api.post<FirewallStartResult>("/api/firewall/enable", body),
+  stopFirewall: () => api.post<FirewallStopResult>("/api/firewall/disable", {}),
   openPort: (body: PortRuleRequest) => api.post<PortRuleResult>("/api/firewall/ports", body),
   // A close carries the rule's whole identity rather than an id: `(port, proto,
   // source)` *is* the identity of a hole, and the panel may be asked to close

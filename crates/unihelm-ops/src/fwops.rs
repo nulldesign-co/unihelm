@@ -28,6 +28,13 @@
 //! * the unspecified and multicast addresses, which are not hosts at all and
 //!   which some backends would widen into a far larger drop than intended.
 //!
+//! The same rule governs `fw.enable`, where a single command turns a list of
+//! recorded rules into an enforced default-deny policy. [`ensure_ssh_reachable`]
+//! refuses to start a firewall that would not accept an SSH connection to the
+//! port sshd actually answers on, from the address the operator is actually
+//! calling from — and refuses just as flatly when it cannot work out what that
+//! port is, because a guess in that direction costs the operator their server.
+//!
 //! **3. Sentinel is off until an operator turns it on** (`sentinel.enabled`,
 //! default false). A fresh install has no allowlist, may be reached through a
 //! NAT that makes an entire office look like one address, and belongs to
@@ -43,6 +50,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use unihelm_config::paths;
 use unihelm_core::{ErrorCode, Permission, Result, UnihelmError};
 use unihelm_db::audit::NewAuditEntry;
 use unihelm_db::settings::keys;
@@ -913,6 +921,931 @@ impl TypedOperation for Rules {
             backend: fw.name(),
             active: fw.is_active().await.unwrap_or(false),
             rules: merge_rules(&live, &intent),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// starting and stopping the firewall itself
+// ---------------------------------------------------------------------------
+
+/// How a backend is switched on and off, or why it cannot be.
+///
+/// [`unihelm_distro::FwBackend`] has no lifecycle call, so the two backends
+/// that have a switch are driven from here. The distinction between them is not
+/// cosmetic: ufw and firewalld are started by different things, and the other
+/// two are not started at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// `ufw enable` / `ufw disable`, never the unit.
+    ///
+    /// `ufw.service` starts on every boot regardless and then does nothing
+    /// while `/etc/ufw/ufw.conf` says `ENABLED=no` — which is exactly the state
+    /// this feature exists for. `systemctl start ufw` there exits 0, changes
+    /// nothing, and would have the panel report a success `ufw status` flatly
+    /// contradicts.
+    Ufw,
+    /// `firewalld.service`. The daemon *is* the firewall; there is no second
+    /// switch to throw.
+    Firewalld,
+    /// Nothing the panel can honestly claim to start or stop, and why.
+    Unsupported(String),
+}
+
+/// firewalld's unit.
+///
+/// Deliberately not a [`unihelm_distro::ManagedUnit`]: that enum is the
+/// whitelist of units `svc.action` may be *asked* for, and its job is to keep a
+/// name off the wire from reaching systemd. This name is a constant in this
+/// file and reachable only through `fw.enable`/`fw.disable`, which the firewall
+/// permission already guards.
+const FIREWALLD_UNIT: &str = "firewalld.service";
+
+impl Lifecycle {
+    pub fn for_backend(backend: &str) -> Self {
+        match backend {
+            "ufw" => Lifecycle::Ufw,
+            "firewalld" => Lifecycle::Firewalld,
+            // nftables has no on/off switch that belongs to us. Our accept
+            // rules live in one `inet unihelm` table beside whatever else the
+            // operator loaded; `nftables.service` loads `/etc/nftables.conf`, a
+            // file the panel has never read, and stopping it flushes rules the
+            // panel did not write. Both directions would be the panel changing
+            // somebody else's firewall on their behalf.
+            "nftables" => Lifecycle::Unsupported(
+                "nftables has no service the panel owns. Starting one would load \
+                 /etc/nftables.conf, a file Unihelm has never read, and stopping it would \
+                 flush rules Unihelm did not add — so this is a change to make from a \
+                 shell, where you can see the whole ruleset first."
+                    .into(),
+            ),
+            "none" => Lifecycle::Unsupported(
+                "no firewall is installed on this host (looked for firewalld, ufw and nft), \
+                 so there is nothing to start or stop"
+                    .into(),
+            ),
+            other => Lifecycle::Unsupported(format!(
+                "the `{other}` firewall backend has no start or stop the panel can drive"
+            )),
+        }
+    }
+
+    /// The error for a backend with no switch, or `None` when there is one.
+    pub fn refusal(&self) -> Option<UnihelmError> {
+        match self {
+            Lifecycle::Unsupported(reason) => {
+                Some(UnihelmError::new(ErrorCode::NotImplemented, reason.clone()))
+            }
+            Lifecycle::Ufw | Lifecycle::Firewalld => None,
+        }
+    }
+}
+
+/// OpenSSH's own default, used only when nothing sets `Port` and labelled as an
+/// assumption wherever it reaches the operator.
+const DEFAULT_SSH_PORT: u16 = 22;
+
+/// How the SSH port was established, so a refusal can say how it knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshPortSource {
+    SshdT,
+    Files,
+    Default,
+}
+
+impl SshPortSource {
+    /// The phrase the refusal message uses, which is also how the operator
+    /// would check the same thing by hand.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            SshPortSource::SshdT => "reported by `sshd -T`",
+            SshPortSource::Files => "read from sshd_config and its drop-ins",
+            SshPortSource::Default => "OpenSSH's default, because nothing sets `Port`",
+        }
+    }
+}
+
+/// What is known about SSH on this host, in the three shapes that lead to three
+/// different decisions about enabling.
+///
+/// Adjacently tagged for the reason `posture::Observed` is: the payload of one
+/// variant is a map and of another is nothing at all, and an internal tag
+/// cannot be folded into both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SshFacts {
+    /// sshd accepts connections on these ports.
+    Ports {
+        ports: Vec<u16>,
+        source: SshPortSource,
+    },
+    /// No sshd configuration on this host at all, so enabling has no SSH
+    /// session to cut.
+    Absent,
+    /// sshd is here and the panel could not work out which port it uses. Fatal
+    /// to an enable: a default-deny firewall holding the wrong port open is the
+    /// outage this whole guard exists to prevent.
+    Unknown { reason: String },
+}
+
+/// The ports in `sshd -T` output.
+///
+/// `port` is one of sshd's *multi-valued* keywords: every `Port` in the settled
+/// configuration is printed on its own line and sshd listens on all of them.
+/// That is the opposite of the first-value-wins rule `posture::parse_sshd_t`
+/// applies to the keywords it reads, and getting it backwards here would leave
+/// a second SSH port shut the moment the firewall came up.
+pub fn parse_sshd_ports(output: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("port") {
+            continue;
+        }
+        if let Some(port) = parts.next().and_then(|p| p.parse::<u16>().ok())
+            && port != 0
+            && !ports.contains(&port)
+        {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
+/// The `Port` directives in `sshd_config`-style files, for when `sshd -T` will
+/// not run.
+///
+/// Same accumulate-rather-than-override rule as above, and `Match` blocks are
+/// skipped for the reason `posture::parse_sshd_files` skips them: what follows
+/// a `Match` applies to some connections only, and this guard is about all of
+/// them.
+pub fn parse_sshd_config_ports(ordered: &[(String, String)]) -> Vec<u16> {
+    let mut ports: Vec<u16> = Vec::new();
+    for (_name, contents) in ordered {
+        let mut in_match = false;
+        for raw in contents.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
+            if key == "match" {
+                in_match = true;
+                continue;
+            }
+            if in_match || key != "port" {
+                continue;
+            }
+            if let Some(port) = parts.next().and_then(|v| v.trim().parse::<u16>().ok())
+                && port != 0
+                && !ports.contains(&port)
+            {
+                ports.push(port);
+            }
+        }
+    }
+    ports
+}
+
+/// ufw rule shapes that mean "SSH", by the names ufw accepts for it.
+///
+/// `ufw allow OpenSSH` is what Ubuntu's own documentation tells people to type
+/// and `ufw limit ssh` is what everyone else types. A guard that only
+/// understood `22/tcp` would tell both of them their SSH port is shut and
+/// offer to open a rule they already have.
+const UFW_SSH_ALIASES: &[&str] = &["ssh", "openssh"];
+
+/// Read `ufw show added`.
+///
+/// `ufw status` is no use here and that is the whole reason this parser exists:
+/// while ufw is inactive it prints `Status: inactive` and not one rule, so the
+/// check that decides whether enabling is safe would see an empty ruleset on
+/// exactly the machines it exists to protect. `show added` prints the
+/// `ufw allow …` commands instead, running or not.
+///
+/// Only rules that would admit a *new inbound connection to this host* count.
+/// `route` rules filter forwarded traffic, `out` rules leave the host, and
+/// `on <iface>` binds a rule to one interface that cannot be matched against
+/// the route the operator arrives by — none of the three is evidence that an
+/// SSH connection would be accepted, so they are skipped rather than
+/// generously assumed.
+pub fn parse_ufw_added(text: &str) -> Vec<PortRule> {
+    let mut rules = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(at) = tokens.iter().position(|t| *t == "ufw") else {
+            continue;
+        };
+        // Everything after `comment` is operator prose and is not read for any
+        // purpose: `ufw allow 22/tcp comment 'ssh on the jump box'` is an
+        // inbound rule, and a scan that saw the `on` in the prose would drop it
+        // and tell that operator their SSH port is shut.
+        let rest = match tokens[at + 1..].iter().position(|t| *t == "comment") {
+            Some(end) => &tokens[at + 1..at + 1 + end],
+            None => &tokens[at + 1..],
+        };
+        if rest.iter().any(|t| matches!(*t, "route" | "out" | "on")) {
+            continue;
+        }
+        // `limit` is `allow` with rate limiting. `ufw limit ssh` is the most
+        // widely recommended SSH rule there is, and reading it as "not allowed"
+        // would make this guard refuse the hosts that did the right thing.
+        let Some(action) = rest.first() else {
+            continue;
+        };
+        if !matches!(*action, "allow" | "limit") {
+            continue;
+        }
+
+        let body = &rest[1..];
+        let mut source: Option<String> = None;
+        let mut port: Option<u16> = None;
+        let mut proto: Option<Proto> = None;
+        let mut index = 0;
+        while index < body.len() {
+            match body[index] {
+                "from" => {
+                    source = body.get(index + 1).map(|s| (*s).to_string());
+                    index += 2;
+                }
+                "port" => {
+                    port = body.get(index + 1).and_then(|p| p.parse().ok());
+                    index += 2;
+                }
+                "proto" => {
+                    proto = body.get(index + 1).and_then(|p| Proto::parse(p));
+                    index += 2;
+                }
+                "to" | "any" | "in" => index += 1,
+                token => {
+                    if port.is_none() {
+                        let (number, spelled) = match token.split_once('/') {
+                            Some((n, p)) => (n, Proto::parse(p)),
+                            None => (token, None),
+                        };
+                        if let Ok(parsed) = number.parse::<u16>() {
+                            port = Some(parsed);
+                            proto = spelled.or(proto);
+                        } else if UFW_SSH_ALIASES.contains(&token.to_ascii_lowercase().as_str()) {
+                            port = Some(DEFAULT_SSH_PORT);
+                            proto = Some(Proto::Tcp);
+                        }
+                    }
+                    index += 1;
+                }
+            }
+        }
+
+        let Some(port) = port.filter(|p| *p != 0) else {
+            continue;
+        };
+        rules.push(PortRule {
+            port,
+            // A bare `ufw allow 22` covers both protocols; recording it as TCP
+            // is the half this guard asks about.
+            proto: proto.unwrap_or(Proto::Tcp),
+            source: source.filter(|s| validate_source(s)),
+            comment: String::new(),
+        });
+    }
+    rules
+}
+
+/// A source we are willing to reason about: a literal address or CIDR.
+///
+/// Anything else — `any`, an interface, a hostname — is dropped rather than
+/// kept, because a source this code cannot evaluate must not be treated as
+/// covering the operator.
+fn validate_source(source: &str) -> bool {
+    parse_cidr(source).is_some()
+}
+
+/// Would anything here accept an SSH connection to `port` from where the
+/// operator is?
+///
+/// A source-restricted rule counts only when the caller is inside it. A
+/// firewall that allows 22 from the office and nothing else still locks out the
+/// admin working from home, and that is the same outage with a nicer name — so
+/// is a restricted rule when the web layer could not tell us the caller's
+/// address at all.
+pub fn ssh_reachable(rules: &[PortRule], port: u16, client_ip: Option<IpAddr>) -> bool {
+    rules.iter().any(|rule| {
+        rule.port == port
+            && rule.proto == Proto::Tcp
+            && match &rule.source {
+                None => true,
+                Some(cidr) => client_ip.is_some_and(|ip| cidr_contains(cidr, ip)),
+            }
+    })
+}
+
+/// The SSH ports that would be shut the moment the firewall came up.
+pub fn unprotected_ssh_ports(
+    rules: &[PortRule],
+    ssh_ports: &[u16],
+    client_ip: Option<IpAddr>,
+) -> Vec<u16> {
+    ssh_ports
+        .iter()
+        .copied()
+        .filter(|port| !ssh_reachable(rules, *port, client_ip))
+        .collect()
+}
+
+/// Read `sshd_config` and every `sshd_config.d/*.conf`.
+///
+/// Order does not matter to [`parse_sshd_config_ports`] the way it matters to
+/// `posture::parse_sshd_files` — every `Port` counts, whichever file it is in —
+/// so this walk is deliberately the simpler one.
+fn read_sshd_files(main: &std::path::Path, dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(main) {
+        out.push((main.display().to_string(), contents));
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("conf") {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                out.push((path.display().to_string(), contents));
+            }
+        }
+    }
+    out
+}
+
+/// Ask sshd, then its files, then admit we do not know.
+///
+/// The order is `posture::gather_sshd`'s, for its reason: `sshd -T` prints the
+/// settled configuration with every `Include` resolved, and it is the only
+/// answer that cannot be wrong about which drop-in won.
+async fn ssh_facts() -> SshFacts {
+    // argv, never a pipeline (spec §12 rule 2) — the parsing happens in
+    // `parse_sshd_ports`, where it is testable.
+    if let Ok(out) = unihelm_distro::Cmd::new("sshd")
+        .arg("-T")
+        .timeout(std::time::Duration::from_secs(10))
+        .run()
+        .await
+        && out.success()
+    {
+        let ports = parse_sshd_ports(&out.stdout);
+        if !ports.is_empty() {
+            return SshFacts::Ports {
+                ports,
+                source: SshPortSource::SshdT,
+            };
+        }
+    }
+
+    let main = paths::sshd_config();
+    let dir = paths::sshd_config_dir();
+    let files = read_sshd_files(&main, &dir);
+    if files.is_empty() {
+        // A host with neither `sshd -T` nor a configuration file is a host with
+        // no sshd. A host that has the file and would not give it to us is a
+        // host we must not guess about.
+        return if main.exists() || dir.exists() {
+            SshFacts::Unknown {
+                reason: format!(
+                    "`sshd -T` did not run and {} could not be read",
+                    main.display()
+                ),
+            }
+        } else {
+            SshFacts::Absent
+        };
+    }
+
+    match parse_sshd_config_ports(&files) {
+        ports if ports.is_empty() => SshFacts::Ports {
+            ports: vec![DEFAULT_SSH_PORT],
+            source: SshPortSource::Default,
+        },
+        ports => SshFacts::Ports {
+            ports,
+            source: SshPortSource::Files,
+        },
+    }
+}
+
+/// What the panel could see of the ruleset that is about to be enforced, and
+/// what it could not.
+///
+/// The distinction is the whole point. A view that holds a matching rule proves
+/// SSH is admitted. A view with nothing matching proves SSH is shut *only if it
+/// is complete* — and on firewalld it very often is not, because a zone admits
+/// SSH through a named service whose port list lives in a separate file. A
+/// guard that treated an incomplete view as proof would tell a correctly
+/// configured operator their SSH is shut and then offer to widen a firewall
+/// that never needed widening.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AdmittingView {
+    /// Rules that would admit a new inbound connection to this host.
+    pub rules: Vec<PortRule>,
+    /// Parts of the ruleset the panel read but could not decode into ports —
+    /// firewalld services whose definition would not open, rich rules in a
+    /// shape this file does not know. Any of these may be what admits SSH.
+    pub opaque: Vec<String>,
+}
+
+impl AdmittingView {
+    /// Is this view good enough to conclude that SSH is *shut*?
+    fn is_complete(&self) -> bool {
+        self.opaque.is_empty()
+    }
+}
+
+/// firewalld's offline client, used because the daemon is stopped.
+///
+/// `firewall-cmd` is a D-Bus client: with firewalld down every call fails, so
+/// the permanent configuration cannot be read through it. That is the reason
+/// the first version of this guard started the daemon and *then* checked, which
+/// is a change to the host made before the check that decides whether to change
+/// the host — and a rollback that could not put back hand-written netfilter
+/// rules firewalld had already replaced. `firewall-offline-cmd` is what
+/// firewalld ships for exactly this, and it reads and writes the same permanent
+/// configuration the daemon will load when it comes up.
+///
+/// Only ever called while `is_active()` says the daemon is down; running it
+/// against a live firewalld is what its own manual warns against.
+const FIREWALLD_OFFLINE: &str = "firewall-offline-cmd";
+
+/// Read the ports out of `firewall-offline-cmd --service=<n> --get-ports`,
+/// which prints `22/tcp` or a space-separated list of the same.
+fn parse_port_tokens(text: &str) -> Vec<PortRule> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            let (port, proto) = token.split_once('/')?;
+            Some(PortRule {
+                port: port.parse::<u16>().ok().filter(|p| *p != 0)?,
+                proto: Proto::parse(proto)?,
+                source: None,
+                comment: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// Read one zone out of `firewall-offline-cmd --list-all`.
+///
+/// Returns the rules it could decode and the names of the services it could
+/// not, which the caller resolves separately. `services:` is the line this
+/// guard exists to read: a stock RHEL host admits SSH through the `ssh`
+/// service and has no port rule for 22 at all, so a check that looked only at
+/// `ports:` and `rich rules:` — which is all `FwBackend::list_rules` reads —
+/// would find nothing on the most ordinary firewalld box there is.
+pub fn parse_firewalld_zone(text: &str) -> (AdmittingView, Vec<String>) {
+    let mut view = AdmittingView::default();
+    let mut services = Vec::new();
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("ports:") {
+            view.rules.extend(parse_port_tokens(rest));
+        } else if let Some(rest) = line.strip_prefix("services:") {
+            services.extend(rest.split_whitespace().map(str::to_string));
+        } else if line.starts_with("rule ") {
+            match parse_firewalld_rich_rule(line) {
+                Some(rule) => view.rules.push(rule),
+                // Not decoded and not dismissed: a rich rule this parser does
+                // not understand may be the one holding SSH open.
+                None if line.ends_with("accept") => view.opaque.push(line.to_string()),
+                None => {}
+            }
+        }
+    }
+
+    (view, services)
+}
+
+/// The accepting rich rules whose port this file can name.
+///
+/// Deliberately narrow, like `unihelm_distro`'s own rich-rule parser: anything
+/// else returns `None` and the caller records it as undecoded rather than as
+/// absent. A rich rule that rejects or drops is not evidence of anything and is
+/// not reported as opaque either — it cannot be what admits a connection.
+fn parse_firewalld_rich_rule(line: &str) -> Option<PortRule> {
+    if !line.ends_with("accept") {
+        return None;
+    }
+    let attribute = |key: &str| -> Option<&str> {
+        let at = line.find(key)?;
+        let rest = &line[at + key.len()..];
+        rest.strip_prefix('"')?.split('"').next()
+    };
+
+    let port = attribute("port port=")?.parse::<u16>().ok()?;
+    let proto = Proto::parse(attribute("protocol=")?)?;
+    Some(PortRule {
+        port,
+        proto,
+        source: attribute("source address=")
+            .map(str::to_string)
+            .filter(|s| validate_source(s)),
+        comment: String::new(),
+    })
+}
+
+/// Run one `firewall-offline-cmd`, failing closed.
+async fn firewalld_offline(args: &[&str]) -> Result<String> {
+    let cmd = unihelm_distro::Cmd::new(FIREWALLD_OFFLINE).args(args);
+    let out = cmd.run().await.map_err(UnihelmError::from)?;
+    if !out.success() {
+        return Err(UnihelmError::new(
+            ErrorCode::CommandFailed,
+            format!("`{}` failed: {}", cmd.display(), out.failure_text()),
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// The rules the SSH guard reasons over, read the only way that works for this
+/// backend in the state it is in.
+async fn admitting_view(lifecycle: &Lifecycle) -> Result<AdmittingView> {
+    match lifecycle {
+        Lifecycle::Ufw => {
+            let cmd = unihelm_distro::Cmd::new("ufw").args(["show", "added"]);
+            let out = cmd.run().await.map_err(UnihelmError::from)?;
+            if !out.success() {
+                return Err(UnihelmError::new(
+                    ErrorCode::CommandFailed,
+                    format!("`{}` failed: {}", cmd.display(), out.failure_text()),
+                ));
+            }
+            Ok(AdmittingView {
+                rules: parse_ufw_added(&out.stdout),
+                opaque: Vec::new(),
+            })
+        }
+        Lifecycle::Firewalld => {
+            let (mut view, services) =
+                parse_firewalld_zone(&firewalld_offline(&["--list-all"]).await?);
+            for name in services {
+                // Resolved one at a time so a single unreadable definition
+                // costs that service and not the whole answer.
+                match firewalld_offline(&[&format!("--service={name}"), "--get-ports"]).await {
+                    Ok(ports) => view.rules.extend(parse_port_tokens(&ports)),
+                    Err(_) => view.opaque.push(name),
+                }
+            }
+            Ok(view)
+        }
+        // Unreachable in practice: `Enable` turns these backends away before it
+        // asks for a view. It still says no rather than substituting
+        // `list_rules`, which reads a different thing on every backend — a
+        // wrong view is worse here than no view, because the whole decision
+        // downstream is "does anything in this admit SSH".
+        Lifecycle::Unsupported(reason) => {
+            Err(UnihelmError::new(ErrorCode::NotImplemented, reason.clone()))
+        }
+    }
+}
+
+/// Open one port ahead of the start, by whichever client works with this
+/// backend stopped.
+///
+/// firewalld cannot go through [`unihelm_distro::FwBackend::open_port`] here:
+/// that speaks to the daemon over D-Bus and the daemon is down, which is the
+/// state this whole path is about. Writing the permanent configuration offline
+/// keeps the ordering that matters — the port exists before anything starts
+/// enforcing — instead of starting a default-deny firewall and racing to widen
+/// it.
+async fn open_before_start(ctx: &OpContext, lifecycle: &Lifecycle, rule: &PortRule) -> Result<()> {
+    match lifecycle {
+        Lifecycle::Firewalld => {
+            firewalld_offline(&[&format!("--add-port={}/{}", rule.port, rule.proto.as_str())])
+                .await?;
+            Ok(())
+        }
+        // ufw reads and writes its rule list happily while stopped.
+        _ => ctx
+            .distro()
+            .fw
+            .open_port(rule)
+            .await
+            .map_err(UnihelmError::from),
+    }
+}
+
+/// The guard: the one thing that must be true before a default-deny firewall
+/// comes up. Returns the ports it had to open to make it true.
+///
+/// It refuses rather than guessing when it cannot tell which port sshd uses,
+/// and it refuses rather than widening the ruleset unasked when SSH is shut —
+/// opening a hole is the operator's decision, and `allow_ssh` is where they
+/// make it.
+async fn ensure_ssh_reachable(
+    ctx: &OpContext,
+    lifecycle: &Lifecycle,
+    view: &AdmittingView,
+    ssh: &SshFacts,
+    client_ip: Option<IpAddr>,
+    allow_ssh: bool,
+) -> Result<Vec<u16>> {
+    let (ports, source) = match ssh {
+        SshFacts::Absent => {
+            ctx.log("no sshd configuration on this host, so there is no SSH port to keep open");
+            return Ok(Vec::new());
+        }
+        SshFacts::Unknown { reason } => {
+            return Err(UnihelmError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "refusing to start the firewall: this host runs sshd and the panel could \
+                     not work out which port it listens on ({reason}). Bringing up a \
+                     default-deny firewall without a rule for that port ends every SSH \
+                     session to this server and every one after it."
+                ),
+            ));
+        }
+        SshFacts::Ports { ports, source } => (ports, *source),
+    };
+
+    let unprotected = unprotected_ssh_ports(&view.rules, ports, client_ip);
+    if unprotected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let listed = unprotected
+        .iter()
+        .map(|p| format!("{p}/tcp"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if !allow_ssh {
+        // Two different sentences, because they are two different claims. With
+        // a complete view the panel knows SSH is shut and says so. With an
+        // undecoded fragment in the ruleset it knows only that it cannot tell,
+        // and stating the stronger claim would send an operator whose firewall
+        // is fine chasing a lockout that is not there — and, if they believed
+        // it, would have them open a port they already had open.
+        let detail = if view.is_complete() {
+            format!(
+                "refusing to start the firewall: no rule in it would accept an SSH \
+                 connection to {listed} ({}) from where you are, and its default policy \
+                 for incoming traffic is deny. Open that port first, or ask again with \
+                 `allow_ssh` to have the panel open it before starting.",
+                source.describe()
+            )
+        } else {
+            format!(
+                "refusing to start the firewall: nothing the panel could read would accept \
+                 an SSH connection to {listed} ({}), and it could not read all of this \
+                 ruleset — {} is undecoded, and may be exactly what holds SSH open. Check \
+                 that part by hand, or ask again with `allow_ssh` to have the panel open \
+                 the port before starting.",
+                source.describe(),
+                view.opaque.join(", ")
+            )
+        };
+        return Err(UnihelmError::new(ErrorCode::Conflict, detail).with_field("allow_ssh"));
+    }
+
+    for port in &unprotected {
+        let rule = PortRule::anywhere(*port, Proto::Tcp, "ssh");
+        // Backend first, record second — the ordering `fw.port.open` uses and
+        // for its reason: a record written first would outlive a failed apply
+        // and show as drift forever.
+        open_before_start(ctx, lifecycle, &rule).await?;
+        ctx.db()
+            .record_fw_rule(rule.port, rule.proto.as_str(), None, &rule.comment)
+            .await
+            .map_err(UnihelmError::from)?;
+        ctx.log(format!(
+            "opened {port}/tcp from anywhere for SSH before starting the firewall"
+        ));
+    }
+    Ok(unprotected)
+}
+
+/// ufw's own switch.
+///
+/// `--force` on the way in because a bare `ufw enable` asks "Command may
+/// disrupt existing ssh connections. Proceed with operation (y|n)?" on a
+/// terminal the agent does not have; without it the call sits until the command
+/// timeout and reports a failure that never happened. The question it is asking
+/// is the one [`ensure_ssh_reachable`] has already answered properly.
+async fn ufw_switch(on: bool) -> Result<()> {
+    let cmd = if on {
+        unihelm_distro::Cmd::new("ufw").args(["--force", "enable"])
+    } else {
+        unihelm_distro::Cmd::new("ufw").arg("disable")
+    };
+    let out = cmd.run().await.map_err(UnihelmError::from)?;
+    if out.success() {
+        return Ok(());
+    }
+    Err(UnihelmError::new(
+        ErrorCode::CommandFailed,
+        format!("`{}` failed: {}", cmd.display(), out.failure_text()),
+    ))
+}
+
+/// firewalld's unit, through the service backend like any other unit.
+///
+/// `--now` in both directions, so "started" and "stopped" both survive a
+/// reboot. A firewall that comes back on its own after an operator stopped it —
+/// or, worse, is gone again after they started it — is a firewall whose state
+/// nobody can reason about.
+async fn firewalld_switch(ctx: &OpContext, on: bool) -> Result<()> {
+    let unit = unihelm_distro::UnitName::parse(FIREWALLD_UNIT).map_err(UnihelmError::from)?;
+    let svc = &ctx.distro().svc;
+    if on {
+        svc.enable(&unit, true).await
+    } else {
+        svc.disable(&unit, true).await
+    }
+    .map_err(UnihelmError::from)
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EnableInput {
+    /// Open the SSH port first when nothing already admits it. Absent means
+    /// refuse instead: starting a firewall is not the moment to widen a
+    /// ruleset nobody asked to widen.
+    #[serde(default)]
+    pub allow_ssh: bool,
+    /// The address the request arrived from, filled in by the web layer from
+    /// the live connection exactly as `fw.ban`'s is. It is what decides whether
+    /// a source-restricted SSH rule protects *this* operator.
+    #[serde(default)]
+    pub client_ip: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EnableOutput {
+    pub backend: &'static str,
+    /// Read back from the backend after the switch, never assumed from an exit
+    /// code.
+    pub active: bool,
+    /// What the panel found out about sshd, so the page can show the port it
+    /// protected and where that number came from.
+    pub ssh: SshFacts,
+    /// Ports this call had to open before starting was safe.
+    pub opened: Vec<u16>,
+}
+
+/// `fw.enable` — start the firewall, and refuse to do it in the one way that
+/// takes the operator's server away from them.
+///
+/// The whole operation is the SSH check. A stopped ufw with a dozen recorded
+/// rules and a default incoming policy of deny is one command away from
+/// enforcing all of them, and if none of them is the port sshd answers on, the
+/// operator's next login is refused by a firewall they can now only reach
+/// through a console.
+pub struct Enable;
+
+#[async_trait]
+impl TypedOperation for Enable {
+    type Input = EnableInput;
+    type Output = EnableOutput;
+
+    const NAME: &'static str = "fw.enable";
+    const PERMISSION: Permission = Permission::FirewallManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let fw = &ctx.distro().fw;
+        let lifecycle = Lifecycle::for_backend(fw.name());
+        if let Some(refusal) = lifecycle.refusal() {
+            return Err(refusal);
+        }
+
+        let client_ip = input
+            .client_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<IpAddr>().ok())
+            .map(canonical);
+        let ssh = ssh_facts().await;
+
+        // Already running is the state the caller asked for. An error here
+        // would send an operator who clicked twice looking for a problem that
+        // is not there.
+        if fw.is_active().await.unwrap_or(false) {
+            return Ok(EnableOutput {
+                backend: fw.name(),
+                active: true,
+                ssh,
+                opened: Vec::new(),
+            });
+        }
+
+        // Both backends are read and written while stopped — ufw through its
+        // own client, firewalld through `firewall-offline-cmd` — so the guard
+        // runs to completion before anything on the host changes and a refusal
+        // leaves the machine untouched. That ordering is not a nicety: starting
+        // firewalld to look at it replaces whatever is in netfilter, and
+        // stopping it again does not put a hand-written ruleset back.
+        let view = admitting_view(&lifecycle).await?;
+        let opened =
+            ensure_ssh_reachable(ctx, &lifecycle, &view, &ssh, client_ip, input.allow_ssh).await?;
+        match lifecycle {
+            Lifecycle::Ufw => ufw_switch(true).await?,
+            _ => firewalld_switch(ctx, true).await?,
+        }
+
+        // Read back rather than trusting the exit code. "port opened" while
+        // nothing is enforcing is the lie this module exists not to tell, and
+        // "firewall started" is the same lie one level up.
+        let active = fw.is_active().await.unwrap_or(false);
+        if !active {
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                format!(
+                    "{} reported that it started and then said it is not running; nothing is \
+                     being enforced",
+                    fw.name()
+                ),
+            ));
+        }
+
+        ctx.log(format!("started {}", fw.name()));
+        Ok(EnableOutput {
+            backend: fw.name(),
+            active,
+            ssh,
+            opened,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisableInput {}
+
+#[derive(Debug, Serialize)]
+pub struct DisableOutput {
+    pub backend: &'static str,
+    pub active: bool,
+    /// Rules the backend was enforcing a moment ago and now is not.
+    pub rules_unenforced: usize,
+    /// Addresses the backend was dropping a moment ago and now is not.
+    pub bans_unenforced: usize,
+}
+
+/// `fw.disable` — stop the firewall.
+///
+/// Not destructive: every rule and every ban stays recorded, and `fw.rules`
+/// starts labelling them "recorded, not enforced", which is the truth. What is
+/// dangerous about it is the other direction — the host is unfiltered from the
+/// moment this returns, including for the addresses Sentinel is banning — so
+/// the counts of what stopped being enforced are read *before* the stop and
+/// returned, and the UI confirms with them in front of the operator.
+pub struct Disable;
+
+#[async_trait]
+impl TypedOperation for Disable {
+    type Input = DisableInput;
+    type Output = DisableOutput;
+
+    const NAME: &'static str = "fw.disable";
+    const PERMISSION: Permission = Permission::FirewallManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        let fw = &ctx.distro().fw;
+        let lifecycle = Lifecycle::for_backend(fw.name());
+        if let Some(refusal) = lifecycle.refusal() {
+            return Err(refusal);
+        }
+
+        if !fw.is_active().await.unwrap_or(false) {
+            return Ok(DisableOutput {
+                backend: fw.name(),
+                active: false,
+                rules_unenforced: 0,
+                bans_unenforced: 0,
+            });
+        }
+
+        // Counted before the stop: afterwards the backend has nothing left to
+        // count, and the operator would be told "0 rules stopped being
+        // enforced" about a firewall that was holding a dozen.
+        let rules_unenforced = fw.list_rules().await.map(|r| r.len()).unwrap_or(0);
+        let bans_unenforced = fw.list_bans().await.map(|b| b.len()).unwrap_or(0);
+
+        match lifecycle {
+            Lifecycle::Ufw => ufw_switch(false).await?,
+            _ => firewalld_switch(ctx, false).await?,
+        }
+
+        ctx.log(format!(
+            "stopped {}: {rules_unenforced} rule(s) and {bans_unenforced} ban(s) are no longer \
+             enforced",
+            fw.name()
+        ));
+
+        Ok(DisableOutput {
+            backend: fw.name(),
+            active: fw.is_active().await.unwrap_or(false),
+            rules_unenforced,
+            bans_unenforced,
         })
     }
 }
@@ -2222,5 +3155,343 @@ not json at all
         assert_eq!(trail.len(), 1);
         assert_eq!(trail[0].target.as_deref(), Some("198.51.100.9"));
         assert_eq!(trail[0].detail["failures"], 5);
+    }
+
+    // -- starting and stopping the firewall ---------------------------------
+
+    #[test]
+    fn every_ssh_port_in_sshd_t_is_kept_not_just_the_first() {
+        // `Port 22` and `Port 2222` both listen. First-value-wins is right for
+        // the keywords posture.rs reads and wrong here, and taking only the
+        // first would leave the second port shut the moment ufw came up.
+        let output = "\
+port 22\n\
+port 2222\n\
+passwordauthentication no\n\
+permitrootlogin prohibit-password\n\
+addressfamily any\n";
+        assert_eq!(parse_sshd_ports(output), vec![22, 2222]);
+
+        // sshd -T always prints the effective port, so an empty answer means
+        // the command did not really run.
+        assert!(parse_sshd_ports("permitrootlogin no\n").is_empty());
+        assert!(parse_sshd_ports("port zero\nport 0\n").is_empty());
+    }
+
+    #[test]
+    fn config_files_yield_every_port_and_nothing_from_a_match_block() {
+        let files = vec![
+            (
+                "/etc/ssh/sshd_config.d/50-cloud.conf".to_string(),
+                "Port 2222\n".to_string(),
+            ),
+            (
+                "/etc/ssh/sshd_config".to_string(),
+                "# Port 9999 is commented out\n\
+                 Port 22\n\
+                 PermitRootLogin no\n\
+                 Match Address 10.0.0.0/8\n\
+                 \x20   Port 2022\n"
+                    .to_string(),
+            ),
+        ];
+        // 2022 is behind a `Match`: it applies to some connections only, and a
+        // guard that reported it as "the SSH port" would be describing a
+        // conditional as a fact.
+        assert_eq!(parse_sshd_config_ports(&files), vec![2222, 22]);
+    }
+
+    #[test]
+    fn ufw_show_added_is_read_in_every_shape_ufw_prints() {
+        // Copied from the shapes `ufw show added` actually emits, including the
+        // two spellings of a source-restricted rule and our own `open_port`.
+        let added = "\
+Added user rules (see 'ufw status' for running firewall):\n\
+ufw limit ssh\n\
+ufw allow OpenSSH\n\
+ufw allow 80/tcp\n\
+ufw allow proto tcp to any port 443 comment 'unihelm: https'\n\
+ufw allow from 10.0.0.0/8 proto tcp to any port 3306\n\
+ufw allow from 203.0.113.0/24 to any port 5432 proto tcp\n\
+ufw allow 53\n";
+        let rules = parse_ufw_added(added);
+        let ports: Vec<u16> = rules.iter().map(|r| r.port).collect();
+        assert_eq!(ports, vec![22, 22, 80, 443, 3306, 5432, 53]);
+
+        // A comment is operator prose: reading past it would let
+        // `comment 'moved to 2222'` invent a rule nobody wrote.
+        assert_eq!(rules[3].port, 443);
+        assert_eq!(rules[3].source, None);
+        assert_eq!(rules[4].source.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(rules[5].source.as_deref(), Some("203.0.113.0/24"));
+        assert_eq!(rules[5].proto, Proto::Tcp);
+    }
+
+    #[test]
+    fn ufw_rules_that_do_not_admit_a_connection_to_this_host_are_not_counted() {
+        // Each of these mentions 22 and none of them means "a new SSH
+        // connection to this machine is accepted". Counting any of them would
+        // clear the guard on a host where SSH is in fact shut.
+        for line in [
+            "ufw deny 22/tcp",
+            "ufw reject 22/tcp",
+            "ufw allow out 22/tcp",
+            "ufw route allow proto tcp to any port 22",
+            "ufw allow in on tailscale0 to any port 22",
+        ] {
+            assert!(parse_ufw_added(line).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_source_restricted_ssh_rule_protects_only_the_operator_inside_it() {
+        let rules = parse_ufw_added("ufw allow from 10.0.0.0/8 proto tcp to any port 22\n");
+        assert!(ssh_reachable(&rules, 22, Some(ip("10.1.2.3"))));
+        // The admin working from home. The rule exists, and it is not theirs.
+        assert!(!ssh_reachable(&rules, 22, Some(ip("203.0.113.9"))));
+        // And when the web layer could not tell us where they are, a restricted
+        // rule is not evidence of anything.
+        assert!(!ssh_reachable(&rules, 22, None));
+    }
+
+    #[test]
+    fn an_unrestricted_rule_protects_anyone_but_only_on_its_own_port_and_proto() {
+        let rules = parse_ufw_added("ufw allow 22/tcp\nufw allow 2222/udp\n");
+        assert!(ssh_reachable(&rules, 22, None));
+        // A UDP hole on 2222 does nothing for an SSH connection to 2222.
+        assert!(!ssh_reachable(&rules, 2222, None));
+        assert!(!ssh_reachable(&rules, 2022, None));
+    }
+
+    #[test]
+    fn a_second_ssh_port_with_no_rule_is_reported_as_unprotected() {
+        let rules = parse_ufw_added("ufw allow 22/tcp\n");
+        assert_eq!(unprotected_ssh_ports(&rules, &[22, 2222], None), vec![2222]);
+        assert!(unprotected_ssh_ports(&rules, &[22], None).is_empty());
+    }
+
+    #[test]
+    fn only_the_backends_with_a_switch_have_one() {
+        assert_eq!(Lifecycle::for_backend("ufw"), Lifecycle::Ufw);
+        assert_eq!(Lifecycle::for_backend("firewalld"), Lifecycle::Firewalld);
+        assert!(Lifecycle::for_backend("ufw").refusal().is_none());
+
+        // nftables and "no firewall" each get their own sentence, because the
+        // fix for them is different and "unsupported" tells nobody which.
+        let nft = Lifecycle::for_backend("nftables")
+            .refusal()
+            .expect("nftables has no switch the panel owns");
+        assert_eq!(nft.code, ErrorCode::NotImplemented);
+        assert!(nft.detail.contains("/etc/nftables.conf"), "{}", nft.detail);
+
+        let none = Lifecycle::for_backend("none")
+            .refusal()
+            .expect("nothing to start");
+        assert!(
+            none.detail.contains("no firewall is installed"),
+            "{}",
+            none.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_and_stopping_are_refused_on_a_backend_that_cannot_do_it() {
+        // The mock backend is not one of the two with a lifecycle, so both
+        // operations must say so by name rather than reporting a success no
+        // firewall took.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+
+        let err = Enable
+            .run(&ctx, EnableInput::default())
+            .await
+            .expect_err("a backend with no switch must refuse");
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert!(err.detail.contains("mock"), "{}", err.detail);
+
+        let err = Disable
+            .run(&ctx, DisableInput {})
+            .await
+            .expect_err("a backend with no switch must refuse");
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert!(err.detail.contains("mock"), "{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn an_unknowable_ssh_port_refuses_the_start_rather_than_assuming_22() {
+        // The lockout that costs a console visit: sshd is on 2222, the panel
+        // could not read the configuration, and it opens 22 "helpfully".
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let err = ensure_ssh_reachable(
+            &ctx,
+            &Lifecycle::Ufw,
+            &AdmittingView::default(),
+            &SshFacts::Unknown {
+                reason: "`sshd -T` did not run".into(),
+            },
+            None,
+            true,
+        )
+        .await
+        .expect_err("an unknown SSH port must stop the start, even with allow_ssh");
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("sshd -T"), "{}", err.detail);
+        // And nothing was touched on the way to saying no.
+        assert!(reg.services().db.fw_rules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_sshd_has_no_ssh_port_to_hold_open() {
+        // A firewall on a box that does not run sshd must still be startable;
+        // the guard exists to protect a session, not to forbid a state.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let opened = ensure_ssh_reachable(
+            &ctx,
+            &Lifecycle::Ufw,
+            &AdmittingView::default(),
+            &SshFacts::Absent,
+            None,
+            false,
+        )
+        .await
+        .expect("no sshd means nothing to protect");
+        assert!(opened.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shut_ssh_port_refuses_the_start_until_the_operator_asks_for_it() {
+        // A view the panel read in full and that holds nothing: the shape of a
+        // firewall about to come up with a deny-by-default policy and nothing
+        // holding SSH open.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let ssh = SshFacts::Ports {
+            ports: vec![2222],
+            source: SshPortSource::SshdT,
+        };
+        let view = AdmittingView::default();
+
+        let err = ensure_ssh_reachable(&ctx, &Lifecycle::Ufw, &view, &ssh, None, false)
+            .await
+            .expect_err("SSH is shut, so starting would end every session");
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(err.field.as_deref(), Some("allow_ssh"));
+        // The port and how the panel knows it, both in the sentence: an
+        // operator has to be able to check the claim before agreeing to it.
+        assert!(err.detail.contains("2222/tcp"), "{}", err.detail);
+        assert!(err.detail.contains("sshd -T"), "{}", err.detail);
+        assert!(
+            reg.services().db.fw_rules().await.unwrap().is_empty(),
+            "a refusal must leave the ruleset exactly as it was"
+        );
+
+        // Asked for explicitly, the same call opens the port and records it,
+        // in that order, before returning it as changed.
+        let opened = ensure_ssh_reachable(&ctx, &Lifecycle::Ufw, &view, &ssh, None, true)
+            .await
+            .expect("allow_ssh opens the port");
+        assert_eq!(opened, vec![2222]);
+        let recorded = reg.services().db.fw_rules().await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].port, 2222);
+        assert_eq!(recorded[0].proto, "tcp");
+        assert_eq!(recorded[0].source, None);
+    }
+
+    #[test]
+    fn a_firewalld_zone_that_admits_ssh_by_service_is_not_read_as_shut() {
+        // The stock RHEL host: SSH is admitted by the `ssh` *service* and there
+        // is no port rule for 22 anywhere. `FwBackend::list_rules` reads only
+        // `ports:` and the rich rules, so a guard built on it finds nothing
+        // here — and tells an operator whose firewall is correct that starting
+        // it would shut them out, then offers to open a port they already have.
+        let listed = "\
+public\n\
+  target: default\n\
+  interfaces: eth0\n\
+  sources: \n\
+  services: cockpit dhcpv6-client ssh\n\
+  ports: 8088/tcp\n\
+  protocols: \n\
+  forward-ports: \n\
+  rich rules: \n\
+\trule family=\"ipv4\" source address=\"10.0.0.0/8\" port port=\"3306\" protocol=\"tcp\" accept\n";
+        let (view, services) = parse_firewalld_zone(listed);
+
+        assert_eq!(services, vec!["cockpit", "dhcpv6-client", "ssh"]);
+        assert!(view.is_complete(), "{:?}", view.opaque);
+        // The panel's own 8088 and the rich rule, both decoded from the zone.
+        assert!(ssh_reachable(&view.rules, 8088, None));
+        assert!(ssh_reachable(&view.rules, 3306, Some(ip("10.1.2.3"))));
+        assert!(!ssh_reachable(&view.rules, 3306, Some(ip("203.0.113.9"))));
+        // 22 is not here yet; it arrives when the `ssh` service is resolved.
+        assert!(!ssh_reachable(&view.rules, 22, None));
+
+        let resolved = parse_port_tokens("22/tcp");
+        assert!(ssh_reachable(&resolved, 22, None));
+    }
+
+    #[test]
+    fn a_rich_rule_that_cannot_be_decoded_is_carried_rather_than_dismissed() {
+        // Anything the parser cannot turn into a port may be the thing holding
+        // SSH open. Dropping it silently would let a firewall the panel only
+        // half-read be reported as one it read completely.
+        let (view, _) = parse_firewalld_zone(
+            "  rich rules: \n\
+             \trule family=\"ipv4\" service name=\"ssh\" accept\n\
+             \trule family=\"ipv4\" source address=\"198.51.100.9\" drop\n",
+        );
+        assert!(view.rules.is_empty());
+        // The drop rule cannot admit anything, so it is not carried; the
+        // accepting one this parser does not understand is.
+        assert_eq!(view.opaque.len(), 1, "{:?}", view.opaque);
+        assert!(view.opaque[0].contains("service name=\"ssh\""));
+        assert!(!view.is_complete());
+    }
+
+    #[tokio::test]
+    async fn an_incompletely_read_ruleset_refuses_without_claiming_ssh_is_shut() {
+        // Same refusal, deliberately not the same sentence. "No rule would
+        // accept an SSH connection" is a claim about the ruleset, and the panel
+        // is not entitled to make it about a ruleset it could not finish
+        // reading.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let ssh = SshFacts::Ports {
+            ports: vec![22],
+            source: SshPortSource::SshdT,
+        };
+        let view = AdmittingView {
+            rules: Vec::new(),
+            opaque: vec!["cockpit".into()],
+        };
+
+        let err = ensure_ssh_reachable(&ctx, &Lifecycle::Ufw, &view, &ssh, None, false)
+            .await
+            .expect_err("an unreadable fragment is still a reason not to start");
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(err.field.as_deref(), Some("allow_ssh"));
+        assert!(err.detail.contains("could not read all"), "{}", err.detail);
+        assert!(err.detail.contains("cockpit"), "{}", err.detail);
+        assert!(
+            !err.detail.contains("no rule in it would accept"),
+            "a partial read must not be reported as a finding: {}",
+            err.detail
+        );
+    }
+
+    #[test]
+    fn a_ufw_comment_is_never_read_as_part_of_the_rule() {
+        // `on`, `out` and `route` decide whether a rule admits an inbound
+        // connection, and all three are ordinary English words. Scanning into
+        // the comment for them drops a perfectly good SSH rule and reports the
+        // port as shut.
+        let rules = parse_ufw_added("ufw allow 22/tcp comment 'ssh on the jump box'\n");
+        assert!(ssh_reachable(&rules, 22, None));
+
+        // The token still counts where ufw itself reads it.
+        assert!(parse_ufw_added("ufw allow in on eth0 to any port 22 comment 'x'").is_empty());
     }
 }

@@ -296,6 +296,8 @@ impl OpRegistry {
         registry.register(crate::fwops::PortOpen);
         registry.register(crate::fwops::PortClose);
         registry.register(crate::fwops::Rules);
+        registry.register(crate::fwops::Enable);
+        registry.register(crate::fwops::Disable);
         registry.register(crate::fwops::Ban);
         registry.register(crate::fwops::Unban);
         registry.register(crate::fwops::Bans);
@@ -342,6 +344,12 @@ impl OpRegistry {
         registry.register(crate::runtimes::List);
         registry.register(crate::runtimes::Install);
         registry.register(crate::docker::List);
+        registry.register(crate::docker::Start);
+        registry.register(crate::docker::Stop);
+        registry.register(crate::docker::Restart);
+        registry.register(crate::docker::Remove);
+        registry.register(crate::docker::Logs);
+        registry.register(crate::runtime_default::SetDefault);
         registry.register(crate::webhook::List);
         registry.register(crate::webhook::Set);
         registry.register(crate::webhook::Delete);

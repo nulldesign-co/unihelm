@@ -7,7 +7,7 @@
 //! looking at twelve live sites.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use serde::Deserialize;
 use serde_json::json;
@@ -139,5 +139,172 @@ pub async fn discover(
         .require(Permission::ServerRead)
         .map_err(ApiError::from)?;
     let data = ops::invoke_now(&state, &current.auth, "sites.discover", json!({})).await?;
+    Ok(Json(data))
+}
+
+// ---------------------------------------------------------------------------
+// driving a container that is already there
+// ---------------------------------------------------------------------------
+
+/// One shape for the four operations that take only a container.
+///
+/// `server_manage` on all of them: most of these containers were not created by
+/// this panel, and one of them may be an nginx serving somebody's production
+/// site. Reading the list is a `server_read`; stopping something is not.
+async fn container_action(
+    state: &SharedState,
+    current: &CurrentUser,
+    op: &'static str,
+    container: &str,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    ops::invoke(
+        &state.clone(),
+        &current.auth,
+        op,
+        json!({ "container": container }),
+    )
+    .await
+}
+
+/// Start a container.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/containers/{id}/start",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = String, Path, description = "Container id or name")),
+    responses(
+        (status = 200, description = "Start a container", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a container reference", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such container", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_start(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    container_action(&state, &current, "docker.start", &id).await
+}
+
+/// Stop a container.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/containers/{id}/stop",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = String, Path, description = "Container id or name")),
+    responses(
+        (status = 200, description = "Stop a container", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a container reference", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such container", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_stop(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    container_action(&state, &current, "docker.stop", &id).await
+}
+
+/// Restart a container.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/containers/{id}/restart",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = String, Path, description = "Container id or name")),
+    responses(
+        (status = 200, description = "Restart a container", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a container reference", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such container", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_restart(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    container_action(&state, &current, "docker.restart", &id).await
+}
+
+/// Delete a container and its writable layer. A running one is refused.
+#[utoipa::path(
+    delete,
+    path = "/api/server/docker/containers/{id}",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = String, Path, description = "Container id or name")),
+    responses(
+        (status = 200, description = "Removed", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such container", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: it is running — stop it first", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_remove(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    container_action(&state, &current, "docker.remove", &id).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogLines {
+    pub lines: Option<u32>,
+}
+
+/// The last lines a container wrote, both streams merged.
+#[utoipa::path(
+    get,
+    path = "/api/server/docker/containers/{id}/logs",
+    tag = "server",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Container id or name"),
+        ("lines" = Option<u32>, Query, description = "How many lines; 200 by default"),
+    ),
+    responses(
+        (status = 200, description = "The tail of the container's output", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such container", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_logs(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Query(q): Query<LogLines>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Reading, so `server_read` — the same permission the list needs.
+    current
+        .auth
+        .require(Permission::ServerRead)
+        .map_err(ApiError::from)?;
+
+    let mut input = json!({ "container": id });
+    if let Some(lines) = q.lines {
+        input["lines"] = json!(lines);
+    }
+    let data = ops::invoke_now(&state, &current.auth, "docker.logs", input).await?;
     Ok(Json(data))
 }

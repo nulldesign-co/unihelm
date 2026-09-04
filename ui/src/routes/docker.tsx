@@ -1,48 +1,74 @@
-import { useQuery } from "@tanstack/react-query";
-import { Boxes, Container, HardDrive, Layers, RotateCw } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  Boxes,
+  Container,
+  HardDrive,
+  Layers,
+  Play,
+  RotateCw,
+  ScrollText,
+  Square,
+  Trash2,
+} from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
+import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError, api } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
+import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
 
 /**
- * Docker's inventory (`docker.list`).
+ * Docker's inventory (`docker.list`), and the lifecycle of what is in it.
  *
- * Four things here are decisions rather than layout:
+ * Five things here are decisions rather than layout:
  *
- * 1. **There is nothing to press.** The panel lists Docker and does not drive
- *    it, and that is said once at the top instead of shown as a row of disabled
- *    Start buttons. A greyed-out control is a promise that some permission
- *    ungreys it; nothing ungreys this one. A container holding the daemon
- *    socket is root on the machine, and the panel exists to keep anybody from
- *    getting there.
- * 2. **"Not installed" and "not answering" are two different pages.** The
+ * 1. **The controls act on containers; nothing here makes one.** Start, stop,
+ *    restart, remove and a log tail, because those are what an operator needs
+ *    at 3am and the alternative is an SSH session. No "run", though, and the
+ *    callout at the top says why rather than leaving a gap somebody reads as an
+ *    oversight: a container can be handed the host's filesystem or the daemon
+ *    socket by a single flag, so a form that took run arguments would be a root
+ *    shell with a nicer font. The flags on what is listed below were chosen by
+ *    whoever created it.
+ * 2. **Stopping asks first; starting does not.** The panel did not create most
+ *    of what is on this page — a container here may be an nginx serving
+ *    somebody's production site, and it looks exactly like one an operator is
+ *    finished with. Stop, restart and remove each take something away, so each
+ *    names the container and waits. Start takes nothing away, and a dialog in
+ *    front of the harmless action is how people learn to click through the one
+ *    in front of the harmful one.
+ * 3. **"Not installed" and "not answering" are two different pages.** The
  *    operation separates them deliberately, so the UI does too: an absent
  *    Docker is an empty state, because nothing is wrong — the operator simply
  *    has no Docker. A wedged daemon is a warning, because something *is*
  *    wrong and the containers it would have listed are still out there
  *    running. An operator debugging one of those does not want to be told the
  *    other.
- * 3. **The diagnosis is quoted, not paraphrased.** `note` carries the panel's
+ * 4. **The diagnosis is quoted, not paraphrased.** `note` carries the panel's
  *    reason in the words that name the next command — `stack.install`,
  *    `systemctl status docker`. Rewriting it here would be inventing a second
- *    source of truth about a machine this page cannot touch.
- * 4. **Stopped containers are listed.** They are still something the operator
+ *    source of truth about a machine this page cannot see. A failed action is
+ *    reported the same way: Docker's own sentence, not ours.
+ * 5. **Stopped containers are listed.** They are still something the operator
  *    has and still hold their writable layer, so leaving them out would make
  *    the page lie about what is on the disk. The badge follows `running`,
  *    which the server derives once from Docker's own status prefix; nothing
  *    here reads the prose beside it. That prose is localised in some builds,
  *    and a panel that decided "stopped" from a translated word would be wrong
- *    on exactly the machines least able to notice.
+ *    on exactly the machines least able to notice — and now it would also
+ *    offer the wrong button, which is how a live container gets a Start it
+ *    does not need and a dead one never gets the one it does.
  */
 export function DockerPage() {
   const { t } = useTranslation();
@@ -55,10 +81,11 @@ export function DockerPage() {
         title={t("docker.title")}
         description={t("docker.subtitle")}
         actions={
-          // A re-read, not a control. Docker changes without the panel, and no
-          // mutation on this page will ever settle and invalidate the query —
-          // asking again is the only way this list gets newer. Deliberately not
-          // a poll: a ten-second shell-out every few seconds is a cost the
+          // A re-read, not a control. Docker changes without the panel — the
+          // actions on this page invalidate the query themselves, but a
+          // container that exited on its own will not — so asking again is how
+          // the list catches up with everything nobody here did. Deliberately
+          // not a poll: a ten-second shell-out every few seconds is a cost the
           // operator did not ask for on a page they may leave open all day.
           <Button variant="outline" loading={list.isFetching} onClick={() => void list.refetch()}>
             <RotateCw className="h-4 w-4" aria-hidden />
@@ -67,8 +94,8 @@ export function DockerPage() {
         }
       />
 
-      <Callout tone="info" title={t("docker.readOnlyTitle")}>
-        {t("docker.readOnly")}
+      <Callout tone="info" title={t("docker.noRunTitle")}>
+        {t("docker.noRun")}
       </Callout>
 
       {list.isPending ? (
@@ -85,16 +112,17 @@ export function DockerPage() {
 }
 
 // ---------------------------------------------------------------------------
-// The operation
+// The operations
 // ---------------------------------------------------------------------------
 
 /**
- * `docker.list`, typed here rather than in `lib/api.ts`.
+ * `docker.list` and the container lifecycle, typed here rather than in
+ * `lib/api.ts`.
  *
- * The shapes mirror `unihelm-ops::docker::ListOutput` field for field. They
- * belong beside `endpoints` with every other operation and should move there
- * once the REST route lands; keeping them local is what let this page be
- * written without editing a file two other pages are being written against.
+ * The shapes mirror `unihelm-ops::docker` field for field. They belong beside
+ * `endpoints` with every other operation and should move there once the REST
+ * routes land; keeping them local is what let this page be written without
+ * editing a file two other pages are being written against.
  */
 interface DockerContainer {
   id: string;
@@ -132,7 +160,31 @@ interface DockerInventory {
   note: string | null;
 }
 
+interface DockerLogs {
+  id: string;
+  name: string;
+  /** Both output streams, already merged into the order they happened. */
+  lines: string[];
+}
+
+/** How many lines the log dialog asks for; the agent's own default is the same. */
+const LOG_LINES = 200;
+
+/** The three actions that change a container without deleting it. */
+type ContainerAction = "start" | "stop" | "restart";
+
 const fetchDockerInventory = () => api.get<DockerInventory>("/api/server/docker");
+
+// Addressed by id, never by name. A name can be moved onto a different
+// container by a `docker rename` or a compose recreate between this list being
+// drawn and a button being pressed; an id cannot.
+const containerAction = (id: string, action: ContainerAction) =>
+  api.post<unknown>(`/api/server/docker/containers/${id}/${action}`);
+
+const removeContainer = (id: string) => api.del<unknown>(`/api/server/docker/containers/${id}`);
+
+const fetchContainerLogs = (id: string) =>
+  api.get<DockerLogs>(`/api/server/docker/containers/${id}/logs?lines=${LOG_LINES}`);
 
 // ---------------------------------------------------------------------------
 // The three answers the operation can give
@@ -205,6 +257,11 @@ function Inventory({ inventory }: { inventory: DockerInventory }) {
  */
 function InventorySkeleton() {
   const { t } = useTranslation();
+  // The same gate the real rows use. A ghost that draws a verb button the
+  // arriving row will not have is a ghost that moves the ⋯ sideways under the
+  // pointer, which is the jump this component exists to stop.
+  const { user } = useSession();
+  const canManage = user?.permissions.includes("server_manage") ?? false;
   return (
     <div role="status" aria-live="polite" className="space-y-6">
       <section className="space-y-3">
@@ -215,7 +272,7 @@ function InventorySkeleton() {
         {/* The same `min-w` as the real table. Without it the ghost lays its
             columns out at one width and the rows arrive at another, which is
             the horizontal version of the jump this component exists to stop. */}
-        <Table className="min-w-[640px]">
+        <Table className="min-w-[780px]">
           <ContainerHead />
           <tbody>
             {Array.from({ length: 3 }, (_, i) => (
@@ -238,6 +295,15 @@ function InventorySkeleton() {
                 </Td>
                 <Td>
                   <Skeleton className="h-3.5 w-24" />
+                </Td>
+                <Td>
+                  {/* A button and a ⋯, at the size they arrive at. This is the
+                      cell the pointer is already heading for, so it is the one
+                      that must not move when the rows land. */}
+                  <div className="flex items-center justify-end gap-1">
+                    {canManage ? <Skeleton className="h-8 w-20 rounded-lg" /> : null}
+                    <Skeleton className="h-8 w-8 rounded-lg" />
+                  </div>
                 </Td>
               </tr>
             ))}
@@ -304,6 +370,7 @@ function ContainerHead() {
         <Th>{t("docker.image")}</Th>
         <Th className="w-48">{t("docker.status")}</Th>
         <Th className="w-56">{t("docker.ports")}</Th>
+        <Th className="w-44 text-end">{t("docker.actions")}</Th>
       </tr>
     </thead>
   );
@@ -312,6 +379,13 @@ function ContainerHead() {
 function ContainerSection({ containers }: { containers: DockerContainer[] }) {
   const { t } = useTranslation();
   const running = containers.filter((row) => row.running).length;
+
+  // One error sink for the whole table rather than one per row. Docker's
+  // failures are sentences — "Cannot connect to the Docker daemon", "container
+  // is marked for removal" — and a sentence folded into a table cell is a
+  // sentence nobody reads. It carries the container's name, so a row far down
+  // a long list is still attributable.
+  const [error, setError] = useState<string | null>(null);
 
   return (
     <section className="space-y-3">
@@ -329,6 +403,9 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
           ) : null
         }
       />
+
+      {error ? <Callout tone="danger">{error}</Callout> : null}
+
       {containers.length === 0 ? (
         <EmptyState
           icon={<Container aria-hidden />}
@@ -337,7 +414,7 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
           className="py-10"
         />
       ) : (
-        <Table className="min-w-[640px]">
+        <Table className="min-w-[780px]">
           <ContainerHead />
           <tbody>
             {containers.map((row, index) => (
@@ -368,12 +445,303 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
                     row.ports
                   )}
                 </Td>
+                <Td>
+                  <ContainerActions container={row} onError={setError} />
+                </Td>
               </Tr>
             ))}
           </tbody>
         </Table>
       )}
     </section>
+  );
+}
+
+/** The three actions that want a second thought before they happen. */
+type Confirmable = "stop" | "restart" | "remove";
+
+/**
+ * One row's controls.
+ *
+ * The state-changing verb is inline and everything else is behind the ⋯, which
+ * is this panel's rule for a table row: three inline buttons per row is a
+ * control panel, one ⋯ is a row. Which verb is inline follows the container —
+ * Start for a stopped one, Stop for a running one — so the button under the
+ * pointer is always the one that changes what the badge beside it says.
+ *
+ * Remove is offered on both. The agent refuses to remove a running container
+ * rather than forcing it, and a menu item that quietly disappeared for running
+ * containers would hide that rule instead of teaching it; the confirmation says
+ * what will happen and the agent's refusal is the backstop.
+ *
+ * The four verbs need `server.manage`; the log tail needs only the
+ * `server.read` that drew this row. This page sits in the sidebar for anyone
+ * who can see the shell, so somebody holding just the read half will reach it —
+ * and showing them a Stop that can only ever answer 403 teaches them the panel
+ * is broken rather than that they lack the permission. Hidden, not disabled:
+ * greying it out promises some toggle ungreys it, and their own role is not one
+ * of the things they can toggle. The agent re-checks regardless.
+ */
+function ContainerActions({
+  container,
+  onError,
+}: {
+  container: DockerContainer;
+  onError: (message: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const { user } = useSession();
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState<Confirmable | null>(null);
+  const [showLogs, setShowLogs] = useState(false);
+
+  const canManage = user?.permissions.includes("server_manage") ?? false;
+
+  const settled = () => {
+    setConfirming(null);
+    onError(null);
+    void queryClient.invalidateQueries({ queryKey: ["docker"] });
+  };
+
+  const failed = (e: unknown) => {
+    // The dialog closes on the way out. Leaving it up over a message printed
+    // behind it would give the operator two places to look and one button that
+    // has already had its effect.
+    setConfirming(null);
+    onError(
+      t("docker.actionFailed", {
+        name: container.name,
+        message: e instanceof ApiError ? e.message : String(e),
+      }),
+    );
+  };
+
+  const act = useMutation({
+    mutationFn: (action: ContainerAction) => containerAction(container.id, action),
+    onSuccess: settled,
+    onError: failed,
+  });
+
+  const remove = useMutation({
+    mutationFn: () => removeContainer(container.id),
+    onSuccess: settled,
+    onError: failed,
+  });
+
+  const busy = act.isPending || remove.isPending;
+
+  return (
+    <div className="flex items-center justify-end gap-1">
+      {canManage &&
+        (container.running ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            loading={act.isPending && act.variables === "stop"}
+            onClick={() => setConfirming("stop")}
+          >
+            <Square className="h-3.5 w-3.5" aria-hidden />
+            {t("docker.stop")}
+          </Button>
+        ) : (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={busy}
+            loading={act.isPending && act.variables === "start"}
+            onClick={() => act.mutate("start")}
+          >
+            <Play className="h-3.5 w-3.5" aria-hidden />
+            {t("docker.start")}
+          </Button>
+        ))}
+
+      <Menu label={t("docker.actionsFor", { name: container.name })}>
+        {canManage && container.running ? (
+          <MenuItem icon={<RotateCw aria-hidden />} onClick={() => setConfirming("restart")}>
+            {t("docker.restart")}
+          </MenuItem>
+        ) : null}
+        <MenuItem icon={<ScrollText aria-hidden />} onClick={() => setShowLogs(true)}>
+          {t("docker.logs")}
+        </MenuItem>
+        {canManage ? (
+          <>
+            <MenuSeparator />
+            <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming("remove")}>
+              {t("docker.remove")}
+            </MenuItem>
+          </>
+        ) : null}
+      </Menu>
+
+      <LogsDialog container={container} open={showLogs} onClose={() => setShowLogs(false)} />
+
+      <ConfirmDialog
+        action={confirming}
+        container={container}
+        busy={busy}
+        onClose={() => setConfirming(null)}
+        onConfirm={(action) => (action === "remove" ? remove.mutate() : act.mutate(action))}
+      />
+    </div>
+  );
+}
+
+/**
+ * The pause in front of stop, restart and remove.
+ *
+ * One dialog for the three, because the shape of the question is identical and
+ * three near-copies would drift apart the first time one of them was reworded.
+ * Rendered only while an action is pending confirmation — `Dialog` disappears
+ * instantly rather than animating out, so there is no closing frame in which a
+ * missing action could show through as the wrong wording.
+ */
+function ConfirmDialog({
+  action,
+  container,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  action: Confirmable | null;
+  container: DockerContainer;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: (action: Confirmable) => void;
+}) {
+  const { t } = useTranslation();
+  if (action === null) return null;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={t(`docker.confirm.${action}.title`, { name: container.name })}
+      description={t(`docker.confirm.${action}.hint`)}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button variant="danger" loading={busy} onClick={() => onConfirm(action)}>
+            {t(`docker.confirm.${action}.confirm`)}
+          </Button>
+        </>
+      }
+    >
+      {/* The sentence that matters is about this machine, not about Docker.
+          Most of what is on this page was put here by somebody else, and the
+          panel genuinely does not know what depends on it. */}
+      <p className="text-sm text-ink-muted">{t(`docker.confirm.${action}.body`)}</p>
+      {/* The id, because two containers can wear one name across a recreate and
+          only this says which one is about to be acted on. */}
+      <p className="mt-3 font-mono text-xs break-all text-ink-subtle">{container.id}</p>
+    </Dialog>
+  );
+}
+
+/**
+ * The last lines a container has written.
+ *
+ * Read only while the dialog is open and never on a timer: a tail is a
+ * shell-out per request, and a dialog left open on a second monitor should not
+ * become a standing load on somebody's server.
+ *
+ * The lines arrive already merged. Docker keeps a container's stdout and its
+ * stderr apart, and most server software logs to stderr, so the agent puts the
+ * two back into one order before they get here; nothing on this side sorts,
+ * filters or re-reads them.
+ */
+function LogsDialog({
+  container,
+  open,
+  onClose,
+}: {
+  container: DockerContainer;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+
+  const logs = useQuery({
+    queryKey: ["docker-logs", container.id],
+    queryFn: () => fetchContainerLogs(container.id),
+    enabled: open,
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      wide
+      title={t("docker.logsTitle", { name: container.name })}
+      description={t("docker.logsHint", { lines: LOG_LINES })}
+      footer={
+        <>
+          <Button variant="ghost" loading={logs.isFetching} onClick={() => void logs.refetch()}>
+            <RotateCw className="h-3.5 w-3.5" aria-hidden />
+            {t("docker.refresh")}
+          </Button>
+          <Button variant="secondary" onClick={onClose}>
+            {t("common.close")}
+          </Button>
+        </>
+      }
+    >
+      <p className="mb-2 truncate font-mono text-xs text-ink-subtle">{container.id}</p>
+
+      {logs.isPending ? (
+        <div className="space-y-2 rounded-lg border border-border bg-canvas p-3">
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-5/6" />
+          <Skeleton className="h-3 w-2/3" />
+          <Skeleton className="h-3 w-3/4" />
+        </div>
+      ) : logs.error ? (
+        <Callout tone="danger">
+          {logs.error instanceof ApiError ? logs.error.message : String(logs.error)}
+        </Callout>
+      ) : (
+        <div
+          aria-busy={logs.isFetching || undefined}
+          className={cn(
+            "max-h-[50vh] overflow-y-auto rounded-lg border border-border bg-canvas p-3 font-mono text-xs leading-relaxed",
+            // A refetch replaces every line in one frame. Fading the panel out
+            // and back is what tells the reader the text they were part-way
+            // through is no longer the same text.
+            "transition-opacity duration-150",
+            logs.isFetching && "opacity-50",
+          )}
+        >
+          {(logs.data?.lines.length ?? 0) === 0 ? (
+            // Nothing written is not a failure: a container started seconds ago
+            // and one whose logging driver sends its output somewhere else both
+            // land here, and the hint says so rather than implying a fault. No
+            // second dashed border inside the log panel's own box, and back to
+            // the UI face — the mono is for log lines, not for prose.
+            <EmptyState
+              className="border-0 px-2 py-8 font-sans"
+              icon={<ScrollText aria-hidden />}
+              title={t("docker.logsEmpty")}
+              hint={t("docker.logsEmptyHint")}
+            />
+          ) : (
+            logs.data!.lines.map((line, index) => (
+              // Container output is machine text; `break-all` keeps a long
+              // stack trace inside the box.
+              <div
+                key={`${index}-${line}`}
+                className="whitespace-pre-wrap break-all text-ink-muted"
+              >
+                {line}
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </Dialog>
   );
 }
 

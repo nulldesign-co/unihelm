@@ -132,9 +132,32 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Site(cmd) => site(cmd)?,
         Command::Docker(cmd) => match cmd {
             DockerCommand::List => call("docker.list", json!({})),
+            DockerCommand::Start { container } => {
+                call("docker.start", json!({ "container": container }))
+            }
+            DockerCommand::Stop { container } => {
+                call("docker.stop", json!({ "container": container }))
+            }
+            DockerCommand::Restart { container } => {
+                call("docker.restart", json!({ "container": container }))
+            }
+            DockerCommand::Remove { container } => {
+                call("docker.remove", json!({ "container": container }))
+            }
+            DockerCommand::Logs { container, lines } => {
+                let input = Input::new()
+                    .set("container", container.clone())
+                    .maybe("lines", *lines)
+                    .done();
+                call("docker.logs", input)
+            }
         },
         Command::Runtime(cmd) => match cmd {
             RuntimeCommand::List => call("runtime.list", json!({})),
+            RuntimeCommand::SetDefault { runtime, version } => call(
+                "runtime.default.set",
+                json!({ "runtime": runtime, "version": version }),
+            ),
             RuntimeCommand::Install { major } => call("runtime.install", json!({ "major": major })),
         },
         Command::Php(cmd) => php(cmd),
@@ -533,6 +556,8 @@ fn dns(cmd: &DnsCommand, secrets: &Secrets) -> Result<Action> {
 fn firewall(cmd: &FirewallCommand) -> Action {
     match cmd {
         FirewallCommand::Rules => call("fw.rules", json!({})),
+        FirewallCommand::Enable => call("fw.enable", json!({})),
+        FirewallCommand::Disable => call("fw.disable", json!({})),
         FirewallCommand::Open {
             port,
             proto,

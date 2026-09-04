@@ -211,6 +211,10 @@ export const en = {
     addFailed: "That key was not accepted.",
   },
   stack: {
+    databases: "Databases",
+    databasesHint:
+      "A database engine has to be on the server before the Databases page can create anything in it.",
+    unmanagedNote: "Managed outside Unihelm",
     title: "Stack",
     subtitle: "Install what this server needs, from the vendors' own repositories.",
     component: "Component",
@@ -229,6 +233,7 @@ export const en = {
     pinsHint:
       "These repositories' keys match what the vendor serves, but no separately published fingerprint corroborates them yet.",
     state: {
+      unmanaged: "Installed, not by Unihelm",
       absent: "Not installed",
       installing: "Installing",
       installed: "Installed",
@@ -333,6 +338,30 @@ export const en = {
     },
   },
   docker: {
+    actionsFor: "Actions for {{name}}",
+    logsEmptyHint: "A container started moments ago, or one whose logging driver sends its output somewhere else, both look like this.",
+    noRun: "Unihelm starts, stops, restarts and removes the containers already on this server. It will not create one: a single flag can hand a container the host's filesystem or the Docker socket, which is root on this machine, so a form that took run arguments would be a root shell with a nicer font. Whatever is listed below was created by somebody who chose its flags.",
+    noRunTitle: "Containers are driven from here, not created",
+    confirm: {
+      remove: {
+        body: "Volumes are left alone, so anything kept in one survives. A running container is refused rather than killed — stop it first.",
+        confirm: "Remove container",
+        hint: "The container and its writable layer are deleted. This cannot be undone.",
+        title: "Remove {{name}}?",
+      },
+      restart: {
+        body: "There are a few seconds of connection refused in the middle. If this container is serving a site, that is downtime somebody may notice before you do.",
+        confirm: "Restart container",
+        hint: "It stops and starts again; connections in flight are lost.",
+        title: "Restart {{name}}?",
+      },
+      stop: {
+        body: "Whatever this container serves stops answering the moment it does. Unihelm did not create it and cannot tell you what depends on it.",
+        confirm: "Stop container",
+        hint: "Docker gives it ten seconds to shut down before killing it.",
+        title: "Stop {{name}}?",
+      },
+    },
     title: "Docker",
     subtitle: "Containers, images and volumes on this server.",
     refresh: "Refresh",
@@ -1165,6 +1194,23 @@ export const en = {
     },
   },
   firewall: {
+    lifecycle: {
+      notSwitchable: "Unihelm cannot start this one for you. Its rules are the kernel's and Unihelm owns only part of them, so starting or stopping it from here would load or flush rules the panel has never read. Do it from a shell, where you can see the whole ruleset first.",
+      sshDescription: "The panel checked before it changed anything, so nothing has been started.",
+      sshOpensHint: "This adds a rule allowing that port from anywhere, records it like any other rule, and then starts the firewall. Narrow it to your own network afterwards under Managed ports.",
+      sshTitle: "Starting now would shut you out over SSH",
+      start: "Start {{backend}}",
+      startWithSsh: "Open SSH and start",
+      stop: "Stop {{backend}}",
+      stopBans: "Every address it is dropping, Sentinel's bans included, can reach this server again.",
+      stopBoot: "It stays stopped after a reboot, until you start it here again.",
+      stopConfirm: "Stop the firewall",
+      stopDescription: "This server stops filtering incoming traffic the moment it does.",
+      stopReversible: "Nothing is deleted. The rules stay recorded and this page will label them as recorded but not enforced; starting the firewall again puts them back.",
+      stopRules: "{{count}} rule the firewall is enforcing stops being enforced.",
+      stopRules_other: "{{count}} rules the firewall is enforcing stop being enforced.",
+      stopTitle: "Stop {{backend}}?",
+    },
     title: "Firewall",
     subtitle: "What this server accepts, and who it is dropping.",
     loadFailed: "Could not read the firewall",

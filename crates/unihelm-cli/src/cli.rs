@@ -223,6 +223,24 @@ pub enum OpsCommand {
 pub enum DockerCommand {
     /// Everything Docker has on this server.
     List,
+    /// Start a container that is already on this server.
+    Start {
+        /// Its id or name.
+        container: String,
+    },
+    /// Stop a container. SIGTERM, ten seconds, then Docker's SIGKILL.
+    Stop { container: String },
+    /// Stop and start again. A few seconds of connection refused in the middle.
+    Restart { container: String },
+    /// Delete a container and its writable layer. A running one is refused.
+    Remove { container: String },
+    /// The last lines a container wrote, both streams merged.
+    Logs {
+        container: String,
+        /// How many lines. 200 unless you say otherwise.
+        #[arg(long)]
+        lines: Option<u32>,
+    },
 }
 
 /// Language runtimes installed on this server.
@@ -230,6 +248,16 @@ pub enum DockerCommand {
 pub enum RuntimeCommand {
     /// Every runtime found, with each version and where it lives.
     List,
+    /// Point a bare command name at one installed version.
+    ///
+    /// Sites are unaffected: each names its own PHP version and has its own
+    /// FPM pool. This is what `php` resolves to on the command line.
+    SetDefault {
+        /// Which runtime. Only `php` has a default this panel can move.
+        runtime: String,
+        /// The version to point at, as `runtime list` reports it.
+        version: String,
+    },
     /// Install a Node major line from NodeSource.
     ///
     /// Installing a line that is already there reports so and changes nothing.
@@ -720,6 +748,13 @@ pub enum DnsProviderArg {
 pub enum FirewallCommand {
     /// Every rule the backend is enforcing, merged with the panel's own.
     Rules,
+    /// Start enforcing the rules.
+    ///
+    /// Refuses if SSH is not allowed, because enabling a default-deny firewall
+    /// without it cuts the connection you are typing this on.
+    Enable,
+    /// Stop enforcing. The rules stay recorded; nothing is deleted.
+    Disable,
     /// Open a port.
     Open {
         /// The port number.

@@ -520,3 +520,54 @@ mod tests {
         assert!(minimal.allowlist.is_empty());
     }
 }
+
+/// Start enforcing the rules.
+#[utoipa::path(
+    post,
+    path = "/api/firewall/enable",
+    tag = "firewall",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "The firewall is enforcing", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: SSH is not allowed — enabling would cut your connection", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn enable(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::FirewallManage)
+        .map_err(ApiError::from)?;
+    let data = ops::invoke_now(&state, &current.auth, "fw.enable", json!({})).await?;
+    Ok(Json(data))
+}
+
+/// Stop enforcing. Nothing is deleted.
+#[utoipa::path(
+    post,
+    path = "/api/firewall/disable",
+    tag = "firewall",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "The firewall is no longer enforcing", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn disable(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::FirewallManage)
+        .map_err(ApiError::from)?;
+    let data = ops::invoke_now(&state, &current.auth, "fw.disable", json!({})).await?;
+    Ok(Json(data))
+}

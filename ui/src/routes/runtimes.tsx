@@ -30,19 +30,30 @@ import { staggerStyle } from "@/lib/motion";
  *    by its absolute path. That is a property of a *row*, so it is a badge on
  *    the row that owns it and names the command — not a "default" column of
  *    yes/no, which puts the answer six columns away from the version it is about.
- * 2. **Installing a line that is already there changes nothing.** The agent
- *    checks first and reports the version it found. So the button stays enabled
- *    on a line that is present — disabling it would claim the click is dangerous
+ * 2. **Installing something already there changes nothing.** The agent checks
+ *    first and reports the version it found. So the button stays enabled on a
+ *    runtime that is present — disabling it would claim the click is dangerous
  *    when it is the safest one on the page — and the card says what the click
  *    will do *before* it happens, rather than making the operator read a task log
  *    to learn that nothing happened.
- * 3. **Only Node installs from here.** Somebody looking for an "install Python"
- *    button will find out either way; the choice is whether they find out from
- *    this page or from its silence. So it is said at the top, and said again per
- *    runtime in the survey: every runtime the panel knows how to look for and did
- *    not find is listed with where it comes from. Go, Deno and Bun have no signed
- *    repository, and the panel does not fetch a tarball over https and unpack it
- *    as root — but it will happily report one that arrived by other means.
+ * 3. **Four of the seven install from here, and the other three each have their
+ *    own reason.** Node comes from NodeSource; Python, Go and Ruby from the
+ *    server's own distribution, which already signs them. PHP is the Stack
+ *    page's, because it needs an FPM pool as well as a package. Deno and Bun are
+ *    single vendor binaries over https with no signed repository, which this
+ *    panel will not unpack as root. Somebody looking for an "install Go" button
+ *    finds out either way; the choice is whether they find out from this page or
+ *    from its silence. So it is said at the top, and said again per runtime in
+ *    the survey — everything the panel knows how to look for and did not find is
+ *    listed with where it would come from.
+ *
+ * The version control changes with the runtime because the runtimes do not
+ * offer the same thing. Node has major lines and NodeSource builds each one.
+ * Python has whatever lines the distribution shipped — usually one, sometimes
+ * two — so the menu is a guess the agent answers honestly when this release does
+ * not carry the pick. Go and Ruby have exactly one that lands on `$PATH`, so
+ * offering a version box for them would be offering a choice that does not
+ * exist.
  *
  * Read on demand rather than polled: `runtime.list` shells out to every
  * interpreter it finds for a `--version`, with five seconds of patience for each
@@ -52,13 +63,6 @@ import { staggerStyle } from "@/lib/motion";
  * page, a tarball unpacked over ssh — is picked up the next time the page is
  * opened. The Stack page polls because a package manager is running behind its
  * back and a stale row there is a lie; a row here is at worst a minute old.
- *
- * The two calls below name REST routes the server does not serve yet: both
- * operations are registered with the agent, but nothing exposes them over HTTP.
- * The paths mirror `/api/stack` and `/api/stack/install`, so the missing piece is
- * a `routes/runtimes.rs` handing them to `ops::invoke_now` and `ops::invoke`, and
- * the typed client belongs in `lib/api.ts` next to `installComponent`. Until then
- * the page fails through its error state rather than rendering half a survey.
  */
 
 // ---------------------------------------------------------------------------
@@ -84,10 +88,21 @@ interface RuntimeListResponse {
   runtimes: InstalledRuntime[];
 }
 
+/** What `runtime.install` takes: a runtime, and a version if it has a choice. */
+interface InstallRuntimeRequest {
+  runtime: RuntimeName;
+  version?: string;
+}
+
 const runtimesApi = {
   list: () => api.get<RuntimeListResponse>("/api/runtimes"),
-  install: (major: number) => api.post<TaskAccepted>("/api/runtimes/install", { major }),
+  install: (body: InstallRuntimeRequest) => api.post<TaskAccepted>("/api/runtimes/install", body),
 };
+
+/** The four this page installs, in the order the menu offers them. */
+const INSTALLABLE = ["node", "python", "go", "ruby"] as const;
+
+type InstallableRuntime = (typeof INSTALLABLE)[number];
 
 /**
  * The Node lines this panel offers.
@@ -102,14 +117,34 @@ const NODE_LINES = [20, 22, 24] as const;
 /** The default choice — the current LTS line, which is what most apps want. */
 const DEFAULT_LINE = 22;
 
-/** `22.11.0` → 22. The same comparison the agent makes before it installs. */
-function majorOf(version: string): number {
-  return Number.parseInt(version.split(".")[0] ?? "", 10);
-}
+/**
+ * Python lines a supported release might carry as `python3.X`.
+ *
+ * A guess, unavoidably: only the server knows what its release shipped, and
+ * asking it would mean a second round trip for a menu. Picking one this release
+ * does not have costs nothing — the agent answers with what it does have and
+ * installs nothing — which is why the menu leads with the distribution's own.
+ */
+const PYTHON_LINES = ["3.11", "3.12", "3.13"] as const;
+
+/** The empty option: whatever `python3` is on this release. */
+const DISTRO_PYTHON = "";
 
 /** `/usr/bin/python3` → `python3`: the bare name that resolves to this row. */
 function commandOf(path: string): string {
   return path.split("/").pop() || path;
+}
+
+/**
+ * Whether an installed version is the one being asked for.
+ *
+ * Component-wise, the same comparison the agent makes: `3.12` matches `3.12.3`
+ * and not `3.1`. A string prefix would call `3.1` a match for `3.12.3` and tell
+ * an operator they already had a version they do not have.
+ */
+function versionMatches(installed: string, wanted: string): boolean {
+  const have = installed.split(".");
+  return wanted.split(".").every((part, index) => have[index] === part);
 }
 
 /**
@@ -144,7 +179,6 @@ export function RuntimesPage() {
   const rows = grouped(list.data?.runtimes ?? []);
   const found = new Set(rows.map((row) => row.runtime));
   const missing = RUNTIMES.filter((runtime) => !found.has(runtime));
-  const node = rows.filter((row) => row.runtime === "node");
 
   return (
     <div className="space-y-6">
@@ -158,7 +192,7 @@ export function RuntimesPage() {
       </Callout>
 
       <InstallCard
-        node={node}
+        installed={rows}
         // A finished install is the one thing that changes the survey, so the
         // list refetches exactly then.
         onSettled={() => void queryClient.invalidateQueries({ queryKey: ["runtimes"] })}
@@ -195,22 +229,49 @@ export function RuntimesPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Installing a Node line
+// Installing a runtime
 // ---------------------------------------------------------------------------
 
-function InstallCard({ node, onSettled }: { node: InstalledRuntime[]; onSettled: () => void }) {
+function InstallCard({
+  installed,
+  onSettled,
+}: {
+  installed: InstalledRuntime[];
+  onSettled: () => void;
+}) {
   const { t } = useTranslation();
+  const [runtime, setRuntime] = useState<InstallableRuntime>("node");
   const [major, setMajor] = useState<number>(DEFAULT_LINE);
+  const [pythonVersion, setPythonVersion] = useState<string>(DISTRO_PYTHON);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Node is asked for by line, Python by line or not at all, and Go and Ruby
+  // have only the one the distribution ships — so for those two the field is
+  // absent rather than empty, which is what the agent reads as "the one you
+  // have".
+  const wanted =
+    runtime === "node"
+      ? String(major)
+      : runtime === "python" && pythonVersion !== DISTRO_PYTHON
+        ? pythonVersion
+        : undefined;
 
   // Answered before the click, not after it. The agent finds this same row and
   // returns it untouched; saying so here is the difference between a button
   // whose outcome is known and one an operator is afraid to press twice.
-  const already = node.find((row) => majorOf(row.version) === major);
+  const present = installed.filter((row) => row.runtime === runtime);
+  const already = wanted
+    ? present.find((row) => versionMatches(row.version, wanted))
+    : // With no version asked for, the agent takes the default row and falls
+      // back to the first one when nothing is default — a Node that lives only
+      // under a version manager has no bare `node`. Matching only on
+      // `is_default` would leave the card silent on exactly the machine where
+      // the click is about to be answered with "already installed".
+      (present.find((row) => row.is_default) ?? present[0]);
 
   const install = useMutation({
-    mutationFn: () => runtimesApi.install(major),
+    mutationFn: () => runtimesApi.install({ runtime, version: wanted }),
     onSuccess: (accepted) => {
       setError(null);
       setTaskId(accepted.task_id);
@@ -233,24 +294,71 @@ function InstallCard({ node, onSettled }: { node: InstalledRuntime[]; onSettled:
           }}
         >
           {/* A plain label rather than `Field`: nothing validates a menu of
-              three numbers, and Field's reserved error line would push the
-              button out of line with the control it belongs to. */}
+              names, and Field's reserved error line would push the button out
+              of line with the control it belongs to. */}
           <div className="min-w-48 flex-1 space-y-1.5">
-            <label htmlFor="runtime-major" className="block text-sm font-medium text-ink">
-              {t("runtimes.install.major")}
+            <label htmlFor="runtime-name" className="block text-sm font-medium text-ink">
+              {t("runtimes.install.runtime")}
             </label>
             <Select
-              id="runtime-major"
-              value={String(major)}
-              onChange={(e) => setMajor(Number(e.target.value))}
+              id="runtime-name"
+              value={runtime}
+              onChange={(e) => {
+                setRuntime(e.target.value as InstallableRuntime);
+                // A task log belonging to the previous runtime is worse than
+                // none: it is a finished install of something else, sitting
+                // under a form that now says Ruby.
+                setTaskId(null);
+                setError(null);
+              }}
             >
-              {NODE_LINES.map((line) => (
-                <option key={line} value={line}>
-                  {t("runtimes.install.line", { major: line })}
+              {INSTALLABLE.map((name) => (
+                <option key={name} value={name}>
+                  {t(`runtimes.name.${name}`)}
                 </option>
               ))}
             </Select>
           </div>
+
+          {runtime === "node" ? (
+            <div className="min-w-48 flex-1 space-y-1.5">
+              <label htmlFor="runtime-major" className="block text-sm font-medium text-ink">
+                {t("runtimes.install.major")}
+              </label>
+              <Select
+                id="runtime-major"
+                value={String(major)}
+                onChange={(e) => setMajor(Number(e.target.value))}
+              >
+                {NODE_LINES.map((line) => (
+                  <option key={line} value={line}>
+                    {t("runtimes.install.line", { major: line })}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          ) : null}
+
+          {runtime === "python" ? (
+            <div className="min-w-48 flex-1 space-y-1.5">
+              <label htmlFor="runtime-python" className="block text-sm font-medium text-ink">
+                {t("runtimes.install.version")}
+              </label>
+              <Select
+                id="runtime-python"
+                value={pythonVersion}
+                onChange={(e) => setPythonVersion(e.target.value)}
+              >
+                <option value={DISTRO_PYTHON}>{t("runtimes.install.distroVersion")}</option>
+                {PYTHON_LINES.map((line) => (
+                  <option key={line} value={line}>
+                    {t("runtimes.install.pythonLine", { version: line })}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          ) : null}
+
           <Button type="submit" variant="primary" loading={install.isPending}>
             <Download className="h-4 w-4" aria-hidden />
             {t("runtimes.install.submit")}
@@ -259,11 +367,20 @@ function InstallCard({ node, onSettled }: { node: InstalledRuntime[]; onSettled:
 
         {already ? (
           <Callout tone="info" className="mt-3">
-            {t("runtimes.install.already", { major, version: already.version })}
+            {t("runtimes.install.already", {
+              runtime: t(`runtimes.name.${runtime}`),
+              version: already.version,
+            })}
           </Callout>
         ) : null}
 
-        <p className="mt-3 text-xs text-ink-muted">{t("runtimes.install.note")}</p>
+        <p className="mt-3 text-xs text-ink-muted">
+          {runtime === "node"
+            ? t("runtimes.install.noteNode")
+            : runtime === "python"
+              ? t("runtimes.install.notePython")
+              : t("runtimes.install.noteDistro", { runtime: t(`runtimes.name.${runtime}`) })}
+        </p>
 
         {error ? (
           <Callout tone="danger" className="mt-3">
@@ -271,8 +388,8 @@ function InstallCard({ node, onSettled }: { node: InstalledRuntime[]; onSettled:
           </Callout>
         ) : null}
 
-        {/* The log, not a chip: apt is the only thing that knows which point
-            release it resolved the line to, and it says so as it goes. */}
+        {/* The log, not a chip: the package manager is the only thing that knows
+            which point release it resolved to, and it says so as it goes. */}
         {taskId ? <TaskLogPanel taskId={taskId} onSettled={onSettled} /> : null}
       </CardBody>
     </Card>
@@ -358,9 +475,9 @@ function RuntimeTable({ rows }: { rows: InstalledRuntime[] }) {
 /**
  * The runtimes the panel looked for and did not find.
  *
- * Present in full rather than only when somebody asks: "there is no Python here"
- * and "Python is not something this page installs" are different sentences, and
- * an operator hunting for the second one will otherwise read the empty survey as
+ * Present in full rather than only when somebody asks: "there is no Ruby here"
+ * and "Ruby is not something this page installs" are different sentences, and an
+ * operator hunting for the second one will otherwise read the empty survey as
  * the first.
  */
 function MissingCard({ missing }: { missing: readonly RuntimeName[] }) {
