@@ -76,6 +76,8 @@ pub const API_VERSION: &str = "1.0.0";
         super::runtimes::docker_logs,
         super::firewall::enable,
         super::firewall::disable,
+        super::stack::engines,
+        super::stack::engine_remove,
         super::stack::status,
         super::stack::install,
         super::stack::remove,

@@ -139,6 +139,15 @@ impl StackComponent {
     /// there the version is part of the identity: `php8.3` and `php8.4` are two
     /// rows. Anything else replaces what is there, so the row is the engine and
     /// the version it happens to be at is a column.
+    /// The catalogue entry's own slug, without the version.
+    ///
+    /// `slug()` carries the version for the entries that run several at once —
+    /// `php8.3` is a row in `stack_components`, `php` is the thing it is a
+    /// version of. Anything asking the catalogue a question wants the second.
+    pub fn catalogue_slug(self) -> &'static str {
+        self.entry.slug
+    }
+
     pub fn slug(self) -> String {
         if self.entry.side_by_side {
             format!("{}{}", self.entry.slug, self.version.version)
@@ -794,6 +803,22 @@ pub struct InstallOutput {
     pub slug: String,
     pub installed_version: Option<String>,
     pub packages: Vec<String>,
+    /// How it actually runs: `host` or `container`.
+    ///
+    /// One install surface answers for both, so the answer has to say which it
+    /// took — an operator reading "installed" wants to know whether that means
+    /// packages on their server or an image.
+    pub runtime: String,
+    /// The container it runs in, when it runs in one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// Where its data lives, which outlives the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    /// The port clients connect to. Not always the number they expect: a second
+    /// version of the same engine cannot publish on the first one's port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
 }
 
 #[async_trait]
@@ -1043,6 +1068,32 @@ async fn install_component(
     component: StackComponent,
     extensions: &[PhpExt],
 ) -> Result<InstallOutput> {
+    // One install surface, two ways of running the thing.
+    //
+    // The catalogue says whether an entry belongs on the host or in a container,
+    // and this is where that is acted on — rather than a second `engine.install`
+    // beside this one. The owner's complaint about the old stack was that the
+    // panel had several places to install software and they disagreed; adding
+    // another would be repeating it in a new shape.
+    if crate::catalogue::default_runtime(component.catalogue_slug())
+        == Some(crate::catalogue::Runtime::Container)
+    {
+        let plan = crate::engine::EnginePlan::for_component(component)?;
+        crate::engine::refuse_when_the_host_already_runs_this_engine(ctx, &plan).await?;
+        let out = crate::engine::install_container(ctx, &plan).await?;
+        return Ok(InstallOutput {
+            slug: out.slug,
+            installed_version: Some(out.version),
+            // No packages were installed on this server, and saying so with an
+            // empty list is more honest than inventing the image's contents.
+            packages: Vec::new(),
+            runtime: "container".into(),
+            container: Some(out.container),
+            volume: out.volume,
+            host_port: Some(out.host_port),
+        });
+    }
+
     let distro = ctx.distro().clone();
     let log = ctx.log_sink();
 
@@ -1190,6 +1241,11 @@ async fn install_component(
         slug: component.slug(),
         installed_version,
         packages: packages.iter().map(|p| p.as_str().to_string()).collect(),
+        // The host path: packages on this server, nothing containerised.
+        runtime: "host".into(),
+        container: None,
+        volume: None,
+        host_port: None,
     })
 }
 

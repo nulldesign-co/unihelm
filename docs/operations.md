@@ -156,6 +156,39 @@ passed explicitly rather than left to Docker's default so the operation's
 timeout can be derived from it. Stopping an already-stopped container succeeds
 and changes nothing.
 
+### `engine.remove`
+
+| | |
+|---|---|
+| Permission | `stack_manage` |
+| Execution | task |
+| Input | `component`, `version` *(optional)*, `delete_data` *(optional bool, default false)* |
+
+Stops and removes the container an engine runs in.
+
+**The data volume survives by default**, so this is reversible: installing the
+same version again picks the volume back up and the databases are still there.
+`delete_data` deletes it, and that is not reversible.
+
+There is no `engine.install`. `stack.install` installs everything — it asks the
+catalogue whether an entry runs on the host or in a container and takes the right
+path. Two ways to install one thing is the shape this release exists to remove.
+
+### `engine.status`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `component` *(optional — one slug, or all of them)* |
+
+Every engine the panel runs as a container: its image, its container name, the
+port it publishes, the volume its data lives in, and whether it is up.
+
+The port matters and is worth reading rather than assuming. Two versions of one
+engine cannot both publish on the default — the second gets another port, and
+anything connecting by hand needs the number this reports.
+
 ### `fw.disable`
 
 | | |

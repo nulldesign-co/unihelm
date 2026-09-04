@@ -21,6 +21,7 @@ import {
   type StackCategory,
   type StackComponentRequest,
   type StackComponentView,
+  type StackRuntime,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
 
@@ -54,6 +55,14 @@ import { staggerStyle } from "@/lib/motion";
  *    marked in the menu, and choosing it raises a warning that says what "end of
  *    life" costs — which is the difference between a deliberate choice and an
  *    accident.
+ * 4. **Host packages and a container are not the same install.** A container
+ *    adds no repository to this server and touches none of its packages, and
+ *    two versions that collide on the host — one port, one data directory — are
+ *    two containers that do not. So the mode is not decoration: it decides
+ *    whether the Replace warning above is true. Every sentence on the row is
+ *    chosen against the mode the chooser is on, because a warning that is right
+ *    for one mode is a lie in the other, and the operator reads it as a fact
+ *    either way.
  */
 
 const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> = {
@@ -69,6 +78,14 @@ const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> 
 
 /** A pseudo-version meaning "whatever this release maintains"; not a number. */
 const DISTRO_VERSION = "distro";
+
+/** The catalogue entry that installs the container runtime everything else needs. */
+const DOCKER_SLUG = "docker";
+
+/** Where the Docker row can be linked to from a row that is waiting on it. */
+function entryAnchor(slug: string): string {
+  return `stack-entry-${slug}`;
+}
 
 /**
  * One category and the entries in it, in the order the server sent them.
@@ -105,11 +122,132 @@ export function rowsFor(
   return components.filter((c) => c.component === entry.slug && c.status !== "absent");
 }
 
-/** The versions of one entry that are on this machine right now. */
-function presentVersions(rows: readonly StackComponentView[]): Set<string> {
+/**
+ * Where one installed row actually lives.
+ *
+ * An agent older than this panel sends no `runtime` at all, and everything it
+ * ever installed is host packages. Reading a missing field as "container" would
+ * put "Container" on a chip over an apt package and offer to remove a container
+ * that does not exist.
+ */
+export function runtimeOf(row: StackComponentView): StackRuntime {
+  return row.runtime === "container" ? "container" : "host";
+}
+
+/** Which modes one entry offers. `either` is the only one that draws a menu. */
+export type RuntimeSupport = "host" | "container" | "either";
+
+/**
+ * Which modes a row offers, read off the catalogue's list of them.
+ *
+ * Derived rather than sent as a field of its own, because the catalogue already
+ * answers it: an entry that lists both runtimes is a choice, and an entry that
+ * lists one is not.
+ *
+ * An entry that lists nothing runs on the host — which is what every entry did
+ * before this existed, and what an agent older than this panel means by sending
+ * no `install` block at all. That is why the read is defensive against a field
+ * the types say is always there: guessing "either" would draw a chooser the
+ * agent cannot honour, and fail every install made from its second option.
+ */
+export function supportFor(entry: CatalogueEntry): RuntimeSupport {
+  const runtimes = entry.install?.runtimes ?? [];
+  if (runtimes.includes("host") && runtimes.includes("container")) return "either";
+  return runtimes.includes("container") && !runtimes.includes("host") ? "container" : "host";
+}
+
+/**
+ * Which mode the chooser opens on.
+ *
+ * On the mode of what is already installed, for the reason `defaultVersionFor`
+ * opens on the installed version: a row that loads pointing somewhere else is
+ * proposing a migration nobody asked for, and the operator who came to install
+ * a second version reads the mode as a description rather than a choice.
+ */
+export function defaultRuntimeFor(
+  entry: CatalogueEntry,
+  rows: readonly StackComponentView[],
+): StackRuntime {
+  const support = supportFor(entry);
+  if (support !== "either") return support;
+  const held = rows.find((r) => r.status === "installed" || r.status === "removing");
+  if (held) return runtimeOf(held);
+  return entry.install?.default_runtime === "container" ? "container" : "host";
+}
+
+/**
+ * Whether several versions can be installed at once *in this mode*.
+ *
+ * The one place the two modes genuinely disagree, and the reason the mode is on
+ * the page at all. MariaDB on the host is one port and one data directory, so a
+ * second version replaces the first. As containers it is one container per tool
+ * and version — the model `docs/design/containerised-runtimes.md` settles on —
+ * each with its own port and its own data, and nothing is replaced by anything.
+ *
+ * `side_by_side` on the entry is an answer about the host path only; the
+ * catalogue says so in as many words. Reading it as the answer for containers
+ * is what puts "installing this replaces what is there" under a click that
+ * replaces nothing, and that sentence is the one an operator believes.
+ *
+ * The Replace warning hangs off this, so being wrong here is the page telling
+ * somebody their database is about to be taken out when it is not — or not
+ * telling them when it is.
+ */
+export function sideBySideIn(entry: CatalogueEntry, runtime: StackRuntime): boolean {
+  return runtime === "container" ? true : entry.side_by_side;
+}
+
+/**
+ * Whether anything can run as a container on this server at all.
+ *
+ * `unmanaged` counts. Docker installed by hand is still Docker, and the panel
+ * already drives containers it did not create — refusing to use it because a
+ * different tool ran the install would be a rule with no reason behind it.
+ */
+export function dockerReady(components: readonly StackComponentView[]): boolean {
+  return components.some(
+    (c) => c.component === DOCKER_SLUG && (c.status === "installed" || c.status === "unmanaged"),
+  );
+}
+
+/**
+ * Whether host packages of this engine already hold the machine.
+ *
+ * The agent refuses a container while they do, and the reason is not tidiness:
+ * with a host MariaDB on its socket and a container MariaDB on another port,
+ * "create this tenant a database" has two answers, and the wrong one writes a
+ * customer's data somewhere nothing will look for it again. So the host install
+ * is the incumbent and the container is the one that does not happen.
+ *
+ * The page has to know this because it draws the button. Left to the agent, the
+ * operator picks the mode the design recommends, presses a live Install, and
+ * gets a red task explaining a rule the row could have stated before the click.
+ *
+ * Only `installed` counts, which is the same test the agent applies: an
+ * unmanaged host copy is not the panel's, and reinstalling a container the
+ * panel already runs has to stay idempotent.
+ */
+export function hostHoldsEntry(rows: readonly StackComponentView[]): boolean {
+  return rows.some((r) => runtimeOf(r) === "host" && r.status === "installed");
+}
+
+/**
+ * The versions of one entry that are in this machine, in the mode being chosen.
+ *
+ * Scoped to the mode because presence is what "held" and "replace" are computed
+ * from, and a host MariaDB neither occupies a container's port nor gets removed
+ * by installing one. Rows themselves stay unfiltered everywhere else: the
+ * operator has to see every version that is on the machine, not only the ones
+ * matching whichever mode the chooser happens to be on.
+ */
+function presentVersions(
+  rows: readonly StackComponentView[],
+  runtime: StackRuntime,
+): Set<string> {
   return new Set(
     rows
       .filter((r) => r.status === "installed" || r.status === "removing")
+      .filter((r) => runtimeOf(r) === runtime)
       .map((r) => r.version),
   );
 }
@@ -126,13 +264,17 @@ function presentVersions(rows: readonly StackComponentView[]): Set<string> {
  * to install. PHP 7.4 is on the menu because somebody migrating needs it, and
  * it stays a version they went and chose rather than the one the page armed the
  * button with while they were reading the summary.
+ *
+ * Both of those depend on the mode: "the version it holds" and "one at a time"
+ * are answers about the host or about containers, never about both.
  */
 export function defaultVersionFor(
   entry: CatalogueEntry,
   rows: readonly StackComponentView[],
+  runtime: StackRuntime = defaultRuntimeFor(entry, rows),
 ): string {
-  const present = presentVersions(rows);
-  if (!entry.side_by_side) {
+  const present = presentVersions(rows, runtime);
+  if (!sideBySideIn(entry, runtime)) {
     const held = entry.versions.find((v) => present.has(v.version));
     if (held) return held.version;
   }
@@ -172,6 +314,24 @@ export interface RowPlan {
   offered: CatalogueVersion[];
   /** The version the chooser is on, resolved against the catalogue. */
   selected: CatalogueVersion | null;
+  /** The mode this plan was computed for — host packages or a container. */
+  runtime: StackRuntime;
+  /** Which modes the entry allows. `either` is the only one that gets a menu. */
+  support: RuntimeSupport;
+  /**
+   * A container was chosen and there is no container runtime to put it in.
+   *
+   * Its own field rather than folding into `action: "none"`: the button still
+   * says what the click would do, and the row says why it cannot happen yet.
+   */
+  dockerMissing: boolean;
+  /**
+   * A container was chosen and host packages of this engine are already
+   * installed, which the agent refuses. Same shape as `dockerMissing`, and for
+   * the same reason: a blocked click the row explains rather than a click that
+   * reaches the agent and comes back red.
+   */
+  hostIncumbent: boolean;
 }
 
 /**
@@ -186,22 +346,41 @@ export function planFor(
   entry: CatalogueEntry,
   components: readonly StackComponentView[],
   selectedVersion: string,
+  runtime: StackRuntime = defaultRuntimeFor(entry, rowsFor(entry, components)),
 ): RowPlan {
   const rows = rowsFor(entry, components);
   const unmanaged = rows.some((r) => r.status === "unmanaged");
   const working = rows.some((r) => r.status === "installing" || r.status === "removing");
-  const present = presentVersions(rows);
+  const present = presentVersions(rows, runtime);
   const selected = entry.versions.find((v) => v.version === selectedVersion) ?? null;
   const offered = entry.versions.filter((v) => !present.has(v.version));
+  const support = supportFor(entry);
+  const dockerMissing = runtime === "container" && !dockerReady(components);
+  const hostIncumbent = runtime === "container" && hostHoldsEntry(rows);
+  const shape = {
+    rows,
+    unmanaged,
+    working,
+    offered,
+    selected,
+    runtime,
+    support,
+    dockerMissing,
+    hostIncumbent,
+  };
 
   // Deliberately first: an unmanaged nginx is installed, has no version the
   // panel knows, and every other branch below would offer to act on it.
   if (unmanaged) {
-    return { action: "none", replaces: null, rows, unmanaged, working, offered, selected };
+    // No chooser on this row, so nothing here is blocked: a warning about a
+    // click the row does not offer is a warning about nothing.
+    return { action: "none", replaces: null, ...shape, dockerMissing: false, hostIncumbent: false };
   }
 
   const held = entry.versions.find((v) => present.has(v.version))?.version ?? null;
-  const failed = rows.some((r) => r.status === "failed" && r.version === selectedVersion);
+  const failed = rows.some(
+    (r) => r.status === "failed" && r.version === selectedVersion && runtimeOf(r) === runtime,
+  );
 
   const action: RowAction =
     selected === null || selected.version === ""
@@ -210,24 +389,28 @@ export function planFor(
         ? "held"
         : failed
           ? "retry"
-          : !entry.side_by_side && held !== null
+          : !sideBySideIn(entry, runtime) && held !== null
             ? "replace"
             : "install";
 
-  return {
-    action,
-    replaces: action === "replace" ? held : null,
-    rows,
-    unmanaged,
-    working,
-    offered,
-    selected,
-  };
+  return { action, replaces: action === "replace" ? held : null, ...shape };
 }
 
-/** `slug@version`, the identity of a row — and of a mutation in flight. */
+/**
+ * `slug@version@mode`, the identity of a row — and of a mutation in flight.
+ *
+ * The mode is part of it because one version can be on the machine twice, once
+ * as packages and once as a container. Without it, removing the container spins
+ * the spinner on both chips and the operator cannot tell which one is going.
+ */
 function keyOf(request: StackComponentRequest | undefined): string | null {
-  return request === undefined ? null : `${request.component}@${request.version ?? ""}`;
+  return request === undefined
+    ? null
+    : `${request.component}@${request.version ?? ""}@${request.runtime ?? "host"}`;
+}
+
+function rowKey(slug: string, version: string, runtime: StackRuntime): string {
+  return `${slug}@${version}@${runtime}`;
 }
 
 export function StackPage() {
@@ -238,6 +421,10 @@ export function StackPage() {
   // to `defaultVersionFor`, so a refetch that installs a version does not leave
   // the menu pointing at something that is now on the machine.
   const [chosen, setChosen] = useState<Record<string, string>>({});
+  // Same rule for the mode: only what the operator touched. Anything absent
+  // falls back to `defaultRuntimeFor`, so a row whose container finishes
+  // installing stops offering to install it on the host.
+  const [chosenRuntime, setChosenRuntime] = useState<Record<string, StackRuntime>>({});
 
   // True from the moment a button is pressed until the row it changed settles.
   //
@@ -317,6 +504,13 @@ export function StackPage() {
   const components = stack.data?.components ?? [];
   const groups = groupByCategory(catalogue);
 
+  // Only offer to jump to the Docker row if this catalogue actually has one.
+  // A link to an anchor that is not on the page is worse than no link: it looks
+  // like the panel can fix the problem and then does nothing when clicked.
+  const dockerAnchor = catalogue.some((e) => e.slug === DOCKER_SLUG)
+    ? `#${entryAnchor(DOCKER_SLUG)}`
+    : null;
+
   // The agent runs one package manager at a time, so every button is disabled
   // while any of them is in flight — but only the row that was clicked spins.
   const busy = install.isPending || remove.isPending;
@@ -356,9 +550,11 @@ export function StackPage() {
             <Card>
               <ul className="divide-y divide-border">
                 {group.entries.map((entry, index) => {
+                  const rows = rowsFor(entry, components);
+                  const runtime = chosenRuntime[entry.slug] ?? defaultRuntimeFor(entry, rows);
                   const selected =
-                    chosen[entry.slug] ?? defaultVersionFor(entry, rowsFor(entry, components));
-                  const plan = planFor(entry, components, selected);
+                    chosen[entry.slug] ?? defaultVersionFor(entry, rows, runtime);
+                  const plan = planFor(entry, components, selected, runtime);
                   return (
                     <EntryRow
                       key={entry.slug}
@@ -368,12 +564,32 @@ export function StackPage() {
                       index={index}
                       busy={busy}
                       acting={acting}
+                      dockerAnchor={dockerAnchor}
                       onSelect={(version) =>
                         setChosen((current) => ({ ...current, [entry.slug]: version }))
                       }
-                      onInstall={() => install.mutate({ component: entry.slug, version: selected })}
-                      onRemove={(version) =>
-                        remove.mutate({ component: entry.slug, version })
+                      onSelectRuntime={(next) => {
+                        setChosenRuntime((current) => ({ ...current, [entry.slug]: next }));
+                        // Drop the version too. What is installed differs by
+                        // mode, so the version that was open in the other one is
+                        // an answer to a question nobody asked here: switching
+                        // to containers on a machine holding MariaDB 11.8 should
+                        // land on the recommended version, not on the one the
+                        // host copy made the page point at.
+                        setChosen((current) => {
+                          const { [entry.slug]: _dropped, ...rest } = current;
+                          return rest;
+                        });
+                      }}
+                      onInstall={() =>
+                        install.mutate({
+                          component: entry.slug,
+                          version: selected,
+                          runtime: plan.runtime,
+                        })
+                      }
+                      onRemove={(version, rowRuntime) =>
+                        remove.mutate({ component: entry.slug, version, runtime: rowRuntime })
                       }
                     />
                   );
@@ -414,7 +630,9 @@ function EntryRow({
   index,
   busy,
   acting,
+  dockerAnchor,
   onSelect,
+  onSelectRuntime,
   onInstall,
   onRemove,
 }: {
@@ -423,20 +641,34 @@ function EntryRow({
   selected: string;
   index: number;
   busy: boolean;
-  /** `slug@version` of the mutation in flight, if any. */
+  /** `slug@version@mode` of the mutation in flight, if any. */
   acting: string | null;
+  /** Anchor of the row that installs Docker, when this catalogue has one. */
+  dockerAnchor: string | null;
   onSelect: (version: string) => void;
+  onSelectRuntime: (runtime: StackRuntime) => void;
   onInstall: () => void;
-  onRemove: (version: string) => void;
+  onRemove: (version: string, runtime: StackRuntime) => void;
 }) {
   const { t } = useTranslation();
   const label = (version: string) => versionLabel(version, t);
-  const installing = acting === `${entry.slug}@${selected}`;
+  const installing = acting === rowKey(entry.slug, selected, plan.runtime);
   const chooserId = `stack-version-${entry.slug}`;
+  const runtimeChooserId = `stack-runtime-${entry.slug}`;
   const eol = plan.selected?.eol === true;
+  const container = plan.runtime === "container";
+  // Worth its own sentence only where the two modes disagree: on the host this
+  // engine replaces itself and in a container it does not, which is the whole
+  // reason the mode is on the page.
+  const gainsSideBySide = container && !entry.side_by_side;
 
   return (
     <li
+      id={entryAnchor(entry.slug)}
+      // Reachable as an anchor target from a row that is waiting on this one,
+      // and focusable when it is jumped to so a keyboard lands where the eye
+      // does — not back at the top of the page.
+      tabIndex={-1}
       className="stagger animate-rise-in px-5 py-4 first:pt-5 last:pb-5"
       style={staggerStyle(index)}
     >
@@ -449,12 +681,13 @@ function EntryRow({
             <ul className="mt-2.5 flex flex-wrap items-center gap-2">
               {plan.rows.map((row) => (
                 <InstalledChip
-                  key={row.slug}
+                  key={rowKey(row.slug, row.version, runtimeOf(row))}
                   entry={entry}
                   row={row}
+                  support={plan.support}
                   busy={busy}
-                  pending={acting === `${entry.slug}@${row.version}`}
-                  onRemove={() => onRemove(row.version)}
+                  pending={acting === rowKey(entry.slug, row.version, runtimeOf(row))}
+                  onRemove={() => onRemove(row.version, runtimeOf(row))}
                 />
               ))}
             </ul>
@@ -475,58 +708,102 @@ function EntryRow({
 
         {plan.unmanaged ? (
           <p className="max-w-56 text-end text-xs text-ink-muted">{t("stack.unmanagedHint")}</p>
-        ) : plan.offered.length === 0 ? (
-          <p className="max-w-56 text-end text-xs text-ink-muted">{t("stack.allInstalled")}</p>
         ) : (
           <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto">
-            {/* Rendered even when there is one version to pick: the label is
-                where "which version am I about to get" is answered, and a row
-                that answers it only sometimes is a row the operator has to
-                read twice. */}
-            <div className="min-w-44 flex-1 space-y-1.5">
-              <label htmlFor={chooserId} className="block text-xs font-medium text-ink-muted">
-                {t("stack.chooseVersion")}
-              </label>
-              <Select
-                id={chooserId}
-                value={selected}
-                disabled={busy}
-                onChange={(event) => onSelect(event.target.value)}
+            {/* "Nothing left to install" is now an answer about one mode. The
+                mode menu stays beside it, because every container version being
+                installed is not a reason to strand an operator who came to put
+                one on the host — the row would otherwise have no way back. */}
+            {plan.offered.length === 0 ? (
+              <p className="max-w-56 text-end text-xs text-ink-muted">{t("stack.allInstalled")}</p>
+            ) : (
+              // Rendered even when there is one version to pick: the label is
+              // where "which version am I about to get" is answered, and a row
+              // that answers it only sometimes is a row the operator has to
+              // read twice.
+              <div className="min-w-44 flex-1 space-y-1.5">
+                <label htmlFor={chooserId} className="block text-xs font-medium text-ink-muted">
+                  {t("stack.chooseVersion")}
+                </label>
+                <Select
+                  id={chooserId}
+                  value={selected}
+                  disabled={busy}
+                  onChange={(event) => onSelect(event.target.value)}
+                >
+                  {entry.versions.map((version) => (
+                    <option key={version.version} value={version.version}>
+                      {optionLabel(version, label(version.version), t)}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
+            {/* Only where both are real. An entry that runs one way is not a
+                choice, and a menu with one option in it reads as a decision the
+                operator has to make and then cannot. */}
+            {plan.support === "either" ? (
+              <div className="min-w-40 flex-1 space-y-1.5">
+                <label
+                  htmlFor={runtimeChooserId}
+                  className="block text-xs font-medium text-ink-muted"
+                >
+                  {t("stack.chooseRuntime")}
+                </label>
+                <Select
+                  id={runtimeChooserId}
+                  value={plan.runtime}
+                  disabled={busy}
+                  onChange={(event) => onSelectRuntime(event.target.value as StackRuntime)}
+                >
+                  <option value="host">{t("stack.runtime.host")}</option>
+                  <option value="container">{t("stack.runtime.container")}</option>
+                </Select>
+              </div>
+            ) : null}
+            {plan.offered.length === 0 ? null : (
+              <Button
+                variant={plan.action === "replace" || eol ? "outline" : "primary"}
+                loading={installing}
+                // `none` here means the chooser resolved to nothing in the
+                // catalogue, so there is no version to send. The other two are
+                // clicks that would reach the agent and be refused there; the
+                // callouts below say what to do about them instead.
+                disabled={
+                  busy ||
+                  plan.action === "held" ||
+                  plan.action === "none" ||
+                  plan.dockerMissing ||
+                  plan.hostIncumbent
+                }
+                onClick={onInstall}
+                aria-label={t(
+                  plan.action === "replace"
+                    ? container
+                      ? "stack.replaceAriaContainer"
+                      : "stack.replaceAria"
+                    : container
+                      ? "stack.installAriaContainer"
+                      : "stack.installAria",
+                  {
+                    name: entry.display_name,
+                    version: label(selected),
+                    current: label(plan.replaces ?? ""),
+                  },
+                )}
               >
-                {entry.versions.map((version) => (
-                  <option key={version.version} value={version.version}>
-                    {optionLabel(version, label(version.version), t)}
-                  </option>
-                ))}
-              </Select>
-            </div>
-            <Button
-              variant={plan.action === "replace" || eol ? "outline" : "primary"}
-              loading={installing}
-              // `none` here means the chooser resolved to nothing in the
-              // catalogue, so there is no version to send.
-              disabled={busy || plan.action === "held" || plan.action === "none"}
-              onClick={onInstall}
-              aria-label={t(
-                plan.action === "replace" ? "stack.replaceAria" : "stack.installAria",
-                {
-                  name: entry.display_name,
-                  version: label(selected),
-                  current: label(plan.replaces ?? ""),
-                },
-              )}
-            >
-              <Download className="h-3.5 w-3.5" aria-hidden />
-              {t(
-                plan.action === "replace"
-                  ? "stack.replace"
-                  : plan.action === "retry"
-                    ? "common.retry"
-                    : plan.action === "held"
-                      ? "stack.state.installed"
-                      : "stack.install",
-              )}
-            </Button>
+                <Download className="h-3.5 w-3.5" aria-hidden />
+                {t(
+                  plan.action === "replace"
+                    ? "stack.replace"
+                    : plan.action === "retry"
+                      ? "common.retry"
+                      : plan.action === "held"
+                        ? "stack.state.installed"
+                        : "stack.install",
+                )}
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -535,11 +812,50 @@ function EntryRow({
           the distribution's package and a vendor's are not the same offer, and
           which one this is decides who ships the next security fix. The
           version's own note is not repeated here — it is already in the option
-          the operator just read. */}
+          the operator just read.
+
+          In container mode the source note is not merely less relevant, it is
+          false: nothing adds a repository, nothing pins a key, and no package on
+          this server moves. So the mode's own sentence replaces it rather than
+          sitting beside it. */}
       {!plan.unmanaged && plan.offered.length > 0 && plan.selected ? (
         <p className="mt-2.5 text-xs text-ink-subtle">
-          {t(`stack.source.${plan.selected.source}`)}
+          {container
+            ? t("stack.runtimeNote.container")
+            : t(`stack.source.${plan.selected.source}`)}
+          {gainsSideBySide ? ` ${t("stack.runtimeNote.containerSideBySide")}` : null}
         </p>
+      ) : null}
+
+      {/* Before the Replace and end-of-life warnings, because it is the one that
+          says the click cannot happen at all. */}
+      {plan.dockerMissing ? (
+        <Callout
+          tone="warning"
+          className="mt-3"
+          title={t("stack.dockerNeededTitle")}
+          action={
+            dockerAnchor ? (
+              <a
+                href={dockerAnchor}
+                className="font-medium text-accent transition-colors hover:underline"
+              >
+                {t("stack.dockerNeededLink")}
+              </a>
+            ) : null
+          }
+        >
+          {t("stack.dockerNeeded")}
+        </Callout>
+      ) : null}
+
+      {/* Also before Replace: the Remove it points at is on a chip above, so the
+          row reads top to bottom as "this is why, and there is the thing to
+          press". */}
+      {plan.hostIncumbent ? (
+        <Callout tone="warning" className="mt-3" title={t("stack.hostIncumbentTitle")}>
+          {t("stack.hostIncumbent", { name: entry.display_name })}
+        </Callout>
       ) : null}
 
       {plan.action === "replace" && plan.replaces ? (
@@ -589,18 +905,27 @@ function optionLabel(
 function InstalledChip({
   entry,
   row,
+  support,
   busy,
   pending,
   onRemove,
 }: {
   entry: CatalogueEntry;
   row: StackComponentView;
+  /** Which modes the entry allows — decides whether "where" is worth saying. */
+  support: RuntimeSupport;
   busy: boolean;
   pending: boolean;
   onRemove: () => void;
 }) {
   const { t } = useTranslation();
   const removable = row.status === "installed";
+  const runtime = runtimeOf(row);
+  // Said only where it could have been the other one. Stamping "Host packages"
+  // on nginx, which has nowhere else to run, is noise on every row of the page;
+  // leaving it off MariaDB is how two chips reading 11.8 and 11.4 look like a
+  // contradiction instead of two containers.
+  const whereMatters = support === "either";
   // Our bookkeeping and systemd can disagree if somebody removed a package by
   // hand. Say so rather than quietly showing one of the two.
   const disagrees = row.status === "installed" && !row.unit_active;
@@ -619,6 +944,7 @@ function InstalledChip({
           </span>
           <span className="text-ink-muted">{t(`stack.state.${row.status}`)}</span>
         </Badge>
+        {whereMatters ? <Badge tone="neutral">{t(`stack.runtime.${runtime}`)}</Badge> : null}
         {removable ? (
           <Button
             variant="ghost"
@@ -626,10 +952,13 @@ function InstalledChip({
             loading={pending}
             disabled={busy}
             onClick={onRemove}
-            aria-label={t("stack.removeAria", {
-              name: entry.display_name,
-              version: versionLabel(row.version, t),
-            })}
+            aria-label={t(
+              runtime === "container" ? "stack.removeAriaContainer" : "stack.removeAria",
+              {
+                name: entry.display_name,
+                version: versionLabel(row.version, t),
+              },
+            )}
           >
             <Trash2 className="h-3.5 w-3.5" aria-hidden />
             {t("stack.remove")}

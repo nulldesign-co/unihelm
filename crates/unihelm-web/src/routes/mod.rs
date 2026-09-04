@@ -64,6 +64,8 @@ fn protected() -> Router<SharedState> {
         .route("/api/runtimes/install", post(runtimes::install))
         .route("/api/server/docker", get(runtimes::docker))
         .route("/api/sites/discover", get(runtimes::discover))
+        .route("/api/engines", get(stack::engines))
+        .route("/api/engines/remove", post(stack::engine_remove))
         .route("/api/stack", get(stack::status))
         .route("/api/stack/install", post(stack::install))
         .route("/api/stack/remove", post(stack::remove))

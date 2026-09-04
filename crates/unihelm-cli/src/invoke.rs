@@ -183,6 +183,23 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Status => call("metrics.snapshot", json!({})),
 
         Command::Site(cmd) => site(cmd)?,
+        Command::Engine(cmd) => match cmd {
+            EngineCommand::Status { component } => {
+                let input = Input::new().maybe("component", component.clone()).done();
+                call("engine.status", input)
+            }
+            EngineCommand::Remove {
+                component,
+                version,
+                delete_data,
+            } => {
+                let mut input = component_value(component, version.as_deref());
+                if let Some(map) = input.as_object_mut() {
+                    map.insert("delete_data".into(), json!(delete_data));
+                }
+                call("engine.remove", input)
+            }
+        },
         Command::Docker(cmd) => match cmd {
             DockerCommand::List => call("docker.list", json!({})),
             DockerCommand::Create {

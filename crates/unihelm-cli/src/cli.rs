@@ -66,6 +66,9 @@ pub enum Command {
     /// Docker containers, images and volumes.
     #[command(subcommand)]
     Docker(DockerCommand),
+    /// Database and cache engines that run as containers.
+    #[command(subcommand)]
+    Engine(EngineCommand),
     /// PHP versions.
     #[command(subcommand)]
     Php(PhpCommand),
@@ -217,6 +220,28 @@ pub enum OpsCommand {
 // ---------------------------------------------------------------------------
 // sites
 // ---------------------------------------------------------------------------
+
+/// Engines the panel runs as containers, one per tool and version.
+#[derive(Subcommand, Debug)]
+pub enum EngineCommand {
+    /// What runs in a container, and whether it is up.
+    Status {
+        /// One catalogue slug. Omit for all of them.
+        component: Option<String>,
+    },
+    /// Stop and remove an engine's container.
+    ///
+    /// The data volume survives unless you ask for it too, so this is
+    /// reversible: installing the same version again picks the volume back up.
+    Remove {
+        component: String,
+        #[arg(long)]
+        version: Option<String>,
+        /// Delete the data volume as well. This destroys every database in it.
+        #[arg(long)]
+        delete_data: bool,
+    },
+}
 
 /// Docker containers, images and volumes.
 #[derive(Subcommand, Debug)]

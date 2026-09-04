@@ -277,6 +277,13 @@ export interface StackComponentRequest {
   component: string;
   /** Omitted means the catalogue's recommended version for that slug. */
   version?: string;
+  /**
+   * Which way to install it, for an entry that offers both.
+   *
+   * Omitted means the catalogue's default — which is a container for the
+   * engines and the host for everything else.
+   */
+  runtime?: StackRuntime;
 }
 
 /** Where an entry belongs on the Stack page. Mirrors `catalogue::Category`. */
@@ -316,7 +323,22 @@ export interface CatalogueVersion {
   recommended: boolean;
 }
 
+/** Host packages, or an image. Mirrors `catalogue::Runtime`. */
+export type StackRuntime = "host" | "container";
+
+/**
+ * How an entry can be installed, and what it is by default.
+ *
+ * The default travels with the list rather than beside it, so there is no way to
+ * describe something that offers only the host and defaults to a container.
+ */
+export interface InstallModes {
+  runtimes: StackRuntime[];
+  default_runtime: StackRuntime;
+}
+
 export interface CatalogueEntry {
+  install: InstallModes;
   slug: string;
   display_name: string;
   category: StackCategory;
@@ -336,6 +358,15 @@ export type ComponentState =
   | "removing";
 
 export interface StackComponentView {
+  /**
+   * How this one runs: `host` or `container`.
+   *
+   * Optional, and that is load-bearing: an agent older than this field sends no
+   * `runtime` at all, and rows written before it exists are still in the table.
+   * Absent means host — reading the gap as `container` would put a Remove beside
+   * an apt package and send the agent to delete a container that never was.
+   */
+  runtime?: StackRuntime;
   slug: string;
   /**
    * The catalogue entry this row belongs to: `php`, `mariadb`, `nginx`.

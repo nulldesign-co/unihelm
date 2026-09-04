@@ -34,6 +34,7 @@ pub mod cron;
 pub mod db;
 pub mod dns;
 pub mod docker;
+pub mod engine;
 pub mod fpm;
 pub mod fsops;
 pub mod fwops;

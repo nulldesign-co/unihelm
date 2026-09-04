@@ -211,6 +211,31 @@ export const en = {
     addFailed: "That key was not accepted.",
   },
   stack: {
+    chooseRuntime: "Run it",
+    dockerNeededTitle: "Docker is not installed",
+    dockerNeeded:
+      "These run in containers, so Docker has to be on this server first. It is in the Containers section below.",
+    dockerNeededLink: "Install Docker",
+    hostIncumbentTitle: "This engine is already installed on the host",
+    hostIncumbent:
+      "{{name}} is installed as packages on this server and holds its port. A container cannot start beside it — remove the host install first, or keep using it.",
+    installAriaContainer: "Run {{name}} {{version}} in a container",
+    removeAriaContainer: "Remove the {{name}} {{version}} container",
+    replaceAriaContainer: "Replace the {{name}} container with {{version}}",
+    runtimeNote: {
+      container:
+        "Runs as a container. No repository is added to this server and none of its packages are touched; the data lives in a volume that outlives the container.",
+      containerSideBySide:
+        "Runs as a container, so two versions can be installed at once — each gets its own container, its own data volume and its own port. On the host they would collide.",
+    },
+    runtime: {
+      host: "On the server",
+      container: "In a container",
+    },
+    runtimeHint: {
+      host: "Packages installed on this server, started by systemd.",
+      container: "An image, run as one container shared by everything that names this version.",
+    },
     emptyTitle: "Nothing to install",
     empty:
       "The agent sent no catalogue. Check that it is running, and that it and this panel are the same version.",

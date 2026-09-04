@@ -246,6 +246,8 @@ impl OpRegistry {
         registry.register(crate::stack::Status);
         registry.register(crate::stack::Install);
         registry.register(crate::stack::Remove);
+        registry.register(crate::engine::Status);
+        registry.register(crate::engine::Remove);
         registry.register(crate::site::List);
         registry.register(crate::site::Create);
         registry.register(crate::site::Update);

@@ -209,3 +209,97 @@ async fn audit(
         .map_err(ApiError::from)?;
     Ok(())
 }
+
+/// What the panel runs in containers, and whether each is up.
+#[utoipa::path(
+    get,
+    path = "/api/engines",
+    tag = "stack",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Every containerised engine and its state", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn engines(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerRead)
+        .map_err(ApiError::from)?;
+    let data = ops::invoke_now(&state, &current.auth, "engine.status", json!({})).await?;
+    Ok(Json(data))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct EngineRemoveRequest {
+    pub component: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Delete the data volume as well. This destroys the databases in it.
+    #[serde(default)]
+    pub delete_data: bool,
+}
+
+/// Stop and remove an engine's container.
+#[utoipa::path(
+    post,
+    path = "/api/engines/remove",
+    tag = "stack",
+    request_body = EngineRemoveRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such engine container", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn engine_remove(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<EngineRemoveRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::StackManage)
+        .map_err(ApiError::from)?;
+
+    // Audited whether or not the data goes: removing the container is what makes
+    // an application stop being able to connect, and "who did that" is the
+    // question asked afterwards.
+    state
+        .db
+        .record_audit(NewAuditEntry {
+            actor_user_id: Some(current.user.id),
+            actor_username: current.user.username.as_str().to_string(),
+            impersonator_id: current.session.impersonator_id,
+            ip: Some(client_ip(Some(&peer), &headers)),
+            action: "engine.remove".into(),
+            target: Some(body.component.clone()),
+            detail: json!({ "delete_data": body.delete_data }),
+            request_id: Some(current.auth.request_id.clone()),
+            subscription_id: current.auth.tenant_scope.subscription_id(),
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "engine.remove",
+        json!({
+            "component": body.component,
+            "version": body.version,
+            "delete_data": body.delete_data,
+        }),
+    )
+    .await
+}
