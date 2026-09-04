@@ -3668,7 +3668,7 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unihelm-agentd"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3693,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-cli"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "clap",
@@ -3712,7 +3712,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-config"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "hex",
@@ -3730,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -3741,7 +3741,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-db"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-distro"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-ipc"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "libc",
@@ -3799,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-metrics"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-ops"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3855,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "unihelm-web"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-stream",

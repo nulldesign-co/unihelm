@@ -1233,6 +1233,26 @@ async fn remove_unit_files(ctx: &OpContext, user: &LinuxUser, name: &AppName) {
         }
         let _ = ctx.db().forget_revisions(&path.to_string_lossy()).await;
     }
+
+    // The drop-in's own directory. Removing the file inside it leaves
+    // `unihelm-app-<user>-<name>.service.d/` behind, empty, for every
+    // application ever deleted — systemd ignores it, and it accumulates in
+    // /etc/systemd/system where an operator reading the directory sees units
+    // that no longer exist.
+    //
+    // `remove_dir` rather than `remove_dir_all`: it fails on a directory that
+    // still has something in it, which is exactly the right behaviour if
+    // somebody put their own drop-in beside ours.
+    let dropin_dir = paths::systemd_dropin(&unit_file, "unihelm-slice.conf")
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    if let Some(dir) = dropin_dir
+        && dir.is_dir()
+        && let Err(e) = std::fs::remove_dir(&dir)
+        && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        ctx.log(format!("could not remove {}: {e}", dir.display()));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2826,6 +2846,55 @@ mod pinning_tests {
         assert!(path.is_file(), "{} is not a file", path.display());
     }
 }
+#[cfg(test)]
+mod dropin_cleanup_tests {
+    use std::path::Path;
+
+    /// Deleting an application must not leave its drop-in directory behind.
+    ///
+    /// Found on a real server: after two applications were created and deleted,
+    /// `/etc/systemd/system` still held two empty
+    /// `unihelm-app-<user>-<name>.service.d/` directories. systemd ignores them,
+    /// so nothing breaks — they simply accumulate, one per application ever
+    /// deleted, and an operator reading that directory sees units that do not
+    /// exist.
+    #[test]
+    fn an_emptied_dropin_directory_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("app.service.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unihelm-slice.conf"), "[Service]\n").unwrap();
+
+        // What the removal does: the file first, then the directory.
+        std::fs::remove_file(dir.join("unihelm-slice.conf")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(!dir.exists(), "the drop-in directory outlived the app");
+    }
+
+    /// A directory somebody else put a file in is not ours to delete.
+    ///
+    /// `remove_dir` fails on a non-empty directory, which is the behaviour that
+    /// makes this safe: an operator's own drop-in beside ours survives, and the
+    /// error it produces is the one that gets ignored rather than logged as a
+    /// failure.
+    #[test]
+    fn a_directory_holding_somebody_elses_dropin_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("app.service.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unihelm-slice.conf"), "[Service]\n").unwrap();
+        std::fs::write(dir.join("operator-override.conf"), "[Service]\n").unwrap();
+
+        std::fs::remove_file(dir.join("unihelm-slice.conf")).unwrap();
+        let err = std::fs::remove_dir(&dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert!(
+            Path::new(&dir).join("operator-override.conf").exists(),
+            "somebody else's drop-in was destroyed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
