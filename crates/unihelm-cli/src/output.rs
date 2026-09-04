@@ -42,7 +42,23 @@ const COLUMNS: &[(&str, &[&str])] = &[
     ("cron.list.jobs", &["id", "subscription_id", "schedule", "command", "enabled", "last_error"]),
     ("plan.list.plans", &["id", "name", "max_sites", "max_dbs", "storage_mb", "can_ssh", "can_cron", "can_node_apps", "subscriptions"]),
     ("subscription.list.subscriptions", &["id", "customer_id", "customer_username", "plan_id", "status", "sites", "suspended_reason"]),
-    ("app.list.apps", &["id", "name", "entry", "port", "node_env", "enabled", "state"]),
+    // `runtime` and `runtime_version` sit next to the entry, because an entry
+    // path alone no longer says what runs it: `main.py` under Node is a real
+    // configuration and the reason to look at this list at all.
+    (
+        "app.list.apps",
+        &[
+            "id",
+            "name",
+            "runtime",
+            "runtime_version",
+            "entry",
+            "port",
+            "node_env",
+            "enabled",
+            "state",
+        ],
+    ),
     ("fw.bans.bans", &["ip", "reason", "banned_at", "expires_at", "in_backend"]),
     ("fw.rules.rules", &["port", "proto", "source", "comment", "in_panel", "in_backend", "drift"]),
     ("backup.list.snapshots", &["short_id", "time", "hostname", "paths", "tags"]),
