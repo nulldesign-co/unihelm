@@ -90,8 +90,16 @@ mod tests {
         status("still here");
     }
 
+    /// These two tests set and clear the same process-wide variables, and cargo
+    /// runs tests in one binary on several threads — so without this they
+    /// interleave, and one reads a `WATCHDOG_PID` the other had just set. It
+    /// failed roughly one run in five, which is the worst frequency: often
+    /// enough to redden CI, rarely enough to look like something else.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn watchdog_interval_is_half_the_configured_timeout() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: as above.
         unsafe {
             std::env::remove_var("WATCHDOG_PID");
@@ -108,12 +116,16 @@ mod tests {
 
     #[test]
     fn a_watchdog_meant_for_another_pid_is_ignored() {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: as above.
         unsafe {
             std::env::set_var("WATCHDOG_USEC", "30000000");
             std::env::set_var("WATCHDOG_PID", "1");
         }
         assert_eq!(watchdog_interval(), None);
-        unsafe { std::env::remove_var("WATCHDOG_PID") };
+        unsafe {
+            std::env::remove_var("WATCHDOG_PID");
+            std::env::remove_var("WATCHDOG_USEC");
+        }
     }
 }

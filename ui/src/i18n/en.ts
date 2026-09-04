@@ -245,7 +245,7 @@ export const en = {
     title: "Runtimes",
     subtitle: "What this server can run, and which version a bare command gets.",
     scope:
-      "This page reads the machine. Node is the only runtime it installs, and PHP is the only other one Unihelm installs anywhere — from the Stack page. Python and Ruby are distribution packages no page here has a button for, and Go, Deno and Bun ship as single binaries from vendors with no signed repository, so those five have to reach this server by other means. Everything installed is listed here, whatever put it there.",
+      "This page reads the machine and installs Node, Python and Go — Node from NodeSource, the other two from the distribution's own repositories. PHP comes from the Stack page. Bun and Deno are single binaries their vendors serve with no signed repository, so those have to reach this server by other means. Everything installed is listed here, whatever put it there.",
     scopeStack: "Open the Stack page",
     listTitle: "Installed",
     defaultHint:
@@ -278,6 +278,16 @@ export const en = {
       bun: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
     },
     install: {
+      runtime: "Runtime",
+      version: "Version",
+      distroVersion: "Whatever this distribution ships",
+      pythonLine: "Python {{version}}",
+      noteNode:
+      "Node comes from NodeSource, one repository per major line, with the signing key pinned by fingerprint.",
+      notePython:
+      "Python and Go come from the distribution's own repositories — the same packages apt would install.",
+      noteDistro:
+      "Bun and Deno are single binaries their vendors serve over https with no signed repository, so this panel does not install them. Put one on the server yourself and it appears below.",
       title: "Install a Node line",
       hint: "One major line at a time, from NodeSource, with the signing key pinned by fingerprint.",
       major: "Major line",
@@ -338,6 +348,8 @@ export const en = {
     },
   },
   docker: {
+    actions: "Actions",
+    stop: "Stop",
     actionsFor: "Actions for {{name}}",
     logsEmptyHint: "A container started moments ago, or one whose logging driver sends its output somewhere else, both look like this.",
     noRun: "Unihelm starts, stops, restarts and removes the containers already on this server. It will not create one: a single flag can hand a container the host's filesystem or the Docker socket, which is root on this machine, so a form that took run arguments would be a root shell with a nicer font. Whatever is listed below was created by somebody who chose its flags.",
