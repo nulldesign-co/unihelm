@@ -83,11 +83,21 @@ modules it needs (`proxy_fcgi`, `ssl`, `rewrite`, `headers`, `expires`,
 socket contract exactly and has a real config validator, which is what the
 apply engine's snapshot → write → validate → roll back cycle is built on.
 
-**3. The switch.** `webserver.switch`, which installs the target if needed,
-re-renders every site, validates the whole configuration with the target's own
-tool, starts it and stops the incumbent — and rolls the whole thing back on any
-failure. Not per-site: a machine half on Apache is a machine with two things
-fighting over port 80.
+**3. The switch.** `webserver.switch`, which re-renders every site, validates
+the whole configuration with the target's own tool, starts it and stops the
+incumbent — and puts the incumbent back on any failure. Not per-site: a machine
+half on Apache is a machine with two things fighting over port 80.
+
+One thing turned up in the building that the plan above did not have, and it is
+the sharpest edge in the whole feature: **a missing Apache module is not a
+syntax error.** `configtest` passes, Apache starts, every page loads, and the
+directives that needed the module are silently inert — and without
+`mod_proxy_fcgi` that means serving the source of every `.php` file on the
+machine as plain text. nginx has no equivalent hazard, because its features are
+compiled in and an unknown directive fails `nginx -t` loudly. So the switch
+enables the eight modules the vhosts need and then *verifies* them against
+Apache's own `-M` output before writing anything. The enable is a best effort;
+the verification is not.
 
 **4. OpenLiteSpeed.** Last because its configuration is a different shape — a
 `virtualhost` block in `httpd_config.conf` plus a per-vhost file, with listeners

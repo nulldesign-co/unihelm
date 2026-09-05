@@ -609,6 +609,27 @@ export function StackPage() {
   });
   const installed = runtimes.data?.runtimes ?? [];
 
+  // Moving the whole machine to another web server. A task, and one that stops
+  // what is serving — so the confirmation is not a toast, it is the refusal the
+  // agent sends back listing every site that would lose a control, shown before
+  // the second click.
+  const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  const switchServer = useMutation({
+    mutationFn: endpoints.switchWebServer,
+    onSuccess: () => {
+      setError(null);
+      setPendingSwitch(null);
+      setJustActed(true);
+      void queryClient.invalidateQueries({ queryKey: ["stack"] });
+    },
+    onError: (e: unknown) => {
+      // A conflict here is the gap list, which is the operator's next decision
+      // rather than a failure — so the row keeps offering the click and the
+      // message stays on screen beside it.
+      setError(e instanceof ApiError ? e.message : String(e));
+    },
+  });
+
   const setDefault = useMutation({
     mutationFn: endpoints.setRuntimeDefault,
     onSuccess: () => {
@@ -704,6 +725,21 @@ export function StackPage() {
                       acting={acting}
                       dockerAnchor={dockerAnchor}
                       installed={installed}
+                      serving={servingState(entry, stack.data?.web_server ?? "", components)}
+                      switching={switchServer.isPending ? switchServer.variables.target : null}
+                      awaitingConfirm={pendingSwitch === entry.slug}
+                      onSwitch={() => {
+                        // First click asks; second click accepts whatever the
+                        // first came back with. An operator who has read a list
+                        // of what four sites lose should not have that click
+                        // look identical to the one that opened it.
+                        if (pendingSwitch === entry.slug) {
+                          switchServer.mutate({ target: entry.slug, accept_gaps: true });
+                        } else {
+                          setPendingSwitch(entry.slug);
+                          switchServer.mutate({ target: entry.slug });
+                        }
+                      }}
                       settingDefault={setDefault.isPending ? setDefault.variables : null}
                       onMakeDefault={(runtime, version) => setDefault.mutate({ runtime, version })}
                       onSelect={(version) =>
@@ -882,6 +918,56 @@ export function defaultCommandFor(
   return { command, owns: mine.is_default, movable: !mine.is_default };
 }
 
+/** Catalogue slugs whose category is the web server. */
+export const WEB_SERVER_CATEGORY: StackCategory = "web_server";
+
+export type ServingState =
+  // This one serves the machine's sites right now.
+  | "serving"
+  // Installed, and a switch to it is offered.
+  | "switchable"
+  // Not installed, or the panel cannot write vhosts for it yet.
+  | "unavailable";
+
+/**
+ * What the Serving badge and the Switch button say about one web server.
+ *
+ * Installed has never meant serving, and on this page the difference is the
+ * whole point: a machine can carry nginx and Apache at once and exactly one of
+ * them answers on port 80. Reading `active` from the agent rather than guessing
+ * from the install rows is what stops the badge landing on whichever was
+ * installed first.
+ *
+ * `unavailable` covers two different reasons deliberately — not installed, and
+ * installed but not renderable (OpenLiteSpeed today). Both mean the same thing
+ * to the button, and the row already says which it is: an uninstalled entry has
+ * an Install button beside it, and one the panel cannot render says so in its
+ * `unavailable` line.
+ */
+export function servingState(
+  entry: CatalogueEntry,
+  active: string,
+  components: readonly StackComponentView[],
+): ServingState {
+  if (entry.category !== WEB_SERVER_CATEGORY) return "unavailable";
+  if (entry.slug === active) return "serving";
+  const rows = rowsFor(entry, components);
+  const here = rows.some((r) => r.status === "installed" || r.status === "unmanaged");
+  // OpenLiteSpeed is catalogued and installable and the panel has no vhost
+  // templates for it. Offering a Switch that always comes back 501 is worse
+  // than not offering one.
+  return here && RENDERABLE_SERVERS.has(entry.slug) ? "switchable" : "unavailable";
+}
+
+/**
+ * The web servers this build can write vhosts for.
+ *
+ * Mirrors the agent's `webserver::WebServer::site_vhost`. It is duplicated here
+ * rather than sent, because the only thing it changes is whether a button is
+ * drawn — and the agent refuses on its own if this list is ever ahead of it.
+ */
+const RENDERABLE_SERVERS = new Set(["nginx", "apache"]);
+
 /**
  * Interpreters on this machine that the catalogue cannot account for.
  *
@@ -911,8 +997,12 @@ function EntryRow({
   acting,
   dockerAnchor,
   installed,
+  serving,
+  switching,
+  awaitingConfirm,
   settingDefault,
   onSelect,
+  onSwitch,
   onSelectRuntime,
   onInstall,
   onRemove,
@@ -929,6 +1019,12 @@ function EntryRow({
   dockerAnchor: string | null;
   /** The machine's survey of `$PATH`, for the bare-command badge. */
   installed: readonly InstalledRuntime[];
+  /** Whether this web server serves, could serve, or neither. */
+  serving: ServingState;
+  /** The slug of the switch in flight, if any. */
+  switching: string | null;
+  /** The agent has answered once and the next click accepts what it said. */
+  awaitingConfirm: boolean;
   /** The default being moved right now, if any. */
   settingDefault: { runtime: string; version: string } | null;
   onSelect: (version: string) => void;
@@ -936,6 +1032,7 @@ function EntryRow({
   onInstall: () => void;
   onRemove: (version: string, runtime: StackRuntime) => void;
   onMakeDefault: (runtime: string, version: string) => void;
+  onSwitch: () => void;
 }) {
   const { t } = useTranslation();
   const label = (version: string) => versionLabel(version, t);
@@ -981,8 +1078,35 @@ function EntryRow({
     >
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
         <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-semibold text-ink">{entry.display_name}</h3>
+          <span className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-semibold text-ink">{entry.display_name}</h3>
+            {serving === "serving" ? (
+              // Accent, not success: serving is the healthy resting state of
+              // exactly one row on this page and must not read as something
+              // that just went right.
+              <Badge tone="accent">{t("stack.serving")}</Badge>
+            ) : null}
+          </span>
           <p className="mt-0.5 max-w-prose text-sm text-ink-muted">{entry.summary}</p>
+
+          {serving === "switchable" ? (
+            <div className="mt-2.5">
+              <Button
+                variant={awaitingConfirm ? "danger" : "secondary"}
+                size="sm"
+                loading={switching === entry.slug}
+                disabled={busy || switching !== null}
+                onClick={onSwitch}
+              >
+                {t(awaitingConfirm ? "stack.switchConfirm" : "stack.switchTo", {
+                  name: entry.display_name,
+                })}
+              </Button>
+              <p className="mt-1.5 max-w-prose text-xs text-ink-subtle">
+                {t("stack.switchHint")}
+              </p>
+            </div>
+          ) : null}
 
           {plan.rows.length > 0 ? (
             <ul className="mt-2.5 flex flex-wrap items-center gap-2">

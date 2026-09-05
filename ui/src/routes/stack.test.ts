@@ -37,6 +37,7 @@ import {
   hostHoldsEntry,
   planFor,
   runtimeOf,
+  servingState,
   sideBySideIn,
   supportFor,
   uncataloguedRuntimes,
@@ -630,5 +631,62 @@ describe("interpreters the catalogue cannot account for", () => {
 
   it("is empty when the catalogue covers everything found", () => {
     expect(uncataloguedRuntimes([found({ runtime: "php", version: "8.3.6" })], [php])).toEqual([]);
+  });
+});
+
+describe("which web server is serving", () => {
+  const apache: CatalogueEntry = {
+    slug: "apache",
+    display_name: "Apache",
+    category: "web_server",
+    summary: "The other one.",
+    side_by_side: false,
+    install: { runtimes: ["host"], default_runtime: "host" },
+    versions: [version({ version: "distro", recommended: true })],
+  };
+  const litespeed: CatalogueEntry = { ...apache, slug: "litespeed", display_name: "OpenLiteSpeed" };
+
+  it("marks the one the agent says is serving, not the one installed first", () => {
+    // Both are installed. Which one answers on port 80 is not derivable from
+    // that, and guessing put the badge on whichever the rows listed first.
+    const both = [
+      row({ component: "nginx", version: "stable" }),
+      row({ component: "apache", version: "distro" }),
+    ];
+    expect(servingState(nginx, "apache", both)).toBe("switchable");
+    expect(servingState(apache, "apache", both)).toBe("serving");
+  });
+
+  it("offers no switch to something that is not installed", () => {
+    expect(servingState(apache, "nginx", [row({ component: "nginx", version: "stable" })])).toBe(
+      "unavailable",
+    );
+  });
+
+  it("offers no switch to a server the panel cannot write vhosts for", () => {
+    // OpenLiteSpeed is catalogued, installable, and has no templates. A button
+    // that always comes back 501 is worse than no button.
+    const installed = [
+      row({ component: "nginx", version: "stable" }),
+      row({ component: "litespeed", version: "openlitespeed" }),
+    ];
+    expect(servingState(litespeed, "nginx", installed)).toBe("unavailable");
+  });
+
+  it("counts a server somebody else installed", () => {
+    // An unmanaged Apache is on the machine and can be switched to. Refusing
+    // because the panel did not install it is the same blindness that had this
+    // page calling a running nginx absent.
+    const rows = [
+      row({ component: "nginx", version: "stable" }),
+      row({ component: "apache", version: "distro", status: "unmanaged" }),
+    ];
+    expect(servingState(apache, "nginx", rows)).toBe("switchable");
+  });
+
+  it("says nothing about anything that is not a web server", () => {
+    expect(servingState(php, "nginx", [row({ component: "php", version: "8.3" })])).toBe(
+      "unavailable",
+    );
   });
 });

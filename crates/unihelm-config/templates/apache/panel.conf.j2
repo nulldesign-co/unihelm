@@ -1,0 +1,93 @@
+{# The Apache counterpart of `nginx/panel.conf.j2`.
+
+   This one is load-bearing in a way the site template is not: if it is wrong,
+   the panel that would tell you it is wrong is the thing that is down. So the
+   switch checks for a working panel over loopback *after* Apache is serving and
+   rolls back if it cannot reach it. #}
+# The panel's own vhost.
+#
+# `unihelm-web` terminates its own TLS, so a server with no domain is still
+# reachable and still safe to type a password into. Once a domain exists, the
+# web server fronts it on 443 with a real certificate and proxies to the panel
+# over loopback — the same certificate handling and the same security headers as
+# every site, with the web process keeping its tiny attack surface.
+
+<VirtualHost *:80>
+    ServerName {{ panel_domain }}
+
+    Alias /.well-known/acme-challenge/ {{ acme_webroot }}/.well-known/acme-challenge/
+    <Directory "{{ acme_webroot }}/.well-known/acme-challenge">
+        Require all granted
+        Options -Indexes
+        ForceType text/plain
+    </Directory>
+
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName {{ panel_domain }}
+
+    SSLEngine on
+    SSLCertificateFile    {{ cert_path }}
+    SSLCertificateKeyFile {{ key_path }}
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+    SSLHonorCipherOrder off
+    Protocols h2 http/1.1
+
+    # The panel is never framed and never embedded, so the policy can be as
+    # tight as it gets.
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    Header always set X-Frame-Options DENY
+    Header always set X-Content-Type-Options nosniff
+    Header always set Referrer-Policy same-origin
+
+    # Chunked uploads in the file manager need headroom; the API itself is
+    # capped far lower inside unihelm-web.
+    LimitRequestBody {{ max_body_bytes }}
+
+{% if upstream_scheme == "https" %}
+    # The panel is serving its own TLS on loopback with a certificate signed for
+    # nobody. Verification off, deliberately and only here: the peer is a socket
+    # on 127.0.0.1 that this same machine started.
+    SSLProxyEngine On
+    SSLProxyVerify none
+    SSLProxyCheckPeerCN off
+    SSLProxyCheckPeerName off
+{% endif %}
+
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto "https"
+
+    # The web terminal and the event stream, before the catch-all below.
+    #
+    # The terminal is a websocket, so it has to leave through mod_rewrite's [P]
+    # rather than ProxyPass — and it has to be matched first, or the handshake is
+    # answered by the HTTP proxy and the terminal hangs on a spinner. This is the
+    # bug the nginx side had for a release: everything looked right and the PTY
+    # never came up.
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} =websocket [NC]
+    RewriteCond %{HTTP:Connection} upgrade [NC]
+    RewriteRule ^/?(.*) {{ upstream_ws_scheme }}://{{ upstream }}/$1 [P,L]
+
+    # 24 hours, not the default 60 seconds. Apache's ProxyTimeout is the gap it
+    # allows between reads, and on an upgraded connection that is the gap
+    # between keystrokes — nothing on either side pings, so a PTY left at a
+    # prompt is torn down a minute in and the operator watches a build from a
+    # dead socket.
+    ProxyTimeout 86400
+
+    # Server-sent events: buffering here would make the task drawer look frozen.
+    <Location "/api/events">
+        ProxyPass {{ upstream_scheme }}://{{ upstream }}/api/events flushpackets=on
+        ProxyPassReverse {{ upstream_scheme }}://{{ upstream }}/api/events
+        SetEnv proxy-sendchunked 1
+        SetEnv proxy-nokeepalive 0
+    </Location>
+
+    ProxyPass        / {{ upstream_scheme }}://{{ upstream }}/
+    ProxyPassReverse / {{ upstream_scheme }}://{{ upstream }}/
+</VirtualHost>

@@ -479,6 +479,20 @@ pub enum StackCommand {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Move every site on this server to another web server.
+    ///
+    /// One operation for the whole machine: two web servers both wanting port 80
+    /// is not a half-migrated server, it is one where the second failed to start
+    /// and nobody noticed. Every vhost is written and the whole configuration is
+    /// checked with the target's own tool before the incumbent stops.
+    Webserver {
+        /// `nginx` or `apache`. It has to be installed already.
+        target: String,
+        /// Switch even though some sites are configured for something the
+        /// target cannot do. Without this the switch refuses and lists them.
+        #[arg(long)]
+        accept_gaps: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

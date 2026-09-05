@@ -36,7 +36,7 @@ use unihelm_distro::{Cmd, Distro, Family, PackageName, ResolvedRepo};
 use crate::catalogue;
 use crate::php::{PhpExt, packages_for};
 use crate::registry::{Execution, OpContext, TypedOperation};
-use crate::services::{NginxValidator, NoReload, SkipValidation, UnitReloader};
+use crate::services::{NoReload, SkipValidation};
 
 /// A component the Stack Manager can install: one catalogue entry at one of its
 /// versions.
@@ -517,6 +517,13 @@ pub struct StatusOutput {
     pub catalogue: &'static [catalogue::Entry],
     /// Repository pins that have not been independently corroborated yet.
     pub unverified_pins: &'static [&'static str],
+    /// Which web server actually serves this machine's sites.
+    ///
+    /// Not derivable from the rows above: two web servers can be installed at
+    /// once, and "installed" has never meant "serving". A page that guessed
+    /// from the install rows would put the Serving badge on whichever was
+    /// installed first.
+    pub web_server: String,
 }
 
 #[async_trait]
@@ -598,6 +605,7 @@ impl TypedOperation for Status {
         }
 
         Ok(StatusOutput {
+            web_server: crate::webserver::active(ctx).await?.as_str().to_string(),
             components,
             catalogue: catalogue::CATALOGUE,
             unverified_pins: unihelm_distro::repos::UNVERIFIED_PINS,
@@ -1252,6 +1260,82 @@ async fn install_component(
     })
 }
 
+/// The default vhost, for a web server that is not (yet) the active one.
+///
+/// The switch's path. Split out of [`bootstrap_nginx`] rather than duplicated,
+/// because the default vhost is the file that decides which site answers for a
+/// hostname nobody configured — and two copies of that decision is how the two
+/// web servers end up disagreeing about it.
+pub async fn write_catchall_for(
+    ctx: &OpContext,
+    server: crate::webserver::WebServer,
+) -> Result<()> {
+    let default_certs = paths::default_cert_dir();
+    if !crate::tls::certificate_present(&default_certs) {
+        crate::tls::write_self_signed(&default_certs, &[])?;
+        ctx.log("generated a self-signed certificate for the default server");
+    }
+
+    let catchall = server.catchall()?;
+    let reloader = server.reloader(ctx.distro())?;
+
+    // Only nginx has a `default_server` keyword to collide over. Apache decides
+    // by parse order, so there is nothing to yield and nothing to survey — see
+    // `apache/catchall.conf.j2`.
+    //
+    // Yielding it: `default_server` may appear once per listening address, so on
+    // a machine that was already serving sites a second one fails `nginx -t`,
+    // the engine rolls the whole apply back, and the panel refuses to set up a
+    // stack on a working server — which is the opposite of what a control panel
+    // is for.
+    let owns_default = if server == crate::webserver::WebServer::Nginx {
+        let existing = crate::nginx_survey::survey();
+        if existing.has_foreign_default_server() {
+            ctx.log(format!(
+                "nginx already has a default server ({}); leaving it in place",
+                existing
+                    .default_server_files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            false
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+
+    ctx.config()
+        .apply(ApplyRequest {
+            file: catchall.file,
+            template: catchall.template,
+            context: serde_json::json!({
+                "acme_webroot": paths::acme_webroot(),
+                "default_cert": default_certs.join("fullchain.pem"),
+                "default_key": default_certs.join("privkey.pem"),
+                "owns_default": owns_default,
+                "catchall_names": CATCHALL_NAME,
+                "catchall_primary": CATCHALL_NAME,
+                "http3": false,
+            }),
+            service: catchall.service,
+            validator: server.validator()?,
+            reloader: &reloader,
+            post_check: None,
+            force: false,
+            task_id: ctx.task_id().map(|t| t.to_string()),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Something has to answer for a hostname nobody configured, and it must not be
+/// a name anyone else serves. `.invalid` is reserved for exactly this.
+const CATCHALL_NAME: &str = "unihelm-catchall.invalid";
+
 /// Everything nginx needs before it is worth starting.
 ///
 /// The include hook, a default server, and a certificate for it — an nginx with
@@ -1314,49 +1398,10 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
 
     // The default server. Now nginx -t can see the whole tree.
     //
-    // Only if nothing else has claimed it. `default_server` may appear once per
-    // listening address, so on a machine that was already serving sites a second
-    // one fails `nginx -t`, the engine rolls the whole apply back, and the panel
-    // refuses to set up a stack on a working server — which is the opposite of
-    // what a control panel is for.
-    let existing = crate::nginx_survey::survey();
-    let owns_default = !existing.has_foreign_default_server();
-    if !owns_default {
-        ctx.log(format!(
-            "nginx already has a default server ({}); leaving it in place",
-            existing
-                .default_server_files
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    engine
-        .apply(ApplyRequest {
-            file: ManagedFile::nginx(paths::nginx_catchall()),
-            template: "nginx/catchall.conf",
-            context: serde_json::json!({
-                "acme_webroot": paths::acme_webroot(),
-                "default_cert": default_certs.join("fullchain.pem"),
-                "default_key": default_certs.join("privkey.pem"),
-                "owns_default": owns_default,
-                // Something has to answer, and it must not be a name anyone
-                // else serves. Only used when yielding the default server.
-                "catchall_names": "unihelm-catchall.invalid",
-                // HTTP/3 needs UDP/443 open; enabling it by default would make
-                // the panel depend on a firewall change nobody made.
-                "http3": false,
-            }),
-            service: "nginx",
-            validator: &NginxValidator,
-            reloader: &UnitReloader::nginx(ctx.distro()),
-            post_check: None,
-            force: false,
-            task_id: ctx.task_id().map(|t| t.to_string()),
-        })
-        .await?;
+    // Through the same function the switch uses, so there is one place that
+    // decides what answers for a hostname nobody configured. Two copies of that
+    // decision is how the two web servers end up disagreeing about it.
+    write_catchall_for(ctx, crate::webserver::WebServer::Nginx).await?;
 
     ctx.log("default server configured");
 

@@ -285,6 +285,11 @@ export const en = {
     answersTo: "answers `{{command}}`",
     makeDefault: "Make `{{command}}`",
     makeDefaultAria: "Point a bare {{command}} at version {{version}}",
+    serving: "Serving",
+    switchTo: "Switch to {{name}}",
+    switchConfirm: "Switch anyway",
+    switchHint:
+      "Moves every site on this server. Nothing stops until the whole configuration has been written and checked with the target's own tool, and if it will not start, what is serving now is put back.",
     alsoTitle: "Also on this machine",
     alsoHint:
       "Interpreters the panel found on $PATH and has no signed repository for, so there is nothing here to install or remove — only to know about. An application can still be pinned to one of these paths.",

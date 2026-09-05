@@ -1,0 +1,56 @@
+{# The Apache counterpart of `nginx/catchall.conf.j2`. #}
+# Default virtual host.
+#
+# Every request whose Host matches no configured site lands here rather than
+# being served by whichever vhost Apache happened to parse first — which is how
+# an unrelated customer's site ends up answering for a domain nobody configured.
+#
+# Apache has no `default_server` keyword: **the first vhost defined for an
+# address is the default for it**, and that is decided by parse order alone.
+# That is why this file is `00-catchall.conf` in a directory included with a
+# wildcard, which Apache walks in alphabetical order. Renaming it is enough to
+# hand every unconfigured hostname to a real customer's site.
+#
+# Because it is parse order rather than a flag, there is no `owns_default`
+# variant here as there is in nginx's: nothing can collide, and nothing has to
+# be yielded. A pre-existing default vhost from the distribution simply parses
+# after this one and stops being the default, which is the intent.
+
+<VirtualHost *:80>
+    ServerName {{ catchall_primary }}
+
+    # ACME challenges must work before a site exists, so the webroot is served
+    # by the default vhost too.
+    Alias /.well-known/acme-challenge/ {{ acme_webroot }}/.well-known/acme-challenge/
+    <Directory "{{ acme_webroot }}/.well-known/acme-challenge">
+        Require all granted
+        Options -Indexes
+        ForceType text/plain
+    </Directory>
+
+    # nginx answers an unconfigured host with 444, which closes the connection
+    # without a response. Apache has no such code — the closest honest thing is
+    # a 403 with nothing in it, so an unconfigured host gets a status and no
+    # content to fingerprint.
+    <Location "/">
+        Require all denied
+    </Location>
+    ErrorDocument 403 " "
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName {{ catchall_primary }}
+
+    SSLEngine on
+    # A self-signed certificate, because TLS on the default vhost has to be
+    # *something* and presenting another customer's certificate would be worse.
+    SSLCertificateFile    {{ default_cert }}
+    SSLCertificateKeyFile {{ default_key }}
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+    SSLHonorCipherOrder off
+
+    <Location "/">
+        Require all denied
+    </Location>
+    ErrorDocument 403 " "
+</VirtualHost>

@@ -587,6 +587,31 @@ pub async fn render_vhost_mode(
     linux_user: &unihelm_core::LinuxUser,
     force_maintenance: bool,
 ) -> Result<()> {
+    let server = crate::webserver::active(ctx).await?;
+    render_vhost_inner(ctx, site, linux_user, force_maintenance, server).await
+}
+
+/// [`render_vhost`], for a web server that is not (yet) the active one.
+///
+/// The switch's path, and its only caller. It writes a site's vhost into the
+/// *target's* tree while the incumbent is still serving out of its own, which is
+/// what lets the whole machine be prepared and checked before anything stops.
+pub async fn render_vhost_for(
+    ctx: &OpContext,
+    site: &Site,
+    linux_user: &unihelm_core::LinuxUser,
+    server: crate::webserver::WebServer,
+) -> Result<()> {
+    render_vhost_inner(ctx, site, linux_user, false, server).await
+}
+
+async fn render_vhost_inner(
+    ctx: &OpContext,
+    site: &Site,
+    linux_user: &unihelm_core::LinuxUser,
+    force_maintenance: bool,
+    server: crate::webserver::WebServer,
+) -> Result<()> {
     let db = ctx.db();
     let mut context = site_context(site, linux_user)?;
 
@@ -633,12 +658,10 @@ pub async fn render_vhost_mode(
         context = context.with_tls(&cert_dir, true);
     }
 
-    // Which server, asked once and used for all four of file, template,
-    // validator and reloader. Mixing two of them — the other server's template
-    // into this one's path, or this one's file checked with the other one's
-    // `-t` — is a way to take every site on the machine down that no individual
-    // argument would look wrong for.
-    let server = crate::webserver::active(ctx).await?;
+    // One server, used for all four of file, template, validator and reloader.
+    // Mixing two of them — the other server's template into this one's path, or
+    // this one's file checked with the other one's `-t` — is a way to take every
+    // site on the machine down that no individual argument would look wrong for.
     let vhost = server.site_vhost(&site.domain)?;
     let reloader = server.reloader(ctx.distro())?;
 

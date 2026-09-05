@@ -30,6 +30,18 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../templates/apache/site.conf.j2"),
     ),
     (
+        "apache/catchall.conf",
+        include_str!("../templates/apache/catchall.conf.j2"),
+    ),
+    (
+        "apache/panel.conf",
+        include_str!("../templates/apache/panel.conf.j2"),
+    ),
+    (
+        "apache/unihelm.conf",
+        include_str!("../templates/apache/unihelm.conf.j2"),
+    ),
+    (
         "nginx/catchall.conf",
         include_str!("../templates/nginx/catchall.conf.j2"),
     ),

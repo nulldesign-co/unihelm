@@ -179,6 +179,67 @@ pub async fn remove(
     .await
 }
 
+/// Which web server to move this machine to.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SwitchWebServer {
+    /// `nginx` or `apache`.
+    pub target: String,
+    /// Switch even though some sites are configured for something the target
+    /// cannot do. Without it the switch refuses and lists every one.
+    #[serde(default)]
+    pub accept_gaps: bool,
+}
+
+/// Move every site on this server to another web server.
+#[utoipa::path(
+    post,
+    path = "/api/stack/webserver",
+    tag = "stack",
+    request_body = SwitchWebServer,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a web server this panel serves with", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `stack.manage`", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: the target is not installed, or sites would lose a control", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: the panel cannot write vhosts for that server yet", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn switch_webserver(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<SwitchWebServer>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::StackManage)
+        .map_err(ApiError::from)?;
+
+    // Audited before the work, like every other stack change: this one moves
+    // what serves every site on the machine, so "who asked for this" is the
+    // first question anybody will have afterwards.
+    audit(
+        &state,
+        &current,
+        &headers,
+        Some(&peer),
+        "webserver.switch",
+        &body.target,
+    )
+    .await?;
+    ops::invoke(
+        &state,
+        &current.auth,
+        "webserver.switch",
+        json!({ "target": body.target, "accept_gaps": body.accept_gaps }),
+    )
+    .await
+}
+
 /// Record the intent before the work starts.
 ///
 /// Auditing after the fact loses the record when the agent is unreachable — and

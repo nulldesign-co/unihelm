@@ -63,6 +63,7 @@ fn protected() -> Router<SharedState> {
         .route("/api/runtimes", get(runtimes::list))
         .route("/api/runtimes/install", post(runtimes::install))
         .route("/api/runtimes/default", post(runtimes::set_default))
+        .route("/api/stack/webserver", post(stack::switch_webserver))
         .route("/api/server/docker", get(runtimes::docker))
         .route("/api/sites/discover", get(runtimes::discover))
         .route("/api/engines", get(stack::engines))

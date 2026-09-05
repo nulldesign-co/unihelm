@@ -1,7 +1,8 @@
 //! The panel's own domain and certificate (spec §11.5).
 //!
 //! `unihelm-web` listens on loopback and never faces the internet directly;
-//! nginx terminates TLS in front of it (`templates/nginx/panel.conf.j2`).
+//! the active web server terminates TLS in front of it — `panel.conf` in
+//! whichever of `templates/nginx/` and `templates/apache/` is serving.
 //! Until now that vhost was a manual exercise — point a domain at the server,
 //! write the proxy config yourself, run certbot by hand. This module turns it
 //! into one operation: `panel.tls.issue` records the domain, obtains a Let's
@@ -14,7 +15,6 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_config::apply::ApplyRequest;
-use unihelm_config::managed::ManagedFile;
 use unihelm_config::paths;
 use unihelm_core::config::UnihelmConfig;
 use unihelm_core::{Domain, Email, ErrorCode, Permission, Result, UnihelmError};
@@ -22,7 +22,7 @@ use unihelm_db::CertKind;
 
 use crate::acme::{self, Directory};
 use crate::registry::{Execution, OpContext, TypedOperation};
-use crate::services::{NginxValidator, UnitReloader};
+use crate::services::UnitReloader;
 
 /// `client_max_body_size` for the panel vhost. Chunked uploads in the file
 /// manager need headroom (spec §11.7); the API itself is capped far lower
@@ -115,8 +115,15 @@ pub fn vhost_context(domain: &Domain, upstream: &Upstream) -> serde_json::Value 
         "cert_path": cert_dir.join("fullchain.pem"),
         "key_path": cert_dir.join("privkey.pem"),
         "max_body_size": PANEL_MAX_BODY,
+        // The same limit Apache's way. Both spellings come from one constant so
+        // the panel cannot accept a different upload size depending on which
+        // web server is in front of it.
+        "max_body_bytes": unihelm_config::parse_body_size(PANEL_MAX_BODY),
         "upstream": upstream.address,
         "upstream_scheme": upstream.scheme,
+        // Apache's websocket rule needs the ws scheme spelled out; nginx infers
+        // it from the same `proxy_pass` the rest of the vhost uses.
+        "upstream_ws_scheme": if upstream.scheme == "https" { "wss" } else { "ws" },
     })
 }
 
@@ -251,15 +258,23 @@ impl TypedOperation for Issue {
         // becomes the row of record (that write is below the reload), so a
         // setting still naming the new domain is the mismatch `renew_panel`
         // reads as a completed re-point.
+        // Whichever server is serving. The panel's vhost has to move with a
+        // switch like every other one, and the alternative — nginx named here
+        // literally — is a panel that goes unreachable the moment somebody
+        // moves their machine to Apache.
+        let server = crate::webserver::active(ctx).await?;
+        let panel_vhost = server.panel_vhost()?;
+        let reloader = server.reloader(ctx.distro())?;
+
         let applied = ctx
             .config()
             .apply(ApplyRequest {
-                file: ManagedFile::nginx(paths::nginx_panel()),
-                template: "nginx/panel.conf",
+                file: panel_vhost.file,
+                template: panel_vhost.template,
                 context: vhost_context(&domain, &panel_upstream()),
-                service: "nginx",
-                validator: &NginxValidator,
-                reloader: &UnitReloader::nginx(ctx.distro()),
+                service: panel_vhost.service,
+                validator: server.validator()?,
+                reloader: &reloader,
                 post_check: None,
                 force: false,
                 task_id: ctx.task_id().map(|t| t.to_string()),
@@ -446,6 +461,70 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    fn render_apache_panel(domain: &str, address: &str, scheme: &'static str) -> String {
+        let set = unihelm_config::TemplateSet::load().unwrap();
+        set.render(
+            "apache/panel.conf",
+            &vhost_context(
+                &Domain::parse(domain).unwrap(),
+                &Upstream {
+                    address: address.to_string(),
+                    scheme,
+                },
+            ),
+        )
+        .unwrap()
+    }
+
+    /// The terminal is a websocket and the upgrade must be matched before the
+    /// catch-all proxy, or the handshake is answered by the HTTP proxy and the
+    /// page sits on a spinner. That bug shipped once on the nginx side; the
+    /// Apache rule is a different mechanism with the same ordering trap.
+    #[test]
+    fn the_apache_panel_matches_the_websocket_before_the_proxy() {
+        let out = directives_only(&render_apache_panel("panel.test", "127.0.0.1:8088", "http"));
+        let ws = out.find("ws://127.0.0.1:8088").expect("no websocket rule");
+        let proxy = out.find("ProxyPass        /").expect("no proxy pass");
+        assert!(ws < proxy, "{out}");
+        // And 24 hours, because Apache's ProxyTimeout is the gap between reads,
+        // which on a PTY is the gap between keystrokes.
+        assert!(out.contains("ProxyTimeout 86400"), "{out}");
+    }
+
+    /// The panel serving its own TLS on loopback has a certificate signed for
+    /// nobody. Apache verifies proxy peers by default and would refuse it.
+    #[test]
+    fn a_panel_on_loopback_tls_is_proxied_without_peer_verification() {
+        let https = directives_only(&render_apache_panel(
+            "panel.test",
+            "127.0.0.1:8443",
+            "https",
+        ));
+        assert!(https.contains("SSLProxyEngine On"), "{https}");
+        assert!(https.contains("SSLProxyVerify none"), "{https}");
+        assert!(https.contains("wss://127.0.0.1:8443"), "{https}");
+
+        // And not otherwise: turning peer verification off on a plain-http
+        // upstream is a directive with no reason to be there.
+        let http = directives_only(&render_apache_panel("panel.test", "127.0.0.1:8088", "http"));
+        assert!(!http.contains("SSLProxyVerify"), "{http}");
+    }
+
+    /// Both templates get the same limit from the same constant. A panel that
+    /// accepts a different upload size depending on what is in front of it is a
+    /// file manager that works until somebody switches web servers.
+    #[test]
+    fn the_two_panel_vhosts_agree_on_the_upload_limit() {
+        assert!(
+            directives_only(&render_panel("panel.test", "127.0.0.1:8088"))
+                .contains("client_max_body_size 64m;")
+        );
+        assert!(
+            directives_only(&render_apache_panel("panel.test", "127.0.0.1:8088", "http"))
+                .contains("LimitRequestBody 67108864")
+        );
     }
 
     /// The rendered file with comment lines stripped, so assertions about

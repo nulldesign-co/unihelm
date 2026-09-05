@@ -403,6 +403,13 @@ fn stack(cmd: &StackCommand) -> Result<Action> {
             "stack.remove",
             component_value(component, version.as_deref()),
         ),
+        StackCommand::Webserver {
+            target,
+            accept_gaps,
+        } => call(
+            "webserver.switch",
+            json!({ "target": target, "accept_gaps": accept_gaps }),
+        ),
     })
 }
 

@@ -1,0 +1,12 @@
+# The entire footprint Unihelm has on Apache's own configuration: one include.
+#
+# Everything the panel writes lives under {{ apache_dir }}/ and is generated.
+# This file exists so the panel never has to edit apache2.conf, sites-available,
+# sites-enabled or any file the distribution owns — which is what makes
+# `apt upgrade apache2` and a panel upgrade independent of each other. `a2ensite`
+# is never run for the same reason: a symlink farm is a second place for a vhost
+# to be half removed from.
+#
+# `IncludeOptional`, not `Include`: an empty or missing directory is a fatal
+# error for the latter, and this file is written before the first vhost is.
+IncludeOptional {{ apache_dir }}/*.conf

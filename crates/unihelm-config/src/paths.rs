@@ -147,6 +147,18 @@ pub fn apache_site(domain: &str) -> PathBuf {
     apache_dir().join(format!("site-{domain}.conf"))
 }
 
+/// Apache has no `default_server` keyword: the first vhost defined for an
+/// address is the default for it, decided by parse order alone. `00-` is
+/// therefore not a convention here as it is for nginx — it is the mechanism,
+/// and renaming this file hands every unconfigured hostname to a real site.
+pub fn apache_catchall() -> PathBuf {
+    apache_dir().join("00-catchall.conf")
+}
+
+pub fn apache_panel() -> PathBuf {
+    apache_dir().join("panel.conf")
+}
+
 pub fn nginx_catchall() -> PathBuf {
     // `00-` so it sorts first and really is the default server.
     nginx_dir().join("00-catchall.conf")

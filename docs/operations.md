@@ -265,6 +265,49 @@ no host binary to point at), and only when a second version is installed to move
 the default away from. It had no HTTP route at all until 0.6.0 — the operation
 and its CLI command existed, and the panel could not reach either.
 
+### `webserver.switch`
+
+| | |
+|---|---|
+| Permission | `stack_manage` |
+| Execution | task — not cancellable, idempotent |
+| Input | `target` — `nginx` or `apache`; `accept_gaps` *(optional bool, default false)* |
+
+Moves every site on this machine to another web server.
+
+**One operation for the whole machine, not one per site.** Two web servers both
+wanting port 80 is not a half-migrated server; it is one where the second failed
+to start and nobody noticed until the first was stopped. So the order is: write
+the include, write every site's vhost into the target's own tree while the
+incumbent is still serving out of its, write the default vhost, check the whole
+configuration with the target's own tool, and only then exchange the two units.
+Every failure before that exchange leaves the incumbent serving and nothing
+switched. If the target will not start, the incumbent is started again and the
+error says so.
+
+The setting is written **last**, after the target is up. Recorded before, it
+would have the panel rendering into a tree nothing reads for as long as it took
+somebody to notice.
+
+`accept_gaps` is the reason this operation is not just "render the other
+template". Three per-site controls have no equivalent in Apache's base modules:
+
+| Control | Why not |
+|---|---|
+| request rate limiting | `mod_ratelimit` throttles bandwidth in KiB/s, not requests. Requests need `mod_qos` or `mod_evasive`, neither of which ships enabled. |
+| HTTP/3 | `mod_http3` is experimental and needs a patched build. The site falls back to HTTP/2, which works — but the panel would go on showing HTTP/3 as on. |
+| a custom snippet | It is nginx configuration. Rendering it into an Apache vhost fails `configtest` and rolls the switch back; translating it means guessing what it was for. |
+
+Without `accept_gaps` the switch refuses and names every site and every control
+it would drop. An operator who has a rate limit on a shop, is moved off it
+silently, and still sees the field set has lost something they chose — which is
+the same failure as every serious bug this project has had, the panel saying a
+thing is true when it is not.
+
+Switching to the server that is already serving is a success that does nothing,
+not a conflict. A target that is in the catalogue but has no vhost templates yet
+(OpenLiteSpeed) refuses **before** anything is written.
+
 ### `sys.ping`
 
 | | |

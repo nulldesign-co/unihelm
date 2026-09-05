@@ -25,7 +25,7 @@ pub use apply::{
     ApplyOutcome, ApplyRequest, ConfigEngine, DriftReport, NewRevision, PostCheck, Reloader,
     RevisionStore, StoredRevision, Validator, managed_for,
 };
-pub use context::{PoolContext, SiteContext, SiteType};
+pub use context::{DEFAULT_BODY_SIZE, PoolContext, SiteContext, SiteType, parse_body_size};
 pub use managed::{CommentStyle, DiffKind, DiffLine, FileState, ManagedFile};
 pub use templates::TemplateSet;
 

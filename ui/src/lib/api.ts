@@ -391,6 +391,14 @@ export interface StackResponse {
   catalogue: CatalogueEntry[];
   components: StackComponentView[];
   unverified_pins: string[];
+  /**
+   * The slug of the web server actually serving this machine's sites.
+   *
+   * Not derivable from `components`: two web servers can be installed at once
+   * and "installed" has never meant "serving", so a page that guessed would put
+   * the badge on whichever was installed first.
+   */
+  web_server: string;
 }
 
 // --- sites ------------------------------------------------------------------
@@ -533,6 +541,13 @@ export interface InstalledRuntime {
   path: string;
   /** Whether a bare command name resolves to this one. */
   is_default: boolean;
+}
+
+/** Which web server to move this machine to. */
+export interface SwitchWebServerRequest {
+  target: string;
+  /** Switch even though some sites lose a control they are configured for. */
+  accept_gaps?: boolean;
 }
 
 export interface RuntimeListResponse {
@@ -1007,6 +1022,15 @@ export const endpoints = {
    */
   setRuntimeDefault: (body: SetRuntimeDefaultRequest) =>
     api.post<SetRuntimeDefaultResponse>("/api/runtimes/default", body),
+  /**
+   * Move every site on this server to another web server.
+   *
+   * A task, and one that touches the whole machine: it re-renders every vhost
+   * and exchanges the two units. The refusal it comes back with when
+   * `accept_gaps` is false is the list of what each site would lose.
+   */
+  switchWebServer: (body: SwitchWebServerRequest) =>
+    api.post<TaskAccepted>("/api/stack/webserver", body),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),

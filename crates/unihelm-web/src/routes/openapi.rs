@@ -67,6 +67,7 @@ pub const API_VERSION: &str = "1.0.0";
         super::runtimes::list,
         super::runtimes::install,
         super::runtimes::set_default,
+        super::stack::switch_webserver,
         super::runtimes::docker,
         super::runtimes::discover,
         super::runtimes::docker_create,
