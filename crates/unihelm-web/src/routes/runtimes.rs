@@ -90,7 +90,13 @@ pub async fn install(
         .map_err(ApiError::from)?;
     // A task, not an immediate call: this runs apt, which takes minutes and
     // streams its output into the task log the page shows.
-    ops::invoke(&state, &current.auth, "runtime.install", install_args(&body)).await
+    ops::invoke(
+        &state,
+        &current.auth,
+        "runtime.install",
+        install_args(&body),
+    )
+    .await
 }
 
 /// The request, as the operation spells it.
