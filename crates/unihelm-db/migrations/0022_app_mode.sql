@@ -1,0 +1,14 @@
+-- How an application runs: a systemd unit on this host, or a container.
+--
+-- `host` is the default because every row that already exists **is** a systemd
+-- unit on somebody's running server. SQLite backfills existing rows with the
+-- column default, so this is not a guess about them — it is what they are.
+--
+-- Defaulting to `container` would reclassify all of them in one statement, and
+-- the next `app.restart` would go looking for a container that was never
+-- created, on a machine whose customers' sites were serving a moment earlier.
+--
+-- New applications are containers, but that is a decision about a *request*,
+-- made in `nodeapp::default_mode`. This column decides what a row written
+-- before it existed is, which is a different question.
+ALTER TABLE node_apps ADD COLUMN mode TEXT NOT NULL DEFAULT 'host';

@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { Boxes, Plus, RotateCw, ScrollText, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
@@ -19,14 +20,20 @@ import {
   ApiError,
   DEFAULT_LOG_LINES,
   endpoints,
+  type AppMode,
   type AppRuntime,
   type AppView,
   type CreateAppRequest,
   type NodeEnv,
+  type StackComponentView,
   type UnitState,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
 import { cn, formatBytes } from "@/lib/utils";
+// Imported rather than re-derived. "Is there a container runtime on this
+// machine" has one answer and one set of edge cases — an unmanaged Docker
+// counts — and a second copy of that rule here is a second copy to get wrong.
+import { dockerReady } from "@/routes/stack";
 
 /**
  * Node applications (spec §11.10).
@@ -47,6 +54,78 @@ const TONE: Record<UnitState, "success" | "accent" | "warning" | "danger" | "neu
   not_found: "danger",
   unknown: "neutral",
 };
+
+/**
+ * Where one application's process actually lives.
+ *
+ * Absent means the host, and that read is load-bearing rather than tidy: every
+ * app made before containers existed is a systemd unit on this server, and an
+ * agent older than this field sends no `mode` at all. Reading the gap as
+ * "container" would tell an operator to look in `docker logs` for a journal,
+ * and put "In a container" on a row that is nothing of the kind.
+ */
+export function modeOf(app: AppView): AppMode {
+  return app.mode === "container" ? "container" : "host";
+}
+
+/**
+ * Whether the chosen mode cannot start on this server as it is.
+ *
+ * A container needs a container runtime, and there is no point letting somebody
+ * fill in a form whose only possible ending is a red task saying Docker is not
+ * installed. The Stack page is where that is fixed, so the callout points there.
+ *
+ * `undefined` components mean the catalogue has not answered — a dialog opened
+ * before the query landed, or an agent that is offline. That is not the same
+ * answer as "no Docker", and treating it as one would disable Create on a
+ * machine that has been running containers all along. Unknown lets the click
+ * through and the agent gives the real answer.
+ */
+export function modeUnavailable(
+  mode: AppMode,
+  components: readonly StackComponentView[] | undefined,
+): boolean {
+  return mode === "container" && components !== undefined && !dockerReady(components);
+}
+
+/**
+ * The state, narrowed to one this build knows how to name.
+ *
+ * `state` is a bare string on the wire and a container has more ways to be
+ * not-running than systemd does — `exited`, `created`, `restarting`. An
+ * unrecognised one reached both the tone table and `t()` unguarded, which is a
+ * badge with no colour reading `service.exited` at a customer.
+ *
+ * `unknown` is the one honest answer for a state this build cannot read, and it
+ * is deliberately not `active`: a container that died on its first second must
+ * never come back up this page reading "Running".
+ *
+ * `Object.hasOwn` rather than `in`, because `in` walks the prototype and would
+ * wave `constructor` and `toString` through as states.
+ */
+export function unitState(state: string): UnitState {
+  return Object.hasOwn(TONE, state) ? (state as UnitState) : "unknown";
+}
+
+/**
+ * Whether this page can offer a version to pin, for an app running this way.
+ *
+ * Two separate reasons it cannot, and they are not the same reason:
+ *
+ * - **Go is compiled.** The entry file is the program; there is no interpreter.
+ * - **A container's version is its image tag**, and the only list this page has
+ *   is `runtime.list` — the interpreters installed on *this server*, which is
+ *   the wrong list twice over. Offering it would pin a host Node 22 onto an app
+ *   that runs from an image, and on a Docker-only machine it is empty, so the
+ *   dialog would answer "no version is installed — install one from the
+ *   Runtimes page" to somebody whose app needs nothing installed here at all.
+ *   Installing something on a live host because this panel advised it is the
+ *   shape of the outage this project has already had. Until the agent can
+ *   report the tags an image actually has, the honest control is no control.
+ */
+export function offersVersion(mode: AppMode, runtime: AppRuntime): boolean {
+  return mode === "host" && runtime !== "go";
+}
 
 export function AppsPage() {
   const { t } = useTranslation();
@@ -120,21 +199,30 @@ export function AppsPage() {
 
 function AppRow({ app }: { app: AppView }) {
   const { t, i18n } = useTranslation();
+  const state = unitState(app.state);
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-3 px-5 py-4">
-      <Badge tone={TONE[app.state]} dot={app.state === "activating" || app.state === "deactivating"}>
+      <Badge tone={TONE[state]} dot={state === "activating" || state === "deactivating"}>
         {/* systemd's states are already named on the dashboard; one vocabulary
             for "running" across the panel beats two that nearly agree. */}
-        {t(`service.${app.state}`)}
+        {t(`service.${state}`)}
       </Badge>
 
       <div className="min-w-0 flex-1">
         <span className="block truncate text-sm font-medium text-ink">{app.name}</span>
-        {/* The entry path is the one thing here longer than its column, so it
-            gets a title as well as the truncation. */}
-        <p className="truncate font-mono text-xs text-ink-subtle" title={app.entry}>
-          {app.entry}
+        {/* How it runs sits on the entry line rather than among the badges. It
+            is a standing fact about the app, not news: given a badge of its own
+            it would carry the same weight as the state, which is the one thing
+            on this row worth looking at twice. The path keeps the title as well
+            as the truncation — it is still the longest thing here — and the
+            mode keeps its full width, because a truncated mode says nothing. */}
+        <p className="flex items-baseline gap-1.5 text-xs text-ink-subtle">
+          <span className="min-w-0 truncate font-mono" title={app.entry}>
+            {app.entry}
+          </span>
+          <span aria-hidden>·</span>
+          <span className="shrink-0">{t(`apps.modeName.${modeOf(app)}`)}</span>
         </p>
       </div>
 
@@ -242,7 +330,10 @@ function AppActions({ app }: { app: AppView }) {
         open={confirming}
         onClose={() => setConfirming(false)}
         title={t("apps.deleteTitle", { name: app.name })}
-        description={t("apps.deleteHint")}
+        // "its unit is removed" is not what happens to a container, and the
+        // half of this sentence that matters — the files stay — is the half an
+        // operator most needs to believe before pressing a red button.
+        description={t(`apps.deleteHint.${modeOf(app)}`)}
         footer={
           <>
             <Button variant="ghost" onClick={() => setConfirming(false)}>
@@ -282,9 +373,18 @@ function AppActions({ app }: { app: AppView }) {
  *    `runtime.list` rather than typed, because the operation refuses a version
  *    that is not installed — offering a free-text box would be inviting a
  *    failure the page could have prevented.
- * 3. **Go takes no version.** The entry file is the program; the panel has no
- *    interpreter to point at, so the version control disappears rather than
- *    showing an empty list somebody would read as "none installed".
+ * 3. **Go takes no version, and neither does a container.** For Go the entry
+ *    file is the program and there is no interpreter to point at. For a
+ *    container the version is the image's tag, and the only list this page has
+ *    is what is installed on *this server* — see `offersVersion`. Either way
+ *    the control disappears rather than showing a list that is wrong.
+ * 4. **There is no control for where it runs.** `app.update` changes the
+ *    language and the version of the app it is given; it does not move one
+ *    between a container and the host, and a select offering both would be a
+ *    migration this panel cannot perform — discovered after the restart warning
+ *    above, by a refusal. The dialog states which it is instead, so the
+ *    question is answered where it is asked. If moving ever lands in the agent,
+ *    this is the sentence that becomes a chooser.
  */
 function RuntimeDialog({
   app,
@@ -301,16 +401,18 @@ function RuntimeDialog({
   const [version, setVersion] = useState<string>(app.runtime_version ?? "");
   const [error, setError] = useState<string | null>(null);
 
-  // Only asked for while the dialog is open: it shells out to every interpreter
-  // on the machine, which is cheap but not free, and the Apps list has no use
-  // for it.
+  const mode = modeOf(app);
+  const versioned = offersVersion(mode, runtime);
+
+  // Only asked for while the dialog is open and only when there is a version
+  // control to fill: it shells out to every interpreter on the machine, which
+  // is cheap but not free, and a container app has no use for the answer.
   const runtimes = useQuery({
     queryKey: ["runtimes"],
     queryFn: () => endpoints.runtimes(),
-    enabled: open,
+    enabled: open && versioned,
   });
 
-  const compiled = runtime === "go";
   const available = (runtimes.data?.runtimes ?? []).filter((r) => r.runtime === runtime);
 
   const save = useMutation({
@@ -319,8 +421,10 @@ function RuntimeDialog({
         runtime,
         // An empty selection is "unpin", which the API spells as an explicit
         // null — undefined would mean "leave the pin alone" and the two must
-        // not collapse. A compiled runtime sends neither.
-        ...(compiled ? {} : { runtime_version: version === "" ? null : version }),
+        // not collapse. Where no version was offered we send neither: an
+        // explicit null here would silently unpin a container's image tag
+        // because this dialog had no control for it.
+        ...(versioned ? { runtime_version: version === "" ? null : version } : {}),
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["apps"] });
@@ -352,8 +456,11 @@ function RuntimeDialog({
         </Callout>
       ) : null}
 
+      {/* Mode-keyed, because the reassurance in the second half is not the same
+          fact: a host app falls back on a version that is not installed, and a
+          container app on an image that cannot be pulled. */}
       <Callout tone="info" className="mb-4">
-        {t("apps.changeRuntimeRestart")}
+        {t(`apps.changeRuntimeRestart.${mode}`)}
       </Callout>
 
       <Field label={t("apps.runtime")} htmlFor="change-runtime">
@@ -376,8 +483,14 @@ function RuntimeDialog({
         </Select>
       </Field>
 
-      {compiled ? (
-        <p className="mt-3 text-xs text-ink-muted">{t("apps.compiledNoVersion")}</p>
+      {!versioned ? (
+        // Two different reasons for the same missing control, and an operator
+        // deserves the one that applies: a container's version rides on its
+        // image, a Go program has no interpreter at all. The container sentence
+        // is checked first because it is true whatever the language.
+        <p className="mt-3 text-xs text-ink-muted">
+          {mode === "container" ? t("apps.imageVersion") : t("apps.compiledNoVersion")}
+        </p>
       ) : (
         <>
           <div className="mt-3">
@@ -404,6 +517,10 @@ function RuntimeDialog({
           </p>
         </>
       )}
+
+      {/* Last, under the choice it qualifies: whatever is picked above, this app
+          keeps running where it already runs. */}
+      <p className="mt-3 text-xs text-ink-muted">{t(`apps.modeStays.${modeOf(app)}`)}</p>
     </Dialog>
   );
 }
@@ -418,6 +535,10 @@ function LogsDialog({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  // Naming the wrong source is the specific mistake this whole change exists to
+  // stop: an operator told these are journal lines goes to `journalctl -u` for
+  // a container that has no unit, finds nothing, and concludes the app is fine.
+  const mode = modeOf(app);
 
   const logs = useQuery({
     queryKey: ["app-logs", app.id],
@@ -431,7 +552,7 @@ function LogsDialog({
       onClose={onClose}
       wide
       title={t("apps.logsTitle", { name: app.name })}
-      description={t("apps.logsHint", { count: DEFAULT_LOG_LINES })}
+      description={t(`apps.logsHint.${mode}`, { count: DEFAULT_LOG_LINES })}
       footer={
         <>
           <Button variant="ghost" loading={logs.isFetching} onClick={() => void logs.refetch()}>
@@ -473,15 +594,15 @@ function LogsDialog({
         >
           {(logs.data?.lines.length ?? 0) === 0 ? (
             // No second dashed border inside the log panel's own box, and back
-            // to the UI face — the mono is for journal lines, not for prose.
+            // to the UI face — the mono is for machine lines, not for prose.
             <EmptyState
               className="border-0 px-2 py-8 font-sans"
               icon={<ScrollText aria-hidden />}
-              title={t("apps.logsEmpty")}
+              title={t(`apps.logsEmpty.${mode}`)}
             />
           ) : (
             logs.data!.lines.map((line, index) => (
-              // Journal output is machine text; `break-all` keeps a long stack
+              // Log output is machine text; `break-all` keeps a long stack
               // trace inside the box.
               <div key={`${index}-${line}`} className="whitespace-pre-wrap break-all text-ink-muted">
                 {line}
@@ -511,6 +632,7 @@ interface CreateForm {
   name: string;
   entry: string;
   runtime: AppRuntime;
+  mode: AppMode;
   node_env: NodeEnv;
   memory_mb: string;
   proxy_domain: string;
@@ -542,12 +664,17 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
     handleSubmit,
     control,
     reset,
+    watch,
     formState: { errors, isSubmitting },
   } = useForm<CreateForm>({
     defaultValues: {
       name: "",
       entry: "",
       runtime: "node",
+      // A container is the default for a new app, which is the point of the
+      // move: what it runs on comes from an image rather than from whatever
+      // this server happens to have installed this week.
+      mode: "container",
       node_env: "production",
       memory_mb: "",
       proxy_domain: "",
@@ -556,14 +683,36 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
   });
 
   const env = useFieldArray({ control, name: "env" });
+  const mode = watch("mode");
+
+  // Only while the dialog is open, and shared with the Stack page's own cache —
+  // the question is small and the answer is the same one that page renders.
+  const stack = useQuery({
+    queryKey: ["stack"],
+    queryFn: endpoints.stack,
+    enabled: open,
+    staleTime: 60_000,
+  });
+
+  const unavailable = modeUnavailable(mode, stack.data?.components);
 
   const submit = handleSubmit(async (values) => {
     setError(null);
+    // The footer button is disabled for this, but Enter in any field submits
+    // the form and never touches it. The callout explaining it is already on
+    // screen, so there is nothing to say here that is not already said.
+    if (modeUnavailable(values.mode, stack.data?.components)) return;
     const body: CreateAppRequest = {
       name: values.name.trim(),
       entry: values.entry.trim(),
       node_env: values.node_env,
       runtime: values.runtime,
+      // Sent whichever way it is set, including the one that matches the
+      // agent's own default. The form showed a choice and somebody may have
+      // left it where it was on purpose; letting the request fall back to a
+      // default is how "In a container" on screen becomes a unit on the host
+      // the first time the two defaults drift apart.
+      mode: values.mode,
     };
 
     // A blank row is somebody who clicked "add" and changed their mind, not an
@@ -597,7 +746,15 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
           <Button variant="ghost" onClick={onClose}>
             {t("common.cancel")}
           </Button>
-          <Button variant="primary" loading={isSubmitting} onClick={() => void submit()}>
+          <Button
+            variant="primary"
+            loading={isSubmitting}
+            // A container on a server with no Docker is a click whose only
+            // ending is a red task. The callout at the mode field says so and
+            // says what to do about it; this stops the round trip.
+            disabled={unavailable}
+            onClick={() => void submit()}
+          >
             {t("apps.create")}
           </Button>
         </>
@@ -657,6 +814,42 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
           </Select>
         </Field>
         <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("apps.runtimeHint")}</p>
+
+        {/* Directly under the language, because the two answer one question
+            between them: what it runs on, and where that comes from. */}
+        <Field label={t("apps.mode")} htmlFor="app-mode">
+          <Select id="app-mode" aria-describedby="app-mode-hint" {...register("mode")}>
+            <option value="container">{t("apps.modeName.container")}</option>
+            <option value="host">{t("apps.modeName.host")}</option>
+          </Select>
+        </Field>
+        {/* One sentence, and it changes with the choice: a hint describing both
+            modes at once is one nobody reads far enough into to learn which of
+            them they are about to get. */}
+        <p id="app-mode-hint" className="-mt-1 mb-3 text-xs text-ink-muted">
+          {t(`apps.modeHint.${mode}`)}
+        </p>
+
+        {/* Before the rest of the form rather than beside the disabled button:
+            this is the answer to "why can I not create this", and it belongs at
+            the control that caused it. */}
+        {unavailable ? (
+          <Callout
+            tone="warning"
+            className="mb-3"
+            title={t("apps.dockerNeededTitle")}
+            action={
+              <Link
+                to="/stack"
+                className="font-medium text-accent transition-colors hover:underline"
+              >
+                {t("apps.dockerNeededLink")}
+              </Link>
+            }
+          >
+            {t("apps.dockerNeeded")}
+          </Callout>
+        ) : null}
 
         <Field label={t("apps.nodeEnv")} htmlFor="app-node-env">
           <Select id="app-node-env" {...register("node_env")}>

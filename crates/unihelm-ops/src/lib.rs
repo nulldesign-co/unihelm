@@ -26,6 +26,7 @@
 pub mod acme;
 pub mod adminer;
 pub mod alerts;
+pub mod appcontainer;
 pub mod backup;
 pub mod branding;
 pub mod catalogue;

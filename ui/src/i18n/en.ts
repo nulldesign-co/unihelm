@@ -545,12 +545,37 @@ export const en = {
     },
   },
   apps: {
+    dockerNeededLink: "Open the Stack page",
+    dockerNeededTitle: "Docker is not installed",
+    dockerNeeded:
+      "A container application needs Docker on this server. Install it from the Stack page, or create this one as a service instead.",
+    modeStays: {
+      container:
+        "This application runs in a container and stays in one. Moving it to a service in place would mean stopping it, rebuilding, and starting again with nothing to fall back to — create a second application, point the domain at it once it answers, then delete this one.",
+      host:
+        "This application runs as a service on the server and stays one. Moving it into a container in place would mean stopping it, pulling an image, and starting again with nothing to fall back to — create a second application, point the domain at it once it answers, then delete this one.",
+    },
+    mode: "Runs as",
+    imageVersion: "Built from",
+    modeName: {
+      host: "Service on this server",
+      container: "Container",
+    },
+    modeHint: {
+      container:
+        "Runs on the official image for its version, so installing another version of the same runtime cannot disturb it. The application's own directory is mounted in, and stays on this server.",
+      host: "Runs directly on this server, using the runtime installed on it.",
+    },
     changeRuntime: "Change runtime",
     changeRuntimeHint:
       "Move {{name}} to a different language or version. It keeps its port, its address and everything in its directory.",
     changeRuntimeConfirm: "Apply and restart",
-    changeRuntimeRestart:
-      "The app restarts to pick this up, so it refuses connections for a few seconds. If the version you choose is not installed, nothing changes and the app keeps running on what it has.",
+      changeRuntimeRestart: {
+        host:
+          "The app restarts to pick this up, so it refuses connections for a few seconds. If the version you choose is not installed, nothing changes and the app keeps running on what it has.",
+        container:
+          "The new image is pulled first and the container is replaced only once it is here, so a slow download costs no downtime. The swap itself is a few seconds of connection refused. If the pull fails, nothing changes.",
+      },
     version: "Version",
     versionDefault: "Whatever the server resolves by default",
     versionIsDefault: "the default",
@@ -599,13 +624,22 @@ export const en = {
     restartQueued: "Restart queued — watch it in Tasks.",
     logs: "Logs",
     logsTitle: "{{name}} logs",
-    logsHint: "The last {{count}} lines of this app's journal.",
-    logsEmpty: "The journal has nothing for this unit yet.",
+    logsHint: {
+      host: "The last {{count}} lines of this app's journal.",
+      container: "The last {{count}} lines this container wrote. Both output streams, merged into the order they were written.",
+    },
+    logsEmpty: {
+      host: "The journal has nothing for this unit yet.",
+      container: "This container has written nothing yet.",
+    },
     refresh: "Refresh",
     delete: "Delete",
     deleteTitle: "Delete {{name}}?",
-    deleteHint:
-      "The app is stopped, its unit is removed and its port is freed. Your files are kept.",
+    deleteHint: {
+      host: "The app is stopped, its unit is removed and its port is freed. Your files are kept.",
+      container:
+        "The app is stopped, its container is removed and its port is freed. Your files are kept — they live on this server, not in the container.",
+    },
     deleteKeepsSite: "Its published domain keeps its site — delete that separately if you no longer want it.",
     deleteConfirm: "Delete app",
     envName: {

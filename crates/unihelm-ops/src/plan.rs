@@ -1360,6 +1360,7 @@ mod tests {
             name: AppName::parse("blog").unwrap(),
             entry: unihelm_core::TenantPath::parse("apps/blog/server.js").unwrap(),
             runtime: Default::default(),
+            mode: Default::default(),
             node_env: NodeEnv::Production,
             runtime_version: None,
         })

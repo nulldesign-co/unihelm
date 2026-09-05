@@ -472,6 +472,12 @@ export type NodeEnv = "production" | "development" | "test";
  * an app that crash-looped overnight is exactly where the two differ.
  */
 export interface AppView {
+  /**
+   * Optional because a row from an agent older than this field has none, and
+   * absent means host — reading the gap as `container` would send the panel
+   * looking for a container that was never created.
+   */
+  mode?: AppMode;
   /** Absent on rows written before other runtimes existed; those are Node. */
   runtime?: AppRuntime;
   /** Null when the app runs on whatever a bare command name resolves to. */
@@ -507,6 +513,15 @@ export interface AppEnvVar {
  * than a long-running process with a port, and is served by the site machinery
  * instead.
  */
+/**
+ * How an application runs.
+ *
+ * `host` is a systemd unit — what every application created before 0.4.0 is, and
+ * what they stay. `container` is an image of the runtime version, which is what
+ * a new one gets.
+ */
+export type AppMode = "host" | "container";
+
 export type AppRuntime = "node" | "python" | "ruby" | "bun" | "deno" | "go";
 
 /** One installed version of one runtime, as `runtime.list` reports it. */
@@ -525,12 +540,15 @@ export interface RuntimeListResponse {
 }
 
 export interface UpdateAppRuntimeRequest {
+  mode?: AppMode;
   runtime?: AppRuntime;
   /** Absent leaves the pin alone; null unpins. */
   runtime_version?: string | null;
 }
 
 export interface CreateAppRequest {
+  /** Omitted lets the server decide: a container, or host for Go. */
+  mode?: AppMode;
   /** Which language it is written in. Omitted means Node, as it always was. */
   runtime?: AppRuntime;
   name: string;

@@ -80,6 +80,58 @@ pub enum AppRuntime {
     Go,
 }
 
+/// How an application is run: a systemd unit on the host, or a container built
+/// from its runtime version's image.
+///
+/// The column this maps to defaults to `host`, and that default is the whole
+/// safety property of the change that introduced it: every application on every
+/// server running this panel today is a systemd unit whose row was written
+/// before the column existed. A default of `container` would reclassify all of
+/// them in one statement, and the next restart would go looking for a container
+/// that has never been created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppMode {
+    /// A `unihelm-app-<user>-<name>.service` unit. What every application
+    /// created before containers existed is.
+    #[default]
+    Host,
+    /// A `unihelm-app-<user>-<name>` container on the runtime version's image.
+    Container,
+}
+
+impl AppMode {
+    pub const ALL: &'static [AppMode] = &[AppMode::Host, AppMode::Container];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AppMode::Host => "host",
+            AppMode::Container => "container",
+        }
+    }
+
+    /// What to show a person, inside a sentence.
+    pub const fn label(self) -> &'static str {
+        match self {
+            AppMode::Host => "service on this host",
+            AppMode::Container => "container",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "host" => AppMode::Host,
+            "container" => AppMode::Container,
+            other => {
+                return Err(DbError::Corrupt {
+                    field: "node_apps.mode",
+                    detail: format!("unknown application mode `{other}`"),
+                });
+            }
+        })
+    }
+}
+
 impl AppRuntime {
     pub const ALL: &'static [AppRuntime] = &[
         AppRuntime::Node,
@@ -185,6 +237,8 @@ pub struct NodeApp {
     pub entry: String,
     pub port: i64,
     pub runtime: AppRuntime,
+    /// Whether this application is a systemd unit or a container.
+    pub mode: AppMode,
     pub node_env: NodeEnv,
     /// The runtime version this app is pinned to, e.g. `22.11.0`.
     ///
@@ -209,6 +263,7 @@ pub struct NodeAppRow {
     pub port: i64,
     pub node_env: String,
     pub runtime: String,
+    pub mode: String,
     pub runtime_version: Option<String>,
     pub enabled: i64,
     pub created_at: String,
@@ -227,6 +282,7 @@ impl TryFrom<NodeAppRow> for NodeApp {
             entry: r.entry,
             port: r.port,
             runtime: AppRuntime::parse(&r.runtime)?,
+            mode: AppMode::parse(&r.mode)?,
             node_env: NodeEnv::parse(&r.node_env)?,
             runtime_version: r.runtime_version,
             enabled: r.enabled != 0,
@@ -244,6 +300,8 @@ pub struct NewNodeApp {
     pub name: AppName,
     pub entry: TenantPath,
     pub runtime: AppRuntime,
+    /// Whether to run it as a systemd unit or as a container.
+    pub mode: AppMode,
     pub node_env: NodeEnv,
     /// Pin to a specific installed version, or `None` for the default one.
     pub runtime_version: Option<String>,
@@ -309,8 +367,8 @@ impl Db {
                 // exhausted.
                 "INSERT INTO node_apps
                      (subscription_id, site_id, name, entry, port, node_env,
-                      runtime, runtime_version, enabled, created_at, updated_at)
-                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, ?9, ?8, 1, ?5, ?5 FROM (
+                      runtime, mode, runtime_version, enabled, created_at, updated_at)
+                 SELECT ?1, NULL, ?2, ?3, MIN(candidate), ?4, ?9, ?10, ?8, 1, ?5, ?5 FROM (
                      SELECT ?6 AS candidate
                      UNION ALL
                      SELECT port + 1 FROM node_apps WHERE port >= ?6
@@ -332,6 +390,7 @@ impl Db {
             .bind(max_port)
             .bind(new.runtime_version.as_deref())
             .bind(new.runtime.as_str())
+            .bind(new.mode.as_str())
             .fetch_one(self.pool())
             .await;
 
@@ -593,6 +652,7 @@ mod tests {
             name: AppName::parse(name).unwrap(),
             entry: TenantPath::parse(&format!("apps/{name}/server.js")).unwrap(),
             runtime: AppRuntime::Node,
+            mode: AppMode::Host,
             node_env: NodeEnv::Production,
             runtime_version: None,
         }

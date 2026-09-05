@@ -8,6 +8,25 @@
 //! half-created app: a port marked taken with nothing listening, or a unit
 //! nobody has a row for.
 //!
+//! # Two ways to run
+//!
+//! An application is either a **systemd unit** on the host or a **container**
+//! built from its runtime version's image, and `node_apps.mode` says which.
+//! What surrounds that choice is shared and stays shared: the row still owns
+//! the port, the code still lives in the tenant's own directory, and the proxy
+//! vhost still names `127.0.0.1:<port>` — the container publishes that same
+//! port on loopback, so a site's nginx configuration is byte-identical either
+//! way and nothing under `templates/nginx` had to be told this happened.
+//!
+//! An application created today is a container ([`default_mode`]). One created
+//! before the column existed is **not**: the migration defaults those rows to
+//! `host`, because they *are* units on somebody's running server, and a default
+//! of `container` would reclassify every one of them into a container that has
+//! never been created. Nothing below may change what a `host` row does.
+//!
+//! The container half is [`crate::appcontainer`]. This module owns the routing,
+//! the naming, and everything the two modes have in common.
+//!
 //! # Why the unit file is generated, not templated by hand
 //!
 //! Everything that reaches the unit comes from validated types — [`AppName`],
@@ -53,7 +72,7 @@ use unihelm_core::{
     AppName, Domain, ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantPath,
     TenantScope, UnihelmError,
 };
-use unihelm_db::node_apps::{AppRuntime, NewNodeApp, NodeApp, NodeEnv};
+use unihelm_db::node_apps::{AppMode, AppRuntime, NewNodeApp, NodeApp, NodeEnv};
 use unihelm_db::subscriptions::Subscription;
 use unihelm_distro::svc::{SvcAction, UnitName, UnitState};
 use unihelm_distro::{Cmd, Distro};
@@ -119,6 +138,61 @@ pub fn app_unit_path(user: &LinuxUser, name: &AppName) -> PathBuf {
     paths::systemd_unit(&unit_file_name(user, name))
 }
 
+/// The container an application runs in: `unihelm-app-<user>-<name>`.
+///
+/// The unit's name without `.service`, and that is the point. An operator
+/// reading `docker ps` and one reading `systemctl` are looking at the same panel
+/// and the same application, and a second naming scheme would mean the two views
+/// stopped agreeing — which nobody discovers from a page, only at 3am.
+///
+/// It lives here rather than in [`crate::appcontainer`] because naming an
+/// application is this module's job in both modes; that module parses it into a
+/// [`ContainerRef`](crate::docker::ContainerRef) before it reaches an argv.
+pub fn app_container_name(user: &LinuxUser, name: &AppName) -> String {
+    format!("unihelm-app-{}-{}", user.as_str(), name.as_str())
+}
+
+/// What to call the thing that is actually running this application.
+///
+/// Every operation reports one of these, in the field named `unit`. The field
+/// keeps that name because the UI renders it and the shape of a reply is not
+/// something to change under a running panel; what it *holds* is "the name you
+/// would type to find this", which is a unit in one mode and a container in the
+/// other.
+fn app_handle(mode: AppMode, user: &LinuxUser, name: &AppName) -> String {
+    match mode {
+        AppMode::Host => unit_file_name(user, name),
+        AppMode::Container => app_container_name(user, name),
+    }
+}
+
+/// What an application of this runtime is, when the caller did not say.
+///
+/// A container, because that is the shape the panel is moving to: a runtime
+/// version becomes an image, so installing one cannot disturb the one already
+/// serving, and removing one is removing an image rather than a package
+/// transaction that can take a production site with it.
+///
+/// Except where there is no image to be a container *of*. A Go application is a
+/// compiled binary with no interpreter to isolate, and
+/// [`crate::appcontainer::is_containerisable`] is what says so — defaulting it
+/// to a container would refuse, by default, every application of a runtime this
+/// panel has supported since it supported six of them. Asking for one explicitly
+/// is still refused, in that module's own sentence, which explains rather than
+/// merely declines.
+///
+/// The **database column** defaults the other way, to `host`, and the two are
+/// not in disagreement — they answer different questions. The column's default
+/// describes rows written *before* the column existed, which are units on
+/// somebody's running server. This describes rows written after.
+fn default_mode(runtime: AppRuntime) -> AppMode {
+    if crate::appcontainer::is_containerisable(runtime) {
+        AppMode::Container
+    } else {
+        AppMode::Host
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input validation: the systemd half
 // ---------------------------------------------------------------------------
@@ -150,6 +224,57 @@ pub struct EnvVar {
 ///    that needs them is a configuration mistake, not a use case — refusing
 ///    says so, where a silently mangled value would not.
 fn environment_lines(env: &[EnvVar]) -> Result<Vec<String>> {
+    check_env_shared(env)?;
+
+    let mut lines = Vec::with_capacity(env.len());
+    for var in env {
+        let key = var.key.trim();
+        // The systemd-only half. A `"` would end the quoting `environment_line`
+        // is about to add; a tab or any other control character would be
+        // ambiguous inside it. Escaping them is possible, but the escape rules
+        // differ between the quoted and unquoted forms and a value that needs
+        // them is a configuration mistake, not a use case — refusing says so,
+        // where a silently mangled value would not.
+        if let Some(bad) = var
+            .value
+            .chars()
+            .find(|c| c.is_control() || *c == '"' || *c == '\\')
+        {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "the value of `{key}` contains {}, which cannot appear in a systemd \
+                     Environment= line",
+                    describe_char(bad)
+                ),
+            )
+            .with_field("env"));
+        }
+
+        lines.push(environment_line(key, &var.value));
+    }
+    Ok(lines)
+}
+
+/// Every environment rule the two modes agree on.
+///
+/// Names, duplicates, the keys the panel owns, how many variables and how long a
+/// value — and the two characters neither a unit file nor an argv can carry: a
+/// newline ends a directive on one side and turns one variable into what looks
+/// like two in every `docker inspect` on the other, and a NUL cannot cross into
+/// a child process at all.
+///
+/// What is deliberately **not** here is everything systemd alone objects to — a
+/// quote, a backslash, a tab. Those are answers to a question `docker run --env`
+/// never asks, and refusing a container's value for them would refuse a working
+/// configuration for a reason that does not apply to it. [`environment_lines`]
+/// adds them for the mode that needs them.
+///
+/// Split out so that it can run **before a port is allocated in either mode**.
+/// The container half checks this again from inside
+/// [`crate::appcontainer`] — that module is reachable from elsewhere and does
+/// not get to assume it was called through here.
+fn check_env_shared(env: &[EnvVar]) -> Result<()> {
     if env.len() > MAX_ENV_VARS {
         return Err(UnihelmError::new(
             ErrorCode::InvalidInput,
@@ -159,7 +284,6 @@ fn environment_lines(env: &[EnvVar]) -> Result<Vec<String>> {
     }
 
     let mut seen: Vec<&str> = Vec::with_capacity(env.len());
-    let mut lines = Vec::with_capacity(env.len());
 
     for var in env {
         let key = var.key.trim();
@@ -195,7 +319,7 @@ fn environment_lines(env: &[EnvVar]) -> Result<Vec<String>> {
         if seen.contains(&key) {
             return Err(UnihelmError::new(
                 ErrorCode::InvalidInput,
-                format!("`{key}` is declared twice; systemd would silently keep the last one"),
+                format!("`{key}` is declared twice; only the last one would survive"),
             )
             .with_field("env"));
         }
@@ -208,25 +332,19 @@ fn environment_lines(env: &[EnvVar]) -> Result<Vec<String>> {
             )
             .with_field("env"));
         }
-        if let Some(bad) = var
-            .value
-            .chars()
-            .find(|c| c.is_control() || *c == '"' || *c == '\\')
-        {
+        if let Some(bad) = var.value.chars().find(|c| matches!(c, '\n' | '\r' | '\0')) {
             return Err(UnihelmError::new(
                 ErrorCode::InvalidInput,
                 format!(
-                    "the value of `{key}` contains {}, which cannot appear in a systemd \
-                     Environment= line",
+                    "the value of `{key}` contains {}, which cannot be carried into a \
+                     process by either a unit file or a container",
                     describe_char(bad)
                 ),
             )
             .with_field("env"));
         }
-
-        lines.push(environment_line(key, &var.value));
     }
-    Ok(lines)
+    Ok(())
 }
 
 /// One validated pair, formatted the way systemd parses it.
@@ -457,6 +575,62 @@ async fn resolve_pinned(runtime: AppRuntime, version: &str) -> Result<PathBuf> {
         ),
     )
     .with_field("runtime_version"))
+}
+
+/// What one mode needs resolved before a port has been allocated.
+///
+/// Both arms make the same promise: whatever is going to start this application
+/// is decided *before* the row exists. An allocated port with nothing behind it
+/// is the one piece of state a failed create cannot undo for free, so neither
+/// mode gets to discover an impossible application after the insert.
+#[derive(Debug)]
+enum Launch {
+    /// The interpreter the unit's `ExecStart` names, or `None` for a compiled
+    /// program whose entry *is* the program.
+    Unit(Option<PathBuf>),
+    /// The image the container will be built from, e.g. `node:22`.
+    Container(String),
+}
+
+impl Launch {
+    /// The interpreter path, for the reply. A container's interpreter is inside
+    /// its image and is not a path on this machine, so there is nothing here to
+    /// report that would be true.
+    fn interpreter(&self) -> Option<String> {
+        match self {
+            Launch::Unit(path) => path.as_ref().map(|p| p.display().to_string()),
+            Launch::Container(_) => None,
+        }
+    }
+}
+
+/// Resolve the half of a create that depends on which mode it is.
+///
+/// The host arm goes looking for an interpreter on this machine. The container
+/// arm must **not**, and that is the whole point of the split: a server with no
+/// Node installed can run Node applications in containers, and asking it for a
+/// `node` binary first would refuse every one of them for a reason that stopped
+/// being true.
+///
+/// What the container arm does instead is resolve the *image*, which
+/// [`crate::appcontainer::plan_image`] does purely — no passwd lookup, no
+/// filesystem, no Docker. That is what lets a runtime with no image (Go) and a
+/// version that is not a tag (`22:latest`) be refused here, in front of the
+/// insert, rather than at `docker run` with a port already spent.
+async fn plan_launch(
+    mode: AppMode,
+    runtime: AppRuntime,
+    version: Option<&str>,
+    fallback_program: &str,
+) -> Result<Launch> {
+    match mode {
+        AppMode::Host => Ok(Launch::Unit(
+            resolve_interpreter(runtime, version, fallback_program).await?,
+        )),
+        AppMode::Container => Ok(Launch::Container(crate::appcontainer::plan_image(
+            runtime, version,
+        )?)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,23 +937,56 @@ impl TypedOperation for List {
                 .by_id(app.subscription_id)
                 .await
                 .map_err(UnihelmError::from)?;
-            let (unit, status) = match subscription {
+            let (unit, state, memory_bytes) = match subscription {
                 Some(sub) => {
                     let user = LinuxUser::parse(&sub.linux_user)?;
                     let name = AppName::parse(&app.name)?;
-                    let unit = app_unit_name(&user, &name);
-                    let status = ctx.distro().svc.status(&unit).await.ok();
-                    (unit.as_str().to_string(), status)
+                    match app.mode {
+                        AppMode::Host => {
+                            let unit = app_unit_name(&user, &name);
+                            let status = ctx.distro().svc.status(&unit).await.ok();
+                            (
+                                unit.as_str().to_string(),
+                                status
+                                    .as_ref()
+                                    .map(|s| s.state)
+                                    .unwrap_or(UnitState::Unknown),
+                                status.and_then(|s| s.memory_bytes),
+                            )
+                        }
+                        // Reported in systemd's vocabulary on purpose. The UI
+                        // has one status renderer and one set of words for
+                        // `active` / `failed` / `not_found`, and "running" and
+                        // "active" say the same thing to the person reading
+                        // them; a second vocabulary would be a second renderer
+                        // and a second set of strings to translate. The
+                        // translation is `appcontainer`'s, because it is the
+                        // half that knows the difference between a container
+                        // that stopped and one that is in a restart loop.
+                        AppMode::Container => {
+                            // An error here is Docker being absent or unhappy,
+                            // which is a fact about this machine rather than
+                            // about this row — the same `unknown` a unit gets
+                            // when `systemctl` cannot be reached, and not a
+                            // reason to fail the whole page.
+                            let status = crate::appcontainer::status(ctx, &user, &name).await.ok();
+                            (
+                                app_container_name(&user, &name),
+                                status
+                                    .as_ref()
+                                    .map(|s| s.state)
+                                    .unwrap_or(UnitState::Unknown),
+                                status.and_then(|s| s.memory_bytes),
+                            )
+                        }
+                    }
                 }
-                None => (String::new(), None),
+                None => (String::new(), UnitState::Unknown, None),
             };
 
             views.push(AppView {
-                state: status
-                    .as_ref()
-                    .map(|s| s.state)
-                    .unwrap_or(UnitState::Unknown),
-                memory_bytes: status.and_then(|s| s.memory_bytes),
+                state,
+                memory_bytes,
                 unit,
                 app,
             });
@@ -844,6 +1051,14 @@ pub struct CreateInput {
     /// which versions this machine has.
     #[serde(default)]
     pub runtime_version: Option<String>,
+    /// Run this as a container, or as a systemd unit on the host.
+    ///
+    /// Omit it and it is a container ([`default_mode`]) — a systemd unit only
+    /// for a runtime that has no image. Applications that
+    /// already exist are untouched by this field: their mode is the one on
+    /// their row, and `app.update` will not move them.
+    #[serde(default)]
+    pub mode: Option<AppMode>,
     /// Publish the app behind this domain as a reverse-proxy site.
     #[serde(default)]
     pub proxy_domain: Option<Domain>,
@@ -854,9 +1069,19 @@ pub struct CreateOutput {
     pub app_id: i64,
     pub name: String,
     pub port: i64,
+    /// The unit for a host application, the container for a container one —
+    /// the name an operator would type to find it either way.
     pub unit: String,
     pub working_dir: String,
     pub linux_user: String,
+    /// `host` or `container`, so the panel can tell somebody which of the two
+    /// they just got rather than making them guess from the name.
+    pub mode: String,
+    /// The image a container application was built from. Absent for a host
+    /// application, which has no image — and absent rather than null so a host
+    /// create's reply is byte-for-byte what it was before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_id: Option<i64>,
     pub next_steps: Vec<String>,
@@ -883,17 +1108,30 @@ impl TypedOperation for Create {
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
         ensure_plan_allows_node_apps(ctx, &subscription).await?;
 
+        let mode = input.mode.unwrap_or_else(|| default_mode(input.runtime));
+
         // Resolved here rather than stored: a path goes stale when a version
         // manager moves its directories, and a version does not. A compiled
         // runtime resolves to nothing, because the entry is the program.
-        let interpreter = resolve_interpreter(
+        let launch = plan_launch(
+            mode,
             input.runtime,
             input.runtime_version.as_deref(),
             &self.node_program,
         )
         .await?;
         check_entry(&input.entry)?;
-        let env = environment_lines(&input.env)?;
+
+        // Everything both modes agree about the environment, refused here —
+        // before the row, before the tenant account, before anything on the
+        // machine has moved. What is left over is each mode's own: systemd's
+        // quoting and specifier rules are answers to a question `docker run
+        // --env` never asks, so a container's values are not put through them.
+        check_env_shared(&input.env)?;
+        let env_lines = match mode {
+            AppMode::Host => environment_lines(&input.env)?,
+            AppMode::Container => Vec::new(),
+        };
 
         // Publishing needs the *site* permission too. The registry checked
         // NodeApps for this operation; calling into the site machinery below
@@ -907,6 +1145,7 @@ impl TypedOperation for Create {
             .db()
             .create_node_app(NewNodeApp {
                 runtime: input.runtime,
+                mode,
                 subscription_id: subscription.id,
                 name: input.name.clone(),
                 entry: input.entry.clone(),
@@ -921,21 +1160,23 @@ impl TypedOperation for Create {
             input.name.as_str()
         ));
 
-        match provision_app(ctx, &app, &input, &user, interpreter.as_deref(), env).await {
-            Ok(site_id) => {
-                let unit = app_unit_name(&user, &input.name);
-                ctx.log(format!("{unit} is running"));
+        match provision_app(ctx, &app, &input, &user, &launch, env_lines).await {
+            Ok(provisioned) => {
+                let handle = app_handle(mode, &user, &input.name);
+                ctx.log(format!("{handle} is running"));
                 Ok(CreateOutput {
                     app_id: app.id,
                     name: app.name.clone(),
                     port: app.port,
-                    unit: unit.as_str().to_string(),
+                    unit: handle,
                     working_dir: paths::app_dir(user.as_str(), input.name.as_str())
                         .to_string_lossy()
                         .into_owned(),
                     linux_user: subscription.linux_user,
-                    site_id,
-                    next_steps: next_steps(&input, app.port),
+                    mode: mode.as_str().to_string(),
+                    image: provisioned.image,
+                    site_id: provisioned.site_id,
+                    next_steps: next_steps(&input, mode, app.port, provisioned.listening),
                 })
             }
             Err(e) => {
@@ -943,17 +1184,42 @@ impl TypedOperation for Create {
                 // best-effort: the error being reported is the one the user
                 // needs, and a failure to clean up must not replace it.
                 ctx.log(format!("could not start the app: {e}"));
-                rollback_app(ctx, &app, &user, &input.name).await;
+                rollback_app(ctx, &app, &user, &input.name, mode).await;
                 Err(e)
             }
         }
     }
 }
 
-fn next_steps(input: &CreateInput, port: i64) -> Vec<String> {
+fn next_steps(
+    input: &CreateInput,
+    mode: AppMode,
+    port: i64,
+    listening: Option<bool>,
+) -> Vec<String> {
     let mut steps = vec![format!(
         "Your app must listen on port {port} — read it from process.env.PORT"
     )];
+    // Said out loud because it is the one thing about a container that is not
+    // obvious and that costs a support ticket when it is not: the code is not
+    // baked into the image, it is the same directory as before, so deploying is
+    // still "put the files there and restart".
+    if mode == AppMode::Container {
+        steps.push(
+            "Your code stays in this directory on the server — the container runs it from \
+             there, so deploying is unchanged"
+                .into(),
+        );
+    }
+    // Said now rather than left for the operator to discover through a 502.
+    // A worker with no HTTP server never binds and is perfectly healthy, so
+    // this is a fact to report and not a failure to raise.
+    if listening == Some(false) {
+        steps.push(format!(
+            "Nothing is listening on port {port} yet — anything in front of it will answer \
+             502 until your app binds it"
+        ));
+    }
     match &input.proxy_domain {
         Some(domain) => {
             steps.push(format!("Point {domain} at this server's IP address"));
@@ -978,44 +1244,93 @@ async fn provision_app(
     app: &NodeApp,
     input: &CreateInput,
     user: &LinuxUser,
-    interpreter: Option<&Path>,
-    env: Vec<String>,
-) -> Result<Option<i64>> {
-    // 1. The account and the app directory.
+    launch: &Launch,
+    env_lines: Vec<String>,
+) -> Result<Provisioned> {
+    // 1. The account and the app directory — the same in both modes. A
+    //    container does not carry the tenant's code inside its image; it runs
+    //    that directory, so the directory has to exist and has to be theirs
+    //    either way. This is also what keeps deployment unchanged for somebody
+    //    switching: rsync into the same path, restart.
     crate::provision::ensure_tenant_user(ctx, user, &tenant_home_of(ctx, user).await?, false)
         .await?;
     ensure_app_dir(ctx, user, &input.name).await?;
 
-    // 2. The slice drop-in, before anything starts.
-    let unit = app_unit_name(user, &input.name);
-    crate::slices::apply_unit_slice_dropin(ctx, &unit, user).await?;
+    let mut image = None;
+    let mut listening = None;
 
-    // 3. The unit itself.
-    apply_app_unit_at(
-        ctx,
-        &app_unit_path(user, &input.name),
-        app,
-        &input.name,
-        user,
-        interpreter,
-        env,
-        input.memory_mb,
-    )
-    .await?;
+    match launch {
+        Launch::Unit(interpreter) => {
+            // 2. The slice drop-in, before anything starts.
+            let unit = app_unit_name(user, &input.name);
+            crate::slices::apply_unit_slice_dropin(ctx, &unit, user).await?;
 
-    // 4. Enable (so it survives a reboot — spec §11.6 AC) and start.
-    ctx.distro()
-        .svc
-        .enable(&unit, true)
-        .await
-        .map_err(UnihelmError::from)?;
+            // 3. The unit itself.
+            apply_app_unit_at(
+                ctx,
+                &app_unit_path(user, &input.name),
+                app,
+                &input.name,
+                user,
+                interpreter.as_deref(),
+                env_lines,
+                input.memory_mb,
+            )
+            .await?;
 
-    // 5. The optional vhost in front.
-    let Some(domain) = input.proxy_domain.clone() else {
-        return Ok(None);
+            // 4. Enable (so it survives a reboot — spec §11.6 AC) and start.
+            ctx.distro()
+                .svc
+                .enable(&unit, true)
+                .await
+                .map_err(UnihelmError::from)?;
+        }
+        // The container's equivalent of steps 2 to 4 in one call, because for a
+        // container they are one call: the memory ceiling is a run flag rather
+        // than a slice drop-in, the tenant's slice is a `--cgroup-parent`, and
+        // surviving a reboot is a restart policy rather than a `WantedBy=`. The
+        // tenant's environment goes across as pairs, not as the systemd lines
+        // above — see the note in `Create::run`.
+        Launch::Container(_) => {
+            let started = crate::appcontainer::create(
+                ctx,
+                app,
+                &input.name,
+                user,
+                &input.env,
+                input.memory_mb,
+            )
+            .await?;
+            image = Some(started.image);
+            listening = Some(started.listening);
+        }
+    }
+
+    // 5. The optional vhost in front. Unchanged in both modes, and deliberately
+    //    so: it names `127.0.0.1:<port>`, and the container publishes that same
+    //    port on loopback, so nginx cannot tell which is behind it.
+    let site_id = match input.proxy_domain.clone() {
+        Some(domain) => Some(publish_proxy_site(ctx, app, domain).await?),
+        None => None,
     };
-    let site = publish_proxy_site(ctx, app, domain).await?;
-    Ok(Some(site))
+
+    Ok(Provisioned {
+        site_id,
+        image,
+        listening,
+    })
+}
+
+/// What provisioning produced that the caller has to be told about.
+struct Provisioned {
+    site_id: Option<i64>,
+    /// The image a container was built from. A unit has none, and reporting one
+    /// would be inventing a fact about how the application runs.
+    image: Option<String>,
+    /// Whether anything answered on the published port by the time the create
+    /// finished. `None` for a unit, where nothing asks the question — and
+    /// `Some(false)` is not a failure: a queue worker never binds.
+    listening: Option<bool>,
 }
 
 /// The tenant's home directory as recorded on the subscription.
@@ -1184,12 +1499,31 @@ async fn publish_proxy_site(ctx: &OpContext, app: &NodeApp, domain: Domain) -> R
 }
 
 /// Undo a failed create, in reverse order. Best effort throughout.
-async fn rollback_app(ctx: &OpContext, app: &NodeApp, user: &LinuxUser, name: &AppName) {
-    let unit = app_unit_name(user, name);
-
-    // Disable stops it too, and a unit systemd never loaded simply fails here.
-    let _ = ctx.distro().svc.disable(&unit, true).await;
-    remove_unit_files(ctx, user, name).await;
+async fn rollback_app(
+    ctx: &OpContext,
+    app: &NodeApp,
+    user: &LinuxUser,
+    name: &AppName,
+    mode: AppMode,
+) {
+    match mode {
+        AppMode::Host => {
+            let unit = app_unit_name(user, name);
+            // Disable stops it too, and a unit systemd never loaded simply
+            // fails here.
+            let _ = ctx.distro().svc.disable(&unit, true).await;
+            remove_unit_files(ctx, user, name).await;
+        }
+        // Whatever exists of it: a create that failed at the run may have left a
+        // container holding the name, and the next attempt would then be refused
+        // for a collision with its own wreckage. Idempotent on the other side,
+        // so a create that never reached `docker run` is not an error here.
+        AppMode::Container => {
+            if let Err(e) = crate::appcontainer::remove(ctx, user, name).await {
+                ctx.log(format!("could not remove the container: {e}"));
+            }
+        }
+    }
 
     // The row last: it owns the port, and freeing the port before the unit is
     // gone would let the next app take a number a stale service still binds.
@@ -1290,19 +1624,32 @@ impl TypedOperation for Delete {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let (app, user, name) = app_and_user(ctx, input.app_id).await?;
-        let unit = app_unit_name(&user, &name);
 
-        // Stop serving before removing what was served. `disable --now` both
-        // stops the unit and removes the `multi-user.target` symlink, so a
-        // reboot cannot resurrect an app the panel has deleted.
-        match ctx.distro().svc.disable(&unit, true).await {
-            Ok(()) => ctx.log(format!("stopped and disabled {unit}")),
-            // A unit that is already gone is not a reason to fail a delete —
-            // deletes get retried, and the row must still go.
-            Err(e) => ctx.log(format!("{unit} could not be disabled ({e}); continuing")),
+        // Stop serving before removing what was served, and in either mode a
+        // thing that is already gone is not a reason to fail a delete — deletes
+        // get retried, and the row must still go.
+        match app.mode {
+            AppMode::Host => {
+                let unit = app_unit_name(&user, &name);
+                // `disable --now` both stops the unit and removes the
+                // `multi-user.target` symlink, so a reboot cannot resurrect an
+                // app the panel has deleted.
+                match ctx.distro().svc.disable(&unit, true).await {
+                    Ok(()) => ctx.log(format!("stopped and disabled {unit}")),
+                    Err(e) => ctx.log(format!("{unit} could not be disabled ({e}); continuing")),
+                }
+                remove_unit_files(ctx, &user, &name).await;
+            }
+            AppMode::Container => {
+                let container = app_container_name(&user, &name);
+                match crate::appcontainer::remove(ctx, &user, &name).await {
+                    Ok(()) => ctx.log(format!("removed {container}")),
+                    Err(e) => ctx.log(format!(
+                        "{container} could not be removed ({e}); continuing"
+                    )),
+                }
+            }
         }
-
-        remove_unit_files(ctx, &user, &name).await;
 
         let removed = ctx
             .db()
@@ -1369,6 +1716,14 @@ pub struct UpdateInput {
     /// are different requests. Flattening them would make unpinning unreachable.
     #[serde(default, deserialize_with = "double_option")]
     pub runtime_version: Option<Option<String>>,
+    /// The mode this application should run in.
+    ///
+    /// Accepted only when it names the mode it is already in, so that a client
+    /// echoing the row back is not punished for it. Asking for the *other* mode
+    /// is refused — see [`refuse_a_mode_change`] for why that is the honest
+    /// answer in this step rather than a shortcoming of it.
+    #[serde(default)]
+    pub mode: Option<AppMode>,
 }
 
 /// `Option<Option<T>>` where absent and null mean different things.
@@ -1386,8 +1741,53 @@ pub struct UpdateOutput {
     pub runtime: String,
     /// The version it now runs on, or null when it runs on the default.
     pub runtime_version: Option<String>,
-    /// The interpreter the unit now names, or null for a compiled program.
+    /// The interpreter the unit now names, or null for a compiled program —
+    /// and null for a container, whose interpreter is inside its image and is
+    /// not a path on this machine.
     pub interpreter: Option<String>,
+    /// `host` or `container`. Unchanged by this operation; reported so the
+    /// reply says what the application is, not only what changed about it.
+    pub mode: String,
+    /// The image a container application now runs. Absent for a host one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Why `app.update` will not move an application between modes.
+///
+/// Not an oversight, and not a small piece of work left undone: moving a
+/// running application from a unit to a container is a stop, a pull, a rebuild
+/// and a start, and the two modes do not hold the same things on either side of
+/// it. A host application's environment lives in its unit file; a container's
+/// lives in the container. A host application's dependencies were installed
+/// against whatever interpreter the machine had; a container's were installed
+/// against its image. Done in place, the application serves 502 through its own
+/// domain for however long an image takes to arrive on the operator's link —
+/// and if the pull fails there is nothing left to go back to, because the unit
+/// was retired first.
+///
+/// The safe version builds the new one, proves it answers and only then retires
+/// the old one, which is a different operation with a different rollback and its
+/// own log. Until that exists, the panel says so and names the manual path,
+/// which costs the operator two clicks and no downtime they did not choose.
+fn refuse_a_mode_change(name: &AppName, from: AppMode, to: AppMode) -> UnihelmError {
+    UnihelmError::new(
+        ErrorCode::NotImplemented,
+        format!(
+            "`{}` runs as a {}, and this panel cannot move an application to a {} in \
+             place. Doing it here would mean stopping it, pulling an image and starting \
+             something else — minutes of 502 through its own domain, with nothing to go \
+             back to if the pull fails — and the two do not hold the same things: the \
+             environment of one lives in its unit file and of the other in the container, \
+             and dependencies installed for one were installed against a different \
+             interpreter. Create a second application in the mode you want, point the \
+             domain at it once it answers, then delete this one.",
+            name.as_str(),
+            from.label(),
+            to.label(),
+        ),
+    )
+    .with_field("mode")
 }
 
 #[async_trait]
@@ -1407,16 +1807,36 @@ impl TypedOperation for Update {
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let (app, user, name) = app_and_user(ctx, input.app_id).await?;
 
+        // Before anything else, and before the row is touched: a request to
+        // change mode is refused whole, rather than half-applied as a runtime
+        // change that leaves the caller thinking the rest took.
+        if let Some(wanted) = input.mode
+            && wanted != app.mode
+        {
+            return Err(refuse_a_mode_change(&name, app.mode, wanted));
+        }
+
         let runtime = input.runtime.unwrap_or(app.runtime);
         let version = match &input.runtime_version {
             Some(v) => v.clone(),
             None => app.runtime_version.clone(),
         };
 
+        // Whether anything actually moved. A retried task, or a client echoing
+        // the row back, asks for the runtime it already has — and rebuilding a
+        // container or restarting a unit for that is seconds of downtime bought
+        // for no change at all.
+        let changed = runtime != app.runtime || version != app.runtime_version;
+
         // Resolve before writing anything. A version that is not installed must
         // fail with the app still running on what it had, not with a unit that
         // names a binary the machine does not have.
-        let interpreter = resolve_interpreter(runtime, version.as_deref(), "node").await?;
+        //
+        // The mode is the app's own: this operation cannot change it, so there
+        // is no question of resolving against the mode somebody asked for — and
+        // a container never reaches `resolve_interpreter`, which is what lets a
+        // Docker-only server hold Node applications at all.
+        let launch = plan_launch(app.mode, runtime, version.as_deref(), "node").await?;
 
         let updated = ctx
             .db()
@@ -1425,32 +1845,48 @@ impl TypedOperation for Update {
             .await
             .map_err(UnihelmError::from)?;
 
-        // The tenant's own `Environment=` lines, carried over verbatim.
-        //
-        // They live only in the unit file — nothing persists them — so changing
-        // a runtime by re-rendering from the database alone would silently wipe
-        // every variable the app was configured with. They are read back out of
-        // the file on disk and written again as they were.
-        let env = carried_environment(&app_unit_path(&user, &name));
+        match &launch {
+            Launch::Unit(interpreter) => {
+                // The tenant's own `Environment=` lines, carried over verbatim.
+                //
+                // They live only in the unit file — nothing persists them — so
+                // changing a runtime by re-rendering from the database alone
+                // would silently wipe every variable the app was configured
+                // with. They are read back out of the file on disk and written
+                // again as they were.
+                let env = carried_environment(&app_unit_path(&user, &name));
 
-        apply_app_unit_at(
-            ctx,
-            &app_unit_path(&user, &name),
-            &updated,
-            &name,
-            &user,
-            interpreter.as_deref(),
-            env,
-            None,
-        )
-        .await?;
+                apply_app_unit_at(
+                    ctx,
+                    &app_unit_path(&user, &name),
+                    &updated,
+                    &name,
+                    &user,
+                    interpreter.as_deref(),
+                    env,
+                    None,
+                )
+                .await?;
 
-        let unit = app_unit_name(&user, &name);
-        ctx.distro()
-            .svc
-            .action(&unit, SvcAction::Restart)
-            .await
-            .map_err(UnihelmError::from)?;
+                let unit = app_unit_name(&user, &name);
+                ctx.distro()
+                    .svc
+                    .action(&unit, SvcAction::Restart)
+                    .await
+                    .map_err(UnihelmError::from)?;
+            }
+            // A new version is a new image, and there is no equivalent of
+            // re-rendering one line: the container is made again. What must not
+            // be made again is the tenant's environment, which for a container
+            // lives in the container rather than in a file — `appcontainer`
+            // reads it back off the one it is replacing, exactly as
+            // `carried_environment` reads it out of the unit file above. That is
+            // the only reason this is a rebuild and not a refusal.
+            Launch::Container(_) if changed => {
+                crate::appcontainer::update(ctx, &updated, &name, &user).await?;
+            }
+            Launch::Container(_) => {}
+        }
 
         ctx.log(format!(
             "{} now runs on {}{}",
@@ -1466,7 +1902,17 @@ impl TypedOperation for Update {
             app_id: updated.id,
             runtime: runtime.as_str().to_string(),
             runtime_version: version,
-            interpreter: interpreter.map(|p| p.display().to_string()),
+            interpreter: launch.interpreter(),
+            mode: app.mode.as_str().to_string(),
+            // The image is `launch`'s answer, which is the same string
+            // `appcontainer` built the container from — `plan_image` is called
+            // once, by `plan_launch`, and both this reply and the run read it.
+            // A reply naming `node:22` while the container ran something else
+            // would be a lie nobody could catch by reading either file alone.
+            image: match &launch {
+                Launch::Unit(_) => None,
+                Launch::Container(image) => Some(image.clone()),
+            },
         })
     }
 }
@@ -1486,35 +1932,50 @@ impl TypedOperation for Restart {
     };
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
-        let (_, user, name) = app_and_user(ctx, input.app_id).await?;
-        let unit = app_unit_name(&user, &name);
+        let (app, user, name) = app_and_user(ctx, input.app_id).await?;
 
-        // A missing unit deserves a sentence, not systemd's "Unit not found".
-        let status = ctx
-            .distro()
-            .svc
-            .status(&unit)
-            .await
-            .map_err(UnihelmError::from)?;
-        if !status.is_installed() {
-            return Err(UnihelmError::new(
-                ErrorCode::NotFound,
-                format!(
-                    "`{unit}` is not installed on this server; the app's unit file is \
-                     missing — delete the app and create it again"
-                ),
-            ));
+        match app.mode {
+            AppMode::Host => {
+                let unit = app_unit_name(&user, &name);
+
+                // A missing unit deserves a sentence, not systemd's "Unit not
+                // found".
+                let status = ctx
+                    .distro()
+                    .svc
+                    .status(&unit)
+                    .await
+                    .map_err(UnihelmError::from)?;
+                if !status.is_installed() {
+                    return Err(UnihelmError::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "`{unit}` is not installed on this server; the app's unit file is \
+                             missing — delete the app and create it again"
+                        ),
+                    ));
+                }
+
+                ctx.distro()
+                    .svc
+                    .action(&unit, SvcAction::Restart)
+                    .await
+                    .map_err(UnihelmError::from)?;
+            }
+            // The same sentence for the same situation — "it is not on this
+            // server; recreate the application, its files are untouched" — is
+            // owed here too, and it is `appcontainer`'s to write: only it knows
+            // the difference between a container that is stopped and one that
+            // was never created, and guessing at that from this side would mean
+            // asking Docker twice.
+            AppMode::Container => crate::appcontainer::restart(ctx, &user, &name).await?,
         }
 
-        ctx.distro()
-            .svc
-            .action(&unit, SvcAction::Restart)
-            .await
-            .map_err(UnihelmError::from)?;
-        ctx.log(format!("restarted {unit}"));
+        let handle = app_handle(app.mode, &user, &name);
+        ctx.log(format!("restarted {handle}"));
 
         Ok(RestartOutput {
-            unit: unit.as_str().to_string(),
+            unit: handle,
             restarted: true,
         })
     }
@@ -1535,6 +1996,9 @@ pub struct LogsInput {
 
 #[derive(Debug, Serialize)]
 pub struct LogsOutput {
+    /// The unit, or the container — whichever produced these lines. One field
+    /// and one shape in both modes, because the UI renders it and a log viewer
+    /// that had to branch on where the text came from would be two log viewers.
     pub unit: String,
     pub lines: Vec<String>,
 }
@@ -1555,33 +2019,42 @@ impl TypedOperation for Logs {
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
-        // The unit whose journal is read is derived here, from a row the
-        // caller's scope could see — there is no field on this input that
-        // names a unit, so no caller can read `sshd.service`'s journal through
-        // an app they own. That is the whole security property of this
-        // operation.
-        let (_, user, name) = app_and_user(ctx, input.app_id).await?;
-        let unit = app_unit_name(&user, &name);
+        // The unit — or the container — whose logs are read is derived here,
+        // from a row the caller's scope could see. There is no field on this
+        // input that names either one, so no caller can read `sshd.service`'s
+        // journal, or another tenant's container, through an app they own. That
+        // is the whole security property of this operation, and routing by mode
+        // does not weaken it: both names are still built from the row.
+        let (app, user, name) = app_and_user(ctx, input.app_id).await?;
 
         let lines = input
             .lines
             .unwrap_or(DEFAULT_LOG_LINES)
             .clamp(1, MAX_LOG_LINES);
 
-        // `SvcBackend::journal_tail` is
-        // `journalctl --no-pager --output=short-iso -n <lines> -u <unit>` as an
-        // argv array — the invocation this operation needs, already written
-        // and already mocked. A second journalctl call site here would be a
-        // second thing to keep shell-free.
-        let lines = ctx
-            .distro()
-            .svc
-            .journal_tail(&unit, lines)
-            .await
-            .map_err(UnihelmError::from)?;
+        let lines = match app.mode {
+            // `SvcBackend::journal_tail` is
+            // `journalctl --no-pager --output=short-iso -n <lines> -u <unit>` as
+            // an argv array — the invocation this operation needs, already
+            // written and already mocked. A second journalctl call site here
+            // would be a second thing to keep shell-free.
+            AppMode::Host => {
+                let unit = app_unit_name(&user, &name);
+                ctx.distro()
+                    .svc
+                    .journal_tail(&unit, lines)
+                    .await
+                    .map_err(UnihelmError::from)?
+            }
+            // A container's output never reaches the journal, so the same
+            // question has to be asked of Docker instead. The *clamp* is
+            // deliberately above this: it bounds one IPC frame, which is a
+            // property of the reply rather than of where the text came from.
+            AppMode::Container => crate::appcontainer::logs(ctx, &user, &name, lines).await?,
+        };
 
         Ok(LogsOutput {
-            unit: unit.as_str().to_string(),
+            unit: app_handle(app.mode, &user, &name),
             lines,
         })
     }
@@ -1616,6 +2089,9 @@ mod tests {
             entry: entry.into(),
             port,
             runtime: AppRuntime::Node,
+            // These tests are about the unit file, so the fixture is a host
+            // application — the mode every row on an upgraded server has.
+            mode: AppMode::Host,
             node_env: NodeEnv::Production,
             runtime_version: None,
             enabled: true,
@@ -2169,6 +2645,7 @@ mod tests {
                 name: AppName::parse("blog").unwrap(),
                 entry: TenantPath::parse("apps/blog/server.js").unwrap(),
                 runtime: AppRuntime::Node,
+                mode: AppMode::Host,
                 node_env: NodeEnv::Production,
                 runtime_version: None,
             })
@@ -2492,6 +2969,8 @@ mod tests {
                     memory_mb: None,
                     runtime: AppRuntime::Node,
                     runtime_version: None,
+                    // Host, because what these assert is the host path.
+                    mode: Some(AppMode::Host),
                     proxy_domain: None,
                 },
             )
@@ -2560,6 +3039,7 @@ mod tests {
             memory_mb: None,
             runtime: AppRuntime::Node,
             runtime_version: None,
+            mode: Some(AppMode::Host),
             proxy_domain: None,
         };
 
@@ -2628,6 +3108,8 @@ mod tests {
                     memory_mb: None,
                     runtime: AppRuntime::Node,
                     runtime_version: None,
+                    // Host, because what these assert is the host path.
+                    mode: Some(AppMode::Host),
                     proxy_domain: None,
                 },
             )
@@ -2690,6 +3172,7 @@ mod tests {
                 name: AppName::parse("blog2").unwrap(),
                 entry: TenantPath::parse("apps/blog2/server.js").unwrap(),
                 runtime: AppRuntime::Node,
+                mode: AppMode::Host,
                 node_env: NodeEnv::Production,
                 runtime_version: None,
             })
@@ -2788,6 +3271,7 @@ mod tests {
             name: AppName::parse("admins-app").unwrap(),
             entry: TenantPath::parse("apps/admins-app/server.js").unwrap(),
             runtime: AppRuntime::Node,
+            mode: AppMode::Host,
             node_env: NodeEnv::Production,
             runtime_version: None,
         })
@@ -3002,5 +3486,623 @@ mod runtime_tests {
     #[test]
     fn a_missing_unit_carries_nothing_rather_than_failing() {
         assert!(carried_environment(Path::new("/nonexistent/app.service")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use crate::registry::testing::{auth_for, registry};
+    use serde_json::json;
+    use unihelm_core::Role;
+    use unihelm_db::Db;
+    use unihelm_db::users::NewUser;
+
+    fn user() -> LinuxUser {
+        LinuxUser::parse("uh_abc12345").unwrap()
+    }
+
+    fn name() -> AppName {
+        AppName::parse("blog").unwrap()
+    }
+
+    // -- the row an upgraded server already has -----------------------------
+
+    /// **The one that must never regress.** Every application on every server
+    /// running this panel today is a systemd unit, and its row was written
+    /// before the column existed. The migration's `DEFAULT 'host'` is what says
+    /// so, and this asserts it against a row inserted the way those rows were:
+    /// without naming the column at all.
+    ///
+    /// Had the default been `container`, upgrading would have reclassified every
+    /// running application in one statement — and the next `app.restart` would
+    /// have gone looking for a container that has never been created, on a
+    /// server whose customers' sites were working a moment earlier.
+    #[tokio::test]
+    async fn a_row_written_without_the_column_is_a_host_application() {
+        let db = Db::open_memory().await.unwrap();
+        let customer = db
+            .users(&TenantScope::Global)
+            .create(NewUser {
+                role: Role::Customer,
+                email: unihelm_core::Email::parse("c@example.com").unwrap(),
+                username: unihelm_core::Username::parse("client").unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+        let sub = db.create_subscription(customer.id).await.unwrap();
+
+        // A row this panel writes today, so the test has a valid timestamp and
+        // subscription to copy — and so the contrast below is visible.
+        let today = db
+            .create_node_app(NewNodeApp {
+                subscription_id: sub.id,
+                name: AppName::parse("today").unwrap(),
+                entry: TenantPath::parse("apps/today/server.js").unwrap(),
+                runtime: AppRuntime::Node,
+                mode: AppMode::Container,
+                node_env: NodeEnv::Production,
+                runtime_version: None,
+            })
+            .await
+            .unwrap();
+
+        // And a row as an existing server holds it: every column the old schema
+        // had, and not one word about the mode.
+        sqlx::query(
+            "INSERT INTO node_apps
+                 (subscription_id, site_id, name, entry, port, node_env, runtime,
+                  enabled, created_at, updated_at)
+             SELECT subscription_id, NULL, 'legacy', entry, port + 1, node_env,
+                    runtime, 1, created_at, updated_at
+             FROM node_apps WHERE id = ?1",
+        )
+        .bind(today.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let apps = db
+            .node_apps(&TenantScope::Global)
+            .list(10, 0)
+            .await
+            .unwrap();
+        let legacy = apps.iter().find(|a| a.name == "legacy").unwrap();
+        assert_eq!(
+            legacy.mode,
+            AppMode::Host,
+            "an application that predates the column is a systemd unit, and \
+             nothing about it may change"
+        );
+        assert_eq!(
+            apps.iter().find(|a| a.name == "today").unwrap().mode,
+            AppMode::Container
+        );
+    }
+
+    // -- what a new application is ------------------------------------------
+
+    /// New applications are containers; saying `host` still gets a unit.
+    ///
+    /// Asserted on the deserialized input rather than through a create, because
+    /// this is a question about the request — a client that sends no `mode` must
+    /// not be silently given the mode the *column* defaults to, which is the
+    /// opposite one and is about old rows.
+    #[test]
+    fn an_application_created_today_is_a_container_unless_asked_otherwise() {
+        let bare: CreateInput =
+            serde_json::from_value(json!({ "name": "blog", "entry": "apps/blog/server.js" }))
+                .unwrap();
+        assert_eq!(
+            bare.mode.unwrap_or_else(|| default_mode(bare.runtime)),
+            AppMode::Container
+        );
+
+        let asked: CreateInput = serde_json::from_value(
+            json!({ "name": "blog", "entry": "apps/blog/server.js", "mode": "host" }),
+        )
+        .unwrap();
+        assert_eq!(asked.mode, Some(AppMode::Host));
+
+        let asked: CreateInput = serde_json::from_value(
+            json!({ "name": "blog", "entry": "apps/blog/server.js", "mode": "container" }),
+        )
+        .unwrap();
+        assert_eq!(asked.mode, Some(AppMode::Container));
+    }
+
+    /// A runtime with no image defaults to the host, and every runtime that has
+    /// one defaults to a container.
+    ///
+    /// Without this, a Go application created the ordinary way — no `mode` in
+    /// the request, which is how every client sends it — would be defaulted into
+    /// a container that cannot exist and refused for a runtime this panel has
+    /// supported since it supported six of them.
+    #[test]
+    fn a_runtime_with_no_image_is_not_defaulted_into_a_container_that_cannot_exist() {
+        assert_eq!(default_mode(AppRuntime::Go), AppMode::Host);
+        for runtime in AppRuntime::ALL {
+            let expected = if crate::appcontainer::is_containerisable(*runtime) {
+                AppMode::Container
+            } else {
+                AppMode::Host
+            };
+            assert_eq!(default_mode(*runtime), expected, "{runtime:?}");
+        }
+    }
+
+    // -- the interpreter is a host question ---------------------------------
+
+    /// A server with no Node installed can still run Node applications, because
+    /// the interpreter is inside the image.
+    ///
+    /// This is the reason `plan_launch` exists at all: `resolve_interpreter`
+    /// searches the system directories, and running it for a container would
+    /// refuse every container application on a machine that never needed a
+    /// `node` binary in the first place.
+    #[tokio::test]
+    async fn a_container_never_goes_looking_for_an_interpreter_on_the_host() {
+        let launch = plan_launch(
+            AppMode::Container,
+            AppRuntime::Node,
+            None,
+            "definitely-not-node-xyz",
+        )
+        .await
+        .expect("a container does not need a host interpreter");
+        assert!(
+            matches!(launch, Launch::Container(_)),
+            "expected a container"
+        );
+        assert!(
+            launch.interpreter().is_none(),
+            "a container has no interpreter path on this machine"
+        );
+
+        // The host arm is unchanged: it still refuses, and still names what to
+        // install rather than writing a unit whose ExecStart does not exist.
+        let err = plan_launch(
+            AppMode::Host,
+            AppRuntime::Node,
+            None,
+            "definitely-not-node-xyz",
+        )
+        .await
+        .expect_err("a unit needs a real binary");
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.detail.contains("Node.js is not installed"),
+            "{}",
+            err.detail
+        );
+    }
+
+    // -- naming -------------------------------------------------------------
+
+    /// The container is the unit's name without `.service`, and it is a name
+    /// Docker will take: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
+    ///
+    /// A name Docker refuses would fail at `docker run`, after the row and the
+    /// port had already been handed out — the same class of late failure that
+    /// `every_valid_name_pair_yields_a_valid_unit_name` exists to prevent for
+    /// systemd.
+    #[test]
+    fn a_container_name_is_the_unit_name_and_a_name_docker_will_accept() {
+        assert_eq!(
+            app_container_name(&user(), &name()),
+            "unihelm-app-uh_abc12345-blog"
+        );
+        assert_eq!(
+            format!("{}.service", app_container_name(&user(), &name())),
+            unit_file_name(&user(), &name()),
+            "one application, one name, whichever mode it is in"
+        );
+
+        for u in ["a", "_x", "uh_abc12345", "a-b-c-d", &"a".repeat(32)] {
+            for n in ["a", "blog", "api-v2", "next_app3", &"z".repeat(32)] {
+                let container =
+                    app_container_name(&LinuxUser::parse(u).unwrap(), &AppName::parse(n).unwrap());
+                let mut chars = container.chars();
+                let first = chars.next().unwrap();
+                assert!(
+                    first.is_ascii_alphanumeric(),
+                    "`{container}` does not start with an alphanumeric"
+                );
+                assert!(
+                    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+                    "`{container}` is outside Docker's alphabet"
+                );
+            }
+        }
+    }
+
+    /// What every reply's `unit` field holds: the name you would type to find
+    /// this application, which differs by mode.
+    #[test]
+    fn the_reported_handle_names_the_thing_that_actually_runs_it() {
+        assert_eq!(
+            app_handle(AppMode::Host, &user(), &name()),
+            "unihelm-app-uh_abc12345-blog.service"
+        );
+        assert_eq!(
+            app_handle(AppMode::Container, &user(), &name()),
+            "unihelm-app-uh_abc12345-blog"
+        );
+    }
+
+    // -- app.update and the mode --------------------------------------------
+
+    async fn seed(db: &Db, customer: unihelm_core::UserId, mode: AppMode) -> i64 {
+        let sub = db.create_subscription(customer).await.unwrap();
+        db.create_node_app(NewNodeApp {
+            subscription_id: sub.id,
+            name: AppName::parse("blog").unwrap(),
+            entry: TenantPath::parse("apps/blog/server.js").unwrap(),
+            runtime: AppRuntime::Node,
+            mode,
+            node_env: NodeEnv::Production,
+            runtime_version: None,
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// Moving an application between modes is refused, and the refusal says
+    /// what to do instead.
+    ///
+    /// The alternative was to do it in place, which is a stop, a pull and a
+    /// start — minutes of 502 through the application's own domain, with nothing
+    /// to return to if the pull fails. A panel that offers that quietly is worse
+    /// than one that says it cannot.
+    #[tokio::test]
+    async fn moving_an_application_between_modes_is_refused_and_names_the_way_round() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let host_app = seed(&db, customer, AppMode::Host).await;
+
+        let err = reg
+            .dispatch(
+                "app.update",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": host_app, "mode": "container" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert_eq!(err.field.as_deref(), Some("mode"));
+        assert!(
+            err.detail.contains("Create a second application"),
+            "the refusal has to leave a route out: {}",
+            err.detail
+        );
+
+        // And it changed nothing on the way to refusing.
+        assert_eq!(
+            db.node_apps(&TenantScope::Global)
+                .by_id(host_app)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            AppMode::Host
+        );
+    }
+
+    /// Echoing the mode a row already has is not a request to change it.
+    ///
+    /// A client that round-trips the object it was given must not be refused for
+    /// sending back what the panel told it.
+    #[tokio::test]
+    async fn naming_the_mode_it_already_has_is_not_a_mode_change() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let host_app = seed(&db, customer, AppMode::Host).await;
+
+        // It may still fail further along — this machine need not have a Node
+        // binary — but it must never fail *here*, for the mode.
+        if let Err(e) = reg
+            .dispatch(
+                "app.update",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": host_app, "mode": "host" }),
+                None,
+            )
+            .await
+        {
+            assert_ne!(
+                e.code,
+                ErrorCode::NotImplemented,
+                "the mode did not change, so nothing about it should have been refused: {e:?}"
+            );
+        }
+    }
+
+    /// Changing a container application's runtime rebuilds it, and does not
+    /// take the tenant's environment with it.
+    ///
+    /// The host path reads its `Environment=` lines back out of the unit file
+    /// before re-rendering, precisely so a version change does not wipe them.
+    /// A container's live in the container, and `appcontainer::update` reads
+    /// them back off the one it replaces for the same reason — which is what
+    /// makes a rebuild an acceptable answer here rather than a refusal.
+    ///
+    /// What is asserted here is the routing and the row: the rebuild itself
+    /// needs Docker, which a build machine need not have, so a failure past
+    /// that point is tolerated as long as it is not a refusal to try.
+    #[tokio::test]
+    async fn changing_a_container_applications_runtime_moves_the_row_and_rebuilds() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let app_id = seed(&db, customer, AppMode::Container).await;
+
+        match reg
+            .dispatch(
+                "app.update",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": app_id, "runtime": "python" }),
+                None,
+            )
+            .await
+        {
+            Ok(out) => {
+                assert_eq!(out["runtime"], "python");
+                assert_eq!(out["mode"], "container");
+                let image = out["image"].as_str().unwrap_or_default();
+                assert!(
+                    image.starts_with("python:"),
+                    "the reply has to name the image it was actually built from: {out}"
+                );
+                assert!(out["interpreter"].is_null(), "{out}");
+            }
+            // No Docker here. The refusal that must never come back is the one
+            // that says this cannot be done at all.
+            Err(e) => assert_ne!(
+                e.code,
+                ErrorCode::NotImplemented,
+                "a container runtime change is supported, not declined: {e:?}"
+            ),
+        }
+    }
+
+    /// A container application whose runtime has no image is refused **before
+    /// the row exists**, in a sentence about the runtime.
+    ///
+    /// This is the whole reason `plan_launch` resolves the image rather than
+    /// leaving it to `docker run`: a port allocated to an application that could
+    /// never have started is the one piece of state a failed create cannot undo
+    /// for free, and the range it comes out of is 5001 wide.
+    #[tokio::test]
+    async fn an_impossible_container_is_refused_before_a_port_is_spent() {
+        let err = plan_launch(AppMode::Container, AppRuntime::Go, None, "node")
+            .await
+            .expect_err("a Go application has no runtime image");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("runtime"));
+
+        let err = plan_launch(
+            AppMode::Container,
+            AppRuntime::Node,
+            Some("22:latest"),
+            "node",
+        )
+        .await
+        .expect_err("a version carrying a colon is not a tag");
+        assert_eq!(err.field.as_deref(), Some("runtime_version"));
+
+        // And the host arm is untouched by either: a Go unit is still perfectly
+        // ordinary, and still resolves to no interpreter at all.
+        let launch = plan_launch(AppMode::Host, AppRuntime::Go, None, "node")
+            .await
+            .expect("a Go application is a binary, and needs nothing resolved");
+        assert!(launch.interpreter().is_none());
+    }
+
+    /// An update naming the runtime it already has is a no-op, not a refusal: a
+    /// retried task must not fail on its second run, and it must not restart a
+    /// healthy container for a change nobody asked for.
+    #[tokio::test]
+    async fn a_container_update_that_changes_nothing_is_answered_not_refused() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let app_id = seed(&db, customer, AppMode::Container).await;
+
+        let out = reg
+            .dispatch(
+                "app.update",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": app_id, "runtime": "node" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["mode"], "container");
+        assert_eq!(out["runtime"], "node");
+        assert!(
+            out["interpreter"].is_null(),
+            "a container has no interpreter path on this host: {out}"
+        );
+    }
+
+    // -- app.logs -----------------------------------------------------------
+
+    /// A container's output never reaches the journal, so `app.logs` must not
+    /// go there for one — and must hand the caller the same two fields either
+    /// way, because the UI renders them.
+    #[tokio::test]
+    async fn a_container_applications_logs_never_come_out_of_the_journal() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let app_id = seed(&db, customer, AppMode::Container).await;
+
+        match reg
+            .dispatch(
+                "app.logs",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": app_id }),
+                None,
+            )
+            .await
+        {
+            Ok(out) => {
+                let unit = out["unit"].as_str().unwrap();
+                assert!(
+                    unit.starts_with("unihelm-app-") && !unit.ends_with(".service"),
+                    "a container application reported a unit name: {unit}"
+                );
+                // The mock journal echoes the unit it was asked for, `.service`
+                // and all — so a line carrying one is proof the journal answered.
+                for line in out["lines"].as_array().unwrap() {
+                    assert!(
+                        !line.as_str().unwrap().contains(".service"),
+                        "these came from the journal: {line}"
+                    );
+                }
+            }
+            // No Docker on this machine. That the journal was not read is still
+            // the thing being asserted, and an error is not journal output.
+            Err(e) => assert_ne!(e.code, ErrorCode::ServiceActionFailed, "{e:?}"),
+        }
+    }
+
+    /// A container create refuses a bad environment before it touches the
+    /// machine.
+    ///
+    /// The container half's own `check_env` runs from inside
+    /// `AppContainer::plan`, and that cannot run until the tenant's Linux
+    /// account exists — so relying on it alone would mean `useradd` and a
+    /// `mkdir` in somebody's home for a request that was always going to be
+    /// refused. `check_env_shared` is what moves that refusal in front of both.
+    #[tokio::test]
+    async fn a_container_create_refuses_a_bad_environment_before_touching_anything() {
+        let (reg, admin, _customer) = registry().await;
+        let db = reg.services().db.clone();
+        db.create_subscription(admin).await.unwrap();
+
+        for env in [
+            // A key the panel owns.
+            json!([{ "key": "PORT", "value": "80" }]),
+            // A value that cannot be carried into a process by either backend.
+            json!([{ "key": "X", "value": "one\ntwo" }]),
+            // The same name twice: one of them would silently disappear.
+            json!([{ "key": "A", "value": "1" }, { "key": "A", "value": "2" }]),
+        ] {
+            let err = reg
+                .dispatch(
+                    "app.create",
+                    &auth_for(admin, Role::Admin),
+                    // No `mode`, so this is the default — a container.
+                    json!({ "name": "blog", "entry": "apps/blog/server.js", "env": env }),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{err:?}");
+            assert_eq!(err.field.as_deref(), Some("env"));
+        }
+
+        assert_eq!(
+            db.node_apps(&TenantScope::Global)
+                .list(10, 0)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "a refused create must not have allocated a port"
+        );
+    }
+
+    // -- app.delete ---------------------------------------------------------
+
+    /// Deleting a container application still frees its port and still leaves
+    /// the tenant's domain standing.
+    ///
+    /// The half of `app.delete` that is not the runtime is the half that must
+    /// not have been made mode-dependent by mistake: the row owns the port, and
+    /// a delete that stopped short of removing it because Docker was unhappy
+    /// would leak a number out of a 5001-wide range.
+    #[tokio::test]
+    async fn deleting_a_container_application_still_frees_its_port() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let app_id = seed(&db, customer, AppMode::Container).await;
+
+        let out = reg
+            .dispatch(
+                "app.delete",
+                &auth_for(admin, Role::Admin),
+                json!({ "app_id": app_id }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["name"], "blog");
+        assert_eq!(out["port"], unihelm_db::node_apps::APP_PORT_MIN);
+        assert!(
+            db.node_apps(&TenantScope::Global)
+                .by_id(app_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // -- the wire ------------------------------------------------------------
+
+    /// The two words `app.list` puts on the wire, asserted as text.
+    ///
+    /// The applications page reads `mode` off every row and compares it against
+    /// the string `"container"`, treating anything else — including a missing
+    /// field — as a host application. That comparison is the whole reason a
+    /// container's logs are fetched from Docker rather than from the journal in
+    /// the UI, and nothing in Rust's type system connects it to
+    /// `AppMode`'s serde attribute: renaming these to `Host`/`Container`, or
+    /// dropping the `rename_all`, compiles cleanly and silently relabels every
+    /// container on the page as a service on this host.
+    ///
+    /// The `unit` field is asserted beside it for the same reason. One field
+    /// carries two kinds of name, and a container's must not arrive wearing
+    /// `.service` — an operator who types that into `systemctl` is told the
+    /// application does not exist.
+    #[test]
+    fn a_list_row_names_its_mode_in_the_two_words_the_page_reads() {
+        let row = |mode: AppMode| NodeApp {
+            id: 1,
+            subscription_id: SubscriptionId(1),
+            site_id: None,
+            name: "blog".into(),
+            entry: "apps/blog/server.js".into(),
+            port: 20001,
+            runtime: AppRuntime::Node,
+            mode,
+            node_env: NodeEnv::Production,
+            runtime_version: None,
+            enabled: true,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let view = |mode: AppMode| {
+            serde_json::to_value(AppView {
+                unit: app_handle(mode, &user(), &name()),
+                state: UnitState::Active,
+                memory_bytes: None,
+                app: row(mode),
+            })
+            .unwrap()
+        };
+
+        let host = view(AppMode::Host);
+        assert_eq!(host["mode"], "host");
+        assert_eq!(host["unit"], "unihelm-app-uh_abc12345-blog.service");
+
+        let container = view(AppMode::Container);
+        assert_eq!(container["mode"], "container");
+        assert_eq!(container["unit"], "unihelm-app-uh_abc12345-blog");
     }
 }
