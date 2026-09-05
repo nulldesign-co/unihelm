@@ -1739,7 +1739,7 @@ listing, so one broken app cannot blank the page.
 |---|---|
 | Permission | `node_apps` |
 | Execution | task — not cancellable, **not** idempotent |
-| Input | `name`; `entry` — tenant-home-relative path to the JS entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)* |, `runtime_version` *(optional string)*, `runtime` *(optional: node, python, ruby, bun, deno, go — default node)*
+| Input | `name`; `entry` — tenant-home-relative path to the entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)*; `runtime` *(optional: node, python, ruby, bun, deno, go — default node)*; `runtime_version` *(optional string)*; `mode` *(optional: `container` \| `host`)* |
 
 Allocates a port, creates `<home>/apps/<name>` owned by the tenant at `0750`,
 writes the slice drop-in, writes and verifies the unit, enables it (so a reboot
@@ -1761,6 +1761,34 @@ node-flavoured vhost, so domain-conflict detection, the plan's site limit, the
 nginx validate/rollback cycle and logrotate all keep working from one
 implementation. It also requires `site_manage` **in addition to** `node_apps`:
 creating a site is creating a site, whichever operation asks for it.
+
+#### `mode`: a container, or a unit
+
+`mode` picks what an application actually *is*. Omit it and it is a
+**container** — one per application, built from its runtime version's image —
+unless the runtime has no image to build from, in which case it is a systemd
+unit on the host. `host` asks for the unit explicitly.
+
+The unit is not a legacy path. An application is somebody's long-running
+process, and the two modes fail differently: a unit shares the machine's
+libraries and can reach anything its Linux user can, and a container carries its
+own and cannot. Which of those is wanted is the operator's call, so both stay.
+
+The order above — port, directory, slice, unit, enable, start, vhost — is the
+host mode's. Container mode substitutes the image and the container for the unit
+and keeps the rest, *including the tenant's ceiling*: the container is started
+with `--cgroup-parent` pointing at the tenant's slice whenever this host has one,
+and with `--memory-swap` equal to `--memory` to match the slice's `MemorySwapMax=0`
+rather than accept Docker's default of twice the limit. A tenant who can spend the
+machine's last gigabyte from inside a container has caused the same outage as one
+who spent it from a unit.
+
+**An existing application's mode does not change.** `mode` is read on create and
+then ignored; `app.update` moves runtimes and versions but never modes. Moving
+one would mean rebuilding it under a different isolation model while its URL
+stays up, and the honest way to ask for that is to create the replacement,
+check it, and delete the original — three operations the operator can see the
+result of, rather than one that silently rebuilds their production app.
 
 Three refusals are worth knowing about, because each is a systemd rule rather
 than a Unihelm preference:
@@ -1808,6 +1836,8 @@ loss of all three.
 `runtime_version` distinguishes absent from null. Omit the key to leave the pin
 alone; send an explicit `null` to unpin back to whatever a bare command name
 resolves to. On the CLI those are the default and `--unpin`.
+
+There is deliberately no `mode` here. See [`app.create`](#mode-a-container-or-a-unit).
 
 The interpreter is resolved **before** anything is written, so a version that is
 not installed fails with the application still running on what it had, rather

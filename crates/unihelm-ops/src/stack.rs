@@ -213,6 +213,7 @@ impl StackComponent {
             "postgres" => unihelm_distro::repos::pgdg(info),
             "mongodb" => unihelm_distro::repos::mongodb(info, self.version.version),
             "docker" => unihelm_distro::repos::docker(info),
+            "litespeed" => unihelm_distro::repos::litespeed(info),
             // A catalogue entry can arrive before its pinned repository does.
             // Refusing with a sentence is the only honest answer: installing it
             // would mean an unpinned archive, and pretending it worked would
@@ -501,8 +502,10 @@ pub struct ComponentView {
     ///
     /// The catalogue is the same everywhere; what a family packages is not.
     /// Valkey is in EPEL rather than EL's own repositories, and OpenLiteSpeed
-    /// has no pinned repository here yet — without this the page offers both
-    /// and an operator finds out by pressing a button and reading a failure.
+    /// publishes a Debian tree this panel pins but an EL layout it does not
+    /// handle — without this the page offers both on a machine that can install
+    /// neither, and an operator finds out by pressing a button and reading a
+    /// failure.
     pub unavailable: Option<String>,
 }
 
@@ -2234,14 +2237,33 @@ mod tests {
     }
 
     #[test]
-    fn a_catalogued_entry_with_no_pinned_repository_refuses_rather_than_installing_nothing() {
-        // LiteSpeed is offered but `repos::litespeed` does not exist yet. The
-        // wrong outcome is an install that adds no repository and then asks apt
-        // for a package the machine has never heard of.
+    fn every_catalogued_vendor_entry_resolves_a_repository() {
+        // The bug this catches shipped once: `repos::litespeed` was written,
+        // reviewed and merged, and nothing connected it to the match below — so
+        // OpenLiteSpeed sat on the Stack page permanently greyed out with
+        // "Unihelm has no pinned repository for it yet", which was true and
+        // entirely self-inflicted. Asserting the *fallback arm's wording* could
+        // not have caught that; asserting that no catalogued entry reaches the
+        // fallback at all is what catches it. The wrong outcome the fallback
+        // guards against — an install that adds no repository and then asks apt
+        // for a package the machine has never heard of — is still guarded,
+        // because an entry added without an arm here fails this test instead of
+        // reaching a user.
         let (debian, _) = mock_distro_with_recorder(Family::Debian);
-        let err = c("litespeed").repo(&debian).unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotImplemented);
-        assert!(err.detail.contains("cannot install"), "{}", err.detail);
+        for e in catalogue::CATALOGUE {
+            for v in e.versions {
+                if v.source != catalogue::Source::Distro {
+                    let component = cv(e.slug, v.version);
+                    assert!(
+                        component.repo(&debian).is_ok(),
+                        "{} {} is catalogued as a vendor package but `repo` has no arm for it, \
+                         so the panel offers something it cannot install",
+                        e.slug,
+                        v.version,
+                    );
+                }
+            }
+        }
     }
 
     /// Hazard 1: `enable --now` succeeding is not the same as running, and a
@@ -2746,8 +2768,11 @@ mod tests {
         // EL carries Valkey only in EPEL, which the panel does not add.
         let valkey = row("valkey").unavailable.as_deref().unwrap_or_default();
         assert!(valkey.contains("Redis"), "{valkey}");
-        // Catalogued, but no pinned repository exists for it yet.
-        assert!(row("litespeed").unavailable.is_some());
+        // LiteSpeed publishes a Debian tree the panel pins, and a per-release
+        // RPM layout it does not handle. This context is EL, so the row says so
+        // rather than offering a button that would fail at the repository step.
+        let litespeed = row("litespeed").unavailable.as_deref().unwrap_or_default();
+        assert!(litespeed.contains("OpenLiteSpeed"), "{litespeed}");
         // And everything the machine can actually install says nothing.
         assert_eq!(row("redis").unavailable, None);
         assert_eq!(row("memcached").unavailable, None);
