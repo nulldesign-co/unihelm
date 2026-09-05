@@ -74,6 +74,15 @@ pub struct SiteContext {
     pub site_type: &'static str,
     /// Primary domain plus aliases, space-separated for `server_name`.
     pub server_names: String,
+    /// Every alias, without the primary domain.
+    ///
+    /// Kept beside `server_names` rather than derived from it, because the two
+    /// web servers want opposite shapes: nginx takes one `server_name` line
+    /// with everything on it, Apache takes `ServerName` for the primary and
+    /// `ServerAlias` for the rest. Splitting the joined string back apart in a
+    /// template is how a domain containing a space — which validation forbids,
+    /// today — becomes two vhosts tomorrow.
+    pub aliases: Vec<String>,
     /// A safe identifier derived from the domain, for nginx zone names.
     pub zone_name: String,
     pub document_root: PathBuf,
@@ -89,6 +98,13 @@ pub struct SiteContext {
     pub chain_path: PathBuf,
 
     pub client_max_body_size: String,
+    /// The same limit in bytes.
+    ///
+    /// nginx parses `64m` itself; Apache's `LimitRequestBody` takes a number of
+    /// bytes and nothing else. Parsed once here rather than in a template,
+    /// because a template that got it wrong would silently serve a limit a
+    /// thousand times too large or too small.
+    pub max_body_bytes: u64,
     pub security_headers: Vec<String>,
     pub maintenance_mode: bool,
 
@@ -118,6 +134,7 @@ impl SiteContext {
             domain: domain.to_string(),
             site_type: site_type.as_str(),
             server_names: domain.to_string(),
+            aliases: Vec::new(),
             zone_name,
             document_root: paths::site_public(linux_user, domain),
             access_log: paths::site_log_dir(domain).join("access.log"),
@@ -133,7 +150,8 @@ impl SiteContext {
             key_path: paths::cert_dir(domain).join("privkey.pem"),
             chain_path: paths::cert_dir(domain).join("chain.pem"),
 
-            client_max_body_size: "64m".into(),
+            client_max_body_size: DEFAULT_BODY_SIZE.into(),
+            max_body_bytes: parse_body_size(DEFAULT_BODY_SIZE),
             security_headers: default_security_headers(false),
             maintenance_mode: false,
 
@@ -160,6 +178,19 @@ impl SiteContext {
         let mut names = vec![self.domain.clone()];
         names.extend(aliases.iter().cloned());
         self.server_names = names.join(" ");
+        self.aliases = aliases.to_vec();
+        self
+    }
+
+    /// Set the body limit from the panel's spelling of it, keeping the byte
+    /// count in step.
+    ///
+    /// The two fields must never be set separately: nginx would enforce one and
+    /// Apache the other, so a machine that switched web servers would change a
+    /// limit nobody touched.
+    pub fn with_body_size(mut self, size: &str) -> Self {
+        self.max_body_bytes = parse_body_size(size);
+        self.client_max_body_size = size.to_string();
         self
     }
 
@@ -177,6 +208,35 @@ impl SiteContext {
 
 /// A domain reduced to something nginx will accept as an identifier.
 ///
+/// The panel's default body limit, in nginx's spelling.
+pub const DEFAULT_BODY_SIZE: &str = "64m";
+
+/// `64m` into bytes, the way nginx reads it.
+///
+/// nginx accepts a bare number of bytes, or one suffixed `k`, `m` or `g`, in
+/// either case. Apache's `LimitRequestBody` takes bytes and nothing else, so a
+/// number has to be produced here for the same limit to mean the same thing
+/// under both.
+///
+/// An unparseable value falls back to the default rather than to zero or to
+/// unlimited. Both of those are catastrophic in opposite directions — zero
+/// refuses every upload on the site, unlimited lets one request fill the disk —
+/// and the value has already been validated by the time it reaches here, so
+/// this arm is reached only if that validation is ever loosened.
+pub fn parse_body_size(size: &str) -> u64 {
+    let trimmed = size.trim();
+    let (digits, scale) = match trimmed.chars().last() {
+        Some('k') | Some('K') => (&trimmed[..trimmed.len() - 1], 1024),
+        Some('m') | Some('M') => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&trimmed[..trimmed.len() - 1], 1024 * 1024 * 1024),
+        _ => (trimmed, 1),
+    };
+    match digits.trim().parse::<u64>() {
+        Ok(n) => n.saturating_mul(scale),
+        Err(_) => 64 * 1024 * 1024,
+    }
+}
+
 /// `example.com` becomes `example_com`. Used for zone and cache names, where a
 /// dot or a hyphen would be a syntax error.
 pub fn zone_name_for(domain: &str) -> String {
@@ -384,6 +444,184 @@ mod tests {
 
     fn php_site() -> SiteContext {
         SiteContext::new("example.com", "uh_abc123", SiteType::Php, PhpVersion::V83)
+    }
+
+    // -----------------------------------------------------------------------
+    // The Apache template
+    //
+    // Read against `nginx/site.conf` rather than on its own. The failure this
+    // guards against is not a template that does not render — it is one that
+    // renders, passes `apachectl configtest`, serves every page correctly, and
+    // has quietly dropped a protection the nginx one has. So each test below
+    // names the nginx line it is the counterpart of.
+    // -----------------------------------------------------------------------
+
+    fn render_apache(ctx: &SiteContext) -> String {
+        let set = TemplateSet::load().unwrap();
+        set.render(
+            "apache/site.conf",
+            &serde_json::json!({
+                "site": ctx,
+                "acme_webroot": paths::acme_webroot(),
+                "maintenance_root": "/var/lib/unihelm/state/maintenance",
+            }),
+        )
+        .unwrap()
+    }
+
+    /// nginx: `try_files $uri =404;` inside `location ~ \.php$`.
+    ///
+    /// Without it a request for `/uploads/avatar.png/evil.php` reaches PHP with
+    /// `PATH_INFO` set and an upload directory is remote code execution. Apache
+    /// spells it `<If "! -f %{REQUEST_FILENAME}">`, and the handler must be
+    /// inside the same block that carries the check.
+    #[test]
+    fn apache_never_hands_php_a_path_that_is_not_a_file() {
+        let out = directives_only(&render_apache(&php_site()));
+        assert!(out.contains("AcceptPathInfo Off"), "{out}");
+        assert!(out.contains(r#"<If "! -f %{REQUEST_FILENAME}">"#), "{out}");
+        assert!(out.contains("Require all denied"), "{out}");
+
+        // Order is the whole point: the guard has to be inside the FilesMatch
+        // that sets the handler, not somewhere else in the file.
+        let files_match = out
+            .find(r#"<FilesMatch "\.php$">"#)
+            .expect("no php FilesMatch");
+        let guard = out.find(r#"<If "! -f"#).expect("no guard");
+        let handler = out.find("SetHandler").expect("no handler");
+        assert!(
+            files_match < guard && guard < handler,
+            "the guard must sit between the FilesMatch and the SetHandler:\n{out}"
+        );
+    }
+
+    /// nginx: `location ~ /\.(?!well-known)` and the dangerous-extension list.
+    #[test]
+    fn apache_denies_dotfiles_and_leftovers_the_way_nginx_does() {
+        let out = directives_only(&render_apache(&php_site()));
+        assert!(
+            out.contains(r#"<DirectoryMatch "/\.(?!well-known)">"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("sql|bak|old|orig|save|swp|log|env|ini|conf|sh|yml|yaml|lock"),
+            "{out}"
+        );
+    }
+
+    /// nginx: the ACME location, before the redirect and outside maintenance.
+    ///
+    /// A certificate has to stay renewable while the site is 301ing everything
+    /// to https and while it is showing a maintenance page. Both vhosts carry
+    /// it, which is why this counts rather than merely checking presence.
+    #[test]
+    fn acme_survives_the_redirect_and_maintenance_mode() {
+        let mut ctx = php_site().with_tls(&paths::cert_dir("example.com"), true);
+        ctx.force_https = true;
+        ctx.maintenance_mode = true;
+        let out = directives_only(&render_apache(&ctx));
+
+        // Per vhost, not in total: a count over the whole file passes when both
+        // aliases land in one vhost and the other has none, which is the exact
+        // shape of the bug — a certificate that renews on http and not on https,
+        // or the other way round.
+        let vhosts: Vec<&str> = out.split("<VirtualHost").skip(1).collect();
+        assert_eq!(
+            vhosts.len(),
+            2,
+            "expected a redirect vhost and a real one:\n{out}"
+        );
+        for vhost in vhosts {
+            assert!(
+                vhost.contains("Alias /.well-known/acme-challenge/"),
+                "a vhost with no ACME alias:\n{vhost}"
+            );
+            assert!(
+                vhost.contains(r"RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/"),
+                "a vhost whose rewrite swallows the ACME path:\n{vhost}"
+            );
+        }
+    }
+
+    /// nginx: `client_max_body_size 64m;`
+    ///
+    /// Apache takes bytes. The same limit has to mean the same thing, or a
+    /// switch silently changes what a site accepts.
+    #[test]
+    fn the_body_limit_means_the_same_under_both() {
+        let out = directives_only(&render_apache(&php_site().with_body_size("64m")));
+        assert!(out.contains("LimitRequestBody 67108864"), "{out}");
+
+        for (spelled, bytes) in [
+            ("512k", 524_288u64),
+            ("8m", 8_388_608),
+            ("1g", 1_073_741_824),
+            ("1048576", 1_048_576),
+            ("2M", 2_097_152),
+        ] {
+            assert_eq!(parse_body_size(spelled), bytes, "{spelled}");
+        }
+        // Already validated upstream; the fallback is the default rather than
+        // zero (refuses every upload) or unlimited (one request fills a disk).
+        assert_eq!(parse_body_size("nonsense"), 64 * 1024 * 1024);
+    }
+
+    /// nginx: one `server_name` line. Apache: `ServerName` plus `ServerAlias`.
+    #[test]
+    fn aliases_become_server_alias_and_the_primary_stays_the_server_name() {
+        let ctx = php_site().with_aliases(&["www.example.com".into(), "example.net".into()]);
+        let out = directives_only(&render_apache(&ctx));
+        assert!(out.contains("ServerName example.com"), "{out}");
+        assert!(out.contains("ServerAlias www.example.com"), "{out}");
+        assert!(out.contains("ServerAlias example.net"), "{out}");
+        // And nginx still gets all three on one line, from the same context.
+        assert!(
+            render_site(&ctx).contains("server_name example.com www.example.com example.net;"),
+            "the two servers disagree about the same site's names"
+        );
+    }
+
+    /// nginx: the asset block only for sites served from disk.
+    ///
+    /// The same bug is available here and is worse, because `<FilesMatch>` has
+    /// no prefix/regex precedence rule to blame it on — it would simply apply.
+    #[test]
+    fn apache_caches_assets_only_for_sites_served_from_disk() {
+        let mut proxy = php_site();
+        proxy.site_type = SiteType::Proxy.as_str();
+        proxy.proxy_port = 3000;
+        assert!(!directives_only(&render_apache(&proxy)).contains("ExpiresActive"));
+        assert!(directives_only(&render_apache(&php_site())).contains("ExpiresActive"));
+    }
+
+    /// A snippet written for nginx must not be rendered into an Apache vhost.
+    ///
+    /// It would fail `apachectl configtest`, roll the whole change back, and
+    /// leave the site unrenderable — so it is left out, and said so in the file.
+    #[test]
+    fn an_nginx_snippet_is_not_rendered_into_apache() {
+        let mut ctx = php_site();
+        ctx.custom_snippet = Some("add_header X-Test 1;".into());
+        let out = render_apache(&ctx);
+        assert!(!directives_only(&out).contains("add_header"), "{out}");
+        assert!(out.contains("NOT APPLIED"), "{out}");
+        // nginx still applies it, from the same context.
+        assert!(directives_only(&render_site(&ctx)).contains("add_header X-Test 1;"));
+    }
+
+    /// A proxy site's websocket upgrade has to be matched before the catch-all,
+    /// or the handshake is answered by the HTTP proxy and fails.
+    #[test]
+    fn websockets_are_matched_before_the_http_proxy() {
+        let mut proxy = php_site();
+        proxy.site_type = SiteType::Proxy.as_str();
+        proxy.proxy_port = 3000;
+        let out = directives_only(&render_apache(&proxy));
+        let ws = out.find("ws://127.0.0.1:3000").expect("no websocket rule");
+        let http = out
+            .find("ProxyPass        / http://")
+            .expect("no proxy pass");
+        assert!(ws < http, "{out}");
     }
 
     /// A regex location outranks a prefix one, so the asset block must not exist

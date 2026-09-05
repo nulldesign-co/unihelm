@@ -67,6 +67,7 @@ pub mod terminal;
 pub mod tls;
 pub mod waf;
 pub mod webhook;
+pub mod webserver;
 pub mod wordpress;
 
 pub use registry::{Execution, OpContext, OpRegistry, Operation, Services, TypedOperation};

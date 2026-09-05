@@ -34,6 +34,43 @@ impl Validator for NginxValidator {
     }
 }
 
+/// `apachectl configtest`, which checks the whole configuration tree.
+///
+/// Debian installs the wrapper as `apache2ctl` and EL as `apachectl`; both
+/// families also ship `apachectl` as a symlink on Debian, but only in some
+/// releases, so both names are tried rather than the family being asked. The
+/// order is Debian's first because that is the family Apache is supported on.
+pub struct ApacheValidator;
+
+#[async_trait]
+impl Validator for ApacheValidator {
+    fn name(&self) -> &'static str {
+        "apachectl configtest"
+    }
+
+    async fn validate(&self) -> Result<(), String> {
+        let mut last = String::new();
+        for binary in ["apache2ctl", "apachectl"] {
+            // `configtest` rather than `-t`: they are the same check, and the
+            // wrapper sets the environment variables Debian's configuration
+            // reads (APACHE_LOG_DIR and the rest) before running it. Calling
+            // `httpd -t` directly on Debian fails on a perfectly valid
+            // configuration, because those variables are unset.
+            match Cmd::new(binary).arg("configtest").run().await {
+                // Apache writes its verdict to stderr on both success and
+                // failure, file and line number included, which is exactly what
+                // an operator needs when a vhost is wrong.
+                Ok(out) if out.success() => return Ok(()),
+                Ok(out) => return Err(out.failure_text()),
+                // Not this name — try the other before giving up, so a missing
+                // wrapper is not reported as a broken configuration.
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(last)
+    }
+}
+
 /// A validator that always passes, for machines where nginx is not installed
 /// yet — writing the catch-all vhost before the package lands is legitimate.
 pub struct SkipValidation;
@@ -124,6 +161,18 @@ impl UnitReloader {
         Self {
             distro: distro.clone(),
             unit: ManagedUnit::Nginx,
+            action: SvcAction::Reload,
+        }
+    }
+
+    /// Apache reloads gracefully — `systemctl reload` runs `apachectl graceful`,
+    /// which lets in-flight requests finish on the old configuration and starts
+    /// new ones on the new. Same reason nginx is a reload: publishing one site
+    /// must not drop a connection on any of the others.
+    pub fn apache(distro: &Distro) -> Self {
+        Self {
+            distro: distro.clone(),
+            unit: ManagedUnit::Apache,
             action: SvcAction::Reload,
         }
     }

@@ -80,6 +80,7 @@ impl From<UnitName> for String {
 #[serde(rename_all = "snake_case", tag = "unit")]
 pub enum ManagedUnit {
     Nginx,
+    Apache,
     PhpFpm {
         version: PhpVersion,
     },
@@ -101,6 +102,12 @@ impl ManagedUnit {
     pub fn unit_name(self, family: Family) -> UnitName {
         let name = match (self, family) {
             (ManagedUnit::Nginx, _) => "nginx.service".to_string(),
+
+            // The one unit name in this table that is not the package name on
+            // either side: Debian calls it `apache2`, EL calls it `httpd`, and
+            // neither ships the other as an alias.
+            (ManagedUnit::Apache, Family::Debian) => "apache2.service".to_string(),
+            (ManagedUnit::Apache, Family::Rhel) => "httpd.service".to_string(),
 
             (ManagedUnit::PhpFpm { version }, Family::Debian) => {
                 format!("php{}-fpm.service", version.as_str())
@@ -143,6 +150,7 @@ impl ManagedUnit {
     pub fn display_name(self) -> String {
         match self {
             ManagedUnit::Nginx => "Nginx".into(),
+            ManagedUnit::Apache => "Apache".into(),
             ManagedUnit::PhpFpm { version } => format!("PHP {} FPM", version.as_str()),
             ManagedUnit::MariaDb => "MariaDB".into(),
             ManagedUnit::PostgreSql => "PostgreSQL".into(),

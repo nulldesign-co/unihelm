@@ -123,6 +123,30 @@ pub fn nginx_site(domain: &str) -> PathBuf {
     nginx_dir().join(format!("site-{domain}.conf"))
 }
 
+/// Where the panel's Apache vhosts live.
+///
+/// Its own directory under Apache's own drop-in tree, not `sites-available`
+/// with a symlink into `sites-enabled`: the panel owns every file in here and
+/// deletes them, and a symlink farm is a second place for a vhost to be half
+/// removed from. `a2ensite` is never run for the same reason.
+pub fn apache_dir() -> PathBuf {
+    under("/etc/apache2/unihelm.d")
+}
+
+/// The one line added to Apache's configuration, through its own drop-in
+/// directory so even that is not an edit to a stock file.
+///
+/// Debian reads `/etc/apache2/conf-enabled`; EL reads `/etc/httpd/conf.d`. The
+/// path is resolved against the family before it is written — this is the
+/// Debian one, which is the family Apache is supported on first.
+pub fn apache_hook() -> PathBuf {
+    under("/etc/apache2/conf-enabled/unihelm.conf")
+}
+
+pub fn apache_site(domain: &str) -> PathBuf {
+    apache_dir().join(format!("site-{domain}.conf"))
+}
+
 pub fn nginx_catchall() -> PathBuf {
     // `00-` so it sorts first and really is the default server.
     nginx_dir().join("00-catchall.conf")

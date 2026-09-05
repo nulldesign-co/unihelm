@@ -633,18 +633,27 @@ pub async fn render_vhost_mode(
         context = context.with_tls(&cert_dir, true);
     }
 
+    // Which server, asked once and used for all four of file, template,
+    // validator and reloader. Mixing two of them — the other server's template
+    // into this one's path, or this one's file checked with the other one's
+    // `-t` — is a way to take every site on the machine down that no individual
+    // argument would look wrong for.
+    let server = crate::webserver::active(ctx).await?;
+    let vhost = server.site_vhost(&site.domain)?;
+    let reloader = server.reloader(ctx.distro())?;
+
     ctx.config()
         .apply(ApplyRequest {
-            file: ManagedFile::nginx(paths::nginx_site(&site.domain)),
-            template: "nginx/site.conf",
+            file: vhost.file,
+            template: vhost.template,
             context: serde_json::json!({
                 "site": context,
                 "acme_webroot": paths::acme_webroot(),
                 "maintenance_root": paths::maintenance_root(),
             }),
-            service: "nginx",
-            validator: &NginxValidator,
-            reloader: &UnitReloader::nginx(ctx.distro()),
+            service: vhost.service,
+            validator: server.validator()?,
+            reloader: &reloader,
             post_check: None,
             force: false,
             task_id: ctx.task_id().map(|t| t.to_string()),
@@ -723,7 +732,10 @@ pub fn site_context(site: &Site, linux_user: &unihelm_core::LinuxUser) -> Result
     context.force_https = site.force_https;
     context.http3 = site.http3;
     context.maintenance_mode = site.maintenance_mode;
-    context.client_max_body_size = site.client_max_body_size.clone();
+    // Through the setter, which keeps the byte count in step: nginx enforces
+    // the string and Apache the number, and setting one without the other is a
+    // machine whose upload limit changes when its web server does.
+    context = context.with_body_size(&site.client_max_body_size);
     context.custom_snippet = site.custom_nginx_snippet.clone();
     context.rate_limit_enabled = site.rate_limit_enabled;
     context.rate_limit_rps = site.rate_limit_rps.clamp(1, 10_000) as u32;
@@ -1355,9 +1367,16 @@ impl TypedOperation for Drift {
             context = context.with_tls(&cert_dir, true);
         }
 
+        // The same seam as the render above, and it has to be: a drift report
+        // built from nginx's template against a machine serving with Apache
+        // would call every vhost on it hand-edited.
+        let vhost = crate::webserver::active(ctx)
+            .await?
+            .site_vhost(&site.domain)?;
+
         let report = ctx.config().drift_report(
-            &ManagedFile::nginx(paths::nginx_site(&site.domain)),
-            "nginx/site.conf",
+            &vhost.file,
+            vhost.template,
             &serde_json::json!({
                 "site": context,
                 "acme_webroot": paths::acme_webroot(),

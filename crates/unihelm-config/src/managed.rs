@@ -326,6 +326,16 @@ impl ManagedFile {
         }
     }
 
+    /// An Apache vhost. Same shape as [`ManagedFile::nginx`] — 0644 so Apache,
+    /// running as its own user, can read it, and `#` comments.
+    pub fn apache(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: 0o644,
+            comment_style: CommentStyle::Hash,
+        }
+    }
+
     /// A PHP-FPM pool file. Comments are semicolons, and it is read by the FPM
     /// master, which runs as root.
     pub fn fpm_pool(path: impl Into<PathBuf>) -> Self {
