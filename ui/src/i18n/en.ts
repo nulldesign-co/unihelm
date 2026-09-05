@@ -211,6 +211,15 @@ export const en = {
     addFailed: "That key was not accepted.",
   },
   stack: {
+    perVersionNote:
+      "One PHP-FPM serves every site on a version, so this choice is for all of them at once — not per site.",
+    hostVersionIncumbentTitle: "This version stays on the host",
+    hostVersionIncumbent:
+      "PHP {{version}} is installed as packages and its sites are serving through it. There is only one PHP {{version}}: a container of it would claim the same sockets and the same sites, and one of the two would stop answering. Install a version this server does not have, or remove the host one during a window where its sites may be down.",
+    hostVersionsStay:
+      "Versions already installed on this server keep running there. Only a version installed fresh comes up as a container.",
+    sitesServed: "{{count}} site uses this version",
+    sitesBadge: "{{count}} sites",
     chooseRuntime: "Run it",
     dockerNeededTitle: "Docker is not installed",
     dockerNeeded:
@@ -223,6 +232,8 @@ export const en = {
     removeAriaContainer: "Remove the {{name}} {{version}} container",
     replaceAriaContainer: "Replace the {{name}} container with {{version}}",
     runtimeNote: {
+      containerPooled:
+        "Runs as one container for this version, holding a pool for every site that names it. Installing or removing another version cannot disturb it, and the sites reach it over the same socket as before.",
       container:
         "Runs as a container. No repository is added to this server and none of its packages are touched; the data lives in a volume that outlives the container.",
       containerSideBySide:

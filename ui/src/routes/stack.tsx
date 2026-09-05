@@ -38,7 +38,7 @@ import { staggerStyle } from "@/lib/motion";
  * response, on purpose: joining two independently-polled queries is how a row
  * ends up naming a stale installed version in a Replace warning.
  *
- * Three of the decisions this page makes are worth stating out loud, because
+ * Five of the decisions this page makes are worth stating out loud, because
  * each of them is a click an operator cannot take back:
  *
  * 1. **A component the panel did not install offers no button.** `unmanaged` is
@@ -63,6 +63,17 @@ import { staggerStyle } from "@/lib/motion";
  *    chosen against the mode the chooser is on, because a warning that is right
  *    for one mode is a lie in the other, and the operator reads it as a fact
  *    either way.
+ * 5. **For PHP the mode is chosen once per version, for every site on it.** One
+ *    FPM master holds one pool per site, so there is only ever one PHP 8.3 and
+ *    everything that names 8.3 goes wherever it goes. That makes two sentences
+ *    load-bearing, and both of them belong beside the chooser rather than in a
+ *    task log afterwards: this choice covers every site on the version, and a
+ *    version the host is already serving stays on the host — a container of the
+ *    same version cannot run beside it, because the two would write pool
+ *    configuration in different places while claiming the same sockets. The
+ *    number of sites riding on a version is drawn beside its Remove for the
+ *    same reason: taking out something a dozen sites answer through must not
+ *    look like taking out something nothing uses.
  */
 
 const TONE: Record<ComponentState, "success" | "accent" | "danger" | "neutral"> = {
@@ -157,6 +168,52 @@ export function supportFor(entry: CatalogueEntry): RuntimeSupport {
 }
 
 /**
+ * Whether choosing a mode for this entry chooses it for everything using the
+ * version, rather than for one thing at a time.
+ *
+ * PHP is why this exists. One FPM master holds one pool per site, so there is
+ * exactly one PHP 8.3 on a server and every 8.3 site is inside it: move the
+ * version and they all move, together, whether or not anybody looked at them
+ * first. An application container is the opposite — one per app, moved on its
+ * own — and a database is a single thing that is only ever itself.
+ *
+ * Read off the catalogue rather than off the slug, because the page holds no
+ * list of product names on purpose. An entry whose versions coexist *and* which
+ * can go either way is one where "where does this run" is a question about a
+ * version, and the answer reaches everything that named it. Nothing else in the
+ * catalogue has that shape today, and anything that grows it wants the same
+ * sentence.
+ */
+export function modeIsPerVersion(entry: CatalogueEntry): boolean {
+  return entry.side_by_side && supportFor(entry) === "either";
+}
+
+/**
+ * How many sites are served through one installed version, when the agent says.
+ *
+ * Optional on the wire and read defensively for the reason `runtimeOf` is: an
+ * agent that does not send it is not an agent reporting zero. The difference
+ * matters more here than anywhere else on the page — "nothing depends on this"
+ * is exactly the reassurance somebody wants before pressing Remove, and
+ * inventing it out of a missing field is how a dozen sites go dark. So an
+ * absent count draws no count at all, and the row says nothing it cannot show.
+ *
+ * An `unmanaged` row is excluded on the same principle: its version is the
+ * agent's guess at which catalogue version this is, and a count attached to a
+ * guessed version is a guess wearing a number.
+ */
+export function sitesUsing(row: StackComponentView): number | null {
+  if (row.status === "unmanaged") return null;
+  const sent = (row as { sites_using?: number | null }).sites_using;
+  // A count of sites is a whole number of sites. `Number.isInteger` and not a
+  // range check, because the shapes this rejects — `2.5`, `NaN`, `Infinity`, a
+  // string that arrived through a hand-rolled client — are all a field the
+  // agent got wrong, and a wrong number beside Remove is worse than no number:
+  // the operator reads it, believes it, and clicks.
+  return typeof sent === "number" && Number.isInteger(sent) && sent >= 0 ? sent : null;
+}
+
+/**
  * Which mode the chooser opens on.
  *
  * On the mode of what is already installed, for the reason `defaultVersionFor`
@@ -226,9 +283,41 @@ export function dockerReady(components: readonly StackComponentView[]): boolean 
  * Only `installed` counts, which is the same test the agent applies: an
  * unmanaged host copy is not the panel's, and reinstalling a container the
  * panel already runs has to stay idempotent.
+ *
+ * `version` narrows it to one, and callers pass it exactly where the agent's
+ * own question is narrow. The agent asks about a row key, and that key carries
+ * the version for entries whose versions coexist (`php8.3`) and not for the
+ * ones where there is only ever one (`mariadb`). So a host MariaDB blocks every
+ * container MariaDB — one port, one data directory — while a host PHP 8.3
+ * blocks a container PHP 8.3 and nothing else. Asking entry-wide for PHP would
+ * refuse to containerise 8.4 because 8.3 is on the machine, which is refusing
+ * the one install this whole change exists to make safe.
  */
-export function hostHoldsEntry(rows: readonly StackComponentView[]): boolean {
-  return rows.some((r) => runtimeOf(r) === "host" && r.status === "installed");
+export function hostHoldsEntry(rows: readonly StackComponentView[], version?: string): boolean {
+  return rows.some(
+    (r) =>
+      runtimeOf(r) === "host" &&
+      r.status === "installed" &&
+      (version === undefined || r.version === version),
+  );
+}
+
+/**
+ * The panel's own host install of one version, when there is one.
+ *
+ * The row [`hostHoldsEntry`] answered "yes" about, handed back so the warning
+ * above the button can name what is riding on it instead of stopping at the
+ * fact that it exists.
+ */
+function hostRowFor(
+  rows: readonly StackComponentView[],
+  version: string,
+): StackComponentView | null {
+  return (
+    rows.find(
+      (r) => runtimeOf(r) === "host" && r.status === "installed" && r.version === version,
+    ) ?? null
+  );
 }
 
 /**
@@ -278,7 +367,15 @@ export function defaultVersionFor(
     const held = entry.versions.find((v) => present.has(v.version));
     if (held) return held.version;
   }
-  const open = entry.versions.filter((v) => !present.has(v.version));
+  // A version the host is already serving cannot also be a container, so the
+  // container menu must not open on one: the operator switches mode to see what
+  // a container would be, lands on a disabled button under a callout, and reads
+  // it as "this panel cannot do containers" rather than as "this one version
+  // stays where it is". It is still in the menu below, where choosing it
+  // deliberately gets the explanation.
+  const blocked = (version: string) =>
+    runtime === "container" && entry.side_by_side && hostHoldsEntry(rows, version);
+  const open = entry.versions.filter((v) => !present.has(v.version) && !blocked(v.version));
   const pick =
     open.find((v) => v.recommended) ??
     open.find((v) => !v.eol) ??
@@ -330,8 +427,17 @@ export interface RowPlan {
    * installed, which the agent refuses. Same shape as `dockerMissing`, and for
    * the same reason: a blocked click the row explains rather than a click that
    * reaches the agent and comes back red.
+   *
+   * Scoped to the selected version where the agent scopes it — see
+   * [`hostHoldsEntry`] — so on PHP this is "8.3 stays on the host", not "this
+   * server can no longer containerise PHP".
    */
   hostIncumbent: boolean;
+  /**
+   * Where this runs is a decision about the version, taken for everything on
+   * it. Drives the sentence that has to be read before the click, not after.
+   */
+  perVersion: boolean;
 }
 
 /**
@@ -356,7 +462,11 @@ export function planFor(
   const offered = entry.versions.filter((v) => !present.has(v.version));
   const support = supportFor(entry);
   const dockerMissing = runtime === "container" && !dockerReady(components);
-  const hostIncumbent = runtime === "container" && hostHoldsEntry(rows);
+  const perVersion = modeIsPerVersion(entry);
+  // The version, and only the version, where the agent's row key carries one.
+  const hostIncumbent =
+    runtime === "container" &&
+    hostHoldsEntry(rows, entry.side_by_side ? selectedVersion : undefined);
   const shape = {
     rows,
     unmanaged,
@@ -367,6 +477,7 @@ export function planFor(
     support,
     dockerMissing,
     hostIncumbent,
+    perVersion,
   };
 
   // Deliberately first: an unmanaged nginx is installed, has no version the
@@ -657,6 +768,26 @@ function EntryRow({
   const runtimeChooserId = `stack-runtime-${entry.slug}`;
   const eol = plan.selected?.eol === true;
   const container = plan.runtime === "container";
+  // The host install the agent would refuse this container over, so the row can
+  // say how much is riding on it rather than only that it exists. Null whenever
+  // nothing is being refused, which is every row on most machines.
+  const incumbent = plan.hostIncumbent && plan.perVersion ? hostRowFor(plan.rows, selected) : null;
+  const incumbentSites = incumbent === null ? null : sitesUsing(incumbent);
+  // The versions this server serves itself, which is why the container menu is
+  // not offering them.
+  //
+  // Without this the page goes quiet about the one fact the operator came for.
+  // `defaultVersionFor` skips a host-held version when the mode menu moves to
+  // containers, so somebody who switched modes meaning to move 8.3 lands on a
+  // different version with a live Install under it and no word about 8.3 at
+  // all — the refusal is still there, but only if they go and select 8.3 to
+  // read it. Saying it up front is the whole point of the step: a version this
+  // server is already serving stays where it is, and the operator learns that
+  // before the click rather than from a menu that quietly moved.
+  const heldOnHost =
+    plan.perVersion && container && !plan.hostIncumbent
+      ? plan.rows.filter((r) => runtimeOf(r) === "host" && r.status === "installed")
+      : [];
   // Worth its own sentence only where the two modes disagree: on the host this
   // engine replaces itself and in a container it does not, which is the whole
   // reason the mode is on the page.
@@ -808,6 +939,34 @@ function EntryRow({
         )}
       </div>
 
+      {/* Before the version's own note, because it is not a note about the
+          version in the box — it is what the mode menu beside it actually
+          decides. One FPM master holds every pool for a version, so there is no
+          such thing as moving one site: the operator is choosing for all of
+          them, and they should read that while the menu is still open rather
+          than in a task log with the sites already stopped. It stays on the row
+          when nothing is left to install, because the mode menu stays too. */}
+      {!plan.unmanaged && plan.perVersion ? (
+        <p className="mt-2.5 max-w-prose text-xs text-ink-muted">
+          {t("stack.perVersionNote", { name: entry.display_name })}
+        </p>
+      ) : null}
+
+      {/* Beside it rather than in a callout: nothing is blocked here — the
+          version under the button is installable — so this is the sentence that
+          explains what the menu did, not a warning about what it will not do.
+          When the selected version *is* the one the server holds, the callout
+          below says it in full and this would only say it twice. */}
+      {!plan.unmanaged && heldOnHost.length > 0 ? (
+        <p className="mt-1.5 max-w-prose text-xs text-ink-muted">
+          {t("stack.hostVersionsStay", {
+            name: entry.display_name,
+            versions: heldOnHost.map((r) => label(r.version)).join(", "),
+            count: heldOnHost.length,
+          })}
+        </p>
+      ) : null}
+
       {/* Where the operator is choosing, so the promise sits next to the choice:
           the distribution's package and a vendor's are not the same offer, and
           which one this is decides who ships the next security fix. The
@@ -820,8 +979,17 @@ function EntryRow({
           sitting beside it. */}
       {!plan.unmanaged && plan.offered.length > 0 && plan.selected ? (
         <p className="mt-2.5 text-xs text-ink-subtle">
+          {/* The generic container note promises a data volume that outlives
+              the container, which is true of a database and false here: PHP's
+              data is the tenant's code, on this server, bind-mounted in. So the
+              per-version entries get the sentence that is true of them — and it
+              is the one worth reading anyway, because "the interpreter and its
+              extensions come out of an image" is precisely why installing a
+              second version can no longer take the first one's sites down. */}
           {container
-            ? t("stack.runtimeNote.container")
+            ? plan.perVersion
+              ? t("stack.runtimeNote.containerPooled")
+              : t("stack.runtimeNote.container")
             : t(`stack.source.${plan.selected.source}`)}
           {gainsSideBySide ? ` ${t("stack.runtimeNote.containerSideBySide")}` : null}
         </p>
@@ -853,8 +1021,30 @@ function EntryRow({
           row reads top to bottom as "this is why, and there is the thing to
           press". */}
       {plan.hostIncumbent ? (
-        <Callout tone="warning" className="mt-3" title={t("stack.hostIncumbentTitle")}>
-          {t("stack.hostIncumbent", { name: entry.display_name })}
+        <Callout
+          tone="warning"
+          className="mt-3"
+          title={t(plan.perVersion ? "stack.hostVersionIncumbentTitle" : "stack.hostIncumbentTitle")}
+        >
+          {/* Two different facts, and the engine one is wrong here: PHP has no
+              port to hold, and what stands in the way is that a host 8.3 and a
+              container 8.3 would write pool configuration in two places while
+              answering on the same sockets. The engine's advice is wrong too.
+              "Remove the host install first" costs a database its downtime; it
+              costs PHP every site on the version, all at once, for as long as
+              the container takes to come up — so this says the version stays,
+              and what the deliberate move would actually cost. */}
+          {plan.perVersion
+            ? t("stack.hostVersionIncumbent", {
+                name: entry.display_name,
+                version: label(selected),
+              })
+            : t("stack.hostIncumbent", { name: entry.display_name })}
+          {/* Only when the agent sent a count. A silent zero here would read as
+              "nothing is on it, go ahead" over a version serving a dozen. */}
+          {incumbentSites !== null && incumbentSites > 0 ? (
+            <> {t("stack.sitesServed", { count: incumbentSites })}</>
+          ) : null}
         </Callout>
       ) : null}
 
@@ -929,6 +1119,11 @@ function InstalledChip({
   // Our bookkeeping and systemd can disagree if somebody removed a package by
   // hand. Say so rather than quietly showing one of the two.
   const disagrees = row.status === "installed" && !row.unit_active;
+  // What is riding on this version, beside the button that takes it away. A
+  // version nothing uses and a version a dozen sites answer through are the
+  // same three characters on this chip otherwise, and only one of them is a
+  // Remove somebody can take back.
+  const sites = sitesUsing(row);
 
   return (
     <li className="inline-flex flex-col gap-1">
@@ -945,6 +1140,23 @@ function InstalledChip({
           <span className="text-ink-muted">{t(`stack.state.${row.status}`)}</span>
         </Badge>
         {whereMatters ? <Badge tone="neutral">{t(`stack.runtime.${runtime}`)}</Badge> : null}
+        {sites === null ? null : (
+          // Accent rather than warning: a version serving sites is the healthy
+          // case and must not be dressed as a fault. It carries weight so the
+          // eye stops on it before the Remove beside it, and reads neutral at
+          // zero, which is the honest difference between the two clicks.
+          <Badge tone={sites > 0 ? "accent" : "neutral"} className="tnum">
+            {/* "12 sites" is enough beside a chip that already names the
+                version; read on its own, out of the row, it is not. A badge is
+                a plain span, and an `aria-label` on one is a name an author put
+                on an element with no role to carry it — browsers are within
+                their rights to drop it, and some do. So the sentence is real
+                text, hidden the way the rest of this panel hides text, and the
+                short form is hidden from the reader that gets the long one. */}
+            <span aria-hidden>{t("stack.sitesBadge", { count: sites })}</span>
+            <span className="sr-only">{t("stack.sitesServed", { count: sites })}</span>
+          </Badge>
+        )}
         {removable ? (
           <Button
             variant="ghost"

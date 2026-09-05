@@ -37,6 +37,7 @@ pub mod dns;
 pub mod docker;
 pub mod engine;
 pub mod fpm;
+pub mod fpmcontainer;
 pub mod fsops;
 pub mod fwops;
 pub mod harden;
