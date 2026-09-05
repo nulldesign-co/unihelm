@@ -688,18 +688,31 @@ async fn refuse_when_the_target_is_not_installed(ctx: &OpContext, target: WebSer
     let unit = target.unit()?.unit_name(ctx.distro().info.family);
     // The unit existing at all is the question, not whether it is running: the
     // target is by definition not running yet.
-    match ctx.distro().svc.status(&unit).await {
-        Ok(_) => Ok(()),
-        Err(_) => Err(UnihelmError::new(
+    //
+    // On the *state*, not on Ok/Err. Asking systemd about a unit it has never
+    // heard of succeeds — it answers `load_state=not-found` — so a match that
+    // accepted any `Ok` would have called an uninstalled Apache installed, and
+    // the switch would have stopped nginx before finding out.
+    let state = ctx
+        .distro()
+        .svc
+        .status(&unit)
+        .await
+        .map(|s| s.state)
+        .unwrap_or(unihelm_distro::svc::UnitState::NotFound);
+    if state == unihelm_distro::svc::UnitState::NotFound {
+        return Err(UnihelmError::new(
             ErrorCode::Conflict,
             format!(
-                "{} is not installed on this server, so there is nothing to switch to. \
-                 Install it from the Stack page first.",
-                target.display_name()
+                "{} is not installed on this server ({unit} does not exist), so there is \
+                 nothing to switch to. Install it from the Stack page first.",
+                target.display_name(),
+                unit = unit.as_str(),
             ),
         )
-        .with_field("target")),
+        .with_field("target"));
     }
+    Ok(())
 }
 
 /// The include the target reads the panel's tree through.
@@ -934,6 +947,21 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotImplemented);
         assert!(err.detail.contains("OpenLiteSpeed"), "{}", err.detail);
         // And the record of what serves is untouched.
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_is_not_installed_refuses_before_stopping_anything() {
+        // The mock has no apache2.service, which is the state of every machine
+        // that has not installed Apache. Systemd answers about a unit it has
+        // never heard of with a *success* carrying `not-found`, so a check that
+        // only looked at Ok/Err would have called this installed and stopped
+        // nginx before finding out otherwise.
+        let ctx = op_ctx().await;
+        let err = switch_to(&ctx, "apache", false).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("not installed"), "{}", err.detail);
+        assert!(err.detail.contains("apache2.service"), "{}", err.detail);
         assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
     }
 
