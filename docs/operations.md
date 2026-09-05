@@ -258,6 +258,13 @@ The version is accepted as either the series or the point release, because
 the series — an operator copying what the panel showed them should not be told
 that version is not installed.
 
+In the panel this is the **Make `php`** button beside an installed version on
+the Stack page, and it appears only where the click can do something: on a host
+version (an alternatives entry points at a path, and a containerised version has
+no host binary to point at), and only when a second version is installed to move
+the default away from. It had no HTTP route at all until 0.6.0 — the operation
+and its CLI command existed, and the panel could not reach either.
+
 ### `sys.ping`
 
 | | |

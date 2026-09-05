@@ -20,11 +20,17 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import type { CatalogueEntry, CatalogueVersion, StackComponentView } from "@/lib/api";
+import type {
+  CatalogueEntry,
+  CatalogueVersion,
+  InstalledRuntime,
+  StackComponentView,
+} from "@/lib/api";
 
 import { en } from "../i18n/en";
 
 import {
+  defaultCommandFor,
   defaultRuntimeFor,
   defaultVersionFor,
   groupByCategory,
@@ -33,6 +39,7 @@ import {
   runtimeOf,
   sideBySideIn,
   supportFor,
+  uncataloguedRuntimes,
 } from "./stack";
 
 const version = (over: Partial<CatalogueVersion> & { version: string }): CatalogueVersion => ({
@@ -522,5 +529,106 @@ describe("translation coverage for the stack page", () => {
     for (const key of DYNAMIC_KEYS) {
       expect(typeof lookup(en, key), `en: ${key}`).toBe("string");
     }
+  });
+});
+
+/**
+ * The survey, as `runtime.list` reports it: what a binary said when asked its
+ * version, and its absolute path.
+ */
+const found = (
+  over: Partial<InstalledRuntime> & { runtime: string; version: string },
+): InstalledRuntime => ({
+  path: `/usr/bin/${over.runtime}`,
+  is_default: false,
+  ...over,
+});
+
+describe("which version answers a bare command name", () => {
+  const php83 = row({ component: "php", version: "8.3" });
+  const php82 = row({ component: "php", version: "8.2" });
+  const two = [
+    found({ runtime: "php", version: "8.3.6", is_default: true }),
+    found({ runtime: "php", version: "8.2.20" }),
+  ];
+
+  it("marks the version the bare name resolves to, and offers the others", () => {
+    expect(defaultCommandFor(php, php83, two)).toEqual({
+      command: "php",
+      owns: true,
+      movable: false,
+    });
+    expect(defaultCommandFor(php, php82, two)).toEqual({
+      command: "php",
+      owns: false,
+      movable: true,
+    });
+  });
+
+  it("says nothing when there is only one version to answer to it", () => {
+    // The badge would be true and the button would be a click whose only
+    // outcome is no change. Both are noise on a machine with one PHP, which is
+    // most of them.
+    const only = [found({ runtime: "php", version: "8.3.6", is_default: true })];
+    expect(defaultCommandFor(php, php83, only)).toBeNull();
+  });
+
+  it("says nothing about a container", () => {
+    // `update-alternatives` points at a path on the host. A containerised
+    // version has no host binary, so the click would aim `php` at a file that
+    // is not there — and the survey, which reads $PATH, cannot see it either.
+    const contained = row({ component: "php", version: "8.3", runtime: "container" });
+    expect(defaultCommandFor(php, contained, two)).toBeNull();
+  });
+
+  it("says nothing about a runtime whose default the agent will not move", () => {
+    // Node from NodeSource installs a real binary with no alternatives entry,
+    // so the agent refuses with a 501. A button that always fails is worse than
+    // no button.
+    const node: CatalogueEntry = { ...php, slug: "node", display_name: "Node.js" };
+    const rows = [
+      found({ runtime: "node", version: "22.11.0", is_default: true }),
+      found({ runtime: "node", version: "20.18.0" }),
+    ];
+    expect(defaultCommandFor(node, row({ component: "node", version: "22" }), rows)).toBeNull();
+  });
+
+  it("compares versions component-wise, not as a prefix", () => {
+    // `8.3` is not `8.30`. A string prefix would put the badge on the wrong
+    // chip, which is an operator reading that a bare php runs a version it
+    // does not.
+    const wide = [
+      found({ runtime: "php", version: "8.30.1", is_default: true }),
+      found({ runtime: "php", version: "8.2.20" }),
+    ];
+    expect(defaultCommandFor(php, php83, wide)).toBeNull();
+    expect(defaultCommandFor(php, row({ component: "php", version: "8.30" }), wide)).toEqual({
+      command: "php",
+      owns: true,
+      movable: false,
+    });
+  });
+});
+
+describe("interpreters the catalogue cannot account for", () => {
+  it("lists what is on the machine and not in the catalogue", () => {
+    // Bun and Deno ship as single vendor binaries with no signed repository, so
+    // they are not in the catalogue and never will be. A page that renders only
+    // the catalogue reports a machine running Bun as a machine with no Bun,
+    // which is the same blindness that had this panel calling nginx `absent`
+    // while it served thirteen sites.
+    const survey = [
+      found({ runtime: "php", version: "8.3.6" }),
+      found({ runtime: "bun", version: "1.1.38", path: "/usr/local/bin/bun" }),
+      found({ runtime: "deno", version: "2.1.4", path: "/usr/local/bin/deno" }),
+    ];
+    expect(uncataloguedRuntimes(survey, [php, nginx]).map((r) => r.runtime)).toEqual([
+      "bun",
+      "deno",
+    ]);
+  });
+
+  it("is empty when the catalogue covers everything found", () => {
+    expect(uncataloguedRuntimes([found({ runtime: "php", version: "8.3.6" })], [php])).toEqual([]);
   });
 });

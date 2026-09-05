@@ -34,7 +34,6 @@ export const en = {
     hidePassword: "Hide password",
   },
   nav: {
-    runtimes: "Runtimes",
     docker: "Docker",
     discover: "Discovered sites",
     settings: "Settings",
@@ -270,7 +269,7 @@ export const en = {
     categoryHint: {
       web_server: "One of these has to be running before a site is served.",
       language:
-        "What your applications are written in. PHP and Node.js keep several versions at once; each site or app picks its own.",
+        "What your applications are written in. PHP and Node.js keep several versions at once; each site or app picks its own. Bun and Deno are not here: their vendors serve single binaries over https with no signed repository, and this panel will not unpack one as root.",
       database:
         "An engine has to be on the server before the Databases page can create anything in it.",
       cache: "In-memory stores, for sessions, queues and caches.",
@@ -283,6 +282,12 @@ export const en = {
     eolWarning: "{{name}} {{version}} is past its upstream support date. It is offered so an application can be moved off it, not so a new one can be built on it.",
     notInstalled: "Not installed",
     packageVersion: "Installed version",
+    answersTo: "answers `{{command}}`",
+    makeDefault: "Make `{{command}}`",
+    makeDefaultAria: "Point a bare {{command}} at version {{version}}",
+    alsoTitle: "Also on this machine",
+    alsoHint:
+      "Interpreters the panel found on $PATH and has no signed repository for, so there is nothing here to install or remove — only to know about. An application can still be pinned to one of these paths.",
     recommended: "recommended",
     removeAria: "Remove {{name}} {{version}}",
     replaceTitle: "This replaces the version that is running",
@@ -316,63 +321,6 @@ export const en = {
       installed: "Installed",
       failed: "Failed",
       removing: "Removing",
-    },
-  },
-  runtimes: {
-    title: "Runtimes",
-    subtitle: "What this server can run, and which version a bare command gets.",
-    scope:
-      "This page reads the machine and installs Node, Python and Go — Node from NodeSource, the other two from the distribution's own repositories. PHP comes from the Stack page. Bun and Deno are single binaries their vendors serve with no signed repository, so those have to reach this server by other means. Everything installed is listed here, whatever put it there.",
-    scopeStack: "Open the Stack page",
-    listTitle: "Installed",
-    defaultHint:
-      "The version marked on its row is the one a bare command name resolves to — what a cron line saying node runs, and what an app created without a pinned version gets. Every other version is reachable only by the absolute path beside it.",
-    runtime: "Runtime",
-    version: "Version",
-    path: "Path",
-    resolvesHere: "{{command}} resolves here",
-    emptyTitle: "No runtimes found",
-    empty:
-      "Not one of the seven interpreters the panel looks for is on this server. Install a Node line above, or PHP from the Stack page.",
-    missingTitle: "Not on this server",
-    missingHint: "The panel looked for these and found no version of any of them.",
-    name: {
-      node: "Node.js",
-      python: "Python",
-      php: "PHP",
-      ruby: "Ruby",
-      go: "Go",
-      deno: "Deno",
-      bun: "Bun",
-    },
-    origin: {
-      node: "Installs from the card above, from NodeSource.",
-      python: "A distribution package, and one Unihelm has no button for on any page. Install it from the distribution yourself and it will be listed here.",
-      php: "A distribution package. The Stack page installs it, not this one.",
-      ruby: "A distribution package, and one Unihelm has no button for on any page. Install it from the distribution yourself and it will be listed here.",
-      go: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
-      deno: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
-      bun: "A single binary from its vendor, with no signed repository behind it. Put it on the server yourself and it will be listed here.",
-    },
-    install: {
-      runtime: "Runtime",
-      version: "Version",
-      distroVersion: "Whatever this distribution ships",
-      pythonLine: "Python {{version}}",
-      noteNode:
-      "Node comes from NodeSource, one repository per major line, with the signing key pinned by fingerprint.",
-      notePython:
-      "Python and Go come from the distribution's own repositories — the same packages apt would install.",
-      noteDistro:
-      "Bun and Deno are single binaries their vendors serve over https with no signed repository, so this panel does not install them. Put one on the server yourself and it appears below.",
-      title: "Install a Node line",
-      hint: "One major line at a time, from NodeSource, with the signing key pinned by fingerprint.",
-      major: "Major line",
-      line: "Node {{major}}",
-      submit: "Install",
-      already:
-        "Node {{major}} is already installed, at {{version}}. Installing it again reports that and changes nothing.",
-      note: "One repository per major line, never one that tracks the latest: an app pinned to 20 has to keep getting 20. apt resolves a line to a point release and the log below names the one that landed. Debian and Ubuntu only — the RPM side of NodeSource is not wired up here, so on a Red Hat family server the install refuses outright rather than half-working.",
     },
   },
   sites: {

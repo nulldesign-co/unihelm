@@ -539,6 +539,20 @@ export interface RuntimeListResponse {
   runtimes: InstalledRuntime[];
 }
 
+/** Which installed version a bare command name should resolve to. */
+export interface SetRuntimeDefaultRequest {
+  /** Only `php` has a default the panel can move. */
+  runtime: string;
+  version: string;
+}
+
+export interface SetRuntimeDefaultResponse {
+  runtime: string;
+  /** What the bare name resolves to now. */
+  path: string;
+  version: string;
+}
+
 export interface UpdateAppRuntimeRequest {
   mode?: AppMode;
   runtime?: AppRuntime;
@@ -985,6 +999,14 @@ export const endpoints = {
   createContainer: (body: CreateContainerRequest) =>
     api.post<TaskAccepted>("/api/server/docker/containers", body),
   runtimes: () => api.get<RuntimeListResponse>("/api/runtimes"),
+  /**
+   * Point a bare command name at one installed version.
+   *
+   * Immediate rather than a task: it is one `update-alternatives --set`, and it
+   * does not move a single site between versions — each names its own.
+   */
+  setRuntimeDefault: (body: SetRuntimeDefaultRequest) =>
+    api.post<SetRuntimeDefaultResponse>("/api/runtimes/default", body),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),

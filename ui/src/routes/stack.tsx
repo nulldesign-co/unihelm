@@ -18,6 +18,7 @@ import {
   type CatalogueEntry,
   type CatalogueVersion,
   type ComponentState,
+  type InstalledRuntime,
   type StackCategory,
   type StackComponentRequest,
   type StackComponentView,
@@ -581,6 +582,10 @@ export function StackPage() {
       setError(null);
       setJustActed(true);
       void queryClient.invalidateQueries({ queryKey: ["stack"] });
+      // Installing or removing a PHP version adds or drops an alternative, so
+      // which version answers to a bare `php` can have changed. Without this the
+      // badge keeps naming a version that is no longer on the machine.
+      void queryClient.invalidateQueries({ queryKey: ["runtimes"] });
     },
     onError: (e: unknown) => {
       setJustActed(false);
@@ -590,6 +595,28 @@ export function StackPage() {
 
   const install = useMutation({ mutationFn: endpoints.installComponent, ...settle });
   const remove = useMutation({ mutationFn: endpoints.removeComponent, ...settle });
+
+  // The machine's own survey of what is on `$PATH`, which the catalogue cannot
+  // answer: it says what the panel can install, not what is there. Read rather
+  // than polled — the survey shells out to every interpreter it finds for a
+  // `--version` with five seconds of patience each, so putting it on the stack
+  // page's two-second poll would spend a whole survey every two seconds to learn
+  // nothing. An install invalidates it without waiting for the clock.
+  const runtimes = useQuery({
+    queryKey: ["runtimes"],
+    queryFn: endpoints.runtimes,
+    staleTime: 60_000,
+  });
+  const installed = runtimes.data?.runtimes ?? [];
+
+  const setDefault = useMutation({
+    mutationFn: endpoints.setRuntimeDefault,
+    onSuccess: () => {
+      setError(null);
+      void queryClient.invalidateQueries({ queryKey: ["runtimes"] });
+    },
+    onError: (e: unknown) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
 
   if (stack.isPending) {
     return (
@@ -676,6 +703,9 @@ export function StackPage() {
                       busy={busy}
                       acting={acting}
                       dockerAnchor={dockerAnchor}
+                      installed={installed}
+                      settingDefault={setDefault.isPending ? setDefault.variables : null}
+                      onMakeDefault={(runtime, version) => setDefault.mutate({ runtime, version })}
                       onSelect={(version) =>
                         setChosen((current) => ({ ...current, [entry.slug]: version }))
                       }
@@ -711,6 +741,8 @@ export function StackPage() {
         ))
       )}
 
+      <AlsoOnThisMachine rows={uncataloguedRuntimes(installed, catalogue)} />
+
       {(stack.data?.unverified_pins.length ?? 0) > 0 ? (
         <Callout tone="warning" title={t("stack.pinsTitle")}>
           <p>{t("stack.pinsHint")}</p>
@@ -720,6 +752,46 @@ export function StackPage() {
         </Callout>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Interpreters the panel found and cannot install.
+ *
+ * Rendered only when there are some, and with no buttons on purpose: every row
+ * here is something the catalogue has no signed repository for, so the only
+ * honest thing the panel can do about it is say it is there. It is the last
+ * section rather than the first because it is a footnote to the catalogue, not
+ * a part of it.
+ */
+function AlsoOnThisMachine({ rows }: { rows: readonly InstalledRuntime[] }) {
+  const { t } = useTranslation();
+  if (rows.length === 0) return null;
+
+  return (
+    <section aria-labelledby="stack-also" className="space-y-3">
+      <SectionHeader
+        title={<span id="stack-also">{t("stack.alsoTitle")}</span>}
+        description={t("stack.alsoHint")}
+      />
+      <Card>
+        <ul className="divide-y divide-border">
+          {rows.map((row) => (
+            <li
+              key={`${row.runtime}@${row.path}`}
+              className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-5 py-3"
+            >
+              <span className="text-sm font-medium text-ink">{row.runtime}</span>
+              <span className="tnum font-mono text-sm text-ink-muted">{row.version}</span>
+              {/* The absolute path, because that is what makes it actionable:
+                  an app can be pinned to it, and it is what an operator needs
+                  to find the thing they installed by hand. */}
+              <span className="font-mono text-xs break-all text-ink-subtle">{row.path}</span>
+            </li>
+          ))}
+        </ul>
+      </Card>
+    </section>
   );
 }
 
@@ -734,6 +806,102 @@ function versionLabel(version: string, t: (key: string) => string): string {
   return version === DISTRO_VERSION ? t("stack.distroVersion") : version;
 }
 
+// ---------------------------------------------------------------------------
+// Which installed version answers a bare command name
+// ---------------------------------------------------------------------------
+
+/**
+ * Catalogue slugs whose bare command this panel can move, and the command.
+ *
+ * PHP alone, and the reason is the agent's rather than this page's: Debian's
+ * `update-alternatives` owns the `php` symlink and every PHP package registers
+ * itself with it, while Node from NodeSource installs a real binary at
+ * /usr/local/bin/node with no alternatives entry — so "set the default Node"
+ * would mean this panel moving somebody else's file. A second entry here
+ * without the agent gaining one would put a button on the page that always
+ * comes back 501.
+ */
+const MOVABLE_DEFAULT: Readonly<Record<string, string>> = { php: "php" };
+
+/**
+ * Component-wise, the same comparison the agent makes: `8.3` matches `8.3.6`
+ * and not `8.30`. A string prefix would call `8.3` a match for `8.30.1` and put
+ * the badge on the wrong chip.
+ */
+function versionMatches(installed: string, wanted: string): boolean {
+  const have = installed.split(".");
+  return wanted.split(".").every((part, index) => have[index] === part);
+}
+
+export interface DefaultCommand {
+  /** The bare name, e.g. `php`. */
+  command: string;
+  /** This version is what the bare name resolves to right now. */
+  owns: boolean;
+  /** The click is offered: another version holds it and this one could. */
+  movable: boolean;
+}
+
+/**
+ * Whether a chip should say — or offer — that it owns a bare command name.
+ *
+ * This is the half of the old Runtimes page worth keeping. A bare `php` in a
+ * cron line or a deploy script resolves to exactly one binary and every other
+ * version is reachable only by absolute path, which is a property of a *version*
+ * and so belongs on the chip that names it rather than on a page of its own.
+ *
+ * Three things make it `null`, each for its own reason:
+ *
+ * - **A container.** `update-alternatives` points at a path on the host, and a
+ *   containerised version has no host binary to point at. Offering the click
+ *   would move `php` to a version that is not there.
+ * - **A runtime the agent will not move**, per [`MOVABLE_DEFAULT`].
+ * - **Nothing else installed to move it from.** One version already answers to
+ *   the bare name because it is the only one; a "Make default" beside it is a
+ *   button whose only outcome is no change.
+ */
+export function defaultCommandFor(
+  entry: CatalogueEntry,
+  row: StackComponentView,
+  runtimes: readonly InstalledRuntime[],
+): DefaultCommand | null {
+  const command = MOVABLE_DEFAULT[entry.slug];
+  if (command === undefined) return null;
+  if (runtimeOf(row) !== "host") return null;
+  if (row.status !== "installed" && row.status !== "unmanaged") return null;
+
+  const ours = runtimes.filter((r) => r.runtime === entry.slug);
+  if (ours.length < 2) return null;
+
+  // The agent's own version string, not the catalogue's: the survey reports
+  // what the binary said when asked, and that is what `update-alternatives`
+  // has an entry for.
+  const mine = ours.find((r) => versionMatches(r.version, row.version));
+  if (mine === undefined) return null;
+
+  return { command, owns: mine.is_default, movable: !mine.is_default };
+}
+
+/**
+ * Interpreters on this machine that the catalogue cannot account for.
+ *
+ * Deno and Bun ship as single vendor binaries over https with no signed
+ * repository, which this panel will not unpack as root — so they are not in the
+ * catalogue and never will be, and a page that only renders the catalogue is
+ * blind to them. That blindness is the failure this whole project keeps
+ * relearning: the panel reporting nginx `absent` while it served thirteen
+ * sites, the firewall reporting "(none)" with eight rules. Somebody who
+ * installed Bun by hand should see the panel knows it is there, even though
+ * there is no button for it.
+ */
+export function uncataloguedRuntimes(
+  runtimes: readonly InstalledRuntime[],
+  catalogue: readonly CatalogueEntry[],
+): InstalledRuntime[] {
+  const known = new Set(catalogue.map((e) => e.slug));
+  return runtimes.filter((r) => !known.has(r.runtime));
+}
+
 function EntryRow({
   entry,
   plan,
@@ -742,10 +910,13 @@ function EntryRow({
   busy,
   acting,
   dockerAnchor,
+  installed,
+  settingDefault,
   onSelect,
   onSelectRuntime,
   onInstall,
   onRemove,
+  onMakeDefault,
 }: {
   entry: CatalogueEntry;
   plan: RowPlan;
@@ -756,10 +927,15 @@ function EntryRow({
   acting: string | null;
   /** Anchor of the row that installs Docker, when this catalogue has one. */
   dockerAnchor: string | null;
+  /** The machine's survey of `$PATH`, for the bare-command badge. */
+  installed: readonly InstalledRuntime[];
+  /** The default being moved right now, if any. */
+  settingDefault: { runtime: string; version: string } | null;
   onSelect: (version: string) => void;
   onSelectRuntime: (runtime: StackRuntime) => void;
   onInstall: () => void;
   onRemove: (version: string, runtime: StackRuntime) => void;
+  onMakeDefault: (runtime: string, version: string) => void;
 }) {
   const { t } = useTranslation();
   const label = (version: string) => versionLabel(version, t);
@@ -818,7 +994,14 @@ function EntryRow({
                   support={plan.support}
                   busy={busy}
                   pending={acting === rowKey(entry.slug, row.version, runtimeOf(row))}
+                  command={defaultCommandFor(entry, row, installed)}
+                  movingDefault={
+                    settingDefault !== null &&
+                    settingDefault.runtime === entry.slug &&
+                    settingDefault.version === row.version
+                  }
                   onRemove={() => onRemove(row.version, runtimeOf(row))}
+                  onMakeDefault={() => onMakeDefault(entry.slug, row.version)}
                 />
               ))}
             </ul>
@@ -1098,7 +1281,10 @@ function InstalledChip({
   support,
   busy,
   pending,
+  command,
+  movingDefault,
   onRemove,
+  onMakeDefault,
 }: {
   entry: CatalogueEntry;
   row: StackComponentView;
@@ -1106,7 +1292,12 @@ function InstalledChip({
   support: RuntimeSupport;
   busy: boolean;
   pending: boolean;
+  /** The bare command this version owns or could own, or `null`. */
+  command: DefaultCommand | null;
+  /** This version's default is being moved right now. */
+  movingDefault: boolean;
   onRemove: () => void;
+  onMakeDefault: () => void;
 }) {
   const { t } = useTranslation();
   const removable = row.status === "installed";
@@ -1157,6 +1348,29 @@ function InstalledChip({
             <span className="sr-only">{t("stack.sitesServed", { count: sites })}</span>
           </Badge>
         )}
+        {command?.owns ? (
+          // A statement, not a control: this version already answers to the
+          // bare name, and a pressed-looking button that does nothing is worse
+          // than a badge. Monospaced because it is a command an operator types.
+          <Badge tone="neutral">
+            <span className="font-mono">{t("stack.answersTo", { command: command.command })}</span>
+          </Badge>
+        ) : null}
+        {command?.movable ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            loading={movingDefault}
+            disabled={busy || movingDefault}
+            onClick={onMakeDefault}
+            aria-label={t("stack.makeDefaultAria", {
+              command: command.command,
+              version: versionLabel(row.version, t),
+            })}
+          >
+            {t("stack.makeDefault", { command: command.command })}
+          </Button>
+        ) : null}
         {removable ? (
           <Button
             variant="ghost"

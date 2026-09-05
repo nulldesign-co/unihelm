@@ -3,6 +3,7 @@ import {
   createRoute,
   createRouter,
   Outlet,
+  redirect,
 } from "@tanstack/react-router";
 
 import { useEffect, useState } from "react";
@@ -25,7 +26,6 @@ import { MailPage } from "@/routes/mail";
 import { PlansPage } from "@/routes/plans";
 import { DiscoverPage } from "@/routes/discover";
 import { DockerPage } from "@/routes/docker";
-import { RuntimesPage } from "@/routes/runtimes";
 import { SettingsPage } from "@/routes/settings";
 import { SiteDetailPage } from "@/routes/site-detail";
 import { SitesPage } from "@/routes/sites";
@@ -197,10 +197,25 @@ const settingsRoute = createRoute({
   component: SettingsPage,
 });
 
+/**
+ * The Runtimes page installed Node, Python, Go and Ruby, which the Stack page
+ * also installs — two buttons for one job, and the one on this page had never
+ * worked: its handler required a field the page did not send, so every click
+ * came back 400 without reaching the agent. What was worth keeping moved onto
+ * the Stack rows the versions belong to (which one answers to a bare `php`) and
+ * to a section under them (interpreters found on `$PATH` with no repository to
+ * install them from).
+ *
+ * The route stays as a redirect rather than being deleted: it is in somebody's
+ * bookmarks and in the nav of every panel installed before this release, and a
+ * 404 there reads as a broken panel rather than as a page that moved.
+ */
 const runtimesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/runtimes",
-  component: RuntimesPage,
+  beforeLoad: () => {
+    throw redirect({ to: "/stack" });
+  },
 });
 
 const dockerRoute = createRoute({

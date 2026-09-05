@@ -107,7 +107,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           { to: "/tasks", label: t("nav.tasks"), icon: ListChecks },
           { to: "/terminal", label: t("nav.terminal"), icon: TerminalSquare },
           { to: "/stack", label: t("nav.stack"), icon: Layers },
-          { to: "/runtimes", label: t("nav.runtimes"), icon: Boxes },
           { to: "/docker", label: t("nav.docker"), icon: Container },
         ],
       },

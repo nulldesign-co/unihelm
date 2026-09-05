@@ -44,13 +44,26 @@ pub async fn list(
     Ok(Json(data))
 }
 
+/// What to install.
+///
+/// Every field is optional because the operation behind this takes them that
+/// way: `runtime` defaults to Node, `version` and `major` are two spellings of
+/// the same choice, and Go and Ruby have exactly one version that lands on
+/// `$PATH` so they name neither.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallRuntime {
-    /// A Node major line: 20, 22, 24.
-    pub major: u32,
+    /// `node`, `python`, `go` or `ruby`. Absent means Node.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// The version, as `runtime.list` spells it: `22`, `3.12`.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// A Node major line: 20, 22, 24. The older spelling of `version`.
+    #[serde(default)]
+    pub major: Option<u32>,
 }
 
-/// Install a Node major line from NodeSource.
+/// Install a language runtime from a signed repository.
 #[utoipa::path(
     post,
     path = "/api/runtimes/install",
@@ -62,7 +75,7 @@ pub struct InstallRuntime {
         (status = 400, description = "`invalid_input`: not a line anyone ships", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied`: needs `stack.manage`", body = ApiErrorBody),
-        (status = 501, description = "`not_implemented`: no NodeSource repository for this distribution", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: no signed repository for this distribution", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
     ),
 )]
@@ -77,13 +90,76 @@ pub async fn install(
         .map_err(ApiError::from)?;
     // A task, not an immediate call: this runs apt, which takes minutes and
     // streams its output into the task log the page shows.
-    ops::invoke(
+    ops::invoke(&state, &current.auth, "runtime.install", install_args(&body)).await
+}
+
+/// The request, as the operation spells it.
+///
+/// Its own function so the forwarding can be asserted. The bug it replaces was
+/// a handler that declared one required `major` and then rebuilt the request
+/// from that field alone: a caller asking for Python 3.12 was rejected by serde
+/// before the operation ever saw it, and the only shape that could reach the
+/// agent was a Node line. Nothing here decides whether a runtime or a version is
+/// installable — `runtime.install` does, and duplicating that judgement is how
+/// the two drifted apart in the first place.
+fn install_args(body: &InstallRuntime) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    if let Some(runtime) = &body.runtime {
+        args.insert("runtime".into(), json!(runtime));
+    }
+    if let Some(version) = &body.version {
+        args.insert("version".into(), json!(version));
+    }
+    if let Some(major) = body.major {
+        args.insert("major".into(), json!(major));
+    }
+    serde_json::Value::Object(args)
+}
+
+/// Which installed version a bare command name resolves to.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetRuntimeDefault {
+    /// Only `php` has a default this panel can move.
+    pub runtime: String,
+    /// The version to point at, as `runtime.list` reports it.
+    pub version: String,
+}
+
+/// Point a bare command name at one installed version.
+#[utoipa::path(
+    post,
+    path = "/api/runtimes/default",
+    tag = "runtimes",
+    request_body = SetRuntimeDefault,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "What the bare name resolves to now", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `stack.manage`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: not installed, or not registered with update-alternatives", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: this runtime has no default to move", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn set_default(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Json(body): Json<SetRuntimeDefault>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::StackManage)
+        .map_err(ApiError::from)?;
+    // Immediate: it is one `update-alternatives --set`, and a task for it would
+    // mean a spinner and a poll for something already finished.
+    let data = ops::invoke_now(
         &state,
         &current.auth,
-        "runtime.install",
-        json!({ "major": body.major }),
+        "runtime.default.set",
+        json!({ "runtime": body.runtime, "version": body.version }),
     )
-    .await
+    .await?;
+    Ok(Json(data))
 }
 
 /// Docker's containers, images and volumes.
@@ -338,4 +414,47 @@ pub async fn docker_create(
     // a second copy of those rules here would be a second thing to keep in step,
     // which is the mistake the stack whitelist made three times over.
     ops::invoke(&state, &current.auth, "docker.create", body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shape the Runtimes page sends, which the previous handler could not
+    /// parse at all: it required `major`, so every Python, Go and Ruby install
+    /// — and every Node install, which the page spells as a version too — came
+    /// back 400 without reaching the agent.
+    #[test]
+    fn the_body_the_panel_sends_reaches_the_operation_intact() {
+        for (body, expected) in [
+            (
+                json!({ "runtime": "python", "version": "3.12" }),
+                json!({ "runtime": "python", "version": "3.12" }),
+            ),
+            (
+                json!({ "runtime": "node", "version": "22" }),
+                json!({ "runtime": "node", "version": "22" }),
+            ),
+            // Go and Ruby have exactly one version that lands on `$PATH`, so
+            // the page sends no version and the operation picks.
+            (json!({ "runtime": "go" }), json!({ "runtime": "go" })),
+            // The older spelling, still accepted: an API client written against
+            // the previous handler keeps working.
+            (json!({ "major": 22 }), json!({ "major": 22 })),
+        ] {
+            let asked: InstallRuntime = serde_json::from_value(body.clone()).unwrap_or_else(|e| {
+                panic!("{body} is what the panel sends and it did not parse: {e}")
+            });
+            assert_eq!(install_args(&asked), expected, "from {body}");
+        }
+    }
+
+    /// An empty body is the operation's decision to refuse or default, not this
+    /// handler's. Inventing a runtime here would mean two places deciding what
+    /// "install" means with nothing keeping them in step.
+    #[test]
+    fn an_empty_body_is_forwarded_empty_rather_than_guessed_at() {
+        let asked: InstallRuntime = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(install_args(&asked), json!({}));
+    }
 }
