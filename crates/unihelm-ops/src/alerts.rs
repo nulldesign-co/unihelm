@@ -114,6 +114,9 @@ pub fn service_is_down(state: UnitState) -> bool {
 pub fn service_target(target: &str) -> Option<ManagedUnit> {
     Some(match target {
         "nginx" => ManagedUnit::Nginx,
+        // Without this arm the web server actually serving a switched machine
+        // was the one thing on it that could not be watched for going down.
+        "apache" => ManagedUnit::Apache,
         "mariadb" => ManagedUnit::MariaDb,
         "postgresql" => ManagedUnit::PostgreSql,
         "kv_store" => ManagedUnit::KvStore,

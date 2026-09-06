@@ -34,19 +34,31 @@ impl NginxSurvey {
     }
 }
 
-/// The directories nginx includes on a stock Debian or RHEL install.
+/// The directories a stock Debian or RHEL install includes vhosts from.
+///
+/// Both web servers, not only nginx. This survey is what stops the panel
+/// creating a site on a domain something else is already serving, and what
+/// answers `sites.discover` — so on a machine switched to Apache it reported an
+/// empty server with a dozen live vhosts on it, and the collision guard never
+/// fired. Scanning a directory that does not exist costs nothing.
 fn search_roots() -> Vec<PathBuf> {
     let root = paths::root();
     vec![
         root.join("etc/nginx/conf.d"),
         root.join("etc/nginx/sites-enabled"),
+        root.join("etc/apache2/conf-enabled"),
+        root.join("etc/apache2/sites-enabled"),
+        root.join("etc/httpd/conf.d"),
     ]
 }
 
 /// True for a file Unihelm itself wrote, which must not count as foreign.
 fn is_ours(path: &Path) -> bool {
-    let ours = paths::nginx_dir();
-    path.starts_with(&ours) || path == paths::nginx_hook()
+    [paths::nginx_dir(), paths::apache_dir()]
+        .iter()
+        .any(|ours| path.starts_with(ours))
+        || path == paths::nginx_hook()
+        || path == paths::apache_hook()
 }
 
 /// Read what nginx is already configured to do.

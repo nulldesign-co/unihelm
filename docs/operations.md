@@ -1731,6 +1731,11 @@ Creates or updates a rule. Thresholds that could never stop firing are refused
 (a disk rule at 0%, a certificate rule at 90 days on a 90-day certificate), and
 so is a `target` on a kind that has nothing to target.
 
+For `service_down` the `target` is a whitelist, not a unit name: `nginx`,
+`apache`, `mariadb`, `postgresql`, `kv_store`, `docker`, `sshd`, `unihelm_web`,
+`unihelm_agentd`, or `php_fpm:<version>`. Operator-supplied text never reaches
+an arbitrary systemd unit.
+
 ### `alert.events.list`
 
 | | |
