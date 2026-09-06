@@ -550,6 +550,21 @@ export interface SwitchWebServerRequest {
   accept_gaps?: boolean;
 }
 
+/** One thing a switch would cost, as `webserver.gaps` reports it. */
+export interface WebServerGap {
+  /** The site it is about, or null when it is about the whole machine. */
+  domain: string | null;
+  field: string;
+  detail: string;
+}
+
+export interface WebServerGapsResponse {
+  target: string;
+  gaps: WebServerGap[];
+  /** How many distinct sites are affected. */
+  sites: number;
+}
+
 export interface RuntimeListResponse {
   runtimes: InstalledRuntime[];
 }
@@ -1026,11 +1041,26 @@ export const endpoints = {
    * Move every site on this server to another web server.
    *
    * A task, and one that touches the whole machine: it re-renders every vhost
-   * and exchanges the two units. The refusal it comes back with when
-   * `accept_gaps` is false is the list of what each site would lose.
+   * and exchanges the two units.
+   *
+   * A task, so this call answers 202 and a task id — not the refusal. Ask
+   * `webServerGaps` first for what it would cost, and watch the task for what
+   * actually happened.
    */
   switchWebServer: (body: SwitchWebServerRequest) =>
     api.post<TaskAccepted>("/api/stack/webserver", body),
+  /**
+   * What a switch would cost, without doing it.
+   *
+   * Asked separately because the switch is a task: it answers 202 with a task
+   * id long before it has looked at a single site, so the refusal listing what
+   * would be lost never reaches the caller of that request. This does, in one
+   * round trip, and needs only read permission.
+   */
+  webServerGaps: (target: string) =>
+    api.get<WebServerGapsResponse>(
+      `/api/stack/webserver/gaps?target=${encodeURIComponent(target)}`,
+    ),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),
   restartApp: (id: number) => api.post<TaskAccepted>(`/api/apps/${id}/restart`),

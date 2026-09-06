@@ -447,6 +447,75 @@ pub async fn active(ctx: &OpContext) -> Result<WebServer> {
 // webserver.switch
 // ---------------------------------------------------------------------------
 
+/// `webserver.gaps` — what a switch to `target` would cost, without doing it.
+///
+/// Immediate, and that is the whole point of it existing. `webserver.switch` is
+/// a task: it re-renders every vhost on the machine, so the HTTP call returns
+/// 202 and a task id long before the operation has looked at a single site. The
+/// refusal that lists what would be lost therefore arrives — if at all — in a
+/// task log nobody is watching, and the panel had no way to show an operator
+/// the cost before they agreed to it. Worse, the confirm-then-accept flow the
+/// page implements could never complete: the first click always succeeded with
+/// a 202, which cleared the pending state, so `accept_gaps` was unsendable.
+///
+/// So the question is asked separately from the doing. This answers it in one
+/// round trip, changes nothing, and needs only `ServerRead` — reading what a
+/// switch would cost is not the same authority as making one.
+pub struct Gaps;
+
+#[derive(Debug, Deserialize)]
+pub struct GapsInput {
+    pub target: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GapsOutput {
+    pub target: String,
+    /// Sites that would lose a control, and features the machine would lose.
+    pub gaps: Vec<Gap>,
+    /// How many distinct sites are affected.
+    pub sites: usize,
+}
+
+#[async_trait::async_trait]
+impl TypedOperation for Gaps {
+    type Input = GapsInput;
+    type Output = GapsOutput;
+
+    const NAME: &'static str = "webserver.gaps";
+    const PERMISSION: Permission = Permission::ServerRead;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let target = WebServer::from_slug(&input.target).ok_or_else(|| {
+            UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "`{}` is not a web server this panel knows. It serves with: nginx, apache.",
+                    input.target
+                ),
+            )
+            .with_field("target")
+        })?;
+
+        let sites = ctx.db().all_sites().await.map_err(UnihelmError::from)?;
+        let mut gaps_found = gaps(target, &sites);
+        gaps_found.extend(server_gaps(ctx, target).await?);
+
+        let affected = gaps_found
+            .iter()
+            .filter_map(|g| g.domain.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+
+        Ok(GapsOutput {
+            target: target.as_str().into(),
+            gaps: gaps_found,
+            sites: affected,
+        })
+    }
+}
+
 /// `webserver.switch` — move every site on this machine to another web server.
 ///
 /// One operation for the whole machine rather than one per site, and that is
@@ -530,10 +599,6 @@ impl TypedOperation for Switch {
 
         refuse_where_the_panel_writes_where_the_server_does_not_read(ctx, target)?;
         refuse_when_the_target_is_not_installed(ctx, target).await?;
-        if target == WebServer::Apache {
-            ensure_apache_modules(ctx).await?;
-            admit_to_the_web_group(ctx, target).await?;
-        }
 
         let db = ctx.db();
         // Every site on the machine, not a tenant's page of them: a switch that
@@ -576,6 +641,18 @@ impl TypedOperation for Switch {
         // From here on the machine is being changed, and every failure has to
         // leave the incumbent serving. Nothing below stops it until the whole
         // target configuration has been written and checked.
+        //
+        // These two come *after* the gaps refusal on purpose. Run before it, a
+        // switch the operator then declined had already enabled Apache modules
+        // and — the part that matters — added `www-data` to the group that
+        // traverses every tenant's site directory. A refusal has to leave the
+        // machine as it found it, and a standing privilege grant made on the
+        // way to being told no is not that.
+        if target == WebServer::Apache {
+            ensure_apache_modules(ctx).await?;
+            admit_to_the_web_group(ctx, target).await?;
+        }
+
         ctx.log(format!(
             "moving {} site(s) from {} to {}",
             sites.len(),
@@ -611,7 +688,26 @@ impl TypedOperation for Switch {
             rendered += 1;
         }
 
-        // 3. The default vhost, which answers for every name no site claims.
+        // 3. The panel's own vhost, when a domain has been attached to it.
+        //
+        //    Left out, a switch made the panel unreachable at its own address —
+        //    the one an operator would use to look at what had just gone wrong.
+        //    It is written with the sites rather than after the exchange for the
+        //    same reason they are: the incumbent is still serving, so a failure
+        //    here costs nothing.
+        if let Some(panel_domain) = db
+            .get_setting::<unihelm_core::Domain>(unihelm_db::panel::DOMAIN_KEY)
+            .await
+            .map_err(UnihelmError::from)?
+        {
+            crate::panel::render_vhost_for(ctx, &panel_domain, target).await?;
+            ctx.log(format!(
+                "the panel's own vhost at {panel_domain} rewritten for {}",
+                target.display_name()
+            ));
+        }
+
+        // 4. The default vhost, which answers for every name no site claims.
         //    Last of the three, because on Apache the *first* vhost parsed owns
         //    an address and this one has to be able to lose that race to
         //    nothing: writing it before the sites would make an unconfigured
@@ -619,7 +715,7 @@ impl TypedOperation for Switch {
         //    the length of the switch.
         crate::stack::write_catchall_for(ctx, target).await?;
 
-        // 4. The target's own check, over the whole tree. The apply calls above
+        // 5. The target's own check, over the whole tree. The apply calls above
         //    each ran it too, but only over what existed at the time — this is
         //    the first moment the complete configuration exists.
         if let Err(detail) = target.validator()?.validate().await {
@@ -634,11 +730,11 @@ impl TypedOperation for Switch {
             ));
         }
 
-        // 5. The exchange. This is the only unsafe moment, and it is as short as
+        // 6. The exchange. This is the only unsafe moment, and it is as short as
         //    two systemctl calls: they both want port 80.
         exchange(ctx, from, target).await?;
 
-        // 6. Only now is it true, so only now is it written. A setting recorded
+        // 7. Only now is it true, so only now is it written. A setting recorded
         //    before the unit started would have the panel render into a tree
         //    nothing reads for as long as it took somebody to notice.
         db.set_setting(WEB_SERVER_SETTING, &target)
@@ -667,6 +763,11 @@ impl TypedOperation for Switch {
 /// equivalent hazard: its features are compiled in, and a directive it does not
 /// know fails `nginx -t` loudly.
 const APACHE_MODULES: &[(&str, &str)] = &[
+    // The base the three proxy modules are built on. Debian's `a2enmod
+    // proxy_fcgi` pulls it in, EL loads it from its own conf.d — but a machine
+    // where somebody has been editing by hand may have neither, and without it
+    // every `ProxyPass` and every `SetHandler proxy:` line is a startup error.
+    ("proxy", "the base every proxy directive is built on"),
     (
         "proxy_fcgi",
         "hands .php requests to PHP-FPM over its socket",
@@ -687,7 +788,33 @@ const APACHE_MODULES: &[(&str, &str)] = &[
     ("headers", "the security headers on every response"),
     ("expires", "cache lifetimes on static assets"),
     ("deflate", "compression"),
+    // Everything below is enabled by default on both families, which is exactly
+    // why it was left out — and why it is here now. The check exists for the
+    // machine that is not in its default state, and on that machine a missing
+    // `alias` is every ACME challenge 404ing with no error anywhere.
+    ("alias", "the ACME challenge path and the maintenance page"),
+    (
+        "dir",
+        "DirectoryIndex, and the front controller PHP sites need",
+    ),
+    ("authz_core", "every `Require` line, including the denials"),
+    ("filter", "the output filters compression runs through"),
+    ("mime", "content types on every response"),
+    ("log_config", "the per-site access log"),
 ];
+
+/// Modules a site is better with and still correct without.
+///
+/// Kept apart from [`APACHE_MODULES`] because the two need opposite treatment.
+/// A missing required module makes the configuration wrong, so it refuses; a
+/// missing one of these makes it *smaller*, and refusing a switch that would
+/// have worked is its own kind of wrong. `Protocols h2 http/1.1` is valid
+/// without mod_http2 — Apache simply never offers HTTP/2 — so this is said out
+/// loud and the switch continues.
+const APACHE_PREFERRED_MODULES: &[(&str, &str)] = &[(
+    "http2",
+    "HTTP/2. Without it every TLS site serves over HTTP/1.1, which works and is slower",
+)];
 
 /// Refuse a target whose configuration tree this build writes to the wrong place.
 ///
@@ -806,7 +933,7 @@ async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()
 /// best effort, the verification is not.
 async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
     if ctx.distro().info.family != unihelm_distro::Family::Rhel {
-        for (module, _) in APACHE_MODULES {
+        for (module, _) in APACHE_MODULES.iter().chain(APACHE_PREFERRED_MODULES) {
             // Failures are not fatal here. A module compiled in statically has
             // no `.load` file for a2enmod to find, and reporting that as a
             // broken machine would refuse a switch that would have worked. The
@@ -844,6 +971,15 @@ async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
         ));
     }
 
+    // Said, not refused: see [`APACHE_PREFERRED_MODULES`].
+    for (module, why) in APACHE_PREFERRED_MODULES {
+        if !module_listed(&listed, module) {
+            ctx.log(format!(
+                "mod_{module} is not loaded, so this machine loses {why}"
+            ));
+        }
+    }
+
     let missing = modules_missing_from(&listed);
     if !missing.is_empty() {
         return Err(UnihelmError::new(
@@ -873,15 +1009,24 @@ async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
 /// a machine that has only the FastCGI half — so the `_module` suffix is part of
 /// what is searched for, and the search is per line rather than over the blob.
 fn modules_missing_from(listed: &str) -> Vec<&'static (&'static str, &'static str)> {
-    let present: std::collections::BTreeSet<&str> = listed
+    APACHE_MODULES
+        .iter()
+        .filter(|(module, _)| !module_listed(listed, module))
+        .collect()
+}
+
+/// Whether `apachectl -M` named this module.
+///
+/// It prints ` proxy_fcgi_module (shared)`, one per line, indented — so the
+/// suffix has to come off before anything is compared. Statically linked
+/// modules appear here too, which is why this is the answer that counts rather
+/// than the presence of a `.load` file.
+fn module_listed(listed: &str, module: &str) -> bool {
+    listed
         .lines()
         .filter_map(|line| line.split_whitespace().next())
         .filter_map(|token| token.strip_suffix("_module"))
-        .collect();
-    APACHE_MODULES
-        .iter()
-        .filter(|(module, _)| !present.contains(module))
-        .collect()
+        .any(|name| name == module)
 }
 
 /// Refuse before anything is written when the target's packages are not there.
@@ -1350,6 +1495,34 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.detail.contains("nginx"), "{}", err.detail);
         assert!(err.detail.contains("apache"), "{}", err.detail);
+    }
+
+    #[test]
+    fn a_preferred_module_is_not_treated_as_a_missing_required_one() {
+        // `Protocols h2 http/1.1` is valid without mod_http2 — Apache simply
+        // never offers HTTP/2. Refusing a switch over it would refuse one that
+        // would have worked, so it is said out loud instead.
+        let required: String = APACHE_MODULES
+            .iter()
+            .map(|(m, _)| format!(" {m}_module (shared)\n"))
+            .collect();
+        assert!(modules_missing_from(&required).is_empty(), "{required}");
+        for (module, _) in APACHE_PREFERRED_MODULES {
+            assert!(
+                !module_listed(&required, module),
+                "{module} is in the preferred list and in the required one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_module_name_is_matched_whole() {
+        // `proxy` and `proxy_fcgi` are different modules, and a machine with
+        // only the second must not read as having the first: every ProxyPass
+        // line is a startup error without the base module.
+        let only_fcgi = " proxy_fcgi_module (shared)\n";
+        assert!(module_listed(only_fcgi, "proxy_fcgi"));
+        assert!(!module_listed(only_fcgi, "proxy"));
     }
 
     #[test]

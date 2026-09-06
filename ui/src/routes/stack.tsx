@@ -12,6 +12,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TaskNotice } from "@/components/task-notice";
 import {
   ApiError,
   endpoints,
@@ -19,6 +20,7 @@ import {
   type CatalogueVersion,
   type ComponentState,
   type InstalledRuntime,
+  type WebServerGap,
   type StackCategory,
   type StackComponentRequest,
   type StackComponentView,
@@ -609,26 +611,69 @@ export function StackPage() {
   });
   const installed = runtimes.data?.runtimes ?? [];
 
-  // Moving the whole machine to another web server. A task, and one that stops
-  // what is serving — so the confirmation is not a toast, it is the refusal the
-  // agent sends back listing every site that would lose a control, shown before
-  // the second click.
+  // Moving the whole machine to another web server, in two steps.
+  //
+  // The switch is a task: it answers 202 with a task id long before it has
+  // looked at a single site, so the refusal that lists what would be lost never
+  // reaches this call at all. Reading that list off `onError` — which is what
+  // this page used to do — could therefore never work: the first click always
+  // *succeeded*, which cleared the pending state, so the second click sent the
+  // same request again and `accept_gaps: true` was unsendable. The cost is
+  // asked for separately now, before anything is done.
   const [pendingSwitch, setPendingSwitch] = useState<string | null>(null);
+  const [gaps, setGaps] = useState<WebServerGap[]>([]);
+  const [switchTask, setSwitchTask] = useState<string | null>(null);
+
+  const clearSwitch = () => {
+    setPendingSwitch(null);
+    setGaps([]);
+  };
+
   const switchServer = useMutation({
     mutationFn: endpoints.switchWebServer,
-    onSuccess: () => {
+    onSuccess: (accepted) => {
       setError(null);
-      setPendingSwitch(null);
+      clearSwitch();
+      // Held, not discarded. It is the only place the operation's own refusals
+      // and its progress appear — without it the page shows a spinner that
+      // stops and nothing else, whatever happened.
+      setSwitchTask(accepted.task_id);
       setJustActed(true);
       void queryClient.invalidateQueries({ queryKey: ["stack"] });
     },
     onError: (e: unknown) => {
-      // A conflict here is the gap list, which is the operator's next decision
-      // rather than a failure — so the row keeps offering the click and the
-      // message stays on screen beside it.
+      clearSwitch();
       setError(e instanceof ApiError ? e.message : String(e));
     },
   });
+
+  const askGaps = useMutation({
+    mutationFn: endpoints.webServerGaps,
+    onError: (e: unknown) => {
+      clearSwitch();
+      setError(e instanceof ApiError ? e.message : String(e));
+    },
+  });
+
+  /** First click: find out what it costs. Second: accept it. */
+  const beginSwitch = (target: string) => {
+    if (pendingSwitch === target) {
+      switchServer.mutate({ target, accept_gaps: true });
+      return;
+    }
+    setError(null);
+    askGaps.mutate(target, {
+      onSuccess: (answer) => {
+        if (answer.gaps.length === 0) {
+          // Nothing is lost, so there is nothing to agree to.
+          switchServer.mutate({ target });
+          return;
+        }
+        setGaps(answer.gaps);
+        setPendingSwitch(target);
+      },
+    });
+  };
 
   const setDefault = useMutation({
     mutationFn: endpoints.setRuntimeDefault,
@@ -685,6 +730,38 @@ export function StackPage() {
 
       {error ? <Callout tone="danger">{error}</Callout> : null}
 
+      {gaps.length > 0 ? (
+        // Warning rather than danger: this is a decision, not a fault. Every
+        // line has to be readable *before* the second click, which is the whole
+        // reason the cost is asked for in its own request.
+        <Callout tone="warning" title={t("stack.gapsTitle")}>
+          <ul className="mt-1 space-y-1.5">
+            {gaps.map((gap, i) => (
+              <li key={`${gap.field}-${gap.domain ?? "server"}-${i}`} className="text-sm">
+                <span className="font-medium text-ink">
+                  {gap.domain ?? t("stack.gapsWholeServer")}
+                </span>
+                <span className="text-ink-muted"> — {gap.detail}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-2 text-sm text-ink-muted">{t("stack.gapsConfirmHint")}</p>
+        </Callout>
+      ) : null}
+
+      {switchTask ? (
+        // The task is where every one of the operation's own refusals lands —
+        // the target not installed, a layout this build does not write, a vhost
+        // the target rejects. Discarding the id left all of that invisible.
+        <TaskNotice
+          taskId={switchTask}
+          onSettled={() => {
+            setSwitchTask(null);
+            void queryClient.invalidateQueries({ queryKey: ["stack"] });
+          }}
+        />
+      ) : null}
+
       {groups.length === 0 ? (
         <EmptyState
           icon={<Boxes aria-hidden />}
@@ -726,20 +803,15 @@ export function StackPage() {
                       dockerAnchor={dockerAnchor}
                       installed={installed}
                       serving={servingState(entry, stack.data?.web_server ?? "", components)}
-                      switching={switchServer.isPending ? switchServer.variables.target : null}
+                      switching={
+                        switchServer.isPending
+                          ? switchServer.variables.target
+                          : askGaps.isPending
+                            ? askGaps.variables
+                            : null
+                      }
                       awaitingConfirm={pendingSwitch === entry.slug}
-                      onSwitch={() => {
-                        // First click asks; second click accepts whatever the
-                        // first came back with. An operator who has read a list
-                        // of what four sites lose should not have that click
-                        // look identical to the one that opened it.
-                        if (pendingSwitch === entry.slug) {
-                          switchServer.mutate({ target: entry.slug, accept_gaps: true });
-                        } else {
-                          setPendingSwitch(entry.slug);
-                          switchServer.mutate({ target: entry.slug });
-                        }
-                      }}
+                      onSwitch={() => beginSwitch(entry.slug)}
                       settingDefault={setDefault.isPending ? setDefault.variables : null}
                       onMakeDefault={(runtime, version) => setDefault.mutate({ runtime, version })}
                       onSelect={(version) =>

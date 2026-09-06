@@ -410,6 +410,9 @@ fn stack(cmd: &StackCommand) -> Result<Action> {
             "webserver.switch",
             json!({ "target": target, "accept_gaps": accept_gaps }),
         ),
+        StackCommand::WebserverGaps { target } => {
+            call("webserver.gaps", json!({ "target": target }))
+        }
     })
 }
 

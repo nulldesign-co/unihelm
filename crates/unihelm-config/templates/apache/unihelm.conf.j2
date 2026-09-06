@@ -10,3 +10,21 @@
 # `IncludeOptional`, not `Include`: an empty or missing directory is a fatal
 # error for the latter, and this file is written before the first vhost is.
 IncludeOptional {{ apache_dir }}/*.conf
+
+# OCSP stapling needs a cache, and the cache is server-scope.
+#
+# `SSLUseStapling on` inside a vhost — which every TLS site this panel writes
+# carries — is not enough on its own: without a cache Apache refuses the
+# configuration outright (AH02172). Every machine with a TLS site would have
+# failed its own configtest at the last step of a switch, which is safe and
+# also means the switch could never have completed on a real server.
+#
+# Server scope is why it lives in this file rather than in the site template:
+# the directive is not allowed inside `<VirtualHost>`, and one cache is shared
+# by every site anyway.
+#
+# `<IfModule>` because this file is included whether or not mod_ssl is loaded,
+# and an unknown directive is a fatal error rather than a warning.
+<IfModule ssl_module>
+    SSLStaplingCache shmcb:${APACHE_RUN_DIR}/unihelm_ssl_stapling(65536)
+</IfModule>

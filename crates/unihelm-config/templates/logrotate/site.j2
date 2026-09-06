@@ -13,7 +13,14 @@
     create 0640 {{ user }} {{ group }}
     sharedscripts
     postrotate
-        # USR1 makes nginx reopen its log files without dropping connections.
+        # USR1 makes either server reopen its log files without dropping
+        # connections. Both are signalled, each guarded by its own pid file, so
+        # this file does not have to be re-rendered when a machine switches web
+        # servers — and a machine that has switched does not go on writing to a
+        # renamed file forever while the new access.log stays empty, which is
+        # what "rotation" quietly became when only nginx was signalled.
         [ -f /run/nginx.pid ] && kill -USR1 "$(cat /run/nginx.pid)" || true
+        [ -f /run/apache2/apache2.pid ] && kill -USR1 "$(cat /run/apache2/apache2.pid)" || true
+        [ -f /run/httpd/httpd.pid ] && kill -USR1 "$(cat /run/httpd/httpd.pid)" || true
     endscript
 }

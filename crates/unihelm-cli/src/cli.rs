@@ -493,6 +493,15 @@ pub enum StackCommand {
         #[arg(long)]
         accept_gaps: bool,
     },
+    /// What switching to another web server would cost, without doing it.
+    ///
+    /// The same list `webserver` refuses with, asked on its own: which sites
+    /// lose a control and which server-wide features stop working. Changes
+    /// nothing, and answers in one call rather than through a task log.
+    WebserverGaps {
+        /// `nginx` or `apache`.
+        target: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

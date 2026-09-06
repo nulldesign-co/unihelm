@@ -290,6 +290,10 @@ export const en = {
     switchConfirm: "Switch anyway",
     switchHint:
       "Moves every site on this server. Nothing stops until the whole configuration has been written and checked with the target's own tool, and if it will not start, what is serving now is put back.",
+    gapsTitle: "What this switch would cost",
+    gapsWholeServer: "This server",
+    gapsConfirmHint:
+      "Press Switch again to go ahead and accept these. Nothing has changed yet, and the sites keep being served by the current web server until it has.",
     alsoTitle: "Also on this machine",
     alsoHint:
       "Interpreters the panel found on $PATH and has no signed repository for, so there is nothing here to install or remove — only to know about. An application can still be pinned to one of these paths.",

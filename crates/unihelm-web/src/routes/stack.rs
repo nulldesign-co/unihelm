@@ -198,12 +198,15 @@ pub struct SwitchWebServer {
     request_body = SwitchWebServer,
     security(("session_cookie" = [], "csrf_header" = [])),
     responses(
-        (status = 202, description = "Queued; poll the task", body = serde_json::Value),
-        (status = 400, description = "`invalid_input`: not a web server this panel serves with", body = ApiErrorBody),
+        // A task. Every refusal the operation makes — not installed, sites would
+        // lose a control, this build cannot write that layout — reaches the
+        // caller through the task, not through this call. Documenting 400, 409
+        // and 501 here said the opposite, and a client written against that
+        // list would wait for a rejection that never arrives. `GET
+        // /api/stack/webserver/gaps` is what answers before the work starts.
+        (status = 202, description = "Queued; poll the task for the outcome", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied`: needs `stack.manage`", body = ApiErrorBody),
-        (status = 409, description = "`conflict`: the target is not installed, or sites would lose a control", body = ApiErrorBody),
-        (status = 501, description = "`not_implemented`: the panel cannot write vhosts for that server yet", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
     ),
 )]
@@ -228,7 +231,14 @@ pub async fn switch_webserver(
         &headers,
         Some(&peer),
         "webserver.switch",
-        &body.target,
+        // With the flag, because "switched to Apache" and "switched to Apache
+        // knowing three sites would lose rate limiting" are different decisions
+        // and only one of them is answerable afterwards from the target alone.
+        &if body.accept_gaps {
+            format!("{} (accepting gaps)", body.target)
+        } else {
+            body.target.clone()
+        },
     )
     .await?;
     ops::invoke(
@@ -363,4 +373,44 @@ pub async fn engine_remove(
         }),
     )
     .await
+}
+
+/// What switching would cost, before anything is done.
+#[utoipa::path(
+    get,
+    path = "/api/stack/webserver/gaps",
+    tag = "stack",
+    params(("target" = String, Query, description = "`nginx` or `apache`")),
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The sites and features a switch would cost", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a web server this panel serves with", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn webserver_gaps(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    axum::extract::Query(query): axum::extract::Query<WebServerTarget>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerRead)
+        .map_err(ApiError::from)?;
+    // Not audited: it reads and changes nothing. The switch that follows is.
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "webserver.gaps",
+        json!({ "target": query.target }),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct WebServerTarget {
+    pub target: String,
 }

@@ -304,9 +304,53 @@ silently, and still sees the field set has lost something they chose — which i
 the same failure as every serious bug this project has had, the panel saying a
 thing is true when it is not.
 
+Two server-wide features are dropped as well, and reported the same way. The
+**WAF** is loaded by nginx's ModSecurity connector, which Apache does not read —
+so after a switch the Firewall page would go on showing it enabled, at the
+paranoia level somebody chose, while no request was inspected. **Adminer** is
+served from an nginx vhost, so the database GUI stops answering. Neither
+announces itself, which is why both are named before the switch runs.
+
 Switching to the server that is already serving is a success that does nothing,
 not a conflict. A target that is in the catalogue but has no vhost templates yet
-(OpenLiteSpeed) refuses **before** anything is written.
+(OpenLiteSpeed) refuses **before** anything is written, and so does Apache on a
+Red Hat family machine: every path this build writes is Debian's `/etc/apache2`,
+and on EL httpd reads `/etc/httpd/conf.d`. That one is a refusal rather than a
+warning because `apachectl configtest` would *pass* — httpd would be checking
+its own stock configuration — so the switch's own safety check would report
+success while taking the machine down to the distribution's default page.
+
+Before any of that, the arriving server is added to the group the incumbent
+was in. The panel's isolation model is that group: a tenant's site directory is
+`tenant:<web server group>` at `0710`, so the server can traverse it and nobody
+else can, and each FPM socket is `0660` with the same group. Apache runs as
+`www-data`, which is in none of it — without this step a switched machine
+answers 403 for every static file and 503 for every PHP page, with a
+configuration that is otherwise perfect.
+
+### `webserver.gaps`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `target` — `nginx` or `apache` |
+
+The same list `webserver.switch` refuses with, asked on its own and without
+doing anything.
+
+It exists because the switch is a **task**. That call answers `202` and a task
+id long before the operation has looked at a single site, so the refusal listing
+what would be lost never reaches the caller of *that* request — it lands in a
+task log. A panel that read the cost off the switch's own error could therefore
+never show it, and the confirm-then-accept flow could never complete: the first
+click always succeeded, which cleared the pending state, so `accept_gaps` was
+unsendable. The question is asked separately now, before anything is done.
+
+Answers with every gap — each naming the site it is about, or `null` where it is
+about the whole machine — and the count of distinct sites affected. `server_read`
+rather than `stack_manage`: reading what a switch would cost is not the same
+authority as making one.
 
 ### `sys.ping`
 

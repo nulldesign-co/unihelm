@@ -348,6 +348,39 @@ impl TypedOperation for Issue {
 }
 
 /// Make `domain` the panel's domain of record, handing back the one it replaced.
+/// Write the panel's own vhost for one particular web server.
+///
+/// Used by `webserver.switch`, which has to move this vhost with every other
+/// one. Left behind, a switch takes the panel offline at its own address — the
+/// address an operator would go to in order to see what had just happened.
+///
+/// It takes the target explicitly rather than reading the active server,
+/// because during a switch the active server is still the *old* one: the
+/// setting is written last, after the exchange, so that a failure anywhere
+/// leaves the panel rendering into the tree that is actually being read.
+pub async fn render_vhost_for(
+    ctx: &OpContext,
+    domain: &Domain,
+    target: crate::webserver::WebServer,
+) -> Result<()> {
+    let vhost = target.panel_vhost()?;
+    let reloader = target.reloader(ctx.distro())?;
+    ctx.config()
+        .apply(ApplyRequest {
+            file: vhost.file,
+            template: vhost.template,
+            context: vhost_context(domain, &panel_upstream()),
+            service: vhost.service,
+            validator: target.validator()?,
+            reloader: &reloader,
+            post_check: None,
+            force: false,
+            task_id: ctx.task_id().map(|t| t.to_string()),
+        })
+        .await?;
+    Ok(())
+}
+
 async fn claim_domain(db: &unihelm_db::Db, domain: &Domain) -> Result<Option<String>> {
     let previous: Option<String> = db
         .get_setting(unihelm_db::panel::DOMAIN_KEY)

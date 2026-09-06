@@ -24,7 +24,7 @@ use unihelm_db::sites::{NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPoli
 use crate::nginx_survey;
 use crate::provision;
 use crate::registry::{Execution, OpContext, TypedOperation};
-use crate::services::{FpmValidator, NginxValidator, UnitReloader};
+use crate::services::{FpmValidator, UnitReloader};
 
 /// How much memory a site's PHP pool may assume, until plans arrive in Phase 2.
 /// Shared with the tenant-slice module so pool sizing and slice limits draw

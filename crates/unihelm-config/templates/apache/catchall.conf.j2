@@ -35,6 +35,17 @@
     <Location "/">
         Require all denied
     </Location>
+    # And then the one path that must still answer.
+    #
+    # `<Location>` is matched against the URL and is merged *after* `<Directory>`,
+    # so the deny above overrides the grant on the webroot no matter which order
+    # they appear in — the ACME `<Directory>` alone left every HTTP-01 challenge
+    # on the default vhost returning 403, which is exactly the request that has
+    # to work before a site exists. Two `<Location>` blocks merge in config
+    # order, so this one, being later and more specific, is what applies.
+    <Location "/.well-known/acme-challenge/">
+        Require all granted
+    </Location>
     ErrorDocument 403 " "
 </VirtualHost>
 
