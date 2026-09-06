@@ -380,7 +380,7 @@ pub async fn engine_remove(
     get,
     path = "/api/stack/webserver/gaps",
     tag = "stack",
-    params(("target" = String, Query, description = "`nginx` or `apache`")),
+    params(("target" = Option<String>, Query, description = "`nginx` or `apache`; absent means the server serving now")),
     security(("session_cookie" = [])),
     responses(
         (status = 200, description = "The sites and features a switch would cost", body = serde_json::Value),
@@ -400,11 +400,15 @@ pub async fn webserver_gaps(
         .require(Permission::ServerRead)
         .map_err(ApiError::from)?;
     // Not audited: it reads and changes nothing. The switch that follows is.
+    let mut args = serde_json::Map::new();
+    if let Some(target) = &query.target {
+        args.insert("target".into(), json!(target));
+    }
     let data = ops::invoke_now(
         &state,
         &current.auth,
         "webserver.gaps",
-        json!({ "target": query.target }),
+        serde_json::Value::Object(args),
     )
     .await?;
     Ok(Json(data))
@@ -412,5 +416,8 @@ pub async fn webserver_gaps(
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 pub struct WebServerTarget {
-    pub target: String,
+    /// Absent means the server serving right now — which is how a page asks
+    /// "what does this machine show as set and not actually apply".
+    #[serde(default)]
+    pub target: Option<String>,
 }

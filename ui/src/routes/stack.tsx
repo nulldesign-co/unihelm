@@ -807,7 +807,7 @@ export function StackPage() {
                         switchServer.isPending
                           ? switchServer.variables.target
                           : askGaps.isPending
-                            ? askGaps.variables
+                            ? (askGaps.variables ?? null)
                             : null
                       }
                       awaitingConfirm={pendingSwitch === entry.slug}

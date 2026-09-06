@@ -567,6 +567,27 @@ function SettingsCard({ site }: { site: SiteDetail }) {
   // Only the PHP versions actually installed are offered; a version nginx has
   // no pool socket for turns every request into a 502.
   const stack = useQuery({ queryKey: ["stack"], queryFn: endpoints.stack });
+
+  // Which of this site's controls the web server currently serving does not
+  // apply. Asked of the *active* server with no target, so it is computed from
+  // what is running rather than remembered from a switch — a stored list would
+  // go on naming a rate limit somebody has since turned off.
+  //
+  // Without this the page went on presenting HTTP/3, request rate limiting and
+  // the nginx snippet as live controls on an Apache machine, where none of them
+  // does anything. Those fields are exactly the ones an operator sets and then
+  // trusts.
+  const notApplied = useQuery({
+    queryKey: ["webserver-gaps"],
+    queryFn: () => endpoints.webServerGaps(),
+    staleTime: 60_000,
+  });
+  const inert = new Set(
+    (notApplied.data?.gaps ?? [])
+      .filter((g) => g.domain === site.domain)
+      .map((g) => g.field),
+  );
+
   const installedPhp =
     stack.data?.components
       .filter((c) => c.slug.startsWith("php") && c.status === "installed")
@@ -723,7 +744,9 @@ function SettingsCard({ site }: { site: SiteDetail }) {
               checked={value("http3")}
               onChange={(next) => set("http3", next)}
               label={t("siteDetail.http3")}
-              description={t("siteDetail.http3Hint")}
+              description={
+                inert.has("http3") ? t("siteDetail.notApplied") : t("siteDetail.http3Hint")
+              }
             />
           </DirtyMark>
           <DirtyMark dirty={isDirty("maintenance_mode")}>
@@ -739,15 +762,22 @@ function SettingsCard({ site }: { site: SiteDetail }) {
               checked={value("rate_limit_enabled")}
               onChange={(next) => set("rate_limit_enabled", next)}
               label={t("siteDetail.rateLimit")}
-              description={t("siteDetail.rateLimitHint", {
-                rps: site.rate_limit_rps,
-                burst: site.rate_limit_burst,
-              })}
+              description={
+                inert.has("rate_limit_enabled")
+                  ? t("siteDetail.notApplied")
+                  : t("siteDetail.rateLimitHint", {
+                      rps: site.rate_limit_rps,
+                      burst: site.rate_limit_burst,
+                    })
+              }
             />
           </DirtyMark>
         </div>
 
         <DirtyMark dirty={isDirty("custom_nginx_snippet")}>
+          {inert.has("custom_nginx_snippet") ? (
+            <Callout tone="warning">{t("siteDetail.notApplied")}</Callout>
+          ) : null}
           <Field label={t("siteDetail.nginxSnippet")} htmlFor="custom_nginx_snippet">
             <Textarea
               id="custom_nginx_snippet"

@@ -1057,9 +1057,11 @@ export const endpoints = {
    * would be lost never reaches the caller of that request. This does, in one
    * round trip, and needs only read permission.
    */
-  webServerGaps: (target: string) =>
+  webServerGaps: (target?: string) =>
     api.get<WebServerGapsResponse>(
-      `/api/stack/webserver/gaps?target=${encodeURIComponent(target)}`,
+      target === undefined
+        ? "/api/stack/webserver/gaps"
+        : `/api/stack/webserver/gaps?target=${encodeURIComponent(target)}`,
     ),
   createApp: (body: CreateAppRequest) => api.post<TaskAccepted>("/api/apps", body),
   deleteApp: (id: number) => api.del<TaskAccepted>(`/api/apps/${id}`),

@@ -677,6 +677,8 @@ export const en = {
     bodySize: "Max upload size",
     bodySizeHint: "nginx client_max_body_size — a number with k, m or g.",
     bodySizeInvalid: "Use a plain number with an optional k, m or g suffix, like 64m",
+    notApplied:
+      "Not in effect. The web server currently serving this machine does not apply this — it is kept so that switching back restores it.",
     nginxSnippet: "Custom nginx snippet",
     nginxSnippetHint:
       "Inserted into the server block. nginx -t validates it before anything goes live; leave empty to remove.",

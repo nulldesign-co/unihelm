@@ -408,13 +408,47 @@ async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result
             target.display_name(),
             from.display_name()
         ));
-        svc.enable(&leaving, true).await.ok();
+        // Read back, not assumed. `enable --now` succeeding means systemd
+        // accepted the request, not that the service is running — the lesson
+        // `stack.rs` already learned — and this message used to state
+        // unconditionally that the incumbent "is serving again" after throwing
+        // the result away with `.ok()`. If nginx also fails to come back, the
+        // machine is serving nothing and the panel was telling the operator it
+        // was fine, in the one moment they most needed the truth.
+        let restored = svc.enable(&leaving, true).await.is_ok()
+            && svc
+                .status(&leaving)
+                .await
+                .map(|s| s.is_active())
+                .unwrap_or(false);
+
+        if restored {
+            return Err(UnihelmError::new(
+                ErrorCode::Internal,
+                format!(
+                    "{} would not start, so {} was put back and is serving again: {e}",
+                    target.display_name(),
+                    from.display_name(),
+                ),
+            ));
+        }
+
+        ctx.log(format!(
+            "{} could not be started again either — this machine is not serving",
+            from.display_name()
+        ));
         return Err(UnihelmError::new(
             ErrorCode::Internal,
             format!(
-                "{} would not start, so {} was put back and is serving again: {e}",
+                "{} would not start, and {} could not be started again either — \
+                 **this machine is serving nothing right now**. Neither web server is \
+                 running. `systemctl status {}` and `systemctl status {}` say why; the \
+                 configuration for both is still on disk and nothing was deleted. \
+                 The original failure was: {e}",
                 target.display_name(),
                 from.display_name(),
+                arriving.as_str(),
+                leaving.as_str(),
             ),
         ));
     }
@@ -465,7 +499,16 @@ pub struct Gaps;
 
 #[derive(Debug, Deserialize)]
 pub struct GapsInput {
-    pub target: String,
+    /// Absent means the server that is serving right now.
+    ///
+    /// That is the *after* the switch question, and it is the same question:
+    /// asked of the active server, this answers "which controls does this
+    /// machine show as set and not actually apply". Computed rather than
+    /// recorded, so it cannot go stale — a site whose rate limit is turned off
+    /// after a switch stops being listed the moment it is, without anything
+    /// having to remember to update a stored list.
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -487,16 +530,19 @@ impl TypedOperation for Gaps {
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
-        let target = WebServer::from_slug(&input.target).ok_or_else(|| {
-            UnihelmError::new(
-                ErrorCode::InvalidInput,
-                format!(
-                    "`{}` is not a web server this panel knows. It serves with: nginx, apache.",
-                    input.target
-                ),
-            )
-            .with_field("target")
-        })?;
+        let target = match &input.target {
+            Some(slug) => WebServer::from_slug(slug).ok_or_else(|| {
+                UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "`{slug}` is not a web server this panel knows. It serves with: \
+                         nginx, apache."
+                    ),
+                )
+                .with_field("target")
+            })?,
+            None => active(ctx).await?,
+        };
 
         let sites = ctx.db().all_sites().await.map_err(UnihelmError::from)?;
         let mut gaps_found = gaps(target, &sites);
@@ -722,10 +768,22 @@ impl TypedOperation for Switch {
             return Err(UnihelmError::new(
                 ErrorCode::ConfigValidationFailed,
                 format!(
-                    "{} rejected the configuration this panel wrote for it, so nothing was \
-                     switched and {} is still serving:\n\n{detail}",
+                    "{} rejected the configuration this panel wrote for it. **{} is still \
+                     serving and nothing about it changed** — the exchange had not happened \
+                     yet. The {} configuration is on disk under {} and is not being read by \
+                     anything; fixing what is named below and running the switch again \
+                     overwrites it. The error was:\n\n{detail}",
                     target.display_name(),
                     from.display_name(),
+                    target.display_name(),
+                    target
+                        .site_vhost("example.com")?
+                        .path()
+                        .parent()
+                        .map_or_else(
+                            || "the target's own tree".to_string(),
+                            |dir| dir.display().to_string()
+                        ),
                 ),
             ));
         }
@@ -737,9 +795,24 @@ impl TypedOperation for Switch {
         // 7. Only now is it true, so only now is it written. A setting recorded
         //    before the unit started would have the panel render into a tree
         //    nothing reads for as long as it took somebody to notice.
-        db.set_setting(WEB_SERVER_SETTING, &target)
-            .await
-            .map_err(UnihelmError::from)?;
+        //
+        //    And if *this* fails, the machine has already switched. Returning
+        //    the database error alone would leave an operator believing nothing
+        //    happened, while every later vhost the panel renders goes into the
+        //    tree the old server used to read — invisibly, until somebody
+        //    notices a new site never came up. So the failure says which of the
+        //    two things is true.
+        if let Err(e) = db.set_setting(WEB_SERVER_SETTING, &target).await {
+            return Err(UnihelmError::internal(format!(
+                "{} is now serving this machine — the switch itself completed — but the \
+                 panel could not record it ({e}). Until that row is written the panel \
+                 will keep rendering vhosts for {}, into a directory nothing reads, so a \
+                 site created now would not come up. Run the switch again once the \
+                 database is writable; it is idempotent and will finish the last step.",
+                target.display_name(),
+                from.display_name(),
+            )));
+        }
         ctx.log(format!("{} is serving this machine", target.display_name()));
 
         Ok(SwitchOutput {
@@ -931,6 +1004,26 @@ async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()
 /// be done over ssh, and `a2enmod` on an already-enabled module is a no-op that
 /// prints so. The check afterwards is what makes it safe — the enable is a
 /// best effort, the verification is not.
+///
+/// A note on why, because the first version of this comment had it wrong and
+/// the wrong version is the more frightening one. It claimed a missing module
+/// is *silently* inert — configtest passing, pages loading, directives doing
+/// nothing — and that without `mod_proxy_fcgi` a site would serve the source of
+/// every `.php` file as plain text. That is not what happens. With `mod_proxy`
+/// loaded and `mod_proxy_fcgi` absent, mod_proxy claims the request, finds no
+/// provider for `fcgi` and returns 500; with `mod_proxy` also absent, the
+/// `<Proxy>` block is an invalid command and configtest fails outright. Five of
+/// the others behave the same way: `Header`, `ExpiresActive`, `RewriteEngine`
+/// and `SSLEngine` are all unknown directives without their modules, and Apache
+/// refuses to start.
+///
+/// So the real hazard is narrower and worth naming accurately: `mod_deflate`
+/// and `mod_http2` *are* silent — `AddOutputFilterByType` without mod_filter
+/// and mod_deflate simply compresses nothing, and `Protocols h2` without
+/// mod_http2 simply never offers HTTP/2. Everything else fails loudly. The
+/// check earns its place anyway, because "loudly" here means a switch that
+/// stops halfway on a machine that was serving fine, and finding that out
+/// before anything is written is the whole point.
 async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
     if ctx.distro().info.family != unihelm_distro::Family::Rhel {
         for (module, _) in APACHE_MODULES.iter().chain(APACHE_PREFERRED_MODULES) {

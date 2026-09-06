@@ -562,6 +562,63 @@ mod tests {
         );
     }
 
+    /// nginx spells both file lists `location ~*`, and the `*` is the whole
+    /// point of them.
+    ///
+    /// `<FilesMatch>` is case-sensitive. Without `(?i)` the deny list refused
+    /// `backup.sql` and served `backup.SQL` in full — and the class of file it
+    /// exists to hide is the hand-made dump, the copied `.env` and the editor
+    /// backup, none of which is reliably lowercase. Confirmed against Apache
+    /// 2.4.67 during review: `GET /backup.SQL` returned 200 and the dump.
+    #[test]
+    fn the_file_denials_are_case_insensitive_the_way_nginx_spells_them() {
+        let out = directives_only(&render_apache(&php_site()));
+        for block in ["sql|bak|old", "jpg|jpeg|png"] {
+            let line = out
+                .lines()
+                .find(|l| l.contains(block) && l.contains("FilesMatch"))
+                .unwrap_or_else(|| panic!("no FilesMatch for {block}:\n{out}"));
+            assert!(
+                line.contains("(?i)"),
+                "case-sensitive where nginx is not — `.SQL` and `.ENV` walk past this: {line}"
+            );
+        }
+        // And nginx really does spell it the case-insensitive way, so this is
+        // parity and not an invention.
+        let nginx = directives_only(&render_site(&php_site()));
+        assert!(nginx.contains("location ~* \\.(?:sql|bak"), "{nginx}");
+    }
+
+    /// A `.htaccess` merges after the vhost's own sections and wins.
+    ///
+    /// `AllowOverride All` therefore let anything inside the document root
+    /// re-grant every file the vhost denies — confirmed against Apache 2.4.67,
+    /// where a four-line `.htaccess` turned the 403 on `/.env` into a 200 with
+    /// its contents. nginx has no `.htaccess` mechanism, so its denials are
+    /// unconditional and this was a difference a switch introduced in silence.
+    #[test]
+    fn a_htaccess_cannot_re_grant_what_the_vhost_denied() {
+        for ctx in [php_site(), {
+            let mut static_site = php_site();
+            static_site.site_type = SiteType::Static.as_str();
+            static_site
+        }] {
+            let out = directives_only(&render_apache(&ctx));
+            assert!(
+                !out.contains("AllowOverride All"),
+                "a .htaccess can switch off every denial in this file:\n{out}"
+            );
+            assert!(out.contains("AllowOverride FileInfo"), "{out}");
+            // FileInfo is what carries RewriteRule, so permalinks still work.
+            // AuthConfig is what carries `Require`, and it must not be here.
+            let line = out
+                .lines()
+                .find(|l| l.trim_start().starts_with("AllowOverride"))
+                .expect("no AllowOverride");
+            assert!(!line.contains("AuthConfig"), "{line}");
+        }
+    }
+
     /// nginx: `location ~ /\.(?!well-known)` and the dangerous-extension list.
     #[test]
     fn apache_denies_dotfiles_and_leftovers_the_way_nginx_does() {
