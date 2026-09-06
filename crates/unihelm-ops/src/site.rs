@@ -752,7 +752,10 @@ pub fn site_context(site: &Site, linux_user: &unihelm_core::LinuxUser) -> Result
         site.php_version.unwrap_or(PhpVersion::V83),
     );
 
-    context.force_https = site.force_https;
+    // Through the setter: it decides what the site listens on, and assigning
+    // the field alone is how a TLS site that does not redirect ends up with no
+    // port 80 at all.
+    context = context.with_force_https(site.force_https);
     context.http3 = site.http3;
     context.maintenance_mode = site.maintenance_mode;
     // Through the setter, which keeps the byte count in step: nginx enforces
@@ -1192,14 +1195,16 @@ impl TypedOperation for Delete {
         let domain = Domain::parse(&site.domain)?;
 
         // The vhost first: stop serving before removing what was served.
-        let vhost = ManagedFile::nginx(paths::nginx_site(&site.domain));
+        //
+        // Through the seam, and from the *active* server. Named as nginx's, a
+        // delete on an Apache machine left the Apache vhost in place — so the
+        // site went on being served from a document root that was about to be
+        // deleted, by an FPM pool that was about to be removed.
+        let server = crate::webserver::active(ctx).await?;
+        let vhost = server.site_vhost(&site.domain)?;
+        let reloader = server.reloader(ctx.distro())?;
         ctx.config()
-            .remove(
-                &vhost,
-                "nginx",
-                &NginxValidator,
-                &UnitReloader::nginx(ctx.distro()),
-            )
+            .remove(&vhost.file, vhost.service, server.validator()?, &reloader)
             .await?;
         ctx.log(format!("removed the vhost for {}", site.domain));
 
@@ -1209,8 +1214,13 @@ impl TypedOperation for Delete {
 
         // Logrotate config, then the revision history for both files.
         let _ = std::fs::remove_file(paths::logrotate_site(&site.domain));
+        // Both servers' paths, not just the active one's: a machine that was
+        // switched has a revision history under the other name too, and leaving
+        // it behind means a later site on the same domain starts with somebody
+        // else's diff.
         for path in [
             paths::nginx_site(&site.domain),
+            paths::apache_site(&site.domain),
             paths::logrotate_site(&site.domain),
         ] {
             let _ = db.forget_revisions(&path.to_string_lossy()).await;

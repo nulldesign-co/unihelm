@@ -221,8 +221,13 @@ impl Vhost {
 /// templates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Gap {
-    /// The site this is about.
-    pub domain: String,
+    /// The site this is about, or `None` when it is about the whole machine.
+    ///
+    /// Two of the panel's features are server-wide and nginx-only — the WAF and
+    /// Adminer — so a switch loses them for every site at once rather than for
+    /// one. Reporting those against an arbitrary domain would tell an operator
+    /// with forty sites that one of them has a problem.
+    pub domain: Option<String>,
     /// The field the panel shows, so the page that reports it can point at the
     /// control the operator set.
     pub field: &'static str,
@@ -250,7 +255,7 @@ pub fn gaps(target: WebServer, sites: &[unihelm_db::Site]) -> Vec<Gap> {
 
         if site.rate_limit_enabled {
             found.push(Gap {
-                domain: site.domain.clone(),
+                domain: Some(site.domain.clone()),
                 field: "rate_limit_enabled",
                 detail: format!(
                     "{} limits requests to {}/s with a burst of {}. {} has no request rate \
@@ -267,7 +272,7 @@ pub fn gaps(target: WebServer, sites: &[unihelm_db::Site]) -> Vec<Gap> {
 
         if site.http3 {
             found.push(Gap {
-                domain: site.domain.clone(),
+                domain: Some(site.domain.clone()),
                 field: "http3",
                 detail: format!(
                     "{} advertises HTTP/3. {} has no production HTTP/3: the module is \
@@ -281,7 +286,7 @@ pub fn gaps(target: WebServer, sites: &[unihelm_db::Site]) -> Vec<Gap> {
 
         if site.custom_nginx_snippet.is_some() {
             found.push(Gap {
-                domain: site.domain.clone(),
+                domain: Some(site.domain.clone()),
                 field: "custom_nginx_snippet",
                 detail: format!(
                     "{} has a custom nginx snippet. It is nginx configuration: rendering it \
@@ -295,6 +300,62 @@ pub fn gaps(target: WebServer, sites: &[unihelm_db::Site]) -> Vec<Gap> {
         }
     }
     found
+}
+
+/// What this machine as a whole loses by moving to `target`.
+///
+/// The companion to [`gaps`], and separate from it because these are not
+/// properties of a site: the WAF and Adminer are configured once and apply to
+/// everything, so a switch turns them off for every site at once.
+///
+/// Both are nginx-only today, and both fail in the way this project treats as
+/// worst. The WAF's rules are loaded by nginx's ModSecurity connector, which
+/// Apache does not read — so after a switch the panel keeps showing the WAF as
+/// enabled, at the paranoia level somebody chose, while no request is inspected.
+/// Adminer is served from an nginx vhost, so the database GUI simply stops
+/// answering. Neither announces itself.
+pub async fn server_gaps(ctx: &OpContext, target: WebServer) -> Result<Vec<Gap>> {
+    if target == WebServer::Nginx {
+        return Ok(Vec::new());
+    }
+
+    let mut found = Vec::new();
+
+    if ctx
+        .db()
+        .get_setting_or(unihelm_db::settings::keys::WAF_ENABLED, false)
+        .await
+    {
+        found.push(Gap {
+            domain: None,
+            field: "waf_enabled",
+            detail: format!(
+                "The WAF is enabled server-wide. Its rules are loaded by nginx's ModSecurity \
+                 connector, and {} does not read that configuration — so no request would be \
+                 inspected, while the Firewall page went on showing the WAF as on. Turn it \
+                 off before switching, so that what the panel says matches what the server \
+                 does.",
+                target.display_name()
+            ),
+        });
+    }
+
+    // The file, not a setting: it is what `db.adminer.status` reads, so this
+    // cannot disagree with what the panel shows on the Databases page.
+    if paths::adminer_php().exists() {
+        found.push(Gap {
+            domain: None,
+            field: "adminer",
+            detail: format!(
+                "Adminer, the database GUI, is served from an nginx vhost this panel writes. \
+                 There is no {} vhost for it yet, so it would stop answering until one \
+                 exists. Nothing in a database is affected.",
+                target.display_name()
+            ),
+        });
+    }
+
+    Ok(found)
 }
 
 /// The refusal for a server that is in the catalogue and cannot serve yet.
@@ -311,6 +372,53 @@ fn unbuilt(server: WebServer) -> UnihelmError {
             server.display_name()
         ),
     )
+}
+
+/// Hand port 80 from one web server to the other.
+///
+/// Pulled out of [`Switch::run`] because it is the only part of a switch that
+/// can leave a machine serving nothing, and a decision that dangerous should be
+/// assertable without standing up a whole switch.
+///
+/// **`disable`, not `stop`.** Stopping leaves the unit enabled, so the next
+/// reboot starts *both* — and they both want port 80. Whichever systemd reaches
+/// first binds it and the other fails, so a machine switched to Apache could
+/// come back from a reboot serving with nginx, or serving nothing at all,
+/// depending on unit ordering nobody controls. The failure is invisible until
+/// that reboot, which may be months after the switch, by which time nothing
+/// connects the outage to the operation that caused it.
+///
+/// The two calls are also deliberately in this order and not overlapped: they
+/// contend for the same port, so starting the target before the incumbent is
+/// down means the target fails to bind and the rollback below fires on a
+/// machine that was never actually broken.
+async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result<()> {
+    let svc = &ctx.distro().svc;
+    let family = ctx.distro().info.family;
+    let leaving = from.unit()?.unit_name(family);
+    let arriving = target.unit()?.unit_name(family);
+
+    svc.disable(&leaving, true).await?;
+    if let Err(e) = svc.enable(&arriving, true).await {
+        // The target would not start. Put the incumbent back — enabled as well
+        // as running, which is what `enable(_, true)` does — because the
+        // alternative is a machine serving nothing, now and after every reboot.
+        ctx.log(format!(
+            "{} did not start ({e}); restoring {}",
+            target.display_name(),
+            from.display_name()
+        ));
+        svc.enable(&leaving, true).await.ok();
+        return Err(UnihelmError::new(
+            ErrorCode::Internal,
+            format!(
+                "{} would not start, so {} was put back and is serving again: {e}",
+                target.display_name(),
+                from.display_name(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Which web server this machine serves sites with.
@@ -420,9 +528,11 @@ impl TypedOperation for Switch {
             });
         }
 
+        refuse_where_the_panel_writes_where_the_server_does_not_read(ctx, target)?;
         refuse_when_the_target_is_not_installed(ctx, target).await?;
         if target == WebServer::Apache {
             ensure_apache_modules(ctx).await?;
+            admit_to_the_web_group(ctx, target).await?;
         }
 
         let db = ctx.db();
@@ -431,19 +541,27 @@ impl TypedOperation for Switch {
         // reading only one of them.
         let sites = db.all_sites().await.map_err(UnihelmError::from)?;
 
-        let dropped = gaps(target, &sites);
+        let mut dropped = gaps(target, &sites);
+        dropped.extend(server_gaps(ctx, target).await?);
         if !dropped.is_empty() && !input.accept_gaps {
+            let affected = dropped
+                .iter()
+                .filter_map(|g| g.domain.as_deref())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let server_wide = dropped.iter().filter(|g| g.domain.is_none()).count();
             return Err(UnihelmError::new(
                 ErrorCode::Conflict,
                 format!(
-                    "{} of this machine's sites are configured for something {} cannot \
-                     do:\n\n{}\n\nSwitch anyway to accept these, or change the sites \
+                    "{} and {} of this machine's sites are configured for something {} cannot \
+                     do:\n\n{}\n\nSwitch anyway to accept these, or change them \
                      first.",
-                    dropped
-                        .iter()
-                        .map(|g| g.domain.as_str())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len(),
+                    match server_wide {
+                        0 => "Nothing server-wide".to_string(),
+                        1 => "One server-wide feature".to_string(),
+                        n => format!("{n} server-wide features"),
+                    },
+                    affected,
                     target.display_name(),
                     dropped
                         .iter()
@@ -518,30 +636,7 @@ impl TypedOperation for Switch {
 
         // 5. The exchange. This is the only unsafe moment, and it is as short as
         //    two systemctl calls: they both want port 80.
-        let svc = &ctx.distro().svc;
-        let leaving = from.unit()?.unit_name(ctx.distro().info.family);
-        let arriving = target.unit()?.unit_name(ctx.distro().info.family);
-
-        svc.action(&leaving, unihelm_distro::svc::SvcAction::Stop)
-            .await?;
-        if let Err(e) = svc.enable(&arriving, true).await {
-            // The target would not start. Put the incumbent back before
-            // returning, because the alternative is a machine serving nothing.
-            ctx.log(format!(
-                "{} did not start ({e}); restoring {}",
-                target.display_name(),
-                from.display_name()
-            ));
-            svc.enable(&leaving, true).await.ok();
-            return Err(UnihelmError::new(
-                ErrorCode::Internal,
-                format!(
-                    "{} would not start, so {} was put back and is serving again: {e}",
-                    target.display_name(),
-                    from.display_name(),
-                ),
-            ));
-        }
+        exchange(ctx, from, target).await?;
 
         // 6. Only now is it true, so only now is it written. A setting recorded
         //    before the unit started would have the panel render into a tree
@@ -593,6 +688,115 @@ const APACHE_MODULES: &[(&str, &str)] = &[
     ("expires", "cache lifetimes on static assets"),
     ("deflate", "compression"),
 ];
+
+/// Refuse a target whose configuration tree this build writes to the wrong place.
+///
+/// Every `paths::apache_*` is `/etc/apache2/...`, which is Debian's layout.
+/// Red Hat's Apache is `httpd` and reads `/etc/httpd/conf.d`, so on EL the panel
+/// would write a complete and correct set of vhosts into a directory httpd has
+/// never heard of.
+///
+/// The reason this has to be a refusal rather than a warning is what happens
+/// next: `apachectl configtest` **passes**, because the configuration httpd
+/// actually parses is the stock one and there is nothing wrong with it. The
+/// switch's own safety check would therefore report success, nginx would be
+/// stopped, httpd would start, and every site on the machine would answer with
+/// the distribution's default page. Validation that cannot see the files it is
+/// meant to be validating is worse than no validation, because it is trusted.
+///
+/// EL support is a matter of resolving these paths against the family. Until
+/// that is done, this says so instead of proving it the expensive way.
+fn refuse_where_the_panel_writes_where_the_server_does_not_read(
+    ctx: &OpContext,
+    target: WebServer,
+) -> Result<()> {
+    if target == WebServer::Apache && ctx.distro().info.family == unihelm_distro::Family::Rhel {
+        return Err(UnihelmError::new(
+            ErrorCode::NotImplemented,
+            format!(
+                "this panel writes Apache vhosts to {}, which is Debian's layout. On {} \
+                 Apache is `httpd` and reads /etc/httpd/conf.d, so the vhosts would be \
+                 written correctly and read by nothing — and `apachectl configtest` would \
+                 still pass, because httpd would be checking its stock configuration. \
+                 Nginx keeps serving this machine.",
+                paths::apache_dir().display(),
+                ctx.distro().info.pretty_name,
+            ),
+        )
+        .with_field("target"));
+    }
+    Ok(())
+}
+
+/// The account each web server runs its workers as.
+///
+/// nginx.org's package uses `nginx` on both families. Apache is `www-data` on
+/// Debian and `apache` on EL — the one place in this module where the two
+/// families disagree about something other than a unit name.
+fn runtime_account(server: WebServer, family: unihelm_distro::Family) -> Option<&'static str> {
+    match (server, family) {
+        (WebServer::Nginx, _) => Some("nginx"),
+        (WebServer::Apache, unihelm_distro::Family::Debian) => Some("www-data"),
+        (WebServer::Apache, unihelm_distro::Family::Rhel) => Some("apache"),
+        (WebServer::Litespeed, _) => None,
+    }
+}
+
+/// Let the arriving web server reach what the incumbent could.
+///
+/// This is the step without which nothing else in a switch matters. The panel's
+/// whole isolation model is built on one group: a tenant's site directory is
+/// `tenant:nginx` at `0710`, so the tenant owns it outright and the web server
+/// can *traverse* it because it is in that group and nobody else can do either.
+/// Each site's FPM socket is `0660` with the same group, for the same reason.
+///
+/// Apache runs as `www-data`, which is in none of that. Without this, a machine
+/// switched to Apache answers **403 for every static file** — it cannot walk
+/// into the directory — and **503 for every PHP page**, because it cannot open
+/// the socket. Every template in this release could be perfect and the machine
+/// would still serve nothing, which is what makes this a precondition and not a
+/// refinement.
+///
+/// Adding the account to the existing group rather than inventing a shared one:
+/// the group already exists on every machine this panel has ever provisioned,
+/// with the right membership and the right mode on several thousand
+/// directories. A new group would mean re-owning all of them, which is a
+/// migration that can half-finish. The name reads oddly on an Apache machine —
+/// it is the web server's group, whatever it is called.
+async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()> {
+    let family = ctx.distro().info.family;
+    let Some(account) = runtime_account(target, family) else {
+        return Ok(());
+    };
+    let group = crate::provision::nginx_user(ctx.distro());
+    if account == group {
+        return Ok(());
+    }
+
+    // `-a -G` appends. Without `-a` this *replaces* every supplementary group
+    // the account has, which on `www-data` is how a switch would take away
+    // whatever else the machine had granted it.
+    unihelm_distro::Cmd::new("usermod")
+        .args(["-a", "-G", group, account])
+        .timeout(std::time::Duration::from_secs(15))
+        .run_checked()
+        .await
+        .map_err(|e| {
+            UnihelmError::internal(format!(
+                "{} runs as `{account}` and could not be added to the `{group}` group ({e}). \
+                 Without it every site directory (mode 0710) and every FPM socket (mode 0660) \
+                 stays unreachable, so the machine would answer 403 for static files and 503 \
+                 for PHP. Nothing was switched.",
+                target.display_name()
+            ))
+        })?;
+
+    ctx.log(format!(
+        "`{account}` added to `{group}`, so {} can read site directories and FPM sockets",
+        target.display_name()
+    ));
+    Ok(())
+}
 
 /// Turn on what the vhosts need, and refuse if anything is still missing.
 ///
@@ -879,9 +1083,57 @@ mod tests {
         );
         // Every gap names its own site: a switch across forty sites has to say
         // which three are affected, not that three things are wrong somewhere.
-        assert!(found.iter().all(|g| g.domain == "a.test"), "{found:?}");
+        assert!(
+            found.iter().all(|g| g.domain.as_deref() == Some("a.test")),
+            "{found:?}"
+        );
         // And a site that uses none of them is not mentioned at all.
-        assert!(!found.iter().any(|g| g.domain == "plain.test"), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|g| g.domain.as_deref() == Some("plain.test")),
+            "{found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enabled_waf_is_reported_before_it_goes_silently_inert() {
+        // The worst shape of failure this project has: the panel keeps showing
+        // the WAF as enabled, at the paranoia level somebody chose, while no
+        // request is inspected — because the rules are loaded by nginx's
+        // ModSecurity connector and Apache never reads that file.
+        let ctx = op_ctx().await;
+        assert_eq!(
+            server_gaps(&ctx, WebServer::Apache).await.unwrap(),
+            Vec::new(),
+            "a machine with no WAF has nothing to report"
+        );
+
+        ctx.db()
+            .set_setting(unihelm_db::settings::keys::WAF_ENABLED, &true)
+            .await
+            .unwrap();
+
+        let found = server_gaps(&ctx, WebServer::Apache).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].field, "waf_enabled");
+        // Server-wide, so it belongs to no site: reporting it against one
+        // domain would tell an operator with forty sites that one has a fault.
+        assert_eq!(found[0].domain, None);
+        assert!(found[0].detail.contains("Apache"), "{}", found[0].detail);
+    }
+
+    #[tokio::test]
+    async fn nginx_loses_nothing_server_wide_either() {
+        let ctx = op_ctx().await;
+        ctx.db()
+            .set_setting(unihelm_db::settings::keys::WAF_ENABLED, &true)
+            .await
+            .unwrap();
+        assert_eq!(
+            server_gaps(&ctx, WebServer::Nginx).await.unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -900,11 +1152,15 @@ mod tests {
     }
 
     async fn op_ctx() -> OpContext {
+        op_ctx_on(unihelm_distro::Family::Debian).await
+    }
+
+    async fn op_ctx_on(family: unihelm_distro::Family) -> OpContext {
         use crate::registry::Services;
         use std::sync::Arc;
         use unihelm_core::{AuthContext, Role, TenantScope, UserId};
 
-        let distro = unihelm_distro::Distro::mock();
+        let distro = unihelm_distro::mock::mock_distro_with_recorder(family).0;
         let db = unihelm_db::Db::open_memory().await.unwrap();
         let services = Arc::new(
             Services::new(distro, db, unihelm_db::MasterKey::generate()).expect("templates"),
@@ -963,6 +1219,128 @@ mod tests {
         assert!(err.detail.contains("not installed"), "{}", err.detail);
         assert!(err.detail.contains("apache2.service"), "{}", err.detail);
         assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
+    }
+
+    #[tokio::test]
+    async fn the_incumbent_is_disabled_and_not_merely_stopped() {
+        // The bug this pins: `systemctl stop nginx` leaves nginx *enabled*, so
+        // the next reboot starts nginx and Apache together and they fight over
+        // port 80. The machine comes back serving with whichever systemd
+        // reached first — possibly the server the operator switched away from,
+        // possibly neither. Nothing about it is visible until that reboot.
+        let ctx = op_ctx().await;
+        let family = ctx.distro().info.family;
+        let nginx = WebServer::Nginx.unit().unwrap().unit_name(family);
+        let apache = WebServer::Apache.unit().unwrap().unit_name(family);
+        let svc = &ctx.distro().svc;
+
+        // A machine as it is before a switch: nginx enabled and running.
+        svc.enable(&nginx, true).await.unwrap();
+
+        exchange(&ctx, WebServer::Nginx, WebServer::Apache)
+            .await
+            .unwrap();
+
+        let left = svc.status(&nginx).await.unwrap();
+        assert_eq!(
+            left.enabled.as_deref(),
+            Some("disabled"),
+            "nginx was stopped but left enabled, so a reboot starts it beside Apache"
+        );
+        assert!(!left.is_active(), "nginx is still running");
+
+        let arrived = svc.status(&apache).await.unwrap();
+        assert_eq!(arrived.enabled.as_deref(), Some("enabled"));
+        assert!(
+            arrived.is_active(),
+            "Apache is not running after the switch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_that_will_not_start_leaves_the_incumbent_enabled_again() {
+        // Rollback has to undo the *disable* as well as the stop. Putting nginx
+        // back with `systemctl start` alone would leave a machine that serves
+        // now and serves nothing after the next reboot — the same latent
+        // failure, reached by the path that was supposed to avoid it.
+        let ctx = op_ctx().await;
+        let family = ctx.distro().info.family;
+        let nginx = WebServer::Nginx.unit().unwrap().unit_name(family);
+        let svc = &ctx.distro().svc;
+        svc.enable(&nginx, true).await.unwrap();
+
+        // Litespeed has no unit arm, so `exchange` fails before touching
+        // anything — the incumbent must be untouched, not merely restored.
+        let err = exchange(&ctx, WebServer::Nginx, WebServer::Litespeed)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+
+        let still = svc.status(&nginx).await.unwrap();
+        assert_eq!(still.enabled.as_deref(), Some("enabled"));
+        assert!(
+            still.is_active(),
+            "nginx was taken down for a target that could never start"
+        );
+    }
+
+    #[test]
+    fn each_web_server_names_the_account_its_workers_run_as() {
+        use unihelm_distro::Family;
+        // The account matters because the panel's whole isolation model is one
+        // group: site directories are `tenant:nginx` at 0710 and FPM sockets
+        // are 0660 with the same group. A web server outside that group answers
+        // 403 for every static file and 503 for every PHP page, with a
+        // configuration that is otherwise perfect.
+        assert_eq!(
+            runtime_account(WebServer::Nginx, Family::Debian),
+            Some("nginx")
+        );
+        assert_eq!(
+            runtime_account(WebServer::Nginx, Family::Rhel),
+            Some("nginx")
+        );
+        // The one place the two families disagree about more than a unit name.
+        assert_eq!(
+            runtime_account(WebServer::Apache, Family::Debian),
+            Some("www-data")
+        );
+        assert_eq!(
+            runtime_account(WebServer::Apache, Family::Rhel),
+            Some("apache")
+        );
+        // Not built, so it has no account to admit rather than a guessed one.
+        assert_eq!(runtime_account(WebServer::Litespeed, Family::Debian), None);
+    }
+
+    #[tokio::test]
+    async fn switching_to_the_server_already_serving_admits_nobody() {
+        // nginx is already the group. `usermod -a -G nginx nginx` would be a
+        // command run for nothing on every no-op switch.
+        let ctx = op_ctx().await;
+        admit_to_the_web_group(&ctx, WebServer::Nginx)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apache_is_refused_on_a_family_whose_layout_this_build_does_not_write() {
+        // Every `paths::apache_*` is Debian's /etc/apache2. On EL, Apache is
+        // httpd and reads /etc/httpd/conf.d — so the vhosts would be written
+        // correctly and read by nothing, and `apachectl configtest` would still
+        // pass because httpd would be checking its own stock configuration.
+        // The switch's safety check would report success while taking every
+        // site on the machine down to the distribution's default page.
+        let ctx = op_ctx_on(unihelm_distro::Family::Rhel).await;
+        let err = switch_to(&ctx, "apache", true).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert!(err.detail.contains("/etc/httpd"), "{}", err.detail);
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
+
+        // And the refusal comes before the not-installed check, so an EL
+        // machine that *does* have httpd still gets the layout answer rather
+        // than being told to install what it already has.
+        assert!(!err.detail.contains("not installed"), "{}", err.detail);
     }
 
     #[tokio::test]

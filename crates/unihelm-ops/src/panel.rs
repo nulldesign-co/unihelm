@@ -22,7 +22,6 @@ use unihelm_db::CertKind;
 
 use crate::acme::{self, Directory};
 use crate::registry::{Execution, OpContext, TypedOperation};
-use crate::services::UnitReloader;
 
 /// `client_max_body_size` for the panel vhost. Chunked uploads in the file
 /// manager need headroom (spec §11.7); the API itself is capped far lower
@@ -293,7 +292,9 @@ impl TypedOperation for Issue {
         // that only shows up ninety days later (the cert.rs lesson).
         {
             use unihelm_config::apply::Reloader;
-            let reloader = UnitReloader::nginx(ctx.distro());
+            // `reloader`, resolved from the active server above, rather than
+            // nginx named a second time in the one function that had already
+            // worked out which server is serving.
             if let Err(e) = reloader.reload().await {
                 // Same reasoning as the apply above: nginx is still serving the
                 // certificate it had, so the domain of record has to be too.

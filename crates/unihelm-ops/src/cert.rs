@@ -199,14 +199,26 @@ impl TypedOperation for Issue {
         // failure that only shows up ninety days later.
         {
             use unihelm_config::apply::Reloader;
-            let reloader = crate::services::UnitReloader::nginx(ctx.distro());
+            // Whichever server is serving. Named literally, this reloaded nginx
+            // on a machine where nginx is stopped and disabled, so a renewed
+            // certificate sat on disk while the expiring one stayed live — the
+            // exact ninety-day failure the comment above is about, reached by a
+            // different route.
+            let server = crate::webserver::active(ctx).await?;
+            let reloader = server.reloader(ctx.distro())?;
             reloader.reload().await.map_err(|e| {
                 UnihelmError::new(
                     ErrorCode::ConfigRollback,
-                    format!("the certificate is on disk but nginx would not reload: {e}"),
+                    format!(
+                        "the certificate is on disk but {} would not reload: {e}",
+                        server.display_name()
+                    ),
                 )
             })?;
-            ctx.log("nginx reloaded onto the new certificate");
+            ctx.log(format!(
+                "{} reloaded onto the new certificate",
+                server.display_name()
+            ));
         }
 
         // The row last, once the certificate is actually being served.

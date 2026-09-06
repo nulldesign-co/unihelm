@@ -220,6 +220,33 @@ impl MockSvc {
             },
         );
     }
+
+    /// Record a unit as enabled or disabled, creating it if this mock has not
+    /// heard of it.
+    ///
+    /// It used to be an `and_modify`, which is a **no-op on a unit that is not
+    /// already in the map** — so `enable` on a fresh mock left the unit
+    /// recorded as `disabled` while `action(Start)` made it active. Any test
+    /// asserting on enablement was therefore asserting on a value nothing had
+    /// set, and the class of bug that assertion exists to catch — a web server
+    /// stopped but left enabled, so a reboot starts two of them on port 80 —
+    /// shipped past a suite of 1892 tests.
+    fn set_enabled(&self, unit: &UnitName, enabled: &str) {
+        self.state
+            .lock()
+            .expect("mock svc state")
+            .entry(unit.as_str().to_string())
+            .or_insert_with(|| UnitStatus {
+                unit: unit.as_str().to_string(),
+                state: UnitState::Inactive,
+                sub_state: "dead".into(),
+                enabled: None,
+                main_pid: None,
+                memory_bytes: None,
+                since: None,
+            })
+            .enabled = Some(enabled.to_string());
+    }
 }
 
 #[async_trait]
@@ -281,11 +308,7 @@ impl SvcBackend for MockSvc {
     }
 
     async fn enable(&self, unit: &UnitName, start_now: bool) -> Result<()> {
-        self.state
-            .lock()
-            .expect("mock svc state")
-            .entry(unit.as_str().to_string())
-            .and_modify(|s| s.enabled = Some("enabled".into()));
+        self.set_enabled(unit, "enabled");
         if start_now {
             self.action(unit, SvcAction::Start).await?;
         }
@@ -293,11 +316,7 @@ impl SvcBackend for MockSvc {
     }
 
     async fn disable(&self, unit: &UnitName, stop_now: bool) -> Result<()> {
-        self.state
-            .lock()
-            .expect("mock svc state")
-            .entry(unit.as_str().to_string())
-            .and_modify(|s| s.enabled = Some("disabled".into()));
+        self.set_enabled(unit, "disabled");
         if stop_now {
             self.action(unit, SvcAction::Stop).await?;
         }

@@ -40,7 +40,16 @@
 </VirtualHost>
 {% endif %}
 
-<VirtualHost *:{% if site.tls_enabled %}443{% else %}80{% endif %}>
+{# One block per listener, and the body is identical in each.
+
+   nginx puts several `listen` lines in one `server` block; Apache cannot, and
+   it cannot mix a TLS port and a plain one in the same `<VirtualHost>` either.
+   So a site with TLS available but not *required* — which still serves plain
+   HTTP rather than redirecting it — is two blocks here. Deriving the port from
+   `tls_enabled` alone rendered only :443 for that site and it stopped answering
+   on port 80 entirely; `site.listeners` is that decision made in typed code. #}
+{% for listener in site.listeners %}
+<VirtualHost *:{{ listener.port }}>
     ServerName {{ site.domain }}
 {% for alias in site.aliases %}
     ServerAlias {{ alias }}
@@ -56,7 +65,7 @@
     # nginx spells this {{ site.client_max_body_size }}; Apache takes bytes.
     LimitRequestBody {{ site.max_body_bytes }}
 
-{% if site.tls_enabled %}
+{% if listener.tls %}
     SSLEngine on
     SSLCertificateFile    {{ site.cert_path }}
     SSLCertificateKeyFile {{ site.key_path }}
@@ -127,7 +136,7 @@
 
     ProxyPass        / http://127.0.0.1:{{ site.proxy_port }}/ timeout={{ site.proxy_timeout }}
     ProxyPassReverse / http://127.0.0.1:{{ site.proxy_port }}/
-    RequestHeader set X-Forwarded-Proto "{% if site.tls_enabled %}https{% else %}http{% endif %}"
+    RequestHeader set X-Forwarded-Proto "{% if listener.tls %}https{% else %}http{% endif %}"
 {% elif site.site_type == "php" %}
     <Directory "{{ site.document_root }}">
         Options -Indexes +FollowSymLinks
@@ -209,3 +218,4 @@
     # --- end custom snippet ---------------------------------------------------
 {% endif %}
 </VirtualHost>
+{% endfor %}

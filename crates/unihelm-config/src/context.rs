@@ -67,6 +67,14 @@ pub fn default_security_headers(tls_enabled: bool) -> Vec<String> {
     headers
 }
 
+/// One address a site answers on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Listener {
+    pub port: u16,
+    /// Whether this one terminates TLS. Never true for port 80.
+    pub tls: bool,
+}
+
 /// Everything `nginx/site.conf` needs.
 #[derive(Debug, Clone, Serialize)]
 pub struct SiteContext {
@@ -91,6 +99,17 @@ pub struct SiteContext {
 
     pub tls_enabled: bool,
     pub force_https: bool,
+    /// The ports the site's own content answers on, and whether each is TLS.
+    ///
+    /// Computed here because it is a real decision and not a formatting one.
+    /// nginx takes several `listen` lines in one `server` block, so its template
+    /// spells the cases out inline; Apache has one port per `<VirtualHost>` and
+    /// cannot mix TLS and plain in the same block, so the same site needs two
+    /// blocks with identical bodies. A template that worked the pair out from
+    /// `tls_enabled` alone got this wrong: with TLS on and `force_https` off it
+    /// rendered only `*:443`, and a site that was meant to keep answering plain
+    /// HTTP stopped listening on port 80 altogether.
+    pub listeners: Vec<Listener>,
     pub http3: bool,
     pub ocsp_stapling: bool,
     pub cert_path: PathBuf,
@@ -142,6 +161,10 @@ impl SiteContext {
 
             tls_enabled: false,
             force_https: true,
+            listeners: vec![Listener {
+                port: 80,
+                tls: false,
+            }],
             // Off by default: QUIC needs UDP/443 open, and silently depending on
             // a firewall change nobody made is worse than plain HTTP/2.
             http3: false,
@@ -202,6 +225,50 @@ impl SiteContext {
         self.chain_path = cert_dir.join("chain.pem");
         self.ocsp_stapling = stapling;
         self.security_headers = default_security_headers(true);
+        self.relisten()
+    }
+
+    /// Whether plain HTTP still serves the site, or only redirects to it.
+    ///
+    /// Its own setter because it changes what the site listens on, and setting
+    /// the field without recomputing that is how a site ends up with no port 80.
+    pub fn with_force_https(mut self, force: bool) -> Self {
+        self.force_https = force;
+        self.relisten()
+    }
+
+    /// Recompute [`SiteContext::listeners`] from the TLS fields.
+    ///
+    /// Three cases, and the middle one is the one that was wrong:
+    ///
+    /// - no TLS — plain 80, and nothing else.
+    /// - TLS, redirecting — 443 only. Port 80 exists, but as the separate
+    ///   redirect vhost the templates render above this one, not as the site.
+    /// - TLS, not redirecting — **both**. The operator has said plain HTTP
+    ///   should still serve the site rather than bounce to https.
+    fn relisten(mut self) -> Self {
+        self.listeners = if !self.tls_enabled {
+            vec![Listener {
+                port: 80,
+                tls: false,
+            }]
+        } else if self.force_https {
+            vec![Listener {
+                port: 443,
+                tls: true,
+            }]
+        } else {
+            vec![
+                Listener {
+                    port: 443,
+                    tls: true,
+                },
+                Listener {
+                    port: 80,
+                    tls: false,
+                },
+            ]
+        };
         self
     }
 }
@@ -541,6 +608,66 @@ mod tests {
                 "a vhost whose rewrite swallows the ACME path:\n{vhost}"
             );
         }
+    }
+
+    /// A TLS site that does not force https must still answer on port 80.
+    ///
+    /// nginx says so with a second `listen 80` inside the same server block.
+    /// Apache cannot mix a TLS port and a plain one in one `<VirtualHost>`, and
+    /// the template used to derive its single port from `tls_enabled` alone —
+    /// so this site rendered as `*:443` only and stopped answering plain HTTP
+    /// altogether. The redirect vhost does not cover it either: that one is
+    /// rendered only when `force_https` is on, which is exactly when this is
+    /// off.
+    #[test]
+    fn a_tls_site_that_does_not_redirect_still_listens_on_port_eighty() {
+        let ctx = php_site()
+            .with_tls(&paths::cert_dir("example.com"), true)
+            .with_force_https(false);
+
+        let out = directives_only(&render_apache(&ctx));
+        assert!(out.contains("<VirtualHost *:443>"), "{out}");
+        assert!(
+            out.contains("<VirtualHost *:80>"),
+            "a TLS site that does not redirect has nothing on port 80:\n{out}"
+        );
+        // And the plain block must not claim TLS — SSLEngine on port 80 is a
+        // configuration Apache refuses to start with.
+        let plain = out
+            .split("<VirtualHost *:80>")
+            .nth(1)
+            .and_then(|s| s.split("</VirtualHost>").next())
+            .expect("no plain vhost body");
+        assert!(!plain.contains("SSLEngine"), "{plain}");
+        // The body is otherwise identical to the TLS one — same document root,
+        // same PHP handler, same denials. A plain block that served less than
+        // the TLS block would be a second, quieter site.
+        assert!(plain.contains("SetHandler"), "{plain}");
+        assert!(plain.contains("Require all denied"), "{plain}");
+
+        // nginx renders the same site the same way, from the same context.
+        let nginx = directives_only(&render_site(&ctx));
+        assert!(nginx.contains("listen 443 ssl"), "{nginx}");
+        assert!(nginx.contains("listen 80;"), "{nginx}");
+    }
+
+    /// The other two cases, so the fix cannot swing the other way.
+    #[test]
+    fn a_redirecting_site_serves_only_on_443_and_a_plain_site_only_on_80() {
+        let redirecting = php_site()
+            .with_tls(&paths::cert_dir("example.com"), true)
+            .with_force_https(true);
+        let out = directives_only(&render_apache(&redirecting));
+        // Exactly two: the redirect vhost on 80, and the site on 443. A third
+        // would mean the site itself is answering plain HTTP after somebody
+        // asked for every request to be redirected.
+        assert_eq!(out.matches("<VirtualHost").count(), 2, "{out}");
+        assert_eq!(out.matches("<VirtualHost *:80>").count(), 1, "{out}");
+
+        let plain = directives_only(&render_apache(&php_site()));
+        assert_eq!(plain.matches("<VirtualHost").count(), 1, "{plain}");
+        assert!(plain.contains("<VirtualHost *:80>"), "{plain}");
+        assert!(!plain.contains("SSLEngine"), "{plain}");
     }
 
     /// nginx: `client_max_body_size 64m;`

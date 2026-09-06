@@ -1653,13 +1653,23 @@ impl TypedOperation for Remove {
             }
         }
 
-        if component.entry.slug == "nginx" {
+        // The web server that is actually serving, not nginx by name.
+        //
+        // Keyed on the literal slug, this guarded the wrong thing twice over on
+        // a machine switched to Apache: removing Apache — the one holding every
+        // site up — was allowed, and removing nginx, which by then serves
+        // nothing, was refused.
+        let serving = crate::webserver::active(ctx).await?;
+        if component.entry.slug == serving.as_str() {
             let site_count = db.all_sites().await.map_err(UnihelmError::from)?.len();
             if site_count > 0 {
                 return Err(UnihelmError::new(
                     ErrorCode::DependentsExist,
                     format!(
-                        "{site_count} sites are still configured; removing nginx would take them all offline"
+                        "{site_count} sites are still configured; removing {} would take \
+                         them all offline. It is what serves this machine — switch to \
+                         another web server first, and this becomes a safe removal.",
+                        serving.display_name()
                     ),
                 ));
             }

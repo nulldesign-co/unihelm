@@ -1429,11 +1429,16 @@ impl TypedOperation for IssueWildcard {
         // certificate stays live. That happened on a live server (see cert.rs).
         {
             use unihelm_config::apply::Reloader;
-            let reloader = crate::services::UnitReloader::nginx(ctx.distro());
+            // Whichever server is serving — see the same fix in `cert.rs`.
+            let server = crate::webserver::active(ctx).await?;
+            let reloader = server.reloader(ctx.distro())?;
             reloader.reload().await.map_err(|e| {
                 UnihelmError::new(
                     ErrorCode::ConfigRollback,
-                    format!("the certificate is on disk but nginx would not reload: {e}"),
+                    format!(
+                        "the certificate is on disk but {} would not reload: {e}",
+                        server.display_name()
+                    ),
                 )
             })?;
             ctx.log("nginx reloaded onto the new wildcard certificate");
