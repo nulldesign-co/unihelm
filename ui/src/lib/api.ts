@@ -859,10 +859,27 @@ export interface AlertEvent {
   notified: number;
 }
 
+/**
+ * One service a `service_down` rule may name.
+ *
+ * The agent's own whitelist, sent down rather than copied into the page: the
+ * copy went stale in both directions — it offered units the agent refuses on
+ * save, and hid `apache` from exactly the operators who need it. `unit` is
+ * resolved for this host's family (`apache2.service` on Debian,
+ * `httpd.service` on EL), which is what lets the page join these against
+ * `/api/server/services` and say which ones the machine actually has.
+ */
+export interface ServiceTargetOption {
+  target: string;
+  display_name: string;
+  unit: string;
+}
+
 export interface AlertRulesResponse {
   rules: AlertRule[];
   open: AlertEvent[];
   kinds: AlertKind[];
+  service_targets: ServiceTargetOption[];
 }
 
 export interface AlertEventsResponse {
@@ -874,6 +891,25 @@ export interface AlertRuleRequest {
   target?: string | null;
   threshold?: number;
   enabled: boolean;
+}
+
+/** The pair that identifies a rule — what the delete addresses. */
+export interface AlertRuleIdentity {
+  kind: AlertKind;
+  target: string | null;
+}
+
+/**
+ * The answer to a rule delete.
+ *
+ * `deleted: false` is a success: the rule is not there, which is what was
+ * asked for. It is reported rather than swallowed so the page can say which of
+ * the two happened instead of claiming a removal that never occurred.
+ */
+export interface AlertRuleDeleted {
+  deleted: boolean;
+  /** `kind` or `kind:target`, as the server names it. */
+  rule: string;
 }
 
 export type ChannelKind = "webhook" | "telegram";
@@ -1183,6 +1219,15 @@ export const endpoints = {
   openAlerts: () => api.get<AlertEventsResponse>("/api/alerts?open_only=true"),
   alertRules: () => api.get<AlertRulesResponse>("/api/alerts/rules"),
   setAlertRule: (body: AlertRuleRequest) => api.post<{ rule: AlertRule }>("/api/alerts/rules", body),
+  // A rule is named by its (kind, target) pair — the same pair the POST writes
+  // — so the DELETE takes them as query parameters rather than by an id the
+  // page would have to carry around. An absent target is the every-subject
+  // rule, and sending an empty one would look for a rule targeting `""`.
+  deleteAlertRule: ({ kind, target }: AlertRuleIdentity) =>
+    api.del<AlertRuleDeleted>(
+      `/api/alerts/rules?kind=${encodeURIComponent(kind)}` +
+        (target === null ? "" : `&target=${encodeURIComponent(target)}`),
+    ),
   channels: () => api.get<ChannelsResponse>("/api/alerts/channels"),
   setChannel: (body: ChannelRequest) =>
     api.post<{ channel: NotifyChannel }>("/api/alerts/channels", body),

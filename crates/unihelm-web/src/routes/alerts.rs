@@ -160,10 +160,7 @@ pub async fn rules_set(
         &headers,
         &peer,
         "alert.rules.set",
-        &match &body.target {
-            Some(t) => format!("{}:{t}", body.kind),
-            None => body.kind.clone(),
-        },
+        &rule_label(&body.kind, body.target.as_deref()),
         json!({ "threshold": body.threshold, "enabled": body.enabled }),
     )
     .await?;
@@ -178,6 +175,75 @@ pub async fn rules_set(
             "threshold": body.threshold,
             "enabled": body.enabled,
         }),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RuleTargetQuery {
+    /// `disk_pct`, `mem_pct`, `load`, `service_down` or `cert_expiry_days`.
+    pub kind: String,
+    /// What within the kind. Absent or empty is the every-subject rule, which
+    /// is a real rule and has to be removable like any other.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// Remove the rule for one `(kind, target)`.
+///
+/// In the query string rather than the body because that pair *is* the rule's
+/// name — the same pair `POST /api/alerts/rules` writes to — and neither half
+/// is a secret: a mount point, a managed unit, a domain already on the sites
+/// page.
+///
+/// **Removing a rule that is not there answers 200 with `deleted: false`, not
+/// 404.** The operator asked for it to be gone and it is gone; a 404 would show
+/// a failure for an already-correct state, which is what the second click of a
+/// double-submitted delete produces. The body says which of the two happened,
+/// so nothing here claims work that did not occur.
+#[utoipa::path(
+    delete,
+    path = "/api/alerts/rules",
+    tag = "alerts",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(RuleTargetQuery),
+    responses(
+        (status = 200, description = "`deleted` — false when there was nothing to remove", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: unknown kind", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn rules_delete(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Query(q): Query<RuleTargetQuery>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "alert.rules.delete",
+        &rule_label(&q.kind, q.target.as_deref()),
+        json!({}),
+    )
+    .await?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "alert.rules.delete",
+        json!({ "kind": q.kind, "target": q.target }),
     )
     .await
 }
@@ -404,6 +470,19 @@ pub async fn channels_test(
     .await
 }
 
+/// How a rule is named in the audit log: `kind`, or `kind:target`.
+///
+/// The same spelling `AlertRule::label` uses in the agent, so a set and the
+/// delete that follows it are one grep in the audit table rather than two.
+/// An empty target is the every-subject rule and must not become a dangling
+/// `disk_pct:` — a target the operator never typed.
+fn rule_label(kind: &str, target: Option<&str>) -> String {
+    match target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!("{kind}:{t}"),
+        None => kind.to_string(),
+    }
+}
+
 async fn audit(
     state: &SharedState,
     current: &CurrentUser,
@@ -491,6 +570,27 @@ mod tests {
             "an absent config must not become an explicit null: {input}"
         );
         assert_eq!(input["label"], json!("night shift"));
+    }
+
+    /// A rule can now be removed, and the audit row for the removal has to be
+    /// findable next to the row that created it — the two are the same rule,
+    /// and the log is how "who deleted the disk alert?" gets answered.
+    #[test]
+    fn a_rule_is_audited_under_the_same_name_whether_it_is_set_or_deleted() {
+        assert_eq!(
+            rule_label("service_down", Some("nginx")),
+            "service_down:nginx"
+        );
+        assert_eq!(rule_label("disk_pct", None), "disk_pct");
+
+        // A DELETE carries its target in the query string, where "no target"
+        // arrives as an empty string rather than as absent.
+        assert_eq!(rule_label("disk_pct", Some("")), "disk_pct");
+        assert_eq!(rule_label("disk_pct", Some("  ")), "disk_pct");
+
+        let query: RuleTargetQuery =
+            serde_json::from_value(json!({ "kind": "disk_pct" })).expect("target is optional");
+        assert_eq!(rule_label(&query.kind, query.target.as_deref()), "disk_pct");
     }
 
     /// `enabled` defaults to true on a rule so that saving a threshold from the

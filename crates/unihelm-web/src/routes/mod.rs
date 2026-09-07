@@ -129,7 +129,12 @@ fn protected() -> Router<SharedState> {
         .route("/api/alerts", get(alerts::events))
         .route(
             "/api/alerts/rules",
-            get(alerts::rules_list).post(alerts::rules_set),
+            get(alerts::rules_list)
+                .post(alerts::rules_set)
+                // No `{id}` segment: a rule is named by its `(kind, target)`
+                // pair, the same pair the POST writes, so the DELETE takes them
+                // as query parameters rather than inventing a second identity.
+                .delete(alerts::rules_delete),
         )
         .route(
             "/api/alerts/channels",

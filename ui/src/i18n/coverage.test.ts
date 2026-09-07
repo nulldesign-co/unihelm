@@ -21,7 +21,17 @@ import { describe, expect, it } from "vitest";
 
 import { en } from "./en";
 
-const PAGES = ["../routes/databases.tsx", "../routes/plans.tsx", "../routes/docker.tsx"];
+const PAGES = [
+  "../routes/databases.tsx",
+  "../routes/plans.tsx",
+  "../routes/docker.tsx",
+  // Added after the Docker page shipped eight raw keys as button labels, and
+  // the cron dialog nearly did the same: a page that is not in this list can
+  // lose a key with nothing failing.
+  "../routes/cron.tsx",
+  "../routes/alerts.tsx",
+  "../routes/files.tsx",
+];
 
 /** Every `t("literal")` in a file. Template-literal keys are handled below. */
 function literalKeys(source: string): string[] {

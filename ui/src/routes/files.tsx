@@ -4,14 +4,16 @@ import {
   Archive,
   ArrowLeft,
   Copy as CopyIcon,
+  FolderInput,
   FolderOpen,
   FolderPlus,
+  FolderUp,
   SearchX,
   Trash2,
   Upload as UploadIcon,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Breadcrumbs } from "@/components/files/breadcrumbs";
@@ -22,12 +24,18 @@ import {
   DeleteDialog,
   ExtractDialog,
   MkdirDialog,
+  MoveDialog,
   RenameDialog,
 } from "@/components/files/dialogs";
 import { FileEditorOverlay } from "@/components/files/editor";
 import { FileTable, FileTableSkeleton, type RowAction } from "@/components/files/file-table";
 import { TrashView } from "@/components/files/trash-view";
-import { UploadPanel, filesFromDrop, useUploader } from "@/components/files/upload";
+import {
+  UploadPanel,
+  filesFromDrop,
+  filesFromPicker,
+  useUploader,
+} from "@/components/files/upload";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Card, CardBody } from "@/components/ui/card";
@@ -73,6 +81,7 @@ type DialogState =
   | { type: "mkdir" }
   | { type: "rename"; entry: FileEntry }
   | { type: "copy"; entries: FileEntry[] }
+  | { type: "move"; entries: FileEntry[] }
   | { type: "delete"; entries: FileEntry[] }
   | { type: "chmod"; entry: FileEntry }
   | { type: "compress"; entries: FileEntry[] }
@@ -108,6 +117,19 @@ export function FilesPage() {
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
   const pickerRef = useRef<HTMLInputElement>(null);
+  const folderPickerRef = useRef<HTMLInputElement | null>(null);
+
+  // `webkitdirectory` is what turns a file input into a folder input, and it
+  // has never been in React's prop types — it is a non-standard attribute that
+  // every engine implements. Setting it on the node is how it gets there
+  // without a cast that would also hide a genuine typo beside it. A callback
+  // ref rather than an effect so it is set whenever the input mounts, including
+  // on the way back from the recycle-bin view.
+  const attachFolderPicker = useCallback((node: HTMLInputElement | null) => {
+    folderPickerRef.current = node;
+    node?.setAttribute("webkitdirectory", "");
+    node?.setAttribute("directory", "");
+  }, []);
 
   const listing = useQuery({
     queryKey: ["files", path, hidden],
@@ -183,6 +205,9 @@ export function FilesPage() {
       case "copy":
         setDialog({ type: "copy", entries: [entry] });
         break;
+      case "move":
+        setDialog({ type: "move", entries: [entry] });
+        break;
       case "chmod":
         setDialog({ type: "chmod", entry });
         break;
@@ -227,7 +252,29 @@ export function FilesPage() {
     event.preventDefault();
     dragDepth.current = 0;
     setDragOver(false);
-    uploader.enqueue(filesFromDrop(event.dataTransfer), path);
+    // `filesFromDrop` grabs every entry handle before its first await, because
+    // the drag data store is emptied the moment this handler returns. It must
+    // therefore be called here and not behind one.
+    const contents = filesFromDrop(event.dataTransfer);
+    const into = path;
+    void contents
+      .then(({ uploads, emptyDirs, unreadable }) => {
+        uploader.enqueue(uploads, into, emptyDirs);
+        // A folder that could not be walked is the whole reason this changed:
+        // it used to be skipped without a word, so dropping one looked accepted
+        // and uploaded nothing at all.
+        if (unreadable.length > 0) {
+          setBanner({
+            kind: "error",
+            text: t("files.dropUnreadable", { names: unreadable.join(", ") }),
+          });
+        } else if (uploads.length === 0 && emptyDirs.length === 0) {
+          setBanner({ kind: "error", text: t("files.dropNothing") });
+        }
+      })
+      // An unhandled rejection here would be the original defect wearing a new
+      // hat: a drop that reports nothing and uploads nothing.
+      .catch((e: unknown) => setBanner({ kind: "error", text: String(e) }));
   };
 
   return (
@@ -309,6 +356,10 @@ export function FilesPage() {
                 <FolderPlus className="h-4 w-4" aria-hidden />
                 {t("files.newFolder")}
               </Button>
+              <Button variant="outline" onClick={() => folderPickerRef.current?.click()}>
+                <FolderUp className="h-4 w-4" aria-hidden />
+                {t("files.uploadFolder")}
+              </Button>
               <Button variant="primary" onClick={() => pickerRef.current?.click()}>
                 <UploadIcon className="h-4 w-4" aria-hidden />
                 {t("files.upload")}
@@ -319,7 +370,21 @@ export function FilesPage() {
                 multiple
                 className="hidden"
                 onChange={(event) => {
-                  uploader.enqueue(Array.from(event.target.files ?? []), path);
+                  uploader.enqueue(filesFromPicker(event.target.files), path);
+                  event.target.value = "";
+                }}
+              />
+              {/* The same control with `webkitdirectory` on it: the browser
+                  then hands back every file under the chosen folder, each
+                  carrying its `webkitRelativePath`, which is what lets the
+                  queue rebuild the tree on the server. */}
+              <input
+                ref={attachFolderPicker}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                  uploader.enqueue(filesFromPicker(event.target.files), path);
                   event.target.value = "";
                 }}
               />
@@ -341,6 +406,14 @@ export function FilesPage() {
                 >
                   <CopyIcon className="h-3.5 w-3.5" aria-hidden />
                   {t("files.copy")}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setDialog({ type: "move", entries: selectedEntries })}
+                >
+                  <FolderInput className="h-3.5 w-3.5" aria-hidden />
+                  {t("files.move")}
                 </Button>
                 <Button
                   variant="outline"
@@ -420,10 +493,18 @@ export function FilesPage() {
                 title={t("files.empty")}
                 hint={t("files.emptyHint")}
                 action={
-                  <Button variant="primary" onClick={() => pickerRef.current?.click()}>
-                    <UploadIcon className="h-4 w-4" aria-hidden />
-                    {t("files.upload")}
-                  </Button>
+                  // An empty folder is exactly where a whole site gets put, so
+                  // both ways in are offered here rather than only the one.
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <Button variant="outline" onClick={() => folderPickerRef.current?.click()}>
+                      <FolderUp className="h-4 w-4" aria-hidden />
+                      {t("files.uploadFolder")}
+                    </Button>
+                    <Button variant="primary" onClick={() => pickerRef.current?.click()}>
+                      <UploadIcon className="h-4 w-4" aria-hidden />
+                      {t("files.upload")}
+                    </Button>
+                  </div>
                 }
               />
             ) : (
@@ -463,6 +544,14 @@ export function FilesPage() {
       ) : null}
       {dialog?.type === "copy" ? (
         <CopyDialog
+          entries={dialog.entries}
+          dir={path}
+          onClose={() => setDialog(null)}
+          onDone={afterMutation}
+        />
+      ) : null}
+      {dialog?.type === "move" ? (
+        <MoveDialog
           entries={dialog.entries}
           dir={path}
           onClose={() => setDialog(null)}

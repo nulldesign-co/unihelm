@@ -149,9 +149,17 @@ export function ScheduleField({
         ) : null}
       </p>
 
+      {/* The chips used to be labelled with the raw expression and carried the
+          sentence in `title` only, which is a hover nobody discovers: an
+          operator who does not read cron was choosing between two rows of
+          stars and slashes on the strength of their punctuation. The sentence
+          is the label now, and the expression stays underneath it in small
+          type — somebody who does read cron still wants to see which five
+          fields a chip is about to write into the field above. */}
       <ul className="flex flex-wrap gap-2" aria-label={t("cron.presets")}>
         {PRESETS.map((preset) => {
           const selected = value.trim() === preset;
+          const text = textOf(preset);
           return (
             <li key={preset}>
               <Button
@@ -159,9 +167,10 @@ export function ScheduleField({
                 size="sm"
                 aria-pressed={selected}
                 onClick={() => onChange(preset)}
-                title={textOf(preset) ?? preset}
                 className={cn(
-                  "tnum gap-1.5 rounded-full font-mono text-[11px] text-ink-muted",
+                  // `h-auto` and `items-start`: the chip is two lines now, and
+                  // the size variant's fixed height would clip the second.
+                  "h-auto items-start gap-1.5 rounded-xl px-3 py-1.5 text-start text-ink-muted",
                   selected &&
                     "border-accent bg-accent-soft text-accent hover:border-accent hover:bg-accent-soft hover:text-accent",
                 )}
@@ -172,12 +181,22 @@ export function ScheduleField({
                     readable without colour. */}
                 <Check
                   className={cn(
-                    "h-3 w-3 shrink-0 transition-opacity duration-150",
+                    "mt-0.5 h-3 w-3 shrink-0 transition-opacity duration-150",
                     selected ? "opacity-100" : "opacity-0",
                   )}
                   aria-hidden
                 />
-                {preset}
+                <span className="flex flex-col gap-0.5">
+                  {/* `textOf` is null only for an expression this file's own
+                      list got wrong; showing the expression alone then is
+                      honest, where a blank chip would not be. */}
+                  <span className="text-xs font-medium">{text ?? preset}</span>
+                  {text ? (
+                    <span className="tnum font-mono text-[10px] font-normal opacity-70">
+                      {preset}
+                    </span>
+                  ) : null}
+                </span>
               </Button>
             </li>
           );

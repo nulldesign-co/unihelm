@@ -8,6 +8,7 @@ import {
   FileImage,
   FileText,
   Folder,
+  FolderInput,
   KeySquare,
   Link2,
   PackageOpen,
@@ -36,6 +37,7 @@ export type RowAction =
   | "open"
   | "rename"
   | "copy"
+  | "move"
   | "chmod"
   | "compress"
   | "extract"
@@ -264,6 +266,12 @@ export function FileTable({
                     </MenuItem>
                     <MenuItem icon={<CopyIcon />} onClick={() => onAction("copy", entry)}>
                       {t("files.copy")}
+                    </MenuItem>
+                    {/* Next to Copy, because without it moving a file was
+                        copy-then-delete: two operations, twice the disk, and a
+                        window where the wrong duplicate gets edited. */}
+                    <MenuItem icon={<FolderInput />} onClick={() => onAction("move", entry)}>
+                      {t("files.move")}
                     </MenuItem>
                     <MenuItem icon={<KeySquare />} onClick={() => onAction("chmod", entry)}>
                       {t("files.chmod")}

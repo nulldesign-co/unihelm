@@ -1808,7 +1808,41 @@ so is a `target` on a kind that has nothing to target.
 For `service_down` the `target` is a whitelist, not a unit name: `nginx`,
 `apache`, `mariadb`, `postgresql`, `kv_store`, `docker`, `sshd`, `unihelm_web`,
 `unihelm_agentd`, or `php_fpm:<version>`. Operator-supplied text never reaches
-an arbitrary systemd unit.
+an arbitrary systemd unit. That whitelist lives in one place —
+`SERVICE_TARGETS` in `unihelm_ops::alerts` — and `alert.rules.list` hands it to
+callers as `service_targets`, because the three hand-written copies of it had
+already gone stale in different directions: the page offered choices the agent
+refuses on save, and the refusal message named every service but `apache`.
+
+### `alert.rules.delete`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `kind`; `target` — omit it for the rule that covers every subject of the kind |
+
+Removes the rule named by that pair, and the alert events belonging to it (they
+cascade — an event is a span of one rule's condition and means nothing without
+it).
+
+**Removing a rule that is not there is a success.** The answer is 200 with
+`deleted: false`, not a 404: the operator asked for that rule to be gone and it
+is gone, and reporting a failure for an already-correct state is what the second
+click of a double-submitted delete would produce. `deleted` is how the caller
+tells "removed it" from "there was nothing to remove", so neither has to be
+guessed and nothing claims work that did not happen.
+
+The counterpart of this operation is the panel's own restraint about creating
+rules. Migration 0011 seeded `service_down`/`nginx` on every install; migration
+0023 retires that seed — but only where the row is provably untouched (0011's
+own threshold and timestamp, never edited, no events against it), so an operator
+who re-thresholded, disarmed or acknowledged it keeps their rule. A service rule
+is now armed when the service is actually installed
+(`unihelm_ops::alerts::arm_service_rule`, called from `stack.install`), which is
+the first moment the panel knows the machine runs it. Arming never touches an
+existing rule, including a disabled one: a reinstall must not undo a decision
+the operator made.
 
 ### `alert.events.list`
 

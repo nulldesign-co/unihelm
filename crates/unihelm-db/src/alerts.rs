@@ -316,6 +316,36 @@ impl Db {
         AlertRule::try_from(row)
     }
 
+    /// Remove the rule for `(kind, target)`, and say whether one was there.
+    ///
+    /// There was no delete at all until this existed, so a rule created by a
+    /// typo — `service_down` on a unit this machine will never run, a mount
+    /// point that does not exist — was permanent, and the best an operator
+    /// could do was disable it and live with the row.
+    ///
+    /// `Ok(false)` is a success, not an error: the caller asked for that rule to
+    /// be gone and it is gone. The boolean exists so the layer above can say
+    /// which of the two happened rather than inventing a "deleted" that was
+    /// really "was never there".
+    ///
+    /// The `COALESCE` matches the expression in `alert_rules_kind_target_uq`,
+    /// so this addresses a rule by exactly the key that made it unique — a bare
+    /// `target = ?2` would never match the NULL-target rules at all.
+    ///
+    /// The rule's events go with it: `alert_events.rule_id` is
+    /// `ON DELETE CASCADE` (migration 0011), because an event is a span of one
+    /// rule's condition and has no meaning once the rule is gone.
+    pub async fn delete_alert_rule(&self, kind: AlertKind, target: Option<&str>) -> Result<bool> {
+        let done = sqlx::query(
+            "DELETE FROM alert_rules WHERE kind = ?1 AND COALESCE(target, '') = COALESCE(?2, '')",
+        )
+        .bind(kind.as_str())
+        .bind(target)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     // -----------------------------------------------------------------------
     // events — the debounce state machine
     // -----------------------------------------------------------------------
@@ -561,9 +591,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_migration_seeds_the_three_default_rules_enabled() {
-        // Spec §11.11: a fresh install is already watching the three things
-        // that actually take servers down.
+    async fn the_migrations_seed_the_two_rules_that_are_true_of_every_machine() {
+        // Spec §11.11: a fresh install is already watching what actually takes
+        // servers down. Every machine has disks and a panel certificate, so
+        // those two are seeded.
         let db = db().await;
         let rules = db.enabled_alert_rules().await.unwrap();
 
@@ -580,13 +611,149 @@ mod tests {
             .expect("a certificate rule");
         assert_eq!(cert.threshold, 14.0);
 
-        let svc = rules
-            .iter()
-            .find(|r| r.kind == AlertKind::ServiceDown)
-            .expect("a service rule");
-        assert_eq!(svc.target.as_deref(), Some("nginx"));
-
         assert!(rules.iter().all(|r| r.enabled));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_is_not_watching_an_nginx_it_may_never_run() {
+        // What 0023 undoes. 0011 armed `service_down`/`nginx` everywhere, and
+        // because `not_found` does not count as down, the rule sat on the alerts
+        // page reading "Armed" on machines with no nginx at all — until nginx
+        // was installed and stopped once, at which point the panel fired an
+        // alert from a rule nobody had created.
+        let db = db().await;
+        let service_rules: Vec<_> = db
+            .alert_rules()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == AlertKind::ServiceDown)
+            .collect();
+        assert!(
+            service_rules.is_empty(),
+            "a service rule is armed when the service is installed, not before: {service_rules:?}"
+        );
+    }
+
+    /// 0023's own text, so a test cannot drift from the migration it checks.
+    const RETIRE_THE_SEED: &str = include_str!("../migrations/0023_service_alert_seed.sql");
+
+    /// Put 0011's nginx seed back, exactly as that migration wrote it: the same
+    /// timestamp as the other two seeded rows, `created_at = updated_at`.
+    async fn restore_the_0011_seed(db: &Db) -> AlertRule {
+        let seeded_at = sqlx::query_scalar::<_, String>(
+            "SELECT created_at FROM alert_rules WHERE kind = 'disk_pct' AND target IS NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let row = sqlx::query_as::<_, AlertRuleRow>(
+            "INSERT INTO alert_rules (kind, target, threshold, enabled, created_at, updated_at)
+             VALUES ('service_down', 'nginx', 1.0, 1, ?1, ?1) RETURNING *",
+        )
+        .bind(&seeded_at)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        AlertRule::try_from(row).unwrap()
+    }
+
+    async fn nginx_rule(db: &Db) -> Option<AlertRule> {
+        db.alert_rules()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == AlertKind::ServiceDown && r.target.as_deref() == Some("nginx"))
+    }
+
+    #[tokio::test]
+    async fn retiring_the_seed_leaves_a_rule_the_operator_edited_alone() {
+        // The clause that matters most: an operator who re-thresholded or
+        // disarmed the seeded rule has told the panel they want it, and an
+        // upgrade that silently deleted it would be exactly the kind of quiet
+        // loss this migration exists to stop.
+        let db = db().await;
+        restore_the_0011_seed(&db).await;
+        db.set_alert_rule(AlertKind::ServiceDown, Some("nginx"), 1.0, false)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(RETIRE_THE_SEED)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let kept = nginx_rule(&db).await.expect("an edited rule survives 0023");
+        assert!(!kept.enabled, "and it keeps the operator's own setting");
+    }
+
+    #[tokio::test]
+    async fn retiring_the_seed_leaves_a_rule_that_has_fired_alone() {
+        // An event means somebody has seen this rule work, and may have acted on
+        // it. Deleting the rule would take the history with it (the events
+        // cascade), so the whole span disappears from the record.
+        let db = db().await;
+        let seed = restore_the_0011_seed(&db).await;
+        db.raise_alert(seed.id, "nginx", "nginx is not running", Some(1.0))
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(RETIRE_THE_SEED)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(
+            nginx_rule(&db).await.is_some(),
+            "a rule with history survives"
+        );
+        assert_eq!(db.open_alert_events().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retiring_the_seed_leaves_an_nginx_rule_the_operator_added_later_alone() {
+        // An untouched rule with no events still is not the seed if the operator
+        // wrote it: it was created at a different moment from 0011's other two
+        // rows, and that timestamp is what tells the two apart.
+        let db = db().await;
+        sqlx::query(
+            "INSERT INTO alert_rules (kind, target, threshold, enabled, created_at, updated_at)
+             VALUES ('service_down', 'nginx', 1.0, 1, '2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(RETIRE_THE_SEED)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(
+            nginx_rule(&db).await.is_some(),
+            "a rule the operator created is not 0011's seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_the_seed_removes_the_untouched_row() {
+        // The case the migration is for, proved against the same SQL the real
+        // upgrade runs.
+        let db = db().await;
+        restore_the_0011_seed(&db).await;
+        assert!(nginx_rule(&db).await.is_some());
+
+        sqlx::raw_sql(RETIRE_THE_SEED)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert!(nginx_rule(&db).await.is_none());
+        assert_eq!(
+            db.alert_rules().await.unwrap().len(),
+            2,
+            "and it takes nothing else with it"
+        );
     }
 
     #[tokio::test]
@@ -633,7 +800,6 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(a.id, b.id);
-        // ...and the nginx one is the seeded row, updated, not a new one.
         assert_eq!(
             db.alert_rules()
                 .await
@@ -753,12 +919,79 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("DELETE FROM alert_rules WHERE id = ?1")
-            .bind(rule.id)
-            .execute(db.pool())
+        assert!(db.delete_alert_rule(AlertKind::MemPct, None).await.unwrap());
+        assert!(db.open_alert_events().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rule_can_be_deleted_by_the_pair_that_identifies_it() {
+        // Before this existed a rule created by a typo was permanent — the
+        // operator could disable it and nothing else.
+        let db = db().await;
+        db.set_alert_rule(AlertKind::ServiceDown, Some("mariadb"), 1.0, true)
             .await
             .unwrap();
-        assert!(db.open_alert_events().await.unwrap().is_empty());
+        db.set_alert_rule(AlertKind::ServiceDown, Some("docker"), 1.0, true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.delete_alert_rule(AlertKind::ServiceDown, Some("mariadb"))
+                .await
+                .unwrap()
+        );
+
+        let left = db.alert_rules().await.unwrap();
+        assert!(
+            left.iter().all(|r| r.target.as_deref() != Some("mariadb")),
+            "{left:?}"
+        );
+        assert!(
+            left.iter().any(|r| r.target.as_deref() == Some("docker")),
+            "the neighbouring target is a different rule and stays: {left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_null_target_rule_does_not_take_its_targeted_siblings() {
+        // `target = ?` never matches NULL in SQL, so a naive delete would either
+        // miss the every-filesystem rule entirely or, written the other way
+        // round, sweep up every disk rule on the machine.
+        let db = db().await;
+        db.set_alert_rule(AlertKind::DiskPct, Some("/var"), 80.0, true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.delete_alert_rule(AlertKind::DiskPct, None)
+                .await
+                .unwrap()
+        );
+
+        let left = db.alert_rules().await.unwrap();
+        let disks: Vec<_> = left
+            .iter()
+            .filter(|r| r.kind == AlertKind::DiskPct)
+            .collect();
+        assert_eq!(disks.len(), 1, "{disks:?}");
+        assert_eq!(disks[0].target.as_deref(), Some("/var"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rule_that_is_not_there_is_a_success_that_changed_nothing() {
+        // The operator asked for that rule to be gone and it is gone. Reporting
+        // NotFound would make an already-correct state look like a failure, and
+        // the second click of a double-submitted delete would show an error for
+        // work that had succeeded.
+        let db = db().await;
+        let before = db.alert_rules().await.unwrap().len();
+        assert!(
+            !db.delete_alert_rule(AlertKind::ServiceDown, Some("nginx"))
+                .await
+                .unwrap(),
+            "nothing was there, and the boolean is how the caller can say so"
+        );
+        assert_eq!(db.alert_rules().await.unwrap().len(), before);
     }
 
     #[tokio::test]

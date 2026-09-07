@@ -1395,6 +1395,20 @@ pub enum AlertCommand {
         #[arg(long)]
         disabled: bool,
     },
+    /// Remove one rule.
+    ///
+    /// A rule is named by its kind and target, the same pair `rules-set` takes.
+    /// Removing one that is not there succeeds and says so.
+    #[command(name = "rules-delete")]
+    RulesDelete {
+        /// What the rule watches.
+        #[arg(value_enum)]
+        kind: AlertKindArg,
+        /// Which resource, for a kind that has one. Omit it to remove the rule
+        /// that covers every subject of the kind.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Alert events.
     Events {
         /// How many to return.

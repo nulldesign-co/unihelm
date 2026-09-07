@@ -1,26 +1,32 @@
 /**
  * Plans and suspension API client (spec §6.2, §6.4).
  *
- * # The gap this file works around
+ * # Where the subscription list comes from
  *
- * The panel exposes `POST /api/subscriptions/{id}/suspend` and its inverse, but
- * there is **no endpoint that lists subscriptions** — no `GET
- * /api/subscriptions`, and no `subscription.list` operation behind one. So the
- * subscriptions the page offers to suspend are derived from the sites the
- * caller can already see (`GET /api/sites`, whose rows carry
- * `subscription_id`).
+ * This header used to say there was no endpoint that listed subscriptions.
+ * That stopped being true: `GET /api/subscriptions` exists, backed by the
+ * `subscription.list` operation, and it returns each subscription's owner,
+ * site counts and — the part the derivation could never see — its suspension
+ * state. The stale sentence was worth more than a wrong comment usually is,
+ * because it was the stated reason for two visible compromises, and anyone
+ * reading it would have gone on believing the compromises were forced.
  *
- * Two consequences, both surfaced in the UI rather than hidden:
+ * `subscriptionsFromSites` below is still the derivation from `GET /api/sites`,
+ * and the pages that call it still carry its limits:
  *
- * - A subscription with no sites does not appear. Suspending one is still
- *   possible, by id, which is why the page keeps a by-id path.
- * - **Suspension state is not knowable here.** Suspending flips
- *   `subscriptions.status` and re-renders each vhost onto the maintenance
- *   page; it deliberately does not touch the sites' own rows (so unsuspend can
- *   restore each site's stored settings), and the site row is all this client
- *   gets to see. The page therefore says "unknown" instead of guessing, and
- *   offers both directions — both operations are idempotent, so neither is a
- *   trap.
+ * - A subscription with no sites does not appear, so every caller keeps a
+ *   by-id path to reach one.
+ * - **Suspension state is not in it.** Suspending flips `subscriptions.status`
+ *   and re-renders each vhost onto the maintenance page; it deliberately does
+ *   not touch the sites' own rows (so unsuspend can restore each site's stored
+ *   settings), and a site row is all the derivation gets to see. A caller
+ *   working from it says "unknown" instead of guessing, and offers both
+ *   directions — both operations are idempotent, so neither is a trap.
+ *
+ * Both of those are answered by the endpoint rather than by this file, and
+ * moving the callers onto it wants an `endpoints.subscriptions` in `api.ts`
+ * first; until then the derivation is what the clients have, and it is
+ * described here as what it is rather than as the only thing possible.
  */
 
 import { api, type SiteView, type TaskAccepted } from "@/lib/api";

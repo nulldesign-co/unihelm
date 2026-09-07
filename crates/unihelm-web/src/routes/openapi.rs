@@ -117,6 +117,7 @@ pub const API_VERSION: &str = "1.0.0";
         super::alerts::events,
         super::alerts::rules_list,
         super::alerts::rules_set,
+        super::alerts::rules_delete,
         super::alerts::channels_list,
         super::alerts::channels_set,
         super::alerts::channels_delete,

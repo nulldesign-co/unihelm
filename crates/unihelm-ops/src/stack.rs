@@ -993,6 +993,21 @@ impl TypedOperation for Install {
                 db.component_installed(&slug, out.installed_version.as_deref())
                     .await
                     .map_err(UnihelmError::from)?;
+
+                // A service the operator has just installed is one this machine
+                // really runs, which is the only honest moment to start watching
+                // it. Migration 0011 armed `service_down`/`nginx` on every
+                // install instead, including machines that would never run it —
+                // so a fresh server showed an armed alert for an nginx it did
+                // not have, and the rule stayed quiet until nginx was installed
+                // and stopped once. Container installs are skipped: there is no
+                // host unit to watch. Never fatal, and never over a rule the
+                // operator already has.
+                if out.container.is_none()
+                    && let Ok(unit) = component.managed_unit()
+                {
+                    crate::alerts::arm_service_rule(ctx, unit).await;
+                }
             }
             Err(e) => {
                 // Record before returning, so the UI can explain a failure that

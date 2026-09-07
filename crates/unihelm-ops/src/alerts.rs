@@ -105,6 +105,31 @@ pub fn service_is_down(state: UnitState) -> bool {
     matches!(state, UnitState::Inactive | UnitState::Failed)
 }
 
+/// Every fixed `service_down` target, with the managed unit it names.
+///
+/// One table, read by everything that needs the list: the parser below, the
+/// refusal message [`validate_rule`] writes, and the options
+/// [`RulesListOutput::service_targets`] hands the UI. It is a table rather than
+/// a `match` arm plus three prose copies because the copies went stale — the
+/// page offered `postgresql` as a choice while the whitelist had grown
+/// `apache`, and the refusal message still named neither correctly.
+///
+/// `php_fpm:<version>` is not here: it is a family, not a name, and it is
+/// parsed below.
+pub const SERVICE_TARGETS: &[(&str, ManagedUnit)] = &[
+    ("nginx", ManagedUnit::Nginx),
+    // Without this the web server actually serving a switched machine was the
+    // one thing on it that could not be watched for going down.
+    ("apache", ManagedUnit::Apache),
+    ("mariadb", ManagedUnit::MariaDb),
+    ("postgresql", ManagedUnit::PostgreSql),
+    ("kv_store", ManagedUnit::KvStore),
+    ("docker", ManagedUnit::Docker),
+    ("sshd", ManagedUnit::Sshd),
+    ("unihelm_web", ManagedUnit::UnihelmWeb),
+    ("unihelm_agentd", ManagedUnit::UnihelmAgentd),
+];
+
 /// The managed units a `service_down` rule may name.
 ///
 /// A whitelist, like `svc.action`'s: the rule target is operator-supplied text,
@@ -112,22 +137,32 @@ pub fn service_is_down(state: UnitState) -> bool {
 /// panel already manages. There is no spelling of this string that reaches an
 /// arbitrary systemd unit.
 pub fn service_target(target: &str) -> Option<ManagedUnit> {
-    Some(match target {
-        "nginx" => ManagedUnit::Nginx,
-        // Without this arm the web server actually serving a switched machine
-        // was the one thing on it that could not be watched for going down.
-        "apache" => ManagedUnit::Apache,
-        "mariadb" => ManagedUnit::MariaDb,
-        "postgresql" => ManagedUnit::PostgreSql,
-        "kv_store" => ManagedUnit::KvStore,
-        "docker" => ManagedUnit::Docker,
-        "sshd" => ManagedUnit::Sshd,
-        "unihelm_web" => ManagedUnit::UnihelmWeb,
-        "unihelm_agentd" => ManagedUnit::UnihelmAgentd,
-        other => ManagedUnit::PhpFpm {
-            version: PhpVersion::parse(other.strip_prefix("php_fpm:")?).ok()?,
-        },
+    if let Some((_, unit)) = SERVICE_TARGETS.iter().find(|(name, _)| *name == target) {
+        return Some(*unit);
+    }
+    Some(ManagedUnit::PhpFpm {
+        version: PhpVersion::parse(target.strip_prefix("php_fpm:")?).ok()?,
     })
+}
+
+/// The target string a rule would store for this unit — [`service_target`]
+/// backwards.
+///
+/// Needed because the panel now arms a service rule at the moment it installs
+/// the service, and what it holds there is a [`ManagedUnit`], while a rule is
+/// keyed by the text form.
+pub fn service_target_name(unit: ManagedUnit) -> String {
+    match unit {
+        ManagedUnit::PhpFpm { version } => format!("php_fpm:{}", version.as_str()),
+        other => SERVICE_TARGETS
+            .iter()
+            .find(|(_, u)| *u == other)
+            .map(|(name, _)| (*name).to_string())
+            // Unreachable while the table covers every non-PHP variant, and the
+            // test below is what keeps that true. A debug name is still a
+            // better failure than a panic inside an install.
+            .unwrap_or_else(|| format!("{other:?}").to_lowercase()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1022,63 @@ pub async fn evaluate_with(ctx: &OpContext, transport: &dyn Transport) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// arming
+// ---------------------------------------------------------------------------
+
+/// Watch this service, now that the machine actually runs it.
+///
+/// Migration 0011 seeded a `service_down` rule for nginx on every install, on
+/// every machine, including the ones that will never run nginx. Because
+/// [`service_is_down`] does not count `not_found`, that rule sat quiet and
+/// "Armed" until somebody installed nginx and stopped it — and then fired an
+/// alert nobody had asked for. The install is the first moment the panel knows
+/// this machine runs this service, so it is where the rule belongs.
+///
+/// An existing rule is left exactly as it is, **including a disabled one**. A
+/// reinstall must not re-arm a rule the operator deliberately switched off, and
+/// it must not reset a threshold they chose. `set_alert_rule` upserts, so this
+/// checks first rather than calling it and hoping.
+///
+/// Returns the rule it created, or `None` when there was already one. Never
+/// fails the caller: an install that worked must not be reported as failed
+/// because the panel could not add a monitoring rule to it.
+pub async fn arm_service_rule(ctx: &OpContext, unit: ManagedUnit) -> Option<AlertRule> {
+    let target = service_target_name(unit);
+
+    let existing = match ctx.db().alert_rules().await {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(target = %target, error = %e, "could not read the alert rules to arm one");
+            return None;
+        }
+    };
+    if existing
+        .iter()
+        .any(|r| r.kind == AlertKind::ServiceDown && r.target.as_deref() == Some(target.as_str()))
+    {
+        return None;
+    }
+
+    match ctx
+        .db()
+        .set_alert_rule(AlertKind::ServiceDown, Some(&target), 1.0, true)
+        .await
+    {
+        Ok(rule) => {
+            ctx.log(format!(
+                "alerting on {target} going down; remove the rule on the alerts page if you \
+                 do not want it"
+            ));
+            Some(rule)
+        }
+        Err(e) => {
+            tracing::warn!(target = %target, error = %e, "could not arm a service alert");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // operations
 // ---------------------------------------------------------------------------
 
@@ -996,6 +1088,23 @@ pub struct RulesList;
 #[derive(Debug, Deserialize)]
 pub struct RulesListInput {}
 
+/// One choice in the `service_down` target list.
+///
+/// The unit name is resolved for *this* host's family, because that is the
+/// question the caller actually has: `apache` is `apache2.service` on Debian
+/// and `httpd.service` on EL, and the panel's own services endpoint reports
+/// units under those names. Handing the UI the resolved name is what lets it
+/// join the two lists and say which of these services the machine has, without
+/// keeping a second copy of the family table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServiceTargetOption {
+    /// What a rule stores in `target`.
+    pub target: String,
+    pub display_name: String,
+    /// The systemd unit on this host, as `/api/server/services` names it.
+    pub unit: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RulesListOutput {
     pub rules: Vec<AlertRule>,
@@ -1004,6 +1113,11 @@ pub struct RulesListOutput {
     pub open: Vec<AlertEvent>,
     /// Every kind a rule may have, for the form's select.
     pub kinds: Vec<&'static str>,
+    /// Every service a `service_down` rule may name, from the agent's own
+    /// whitelist. The page used to carry its own copy of this list, which went
+    /// stale in both directions: it offered choices the agent refuses on save,
+    /// and hid `apache` from the operators most likely to want it.
+    pub service_targets: Vec<ServiceTargetOption>,
 }
 
 #[async_trait]
@@ -1016,6 +1130,7 @@ impl TypedOperation for RulesList {
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        let family = ctx.distro().info.family;
         Ok(RulesListOutput {
             rules: ctx.db().alert_rules().await.map_err(UnihelmError::from)?,
             open: ctx
@@ -1024,6 +1139,14 @@ impl TypedOperation for RulesList {
                 .await
                 .map_err(UnihelmError::from)?,
             kinds: AlertKind::ALL.iter().map(|k| k.as_str()).collect(),
+            service_targets: SERVICE_TARGETS
+                .iter()
+                .map(|(target, unit)| ServiceTargetOption {
+                    target: (*target).to_string(),
+                    display_name: unit.display_name(),
+                    unit: unit.unit_name(family).as_str().to_string(),
+                })
+                .collect(),
         })
     }
 }
@@ -1078,6 +1201,73 @@ impl TypedOperation for RulesSet {
     }
 }
 
+/// `alert.rules.delete` — remove the rule for one `(kind, target)`.
+pub struct RulesDelete;
+
+#[derive(Debug, Deserialize)]
+pub struct RulesDeleteInput {
+    pub kind: AlertKind,
+    /// Absent or empty is the every-subject rule of that kind, exactly as it is
+    /// on the way in — a `disk_pct` rule with no target is a real rule and has
+    /// to be deletable.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RulesDeleteOutput {
+    /// Whether a row actually went. `false` is still a success — see below.
+    pub deleted: bool,
+    /// The rule as `kind` or `kind:target`, so the answer names what was asked
+    /// for rather than making the caller reconstruct it.
+    pub rule: String,
+}
+
+#[async_trait]
+impl TypedOperation for RulesDelete {
+    type Input = RulesDeleteInput;
+    type Output = RulesDeleteOutput;
+
+    const NAME: &'static str = "alert.rules.delete";
+    // The same permission as the setter, deliberately: being able to create a
+    // rule and not remove it is how a mistyped rule becomes permanent.
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let target = input
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+
+        // Deliberately **not** a NotFound. The operator asked for this rule to
+        // be gone; if it was already gone their intent is satisfied, and an
+        // error would make an already-correct state read as a failure — the
+        // second click of a double-submitted delete, or a delete racing the
+        // scheduler. `deleted` is how the caller tells the two apart, so
+        // nothing has to pretend work happened that did not.
+        let deleted = ctx
+            .db()
+            .delete_alert_rule(input.kind, target.as_deref())
+            .await
+            .map_err(UnihelmError::from)?;
+
+        let rule = match &target {
+            Some(t) => format!("{}:{t}", input.kind.as_str()),
+            None => input.kind.as_str().to_string(),
+        };
+        ctx.log(if deleted {
+            format!("removed the {rule} rule")
+        } else {
+            format!("there was no {rule} rule to remove")
+        });
+
+        Ok(RulesDeleteOutput { deleted, rule })
+    }
+}
+
 /// Check a rule the operator is trying to save, and settle its threshold.
 ///
 /// The bounds are not pedantry: a `disk_pct` rule at 0 fires on every disk on
@@ -1097,11 +1287,16 @@ fn validate_rule(kind: AlertKind, target: Option<&str>, threshold: Option<f64>) 
                 )
             })?;
             if service_target(target).is_none() {
+                // Built from the table, not typed out again: the hand-written
+                // version of this sentence had already lost `apache`, so the
+                // refusal named every choice but the one an Apache operator
+                // needed.
+                let known: Vec<&str> = SERVICE_TARGETS.iter().map(|(name, _)| *name).collect();
                 return Err(field(
                     format!(
-                        "`{target}` is not a service the panel manages; use one of \
-                         nginx, mariadb, postgresql, kv_store, docker, sshd, \
-                         unihelm_web, unihelm_agentd or php_fpm:<version>"
+                        "`{target}` is not a service the panel manages; use one of {} or \
+                         php_fpm:<version>",
+                        known.join(", ")
                     ),
                     "target",
                 ));
@@ -2181,8 +2376,8 @@ mod tests {
 
     // -- evaluate, end to end ---------------------------------------------
 
-    /// Leave exactly one seeded rule live, so the machine running the tests
-    /// cannot make them flaky with its own disks.
+    /// Leave exactly one rule live, so the machine running the tests cannot
+    /// make them flaky with its own disks.
     async fn only_rule(ctx: &OpContext, keep: AlertKind) {
         for rule in ctx.db().alert_rules().await.unwrap() {
             if rule.kind != keep {
@@ -2199,6 +2394,11 @@ mod tests {
         use unihelm_distro::svc::SvcAction;
 
         let (_reg, ctx) = admin_ctx().await;
+        // The rule exists because this machine has nginx, which is the only
+        // reason it ever should — nothing is seeded for it any more.
+        arm_service_rule(&ctx, ManagedUnit::Nginx)
+            .await
+            .expect("arming a service with no rule creates one");
         only_rule(&ctx, AlertKind::ServiceDown).await;
         add_channel(
             &ctx,
@@ -2317,6 +2517,9 @@ mod tests {
     #[tokio::test]
     async fn evaluation_records_the_event_even_when_every_channel_fails() {
         let (_reg, ctx) = admin_ctx().await;
+        arm_service_rule(&ctx, ManagedUnit::Nginx)
+            .await
+            .expect("armed");
         only_rule(&ctx, AlertKind::ServiceDown).await;
         add_channel(
             &ctx,
@@ -2409,8 +2612,187 @@ mod tests {
             .await
             .unwrap();
         let rules = listed["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 3, "updated in place, not appended");
+        assert_eq!(
+            rules.len(),
+            2,
+            "the two seeded rules, one of them updated in place rather than appended"
+        );
         assert!(listed["kinds"].as_array().unwrap().contains(&json!("load")));
+    }
+
+    #[tokio::test]
+    async fn the_rules_list_carries_the_agents_own_service_whitelist() {
+        // The page used to hold its own copy of this list, and the copy went
+        // stale: it offered `postgresql` while omitting `apache`, so an Apache
+        // machine could not pick the one service worth watching on it and other
+        // choices were refused a round trip later.
+        let (reg, admin, _) = registry().await;
+        let listed = reg
+            .dispatch(
+                "alert.rules.list",
+                &auth_for(admin, Role::Admin),
+                json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let options = listed["service_targets"].as_array().unwrap();
+        let targets: Vec<&str> = options
+            .iter()
+            .map(|o| o["target"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets.len(), SERVICE_TARGETS.len());
+        for (name, _) in SERVICE_TARGETS {
+            assert!(
+                targets.contains(name),
+                "`{name}` is missing from {targets:?}"
+            );
+            // Every choice offered is one the setter accepts. That is the whole
+            // claim: a list the operator can pick from and then be refused is
+            // worse than no list.
+            assert!(service_target(name).is_some());
+        }
+
+        // The unit name is resolved for this host's family, so the UI can join
+        // these against `/api/server/services` and say which are installed.
+        let nginx = options
+            .iter()
+            .find(|o| o["target"] == json!("nginx"))
+            .unwrap();
+        assert_eq!(nginx["unit"], json!("nginx.service"));
+        assert_eq!(nginx["display_name"], json!("Nginx"));
+    }
+
+    #[tokio::test]
+    async fn a_rule_can_be_deleted_and_deleting_it_twice_is_still_a_success() {
+        // Issue: there was no delete at all, so a rule created by a typo was
+        // permanent. The second call is the one worth pinning — the operator's
+        // intent is satisfied either way, and a 404 would show a failure for an
+        // already-correct state.
+        let (reg, admin, _) = registry().await;
+        let auth = auth_for(admin, Role::Admin);
+
+        reg.dispatch(
+            "alert.rules.set",
+            &auth,
+            json!({ "kind": "service_down", "target": "docker" }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let first = reg
+            .dispatch(
+                "alert.rules.delete",
+                &auth,
+                json!({ "kind": "service_down", "target": "docker" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["deleted"], json!(true));
+        assert_eq!(first["rule"], json!("service_down:docker"));
+
+        let again = reg
+            .dispatch(
+                "alert.rules.delete",
+                &auth,
+                json!({ "kind": "service_down", "target": "docker" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            again["deleted"],
+            json!(false),
+            "gone already, and the answer says so rather than claiming a deletion"
+        );
+
+        // And the every-subject rules are reachable too: no target at all.
+        let disk = reg
+            .dispatch(
+                "alert.rules.delete",
+                &auth,
+                json!({ "kind": "disk_pct" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(disk["deleted"], json!(true));
+        assert_eq!(disk["rule"], json!("disk_pct"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rule_is_admin_only() {
+        let (reg, _admin, customer) = registry().await;
+        let err = reg
+            .dispatch(
+                "alert.rules.delete",
+                &auth_for(customer, Role::Customer),
+                json!({ "kind": "disk_pct" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, unihelm_core::ErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn arming_a_service_never_overwrites_a_rule_the_operator_already_set() {
+        // A reinstall must not re-arm a rule somebody deliberately switched off,
+        // and must not reset a threshold they chose.
+        let (_reg, ctx) = admin_ctx().await;
+
+        let armed = arm_service_rule(&ctx, ManagedUnit::MariaDb)
+            .await
+            .expect("nothing was watching mariadb, so a rule is created");
+        assert_eq!(armed.target.as_deref(), Some("mariadb"));
+        assert!(armed.enabled);
+
+        ctx.db()
+            .set_alert_rule(AlertKind::ServiceDown, Some("mariadb"), 1.0, false)
+            .await
+            .unwrap();
+        assert!(
+            arm_service_rule(&ctx, ManagedUnit::MariaDb).await.is_none(),
+            "a second install must leave the operator's setting alone"
+        );
+
+        let stored = ctx
+            .db()
+            .alert_rules()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.target.as_deref() == Some("mariadb"))
+            .unwrap();
+        assert!(!stored.enabled, "still off, as the operator left it");
+    }
+
+    #[tokio::test]
+    async fn arming_names_a_php_pool_by_its_version() {
+        // `service_target` parses `php_fpm:8.3`; arming has to spell the same
+        // string back, or an install would create a rule the setter would then
+        // refuse to edit.
+        let (_reg, ctx) = admin_ctx().await;
+        let unit = ManagedUnit::PhpFpm {
+            version: PhpVersion::parse("8.3").unwrap(),
+        };
+        let armed = arm_service_rule(&ctx, unit).await.expect("armed");
+        assert_eq!(armed.target.as_deref(), Some("php_fpm:8.3"));
+        assert_eq!(service_target("php_fpm:8.3"), Some(unit));
+    }
+
+    #[test]
+    fn every_managed_unit_a_rule_can_name_survives_the_round_trip() {
+        // `service_target_name` is `service_target` backwards, and the table is
+        // the only place either is written down. A unit missing from it would
+        // silently arm a rule under a name the parser then rejects.
+        for (name, unit) in SERVICE_TARGETS {
+            assert_eq!(service_target(name), Some(*unit));
+            assert_eq!(&service_target_name(*unit), name);
+        }
     }
 
     #[tokio::test]

@@ -32,10 +32,13 @@ import {
   type AlertEvent,
   type AlertKind,
   type AlertRule,
+  type AlertRuleIdentity,
   type ChannelKind,
   type ChannelRequest,
   type ChannelTestResult,
   type NotifyChannel,
+  type ServiceStatus,
+  type ServiceTargetOption,
 } from "@/lib/api";
 
 /**
@@ -128,17 +131,59 @@ const BOUNDS: Record<Exclude<AlertKind, "service_down">, [number, number]> = {
   load: [0.1, 1000],
 };
 
-/** Units the agent's `service_target` accepts, minus the `php_fpm:<version>` form. */
-export const SERVICE_TARGETS = [
-  "nginx",
-  "mariadb",
-  "postgresql",
-  "kv_store",
-  "docker",
-  "sshd",
-  "unihelm_web",
-  "unihelm_agentd",
-] as const;
+/**
+ * Whether the machine actually runs the service behind one target option.
+ *
+ * Three answers, not two, and the third is the point. `/api/server/services`
+ * reports the units the dashboard watches, and it reports `not_found` for one
+ * that is not installed — but it does not cover every unit a rule may name. A
+ * target with no row in that list has not been checked, and saying "not
+ * installed" about it would be the panel claiming something it does not know.
+ * So an unchecked option is offered without a claim either way.
+ */
+export type ServiceAvailability = "installed" | "missing" | "unknown";
+
+export function serviceAvailability(
+  option: ServiceTargetOption,
+  services: ServiceStatus[] | undefined,
+): ServiceAvailability {
+  const status = services?.find((service) => service.unit === option.unit);
+  if (!status) return "unknown";
+  return status.state === "not_found" ? "missing" : "installed";
+}
+
+/** Empty is "every subject of this kind", which the server stores as NULL. */
+export function normalizeTarget(target: string): string | null {
+  const trimmed = target.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/** How the server names a rule: `kind`, or `kind:target`. */
+export function ruleLabel({ kind, target }: AlertRuleIdentity): string {
+  return target === null ? kind : `${kind}:${target}`;
+}
+
+/**
+ * The rule this save would leave behind, if any.
+ *
+ * `(kind, target)` **is** a rule's identity on the server — saving a different
+ * pair creates a second rule rather than editing this one. The dialog used to
+ * deal with that by locking all three fields, which meant opening Edit on a
+ * `service_down` rule gave a form where nothing could be changed and Save did
+ * nothing at all. Now the fields are editable and a changed pair is honestly a
+ * replace: write the new rule, then remove the old one. This returns the old
+ * one, so the dialog can say so before it does it.
+ */
+export function ruleToReplace(
+  rule: AlertRule | null,
+  kind: AlertKind,
+  target: string,
+): AlertRuleIdentity | null {
+  if (rule === null) return null;
+  const next = normalizeTarget(target);
+  if (rule.kind === kind && rule.target === next) return null;
+  return { kind: rule.kind, target: rule.target };
+}
 
 export type RuleProblem =
   | "target_required"
@@ -236,6 +281,7 @@ function RulesCard() {
         <RuleDialog
           rule={editing === "new" ? null : editing}
           kinds={rules.data?.kinds ?? []}
+          serviceTargets={rules.data?.service_targets ?? []}
           onClose={() => setEditing(null)}
         />
       ) : null}
@@ -257,6 +303,21 @@ function RuleRow({
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+
+  // There was no delete at all until this existed: a rule added by a typo — a
+  // service this machine will never run, a mount point that does not exist —
+  // was permanent, and the most an operator could do was switch it off and
+  // leave the row on the page.
+  const remove = useMutation({
+    mutationFn: () => endpoints.deleteAlertRule({ kind: rule.kind, target: rule.target }),
+    onSuccess: () => {
+      setConfirming(false);
+      void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+      void queryClient.invalidateQueries({ queryKey: ["alert-events"] });
+    },
+    onError: (e) => setError(errorText(e)),
+  });
 
   const toggle = useMutation({
     mutationFn: (enabled: boolean) =>
@@ -323,10 +384,17 @@ function RuleRow({
           label={t("alerts.rules.enabled")}
         />
 
-        <Button variant="ghost" size="sm" onClick={onEdit}>
-          <Pencil className="h-3.5 w-3.5" aria-hidden />
-          {t("alerts.rules.edit")}
-        </Button>
+        {/* Edit and delete sit behind the one ⋯ the rest of the panel uses,
+            rather than a bare delete button next to an arming switch. */}
+        <Menu label={t("files.actions")}>
+          <MenuItem icon={<Pencil />} onClick={onEdit}>
+            {t("alerts.rules.edit")}
+          </MenuItem>
+          <MenuSeparator />
+          <MenuItem danger icon={<Trash2 />} onClick={() => setConfirming(true)}>
+            {t("alerts.rules.delete")}
+          </MenuItem>
+        </Menu>
       </div>
 
       {open.length > 0 ? (
@@ -340,17 +408,65 @@ function RuleRow({
           {error}
         </Callout>
       ) : null}
+
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title={t("alerts.rules.deleteTitle", {
+          rule: ruleLabel({ kind: rule.kind, target: rule.target }),
+        })}
+        description={t("alerts.rules.deleteHint")}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setConfirming(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button variant="danger" onClick={() => remove.mutate()} loading={remove.isPending}>
+              {t("alerts.rules.delete")}
+            </Button>
+          </>
+        }
+      >
+        {/* Named, because deleting the rule takes its events with it: the
+            history of a disk that filled up last month goes too, and an
+            operator should know that before clicking, not after. */}
+        <p className="text-sm text-ink-muted">
+          {open.length > 0
+            ? t("alerts.rules.deleteBodyFiring", { count: open.length })
+            : t("alerts.rules.deleteBody")}
+        </p>
+      </Dialog>
     </li>
   );
+}
+
+/**
+ * The choices to show for a `service_down` target.
+ *
+ * The agent's own list, plus whatever the rule is already set to when that is
+ * not on it — a `php_fpm:8.4` rule made from the CLI, or a unit dropped from
+ * the whitelist by an upgrade. A `<select>` cannot hold a value it has no
+ * option for: it would quietly show the first entry instead, and saving would
+ * then move the rule to a service nobody chose.
+ */
+export function serviceChoices(
+  options: ServiceTargetOption[],
+  current: string,
+): ServiceTargetOption[] {
+  if (current === "" || options.some((option) => option.target === current)) return options;
+  // No `unit`, so nothing claims to know whether this one is installed.
+  return [{ target: current, display_name: current, unit: "" }, ...options];
 }
 
 function RuleDialog({
   rule,
   kinds,
+  serviceTargets,
   onClose,
 }: {
   rule: AlertRule | null;
   kinds: AlertKind[];
+  serviceTargets: ServiceTargetOption[];
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -361,22 +477,58 @@ function RuleDialog({
   const [threshold, setThreshold] = useState(rule ? String(rule.threshold) : "");
   const [enabled, setEnabled] = useState(rule?.enabled ?? true);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const problem = ruleProblem(kind, target, threshold);
 
+  // Which of the offered services this machine actually runs. The same key and
+  // endpoint the dashboard uses, so react-query answers from one request.
+  const services = useQuery({
+    queryKey: ["services"],
+    queryFn: endpoints.services,
+    enabled: kind === "service_down",
+  });
+
+  // A changed (kind, target) is a different rule on the server, not an edit of
+  // this one — so saving it means writing the new rule and removing the old.
+  const replacing = ruleToReplace(rule, kind, target);
+  const next: AlertRuleIdentity = { kind, target: normalizeTarget(target) };
+
   const save = useMutation({
-    mutationFn: () =>
-      endpoints.setAlertRule({
+    mutationFn: async () => {
+      const saved = await endpoints.setAlertRule({
         kind,
-        target: target.trim() === "" ? null : target.trim(),
+        target: next.target,
         ...(kind === "service_down" ? {} : { threshold: Number(threshold.trim()) }),
         enabled,
-      }),
+      });
+      if (replacing !== null) {
+        // Write first, remove second. The other order risks deleting the rule
+        // the operator has and then failing to create its replacement, which
+        // would leave the machine unwatched with nothing on screen to say so.
+        try {
+          await endpoints.deleteAlertRule(replacing);
+        } catch (e) {
+          throw new Error(
+            t("alerts.rules.replacePartial", {
+              next: ruleLabel(next),
+              previous: ruleLabel(replacing),
+              detail: errorText(e),
+            }),
+          );
+        }
+      }
+      return saved;
+    },
     onSuccess: () => {
       onClose();
       void queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
+      void queryClient.invalidateQueries({ queryKey: ["alert-events"] });
     },
-    onError: (e) => setError(errorText(e)),
+    onError: (e) => {
+      setConfirming(false);
+      setError(errorText(e));
+    },
   });
 
   return (
@@ -387,19 +539,24 @@ function RuleDialog({
       // `(kind, target)` is the rule's identity on the server, so saving the
       // same pair edits the existing rule rather than adding a second one that
       // would notify twice for one full disk.
-      description={t("alerts.rules.addHint")}
+      description={rule ? t("alerts.rules.editHint") : t("alerts.rules.addHint")}
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>
-            {t("common.cancel")}
+          <Button
+            variant="ghost"
+            onClick={() => (confirming ? setConfirming(false) : onClose())}
+          >
+            {confirming ? t("alerts.rules.replaceBack") : t("common.cancel")}
           </Button>
           <Button
-            variant="primary"
-            onClick={() => save.mutate()}
+            variant={confirming ? "danger" : "primary"}
+            // One confirmation, and only when the save would remove a rule:
+            // an in-place edit is not worth a second click.
+            onClick={() => (replacing !== null && !confirming ? setConfirming(true) : save.mutate())}
             loading={save.isPending}
             disabled={problem !== null}
           >
-            {t("alerts.rules.save")}
+            {replacing !== null ? t("alerts.rules.replace") : t("alerts.rules.save")}
           </Button>
         </>
       }
@@ -408,12 +565,10 @@ function RuleDialog({
         <Select
           id="alert-kind"
           value={kind}
-          // Editing the kind of an existing rule would create a second rule
-          // rather than change this one, so it is fixed once saved.
-          disabled={rule !== null}
           onChange={(event) => {
             setKind(event.target.value as AlertKind);
             setTarget("");
+            setConfirming(false);
           }}
         >
           {(kinds.length > 0 ? kinds : (["disk_pct"] as AlertKind[])).map((option) => (
@@ -441,26 +596,41 @@ function RuleDialog({
           <Select
             id="alert-target"
             value={target}
-            disabled={rule !== null}
-            onChange={(event) => setTarget(event.target.value)}
+            onChange={(event) => {
+              setTarget(event.target.value);
+              setConfirming(false);
+            }}
           >
             <option value="">{t("alerts.rules.pickService")}</option>
-            {SERVICE_TARGETS.map((unit) => (
-              <option key={unit} value={unit}>
-                {unit}
-              </option>
-            ))}
+            {serviceChoices(serviceTargets, target).map((option) => {
+              const availability = serviceAvailability(option, services.data?.services);
+              return (
+                <option
+                  key={option.target}
+                  value={option.target}
+                  // A service the machine does not have can still be the rule's
+                  // current value — it is how an operator finds and fixes one.
+                  disabled={availability === "missing" && option.target !== target}
+                >
+                  {availability === "missing"
+                    ? t("alerts.rules.serviceMissing", { service: option.display_name })
+                    : option.display_name}
+                </option>
+              );
+            })}
           </Select>
         ) : (
           <Input
             id="alert-target"
             className="font-mono"
-            disabled={rule !== null}
             placeholder={kind === "disk_pct" ? "/" : kind === "cert_expiry_days" ? "example.com" : ""}
             value={target}
             aria-describedby="alert-target-hint"
             aria-invalid={problem?.startsWith("target") ?? false}
-            onChange={(event) => setTarget(event.target.value)}
+            onChange={(event) => {
+              setTarget(event.target.value);
+              setConfirming(false);
+            }}
           />
         )}
       </Field>
@@ -500,6 +670,32 @@ function RuleDialog({
         label={t("alerts.rules.enabled")}
         description={t("alerts.rules.enabledHint")}
       />
+
+      {/* Said before the operator can act on it, not after: a rule for a
+          service this machine does not have never fires, because a unit that
+          is not installed is not the same as one that has stopped. */}
+      {kind === "service_down" &&
+      target !== "" &&
+      serviceChoices(serviceTargets, target).some(
+        (option) =>
+          option.target === target &&
+          serviceAvailability(option, services.data?.services) === "missing",
+      ) ? (
+        <Callout tone="warning" className="mt-3">
+          {t("alerts.rules.serviceMissingHint")}
+        </Callout>
+      ) : null}
+
+      {/* What "replace" will actually do, in full, before the second click:
+          the old rule goes, and its recorded spans go with it. */}
+      {replacing !== null ? (
+        <Callout tone={confirming ? "warning" : "info"} className="mt-3">
+          {t("alerts.rules.replaceBody", {
+            next: ruleLabel(next),
+            previous: ruleLabel(replacing),
+          })}
+        </Callout>
+      ) : null}
 
       {error ? (
         <Callout tone="danger" className="mt-3">

@@ -5,7 +5,16 @@ import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { ApiError } from "@/lib/api";
-import { CHUNK_BYTES, blobToBase64, filesApi, joinPath } from "@/lib/files-api";
+import {
+  CHUNK_BYTES,
+  baseName,
+  blobToBase64,
+  cleanPath,
+  ensureDir,
+  filesApi,
+  joinPath,
+  parentPath,
+} from "@/lib/files-api";
 import { cn, formatBytes } from "@/lib/utils";
 
 /**
@@ -19,15 +28,30 @@ import { cn, formatBytes } from "@/lib/utils";
  * a failed chunk the retry asks the server how much it already has (by listing
  * the directory) and continues from that byte. A page reload starts over —
  * cross-session resume would need the user to re-pick the file anyway.
+ *
+ * A whole folder can be uploaded, by drop or by picker. Each file carries the
+ * path it had relative to the folder that was dropped, and the queue creates
+ * the directories on the way down before writing into them — the upload
+ * endpoint takes a path and no `create_parents`, so an un-made parent is a
+ * `NotFound` per file.
  */
 
 export type UploadStatus = "queued" | "uploading" | "done" | "error" | "cancelled";
 
 export interface UploadItem {
   id: string;
+  /**
+   * A folder row carries no bytes: it exists so an empty directory inside a
+   * dropped tree is created rather than quietly dropped, and so its failure is
+   * visible instead of being blamed on the files that would have gone in it.
+   */
+  kind: "file" | "folder";
+  /** Base name — what `resume` matches against a fresh listing. */
   name: string;
+  /** Path relative to the folder the upload was started in, for the panel. */
+  display: string;
   size: number;
-  /** Target directory, tenant-home-relative. */
+  /** The item's own parent directory, tenant-home-relative. */
   dir: string;
   /** Full target path. */
   path: string;
@@ -36,17 +60,32 @@ export interface UploadItem {
   error: string | null;
 }
 
+/** A file the user handed over, with the path it had inside the dropped tree. */
+export interface PendingUpload {
+  file: File;
+  /** `/`-separated and relative to the drop target — `site/css/app.css`. */
+  relativePath: string;
+}
+
 interface Job {
   id: string;
-  file: File;
+  /** Null for a folder job, which only has to exist. */
+  file: File | null;
   dir: string;
   path: string;
   startAt: number;
+  /**
+   * The directory chain to make before writing, or null when the target
+   * directory is the one the page is already showing — that one exists, and
+   * walking it would cost a round trip per level per upload.
+   */
+  createDir: string | null;
 }
 
 let nextUploadId = 0;
 
 export function useUploader(onFileDone: (dir: string) => void) {
+  const { t } = useTranslation();
   const [items, setItems] = useState<UploadItem[]>([]);
   // A synchronous mirror of `items`, so event handlers can read the latest
   // state without putting side effects inside a state updater (StrictMode
@@ -56,6 +95,10 @@ export function useUploader(onFileDone: (dir: string) => void) {
   const filesRef = useRef(new Map<string, File>());
   const queueRef = useRef<Job[]>([]);
   const cancelledRef = useRef(new Set<string>());
+  // Directories this session has already made. A 400-file folder shares a
+  // handful of parents, and re-walking them would be a mkdir round trip per
+  // level per file.
+  const ensuredRef = useRef(new Set<string>());
   const pumpingRef = useRef(false);
   const onFileDoneRef = useRef(onFileDone);
   onFileDoneRef.current = onFileDone;
@@ -76,18 +119,31 @@ export function useUploader(onFileDone: (dir: string) => void) {
           update(job.id, { status: "uploading" });
           let offset = job.startAt;
           try {
-            if (job.file.size === 0) {
+            // Before the first byte, not after a NotFound: the endpoint writes
+            // to a path and will not make the folder on the way.
+            if (job.createDir !== null && !ensuredRef.current.has(job.createDir)) {
+              await ensureDir(job.createDir);
+              ensuredRef.current.add(job.createDir);
+            }
+            const file = job.file;
+            if (file === null) {
+              // A folder job is finished the moment its directory exists.
+              update(job.id, { status: "done", sent: 0 });
+              onFileDoneRef.current(job.dir);
+              continue;
+            }
+            if (file.size === 0) {
               await filesApi.uploadChunk({ path: job.path, offset: 0, content_b64: "", done: true });
             }
-            while (offset < job.file.size) {
+            while (offset < file.size) {
               if (cancelledRef.current.has(job.id)) break;
-              const end = Math.min(offset + CHUNK_BYTES, job.file.size);
-              const content_b64 = await blobToBase64(job.file.slice(offset, end));
+              const end = Math.min(offset + CHUNK_BYTES, file.size);
+              const content_b64 = await blobToBase64(file.slice(offset, end));
               await filesApi.uploadChunk({
                 path: job.path,
                 offset,
                 content_b64,
-                done: end === job.file.size,
+                done: end === file.size,
               });
               offset = end;
               update(job.id, { sent: offset });
@@ -95,7 +151,7 @@ export function useUploader(onFileDone: (dir: string) => void) {
             if (cancelledRef.current.has(job.id)) {
               update(job.id, { status: "cancelled" });
             } else {
-              update(job.id, { status: "done", sent: job.file.size });
+              update(job.id, { status: "done", sent: file.size });
               onFileDoneRef.current(job.dir);
             }
           } catch (e) {
@@ -114,29 +170,90 @@ export function useUploader(onFileDone: (dir: string) => void) {
   }, [update]);
 
   const enqueue = useCallback(
-    (files: File[], dir: string) => {
+    /**
+     * @param uploads   Files, each with the path it had inside the dropped tree.
+     * @param dir       Where the tree lands, tenant-home-relative.
+     * @param emptyDirs Directories in the tree that hold no files at any depth.
+     *                  Nothing is ever written into them, so without their own
+     *                  jobs they would vanish from a folder that "uploaded".
+     */
+    (uploads: PendingUpload[], dir: string, emptyDirs: string[] = []) => {
       const fresh: UploadItem[] = [];
-      for (const file of files) {
+
+      for (const relative of emptyDirs.map(cleanPath)) {
+        if (relative === "") continue;
         const id = `u${nextUploadId++}`;
-        filesRef.current.set(id, file);
-        const path = joinPath(dir, file.name);
+        const path = joinPath(dir, relative);
+        const parent = parentPath(path);
         fresh.push({
           id,
-          name: file.name,
-          size: file.size,
-          dir,
+          kind: "folder",
+          name: baseName(relative),
+          display: relative,
+          size: 0,
+          dir: parent,
           path,
           sent: 0,
           status: "queued",
           error: null,
         });
-        queueRef.current.push({ id, file, dir, path, startAt: 0 });
+        queueRef.current.push({ id, file: null, dir: parent, path, startAt: 0, createDir: path });
       }
+
+      for (const upload of uploads) {
+        const id = `u${nextUploadId++}`;
+        // A browser-supplied relative path is data, not a promise: cleaning is
+        // what keeps a `..` in it from being joined onto the target folder.
+        const relative = cleanPath(upload.relativePath);
+        const path = joinPath(dir, relative);
+        const parent = parentPath(path);
+        if (relative === "") {
+          // Nothing survived cleaning, so there is no name to write to. It goes
+          // into the queue as a failure rather than onto the floor.
+          fresh.push({
+            id,
+            kind: "file",
+            name: upload.file.name,
+            display: upload.file.name,
+            size: upload.file.size,
+            dir,
+            path: dir,
+            sent: 0,
+            status: "error",
+            error: t("files.uploadUnusableName", { name: upload.relativePath }),
+          });
+          continue;
+        }
+        filesRef.current.set(id, upload.file);
+        fresh.push({
+          id,
+          kind: "file",
+          name: baseName(relative),
+          display: relative,
+          size: upload.file.size,
+          dir: parent,
+          path,
+          sent: 0,
+          status: "queued",
+          error: null,
+        });
+        queueRef.current.push({
+          id,
+          file: upload.file,
+          dir: parent,
+          path,
+          startAt: 0,
+          // Only a file that arrived from inside a folder needs one built; the
+          // directory the page is showing is already there.
+          createDir: parentPath(relative) === "" ? null : parent,
+        });
+      }
+
       if (fresh.length === 0) return;
       setItems((prev) => [...prev, ...fresh]);
       pump();
     },
-    [pump],
+    [pump, t],
   );
 
   const cancel = useCallback(
@@ -157,10 +274,32 @@ export function useUploader(onFileDone: (dir: string) => void) {
 
   const resume = useCallback(
     (id: string) => {
-      const file = filesRef.current.get(id);
       const item = itemsRef.current.find((i) => i.id === id);
-      if (!item || !file || (item.status !== "error" && item.status !== "cancelled")) return;
+      if (!item || (item.status !== "error" && item.status !== "cancelled")) return;
       cancelledRef.current.delete(id);
+      // Whatever failed may have been the directory, so a retry rebuilds the
+      // chain rather than trusting that this session already made it. On an
+      // existing chain that is one `already_exists` per level, which is a fair
+      // price for a button a person pressed on purpose.
+      ensuredRef.current.delete(item.dir);
+      ensuredRef.current.delete(item.path);
+
+      if (item.kind === "folder") {
+        update(id, { status: "queued", error: null });
+        queueRef.current.push({
+          id,
+          file: null,
+          dir: item.dir,
+          path: item.path,
+          startAt: 0,
+          createDir: item.path,
+        });
+        pump();
+        return;
+      }
+
+      const file = filesRef.current.get(id);
+      if (!file) return;
       update(id, { status: "queued", error: null });
       void (async () => {
         // Ask the server how much of the file already landed and continue
@@ -175,7 +314,14 @@ export function useUploader(onFileDone: (dir: string) => void) {
           // The listing failing is not fatal; restart from zero.
         }
         update(id, { sent: startAt });
-        queueRef.current.push({ id, file, dir: item.dir, path: item.path, startAt });
+        queueRef.current.push({
+          id,
+          file,
+          dir: item.dir,
+          path: item.path,
+          startAt,
+          createDir: item.dir === "" ? null : item.dir,
+        });
         pump();
       })();
     },
@@ -197,24 +343,157 @@ export function useUploader(onFileDone: (dir: string) => void) {
   return { items, enqueue, cancel, resume, clearFinished };
 }
 
-/** Files from a drop event; directories are skipped (folder upload is not v1). */
-export function filesFromDrop(dataTransfer: DataTransfer): File[] {
-  const out: File[] = [];
-  if (dataTransfer.items.length > 0) {
-    for (const item of Array.from(dataTransfer.items)) {
-      if (item.kind !== "file") continue;
-      const entry = item.webkitGetAsEntry?.();
-      if (entry?.isDirectory) continue;
-      const file = item.getAsFile();
-      if (file) out.push(file);
-    }
-  } else {
-    out.push(...Array.from(dataTransfer.files));
+// ---------------------------------------------------------------------------
+// Getting files out of the browser
+// ---------------------------------------------------------------------------
+
+/** What a drop turned out to contain. */
+export interface DropContents {
+  uploads: PendingUpload[];
+  /** Folders in the tree that hold no files at any depth. */
+  emptyDirs: string[];
+  /**
+   * Names of dropped things this browser would not let us read. Never empty
+   * silently: the whole point of reporting these is that a folder dropped on a
+   * browser without the entries API used to look accepted and upload nothing.
+   */
+  unreadable: string[];
+}
+
+function fileOf(entry: FileSystemFileEntry): Promise<File> {
+  return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+/**
+ * Every child of a directory entry.
+ *
+ * `readEntries` answers with *a batch*, not the directory — Chromium caps it at
+ * 100 — and stops only when it hands back an empty one. Reading it once is the
+ * classic way a folder upload silently loses everything past the hundredth
+ * file, which is the same defect as losing all of them, just harder to notice.
+ */
+function readAllEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  return new Promise((resolve, reject) => {
+    const all: FileSystemEntry[] = [];
+    const next = () =>
+      reader.readEntries((batch) => {
+        if (batch.length === 0) {
+          resolve(all);
+          return;
+        }
+        all.push(...batch);
+        next();
+      }, reject);
+    next();
+  });
+}
+
+async function walkEntry(
+  entry: FileSystemEntry,
+  relativePath: string,
+  into: { uploads: PendingUpload[]; emptyDirs: string[] },
+): Promise<void> {
+  if (entry.isFile) {
+    into.uploads.push({ file: await fileOf(entry as FileSystemFileEntry), relativePath });
+    return;
   }
-  return out;
+  if (!entry.isDirectory) return;
+
+  const children = await readAllEntries((entry as FileSystemDirectoryEntry).createReader());
+  const before = into.uploads.length;
+  for (const child of children) {
+    await walkEntry(child, `${relativePath}/${child.name}`, into);
+  }
+  // A directory with no file anywhere under it is never named by any upload
+  // path, so it needs a job of its own or it disappears from the copy.
+  if (into.uploads.length === before) into.emptyDirs.push(relativePath);
+}
+
+/**
+ * A dropped `File` that is really a directory.
+ *
+ * Only reachable on a browser with no `webkitGetAsEntry`, where a dropped
+ * folder arrives as a zero-byte `File` and is indistinguishable from an empty
+ * one until you try to read a byte — which fails for a directory. Uploading it
+ * would create an empty file wearing the folder's name and call it done.
+ */
+async function isUnreadableDirectory(file: File): Promise<boolean> {
+  if (file.size !== 0) return false;
+  try {
+    await file.slice(0, 1).arrayBuffer();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Everything a drop is offering, folders walked to the bottom.
+ *
+ * The handler must call this synchronously from the drop event: the browser
+ * empties the drag data store as soon as that handler returns, so every
+ * `webkitGetAsEntry` and `getAsFile` is taken here, before the first `await`.
+ */
+export async function filesFromDrop(dataTransfer: DataTransfer): Promise<DropContents> {
+  const roots = Array.from(dataTransfer.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => ({ entry: item.webkitGetAsEntry?.() ?? null, file: item.getAsFile() }));
+  const loose = roots.length === 0 ? Array.from(dataTransfer.files) : [];
+
+  const into = { uploads: [] as PendingUpload[], emptyDirs: [] as string[] };
+  const unreadable: string[] = [];
+
+  for (const root of roots) {
+    if (root.entry) {
+      try {
+        await walkEntry(root.entry, root.entry.name, into);
+      } catch {
+        // The walk died partway: some of this folder may already be queued, so
+        // naming it is the only honest thing left to do.
+        unreadable.push(root.entry.name);
+      }
+    } else if (root.file) {
+      if (await isUnreadableDirectory(root.file)) unreadable.push(root.file.name);
+      else into.uploads.push({ file: root.file, relativePath: root.file.name });
+    }
+  }
+
+  for (const file of loose) {
+    if (await isUnreadableDirectory(file)) unreadable.push(file.name);
+    else into.uploads.push({ file, relativePath: file.name });
+  }
+
+  return { uploads: into.uploads, emptyDirs: into.emptyDirs, unreadable };
+}
+
+/**
+ * Files from an `<input type="file">`.
+ *
+ * `webkitRelativePath` is filled in by a `webkitdirectory` picker and empty for
+ * a plain one, so both pickers come through here.
+ */
+export function filesFromPicker(files: FileList | null): PendingUpload[] {
+  return Array.from(files ?? []).map((file) => ({
+    file,
+    relativePath: file.webkitRelativePath || file.name,
+  }));
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * How far along an item is, as a percentage.
+ *
+ * A folder job and a zero-byte file have no bytes to measure. They read as
+ * nothing until they are actually finished — the bar used to sit at 100% for
+ * both the moment they were queued, which is a full progress bar in front of
+ * work that had not started.
+ */
+function percentOf(item: UploadItem): number {
+  if (item.status === "done") return 100;
+  if (item.size === 0) return 0;
+  return Math.min(100, Math.floor((item.sent / item.size) * 100));
+}
 
 export function UploadPanel({
   items,
@@ -254,7 +533,11 @@ export function UploadPanel({
         {items.map((item) => (
           <li key={item.id} className="animate-rise-in">
             <div className="flex items-center gap-2">
-              <span className="min-w-0 flex-1 truncate text-sm text-ink">{item.name}</span>
+              {/* The path inside the dropped folder, not the bare name: forty
+                  rows all reading `index.php` name nothing at all. */}
+              <span className="min-w-0 flex-1 truncate text-sm text-ink" title={item.path}>
+                {item.display}
+              </span>
               {item.status === "uploading" ? <Spinner className="h-3.5 w-3.5" /> : null}
               {item.status === "error" || item.status === "cancelled" ? (
                 <Button
@@ -283,8 +566,8 @@ export function UploadPanel({
               role="progressbar"
               aria-valuemin={0}
               aria-valuemax={100}
-              aria-valuenow={item.size === 0 ? 100 : Math.floor((item.sent / item.size) * 100)}
-              aria-label={item.name}
+              aria-valuenow={percentOf(item)}
+              aria-label={item.display}
               className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-surface-muted"
             >
               <div
@@ -299,9 +582,7 @@ export function UploadPanel({
                       ? "bg-success"
                       : "bg-accent",
                 )}
-                style={{
-                  width: `${item.size === 0 ? 100 : Math.min(100, (item.sent / item.size) * 100)}%`,
-                }}
+                style={{ width: `${percentOf(item)}%` }}
               />
             </div>
             <p className="tnum mt-1 text-xs text-ink-muted">
@@ -309,6 +590,14 @@ export function UploadPanel({
                 <span className="text-danger">{item.error ?? t("files.uploadFailed")}</span>
               ) : item.status === "cancelled" ? (
                 t("files.uploadCancelled")
+              ) : item.kind === "folder" ? (
+                // A folder row has no bytes to count, and saying "0 B / 0 B"
+                // beside it reads like an upload that went nowhere.
+                item.status === "done" ? (
+                  t("files.folderCreated")
+                ) : (
+                  t("files.creatingFolder")
+                )
               ) : item.status === "done" ? (
                 t("files.uploadDone")
               ) : (

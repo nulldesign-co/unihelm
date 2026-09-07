@@ -1293,6 +1293,18 @@ fn branding(cmd: &BrandingCommand) -> Action {
     }
 }
 
+/// The wire spelling of a rule kind. One function, because the delete has to
+/// name a rule exactly as the set that created it did.
+fn alert_kind(kind: &AlertKindArg) -> &'static str {
+    match kind {
+        AlertKindArg::DiskPct => "disk_pct",
+        AlertKindArg::MemPct => "mem_pct",
+        AlertKindArg::Load => "load",
+        AlertKindArg::ServiceDown => "service_down",
+        AlertKindArg::CertExpiryDays => "cert_expiry_days",
+    }
+}
+
 fn alert(cmd: &AlertCommand) -> Result<Action> {
     Ok(match cmd {
         AlertCommand::Rules => call("alert.rules.list", json!({})),
@@ -1302,13 +1314,7 @@ fn alert(cmd: &AlertCommand) -> Result<Action> {
             threshold,
             disabled,
         } => {
-            let kind = match kind {
-                AlertKindArg::DiskPct => "disk_pct",
-                AlertKindArg::MemPct => "mem_pct",
-                AlertKindArg::Load => "load",
-                AlertKindArg::ServiceDown => "service_down",
-                AlertKindArg::CertExpiryDays => "cert_expiry_days",
-            };
+            let kind = alert_kind(kind);
             let input = Input::new()
                 .set("kind", kind)
                 .set("enabled", !*disabled)
@@ -1316,6 +1322,13 @@ fn alert(cmd: &AlertCommand) -> Result<Action> {
                 .maybe("threshold", *threshold)
                 .done();
             call("alert.rules.set", input)
+        }
+        AlertCommand::RulesDelete { kind, target } => {
+            let input = Input::new()
+                .set("kind", alert_kind(kind))
+                .maybe("target", target.clone())
+                .done();
+            call("alert.rules.delete", input)
         }
         AlertCommand::Events { limit, open_only } => {
             let input = Input::new()
@@ -1730,6 +1743,51 @@ mod tests {
             "/bin/true",
         ]);
         assert_eq!(inv.input["enabled"], true);
+    }
+
+    #[test]
+    fn deleting_a_rule_names_it_the_same_way_setting_it_does() {
+        // Until this subcommand existed a rule created by a typo was permanent:
+        // the CLI could set one and never remove it. The two have to agree on
+        // the pair that identifies a rule, or the delete addresses a different
+        // rule from the one the operator just made.
+        let set = invocation(&[
+            "unihelm",
+            "alert",
+            "rules-set",
+            "service_down",
+            "--target",
+            "nginx",
+        ]);
+        let deleted = invocation(&[
+            "unihelm",
+            "alert",
+            "rules-delete",
+            "service_down",
+            "--target",
+            "nginx",
+        ]);
+        assert_eq!(deleted.op, "alert.rules.delete");
+        assert_eq!(deleted.input["kind"], set.input["kind"]);
+        assert_eq!(deleted.input["target"], set.input["target"]);
+    }
+
+    #[test]
+    fn deleting_a_rule_with_no_target_sends_no_target_key_at_all() {
+        // The every-subject rule — one `disk_pct` rule covering every
+        // filesystem — is stored with a NULL target, and it has to be
+        // removable. An empty string here would look for a rule targeting `""`
+        // and report "there was no such rule" over one plainly on the page.
+        let inv = invocation(&["unihelm", "alert", "rules-delete", "disk_pct"]);
+        assert_eq!(inv.input["kind"], "disk_pct");
+        assert!(
+            !inv.input
+                .as_object()
+                .expect("an object")
+                .contains_key("target"),
+            "{}",
+            inv.input
+        );
     }
 
     #[test]

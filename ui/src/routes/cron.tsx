@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Clock, Pencil, Plus, Trash2 } from "lucide-react";
+import { Check, Clock, Pencil, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -12,13 +12,28 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
+import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
-import { ApiError, endpoints, type CronJob, type CronSetRequest } from "@/lib/api";
+import { ApiError, endpoints, type CronJob, type CronSetRequest, type SiteView } from "@/lib/api";
+import {
+  JOB_KINDS,
+  OWN_SUBSCRIPTION,
+  SUBSCRIPTION_BY_ID,
+  chosenSubscription,
+  composeCommand,
+  draftProblem,
+  recogniseCommand,
+  runsEveryMinute,
+  subscriptionDomains,
+  type JobDraft,
+  type JobKind,
+} from "@/lib/cron-api";
 import { checkCommand } from "@/lib/cron-schedule";
 import { staggerStyle } from "@/lib/motion";
+import { subscriptionsFromSites } from "@/lib/plans-api";
 import { cn } from "@/lib/utils";
 
 /**
@@ -313,6 +328,25 @@ function JobRow({ job, index, onEdit }: { job: CronJob; index: number; onEdit: (
   );
 }
 
+/** Every site root the panel can see, deduplicated, as folder suggestions. */
+function siteRoots(sites: SiteView[]): string[] {
+  return [...new Set(sites.map((site) => site.root_dir))].sort();
+}
+
+/**
+ * The builder a job opens in.
+ *
+ * An existing command opens in whatever mode would rebuild it exactly, and in
+ * Custom when nothing would — `recogniseCommand` is deliberately strict about
+ * that. A *new* job starts on the first template rather than on the escape
+ * hatch: an empty Custom box is precisely the dialog somebody who does not
+ * write shell could not use, and the chooser above it is easier to notice when
+ * something is already filling the space below.
+ */
+function draftFor(command: string | undefined): JobDraft {
+  return command ? recogniseCommand(command) : { kind: "url", url: "", path: "", custom: "" };
+}
+
 /**
  * Create or edit one job.
  *
@@ -320,6 +354,16 @@ function JobRow({ job, index, onEdit }: { job: CronJob; index: number; onEdit: (
  * whether an id goes in the URL, and whether the subscription can still be
  * chosen (it cannot be changed afterwards — a job does not move between
  * tenants, and the agent refuses the attempt rather than ignoring it).
+ *
+ * Two things a fresh install taught, both about who is standing in front of
+ * this dialog. The command was one bare input with a PHP path for a
+ * placeholder, so a customer who wanted "run my WordPress cron" had to know a
+ * shell to say it; it is a job-type chooser now, with the composed line shown
+ * read-only underneath, because a generator whose output is hidden is a second
+ * thing to distrust. And the subscription was a raw numeric id — a number
+ * nobody knows about themselves — so it is a picker labelled by the domains
+ * the panel can already see, with the by-id path kept for the subscription
+ * that has no sites yet.
  */
 function JobDialog({
   job,
@@ -335,33 +379,49 @@ function JobDialog({
   const problemOf = useScheduleProblem();
 
   const [schedule, setSchedule] = useState(job?.schedule ?? "0 3 * * *");
-  const [command, setCommand] = useState(job?.command ?? "");
-  const [subscription, setSubscription] = useState("");
+  const [draft, setDraft] = useState<JobDraft>(() => draftFor(job?.command));
+  const [subscription, setSubscription] = useState(OWN_SUBSCRIPTION);
+  const [subscriptionId, setSubscriptionId] = useState("");
   const [enabled, setEnabled] = useState(job?.enabled ?? true);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // The sites are what both pickers are built out of: the subscriptions behind
+  // them, and the folders their sites live in. Fetched only while the dialog is
+  // open, and shared with every other page's `["sites"]` cache.
+  const sites = useQuery({ queryKey: ["sites"], queryFn: endpoints.sites, enabled: open });
+  const subscriptions = subscriptionsFromSites(sites.data?.sites ?? []);
 
   // Reopening the dialog on a different job must not show the previous one's
   // half-typed command.
   useEffect(() => {
     if (!open) return;
     setSchedule(job?.schedule ?? "0 3 * * *");
-    setCommand(job?.command ?? "");
-    setSubscription("");
+    setDraft(draftFor(job?.command));
+    setSubscription(OWN_SUBSCRIPTION);
+    setSubscriptionId("");
     setEnabled(job?.enabled ?? true);
     setSubmitted(false);
     setError(null);
   }, [open, job]);
 
   const scheduleProblem = problemOf(schedule);
+
+  // The composed line is what is stored, validated and sent — for every job
+  // type, including the custom one, which composes to itself. Nothing about
+  // the command's rules moved into the builder.
+  const composed = composeCommand(draft);
+  const command = composed ?? "";
+  const draftIssue = draftProblem(draft);
   const commandProblem = checkCommand(command);
-  const commandMessage = commandProblem
-    ? t(`cron.problem.${commandProblem.key}`, { ...commandProblem.params })
-    : null;
-  const subscriptionProblem =
-    subscription.trim() !== "" && !/^\d{1,18}$/.test(subscription.trim())
-      ? t("cron.subscriptionInvalid")
+  const commandMessage = draftIssue
+    ? t(`cron.jobProblem.${draftIssue.key}`, { ...draftIssue.params })
+    : commandProblem
+      ? t(`cron.problem.${commandProblem.key}`, { ...commandProblem.params })
       : null;
+
+  const chosen = chosenSubscription(subscription, subscriptionId);
+  const subscriptionProblem = chosen.kind === "problem" ? t("cron.subscriptionInvalid") : null;
 
   const save = useMutation({
     mutationFn: (body: CronSetRequest) =>
@@ -378,12 +438,12 @@ function JobDialog({
     setError(null);
     if (scheduleProblem || commandMessage || subscriptionProblem) return;
 
-    const body: CronSetRequest = { schedule: schedule.trim(), command: command.trim(), enabled };
-    // Only on create, and only when it was actually typed: an absent key means
-    // "the caller's own subscription" to the agent, and an update that carried
-    // one would be asking to move the job.
-    if (job === null && subscription.trim() !== "") {
-      body.subscription_id = Number(subscription.trim());
+    const body: CronSetRequest = { schedule: schedule.trim(), command, enabled };
+    // Only on create, and only when one was actually chosen: an absent key
+    // means "the caller's own subscription" to the agent, and an update that
+    // carried one would be asking to move the job.
+    if (job === null && chosen.kind === "id") {
+      body.subscription_id = chosen.id;
     }
     save.mutate(body);
   };
@@ -422,45 +482,183 @@ function JobDialog({
           showProblem={submitted || schedule.trim() !== ""}
         />
 
-        <Field
-          label={t("cron.command")}
-          htmlFor="cron-command"
-          error={submitted ? (commandMessage ?? undefined) : undefined}
-        >
-          <Input
-            id="cron-command"
-            className="font-mono"
-            placeholder="/usr/bin/php ~/cron.php"
-            autoComplete="off"
-            spellCheck={false}
-            aria-invalid={submitted && Boolean(commandMessage)}
-            aria-describedby="cron-command-hint"
-            value={command}
-            onChange={(event) => setCommand(event.target.value)}
-          />
-        </Field>
-        <p id="cron-command-hint" className="-mt-2 text-xs text-ink-muted">
-          {t("cron.commandHint")}
-        </p>
+        <JobKindField
+          kind={draft.kind}
+          onKind={(kind) =>
+            setDraft((current) => {
+              if (kind === current.kind) return current;
+              // Switching to Custom carries the composed line across, so
+              // changing the interpreter or adding a flag is an edit rather
+              // than a retype — which is what makes Custom a usable escape
+              // hatch instead of a blank page.
+              if (kind !== "custom") return { ...current, kind };
+              return { ...current, kind, custom: composeCommand(current) ?? current.custom };
+            })
+          }
+        />
+
+        {draft.kind === "url" ? (
+          <Field
+            label={t("cron.url")}
+            htmlFor="cron-url"
+            error={submitted ? (commandMessage ?? undefined) : undefined}
+          >
+            <Input
+              id="cron-url"
+              className="font-mono"
+              // `inputMode`, not `type="url"`: a typed address that the
+              // browser's own URL validation rejects would be refused by a
+              // native bubble on Enter, in place of the sentence below the
+              // field that says which part of it is wrong.
+              inputMode="url"
+              placeholder="https://example.com/cron.php"
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={submitted && Boolean(commandMessage)}
+              value={draft.url}
+              onChange={(event) => setDraft({ ...draft, url: event.target.value })}
+            />
+          </Field>
+        ) : draft.kind === "custom" ? (
+          <>
+            <Field
+              label={t("cron.command")}
+              htmlFor="cron-command"
+              error={submitted ? (commandMessage ?? undefined) : undefined}
+            >
+              {/* Unwrapped, unquoted, stored exactly as typed. Anything this
+                  input grew around the text would be the one place in the
+                  dialog with nowhere left to escape to. */}
+              <Input
+                id="cron-command"
+                className="font-mono"
+                placeholder="/usr/bin/php ~/cron.php"
+                autoComplete="off"
+                spellCheck={false}
+                aria-invalid={submitted && Boolean(commandMessage)}
+                aria-describedby="cron-command-hint"
+                value={draft.custom}
+                onChange={(event) => setDraft({ ...draft, custom: event.target.value })}
+              />
+            </Field>
+            <p id="cron-command-hint" className="-mt-2 text-xs text-ink-muted">
+              {t("cron.commandHint")}
+            </p>
+          </>
+        ) : (
+          <>
+            <Field
+              label={t("cron.folder")}
+              htmlFor="cron-folder"
+              error={submitted ? (commandMessage ?? undefined) : undefined}
+            >
+              <Input
+                id="cron-folder"
+                className="font-mono"
+                placeholder="/home/uh_a/example.com"
+                autoComplete="off"
+                spellCheck={false}
+                // A datalist, not a select: these are the roots of the sites
+                // this panel can see, and the folder that holds wp-cron.php may
+                // be a subdirectory of one of them — a suggestion, not the set
+                // of valid answers.
+                list="cron-folder-known"
+                aria-invalid={submitted && Boolean(commandMessage)}
+                aria-describedby="cron-folder-hint"
+                value={draft.path}
+                onChange={(event) => setDraft({ ...draft, path: event.target.value })}
+              />
+            </Field>
+            <datalist id="cron-folder-known">
+              {siteRoots(sites.data?.sites ?? []).map((root) => (
+                <option key={root} value={root} />
+              ))}
+            </datalist>
+            <p id="cron-folder-hint" className="-mt-2 text-xs text-ink-muted">
+              {t("cron.folderHint")}
+            </p>
+          </>
+        )}
+
+        {draft.kind === "custom" ? null : (
+          <div className="space-y-1.5">
+            {/* The generated line, in full. An operator who cannot see what a
+                builder wrote has to take its word for what their server will
+                run — and the panel's word is worth less than the text. */}
+            <p className="text-sm font-medium text-ink">{t("cron.composed")}</p>
+            <p className="rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs break-all text-ink-muted">
+              {composed ?? t("cron.composedPending")}
+            </p>
+            <p className="text-xs text-ink-muted">{t("cron.composedHint")}</p>
+          </div>
+        )}
+
+        {draft.kind === "laravel" && !runsEveryMinute(schedule) ? (
+          // Said rather than silently corrected: `artisan schedule:run` only
+          // dispatches what is due at the moment it runs, so an hourly line
+          // runs the app's hourly tasks and skips everything finer. Changing
+          // the schedule underneath the operator would be the panel deciding
+          // something it was not asked to decide.
+          <Callout tone="warning">{t("cron.laravelEveryMinute")}</Callout>
+        ) : null}
 
         {job === null ? (
           <>
             <Field
               label={t("cron.subscription")}
               htmlFor="cron-subscription"
-              error={submitted ? (subscriptionProblem ?? undefined) : undefined}
+              error={
+                submitted && subscription === SUBSCRIPTION_BY_ID
+                  ? (subscriptionProblem ?? undefined)
+                  : undefined
+              }
             >
-              <Input
+              <Select
                 id="cron-subscription"
-                inputMode="numeric"
-                placeholder={t("cron.subscriptionPlaceholder")}
                 aria-describedby="cron-subscription-hint"
                 value={subscription}
                 onChange={(event) => setSubscription(event.target.value)}
-              />
+              >
+                <option value={OWN_SUBSCRIPTION}>{t("cron.subscriptionOwn")}</option>
+                {subscriptions.map((entry) => {
+                  // The domains are what an operator recognises; the id is what
+                  // the API takes. Both are in the option, in that order.
+                  const { shown, more } = subscriptionDomains(entry);
+                  const rest = more > 0 ? ` ${t("cron.subscriptionAndMore", { more })}` : "";
+                  const domains = shown.join(", ") + rest;
+                  return (
+                    <option key={entry.id} value={String(entry.id)}>
+                      {t("cron.subscriptionOption", { id: entry.id, domains })}
+                    </option>
+                  );
+                })}
+                {/* The list is derived from sites, so a subscription without
+                    one is not in it. Reaching that tenant by number is the
+                    only way, and it stays offered rather than the picker
+                    quietly narrowing what can be created. */}
+                <option value={SUBSCRIPTION_BY_ID}>{t("cron.subscriptionOther")}</option>
+              </Select>
             </Field>
+
+            {subscription === SUBSCRIPTION_BY_ID ? (
+              <Input
+                id="cron-subscription-id"
+                inputMode="numeric"
+                placeholder="1"
+                aria-label={t("cron.subscriptionNumber")}
+                aria-invalid={submitted && Boolean(subscriptionProblem)}
+                className="-mt-2"
+                value={subscriptionId}
+                onChange={(event) => setSubscriptionId(event.target.value)}
+              />
+            ) : null}
+
             <p id="cron-subscription-hint" className="-mt-2 text-xs text-ink-muted">
-              {t("cron.subscriptionHint")}
+              {sites.error
+                ? t("cron.subscriptionListFailed")
+                : sites.isPending
+                  ? t("cron.subscriptionLoading")
+                  : t("cron.subscriptionDerived")}
             </p>
           </>
         ) : null}
@@ -475,5 +673,48 @@ function JobDialog({
         {error ? <Callout tone="danger">{error}</Callout> : null}
       </form>
     </Dialog>
+  );
+}
+
+/**
+ * What the job is for, above the field it fills in.
+ *
+ * A segmented control rather than a select, following the terminal's run-as
+ * chooser: four options is few enough to show, and the whole point of the
+ * chooser is that somebody who did not know a cron command could be built for
+ * them can see that it can. The hint underneath says what the chosen template
+ * will actually do, because the label alone ("WordPress cron") does not say
+ * whose PHP runs it or where.
+ */
+function JobKindField({ kind, onKind }: { kind: JobKind; onKind: (next: JobKind) => void }) {
+  const { t } = useTranslation();
+  return (
+    <fieldset className="space-y-2">
+      <legend className="text-sm font-medium text-ink">{t("cron.jobKind")}</legend>
+      <div className="inline-flex flex-wrap items-center gap-1 rounded-lg border border-border bg-surface-muted p-1">
+        {JOB_KINDS.map((option) => (
+          <Button
+            key={option}
+            size="sm"
+            variant={kind === option ? "primary" : "ghost"}
+            aria-pressed={kind === option}
+            onClick={() => onKind(option)}
+          >
+            {/* The check keeps its space when hidden so the four never re-flow,
+                and it carries the choice as well as the fill does — which
+                template is selected must be readable without colour. */}
+            <Check
+              className={cn(
+                "h-3.5 w-3.5 transition-opacity duration-150",
+                kind === option ? "opacity-100" : "opacity-0",
+              )}
+              aria-hidden
+            />
+            {t(`cron.jobKindLabel.${option}`)}
+          </Button>
+        ))}
+      </div>
+      <p className="text-xs text-ink-muted">{t(`cron.jobKindHint.${kind}`)}</p>
+    </fieldset>
   );
 }

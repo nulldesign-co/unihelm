@@ -208,6 +208,72 @@ export function baseName(path: string): string {
   return idx === -1 ? path : path.slice(idx + 1);
 }
 
+/** True when `child` is `parent` itself, or sits anywhere underneath it. */
+export function isWithin(parent: string, child: string): boolean {
+  // Everything is under the home root, and `startsWith("/")` would never match
+  // a home-relative path, so the root is its own case.
+  if (parent === "") return true;
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+/** Why a move cannot be attempted at all — see {@link moveRefusal}. */
+export type MoveRefusal = "sameFolder" | "intoItself";
+
+/**
+ * Whether a move to `target` is worth sending, and if not, why.
+ *
+ * Move is `fs.rename` with a different parent in the destination (the delete
+ * operation itself renames into `.trash/`), and the server refuses both of
+ * these — but as `already exists` and as a bare `EINVAL` from `rename(2)`,
+ * neither of which tells an operator that they picked the folder the files are
+ * already in, or dropped a folder inside itself. Catching them here buys a
+ * sentence that names the mistake.
+ */
+export function moveRefusal(
+  entries: { path: string; kind: FileKind }[],
+  target: string,
+): MoveRefusal | null {
+  for (const entry of entries) {
+    if (parentPath(entry.path) === target) return "sameFolder";
+    // Only a real directory can contain the destination. A symlink is moved as
+    // the link, not as what it points at, so it has no inside to fall into.
+    if (entry.kind === "dir" && isWithin(entry.path, target)) return "intoItself";
+  }
+  return null;
+}
+
+/** Every directory from the home root down to `path`, shallowest first. */
+export function ancestorDirs(path: string): string[] {
+  const out: string[] = [];
+  let at = "";
+  for (const segment of cleanPath(path).split("/")) {
+    if (segment === "") continue;
+    at = joinPath(at, segment);
+    out.push(at);
+  }
+  return out;
+}
+
+/**
+ * `mkdir -p`, built from an endpoint that makes exactly one level.
+ *
+ * `fs.mkdir` is a single `create_dir` on purpose — a missing parent is a
+ * `NotFound`, never a silent chain of new directories. A folder upload does
+ * need the chain, so it is spelled out one level at a time here, where a
+ * failure other than "it is already there" still surfaces with the server's own
+ * message rather than being swallowed.
+ */
+export async function ensureDir(path: string): Promise<void> {
+  for (const dir of ancestorDirs(path)) {
+    try {
+      await filesApi.mkdir(dir);
+    } catch (e) {
+      if (e instanceof ApiError && e.slug === "already_exists") continue;
+      throw e;
+    }
+  }
+}
+
 /** A file name typed into a dialog: one segment, no separators, no NUL. */
 export function isValidName(name: string): boolean {
   return (
