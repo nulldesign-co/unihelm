@@ -57,7 +57,18 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # $remote_addr, not $proxy_add_x_forwarded_for — the panel is the one
+        # vhost where the chain is worth nothing and costs something.
+        #
+        # $proxy_add_x_forwarded_for keeps whatever the client sent and appends
+        # the address we saw. Downstream that address is the panel's login
+        # budget, its audit trail, and what Sentinel hands the firewall to ban,
+        # so a client-written prefix was a client-chosen victim. A site behind
+        # this proxy may legitimately want the whole chain (see site.conf.j2);
+        # the panel has exactly one hop in front of it and needs exactly one
+        # entry. The panel also refuses to read anything but the last entry, so
+        # a machine still running an older vhost is safe too.
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_ssl_verify off;
         proxy_set_header Upgrade $http_upgrade;
@@ -74,7 +85,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_ssl_verify off;
         proxy_set_header Upgrade $http_upgrade;
@@ -88,7 +99,7 @@ server {
         proxy_pass {{ upstream_scheme }}://{{ upstream }};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
         proxy_cache off;

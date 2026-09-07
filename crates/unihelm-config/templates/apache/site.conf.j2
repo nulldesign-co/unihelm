@@ -159,7 +159,25 @@
     SetEnv proxy-sendchunked 1
 {% elif site.site_type == "php" %}
     <Directory "{{ site.document_root }}">
-        Options -Indexes +FollowSymLinks
+        # Symlinks only where the link and its target have the same owner.
+        #
+        # The web server account is in every tenant's group so it can traverse
+        # their site directories, so `+FollowSymLinks` made
+        # `ln -s /home/other_tenant/sites/x/public/.env .` a working URL on this
+        # site: any customer who could write a file could read another tenant's,
+        # while the panel went on presenting the two as isolated.
+        #
+        # `-FollowSymLinks` is spelled out rather than merely left off. `Options`
+        # merges with the enclosing block, Debian's stock `<Directory />` grants
+        # FollowSymLinks, and where a directory ends up with both Apache follows
+        # the link without checking the owner — so dropping the `+` alone would
+        # have looked like the fix and changed nothing.
+        #
+        # This is a deliberate behaviour change: a deploy that symlinks a shared
+        # vendor, media or release directory owned by another account stops being
+        # served, because that link is indistinguishable from the planted one.
+        # Copy the directory, or give the link and its target the same owner.
+        Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
         # Not `All`.
         #
         # A `.htaccess` merges *after* the vhost's `<FilesMatch>` sections and
@@ -174,7 +192,11 @@
         # `RewriteRule`, which is permalinks. `AuthConfig` is what carries
         # `Require`, and it is deliberately not here. Nothing routing-related is
         # lost: `FallbackResource` below is the front controller.
-        AllowOverride FileInfo Indexes Options=FollowSymLinks,SymLinksIfOwnerMatch
+        #
+        # `Options=SymLinksIfOwnerMatch` and nothing else: the restriction above
+        # is worth nothing if a one-line `.htaccess` — which the customer, or a
+        # compromised plugin, can write — puts `Options +FollowSymLinks` back.
+        AllowOverride FileInfo Indexes Options=SymLinksIfOwnerMatch
         Require all granted
         # The front controller, which is nginx's
         # `try_files $uri $uri/ /index.php?$query_string`. Apache keeps the
@@ -206,10 +228,14 @@
     </Proxy>
 {% else %}
     <Directory "{{ site.document_root }}">
-        Options -Indexes +FollowSymLinks
-        # See the PHP branch above: `All` lets a `.htaccess` re-grant every file
-        # the denials below refuse.
-        AllowOverride FileInfo Indexes Options=FollowSymLinks,SymLinksIfOwnerMatch
+        # See the PHP branch above for both lines: `-FollowSymLinks` because the
+        # web server can traverse every tenant's directory and a planted symlink
+        # was therefore served, and `Options=SymLinksIfOwnerMatch` because a
+        # `.htaccess` must not be able to hand the unrestricted form back.
+        Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch
+        # And `All` would let a `.htaccess` re-grant every file the denials below
+        # refuse.
+        AllowOverride FileInfo Indexes Options=SymLinksIfOwnerMatch
         Require all granted
     </Directory>
 {% endif %}

@@ -875,13 +875,55 @@ impl TryFrom<String> for ImageRef {
     }
 }
 
-/// One published port: a host port, a container port, and TCP or UDP.
+/// The interface a published port is bound to unless somebody asks for more.
+///
+/// Docker installs its published-port DNAT rule in `PREROUTING`, which nftables
+/// evaluates before `INPUT` — where ufw and firewalld keep their rules. A port
+/// published as `-p 8080:80` therefore answers the internet whatever the panel's
+/// own Firewall page has been told, and that page has no way to see it: the
+/// operator reads "closed" off a chain the packet never reaches. Binding the
+/// host side to loopback puts the port back under the firewall's jurisdiction,
+/// which is what [`crate::engine`] and [`crate::appcontainer`] have always done.
+const LOOPBACK: &str = "127.0.0.1";
+
+/// One published port: a host port, a container port, TCP or UDP, and who may
+/// reach it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
     pub host: u16,
     pub container: u16,
     #[serde(default)]
     pub udp: bool,
+    /// Bind the host side to every interface instead of to [`LOOPBACK`].
+    ///
+    /// Defaults to false, and the default is the security property. Until 0.7.2
+    /// there was no field here at all and every container the panel created was
+    /// published on `0.0.0.0`: a database created from this form was open to the
+    /// internet from the moment it started, and the Firewall page went on
+    /// showing the port as closed because Docker's DNAT rule is evaluated before
+    /// the chain that page describes. That is the panel reporting something is
+    /// true when it is not, which is the one thing it must never do.
+    ///
+    /// Set, this is a deliberate choice by somebody who wants a port reachable
+    /// from outside — and [`Create`] writes that choice into the task output, so
+    /// the audit trail says who opened it and when rather than leaving the next
+    /// operator to find it with a port scan.
+    #[serde(default)]
+    pub public: bool,
+}
+
+/// What goes after `--publish`, which is the whole of this defect's surface.
+///
+/// Built as a function rather than inline so a test can hold it: the difference
+/// between the two branches is invisible in a diff of the argv, and nothing else
+/// in this file notices if the loopback prefix goes missing again.
+fn publish_spec(p: &PortMap) -> String {
+    let proto = if p.udp { "/udp" } else { "" };
+    if p.public {
+        format!("{}:{}{proto}", p.host, p.container)
+    } else {
+        format!("{LOOPBACK}:{}:{}{proto}", p.host, p.container)
+    }
 }
 
 /// What `docker.create` accepts, and by omission what it refuses.
@@ -996,48 +1038,29 @@ impl TypedOperation for Create {
             .with_field("name"));
         }
 
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "--detach".into(),
-            "--name".into(),
-            input.name.as_str().to_string(),
-            "--restart".into(),
-            input.restart.as_str().to_string(),
-        ];
-
-        for p in &input.ports {
-            // Bound to every interface, as `docker run -p` does by default. The
-            // firewall is where an operator decides who reaches it, and the
-            // panel has a page for that; quietly binding to loopback here would
-            // make a published port that nothing can reach.
-            args.push("--publish".into());
-            args.push(format!(
-                "{}:{}{}",
-                p.host,
-                p.container,
-                if p.udp { "/udp" } else { "" }
-            ));
-        }
-
-        for e in &input.env {
-            validate_env_key(&e.key)?;
-            args.push("--env".into());
-            args.push(format!("{}={}", e.key, e.value));
-        }
-
-        for v in &input.volumes {
-            validate_volume(v)?;
-            args.push("--volume".into());
-            args.push(format!("{}:{}", v.volume, v.path));
-        }
-
-        args.push(input.image.as_str().to_string());
+        let args = create_argv(&input)?;
 
         ctx.log(format!(
             "docker run --detach --name {} {}",
             input.name.as_str(),
             input.image.as_str()
         ));
+
+        // A public port is the one thing this form can do that the Firewall page
+        // will not show afterwards, so it is named in the task output at the
+        // moment it happens. Without this line the only record of the decision
+        // is the DNAT rule itself, and the operator who finds that six months
+        // later has no way to tell a deliberate choice from this module's old
+        // default.
+        for p in input.ports.iter().filter(|p| p.public) {
+            ctx.log(format!(
+                "publishing {}{} on every interface, as asked: this port is \
+                 reachable from the internet and the Firewall page cannot close \
+                 it, because Docker's rule is evaluated before ufw's",
+                p.host,
+                if p.udp { "/udp" } else { "" }
+            ));
+        }
 
         let out = unihelm_distro::Cmd::new(&docker)
             .args(args.iter().map(String::as_str))
@@ -1076,6 +1099,47 @@ impl TypedOperation for Create {
             running,
         })
     }
+}
+
+/// The whole `docker run` argv, and every check that has to pass before one
+/// exists.
+///
+/// Lifted out of [`Create::run`] for the same reason [`inspect_argv`] and
+/// [`logs_argv`] are functions: a test can hold it. The bindings below are each
+/// load bearing and each invisible in their absence — a missing `127.0.0.1:` on
+/// a `--publish` reads exactly like the argv that has one until somebody scans
+/// the port from outside.
+fn create_argv(input: &CreateInput) -> Result<Vec<String>> {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--detach".into(),
+        "--name".into(),
+        input.name.as_str().to_string(),
+        "--restart".into(),
+        input.restart.as_str().to_string(),
+    ];
+
+    for p in &input.ports {
+        args.push("--publish".into());
+        args.push(publish_spec(p));
+    }
+
+    for e in &input.env {
+        validate_env_key(&e.key)?;
+        args.push("--env".into());
+        args.push(format!("{}={}", e.key, e.value));
+    }
+
+    for v in &input.volumes {
+        validate_volume(v)?;
+        args.push("--volume".into());
+        args.push(format!("{}:{}", v.volume, v.path));
+    }
+
+    // The image last, after every flag, so it is never read as the value of one
+    // — the same rule the lifecycle argvs follow for the container.
+    args.push(input.image.as_str().to_string());
+    Ok(args)
 }
 
 /// An environment key that cannot smuggle a second variable in.
@@ -1593,6 +1657,132 @@ mod create_tests {
         assert_eq!(RestartPolicy::Always.as_str(), "always");
         assert_eq!(RestartPolicy::UnlessStopped.as_str(), "unless-stopped");
         assert_eq!(RestartPolicy::default(), RestartPolicy::No);
+    }
+
+    // -----------------------------------------------------------------------
+    // Where a published port is bound
+    // -----------------------------------------------------------------------
+
+    fn port(host: u16, container: u16) -> PortMap {
+        PortMap {
+            host,
+            container,
+            udp: false,
+            public: false,
+        }
+    }
+
+    fn create_input(ports: Vec<PortMap>) -> CreateInput {
+        CreateInput {
+            image: ImageRef::parse("nginx").unwrap(),
+            name: ContainerRef::parse("web").unwrap(),
+            ports,
+            env: Vec::new(),
+            volumes: Vec::new(),
+            restart: RestartPolicy::No,
+        }
+    }
+
+    fn value_of(argv: &[String], flag: &str) -> String {
+        argv.windows(2)
+            .find(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| panic!("no `{flag}` in {argv:?}"))
+    }
+
+    /// The defect this binding exists for, and the reason a test rather than a
+    /// comment holds it.
+    ///
+    /// Docker's published-port DNAT rule lands in `PREROUTING`, ahead of the
+    /// `INPUT` chain ufw and firewalld write to. A container created here with a
+    /// bare `-p 8080:80` was reachable from the internet the moment it started,
+    /// and the panel's own Firewall page kept showing the port as closed —
+    /// because the packet never reaches the chain that page describes. Nothing
+    /// else in this file notices if the prefix is dropped again.
+    #[test]
+    fn a_published_port_is_bound_to_loopback_unless_it_was_asked_for() {
+        let argv = create_argv(&create_input(vec![port(8080, 80)])).unwrap();
+        let publish = value_of(&argv, "--publish");
+        assert!(
+            publish.starts_with("127.0.0.1:"),
+            "this container would answer the internet: {publish}"
+        );
+        assert_eq!(publish, "127.0.0.1:8080:80");
+        assert_eq!(argv.last().map(String::as_str), Some("nginx"));
+    }
+
+    /// UDP is published the same way. The protocol suffix goes on the end, where
+    /// Docker expects it, and does not displace the bind address.
+    #[test]
+    fn a_udp_port_is_bound_to_loopback_too() {
+        let mut p = port(5353, 53);
+        p.udp = true;
+        assert_eq!(publish_spec(&p), "127.0.0.1:5353:53/udp");
+        p.public = true;
+        assert_eq!(publish_spec(&p), "5353:53/udp");
+    }
+
+    /// Asking for it is the only way to get it, and asking for it drops the bind
+    /// address rather than adding a second one — `0.0.0.0:8080:80` and
+    /// `8080:80` mean the same thing to Docker, and the shorter is what an
+    /// operator would have typed.
+    #[test]
+    fn the_public_flag_is_the_only_thing_that_opens_a_port_to_the_internet() {
+        let mut p = port(8080, 80);
+        p.public = true;
+        let argv = create_argv(&create_input(vec![p])).unwrap();
+        let publish = value_of(&argv, "--publish");
+        assert_eq!(publish, "8080:80");
+        assert!(!publish.contains("127.0.0.1"));
+    }
+
+    /// One public port must not carry its neighbours out with it: each mapping
+    /// is bound on its own, in the order the operator listed them.
+    #[test]
+    fn one_public_port_does_not_open_the_others() {
+        let mut open = port(8080, 80);
+        open.public = true;
+        let argv = create_argv(&create_input(vec![
+            port(5432, 5432),
+            open,
+            port(6379, 6379),
+        ]))
+        .unwrap();
+        let published: Vec<&String> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--publish")
+            .map(|w| &w[1])
+            .collect();
+        assert_eq!(
+            published,
+            vec!["127.0.0.1:5432:5432", "8080:80", "127.0.0.1:6379:6379"]
+        );
+    }
+
+    /// The wire default is the safe one. A caller that has never heard of this
+    /// field — an older UI build, a script written against 0.7.1, `curl` — gets
+    /// a private port, because the alternative is a silent world-reachable one.
+    #[test]
+    fn a_port_with_no_public_field_is_private() {
+        let parsed: CreateInput = serde_json::from_value(serde_json::json!({
+            "image": "postgres:16",
+            "name": "db",
+            "ports": [{ "host": 5432, "container": 5432 }],
+        }))
+        .expect("a port map without `public` must still parse");
+        assert!(!parsed.ports[0].public);
+        assert_eq!(
+            value_of(&create_argv(&parsed).unwrap(), "--publish"),
+            "127.0.0.1:5432:5432"
+        );
+
+        let asked: CreateInput = serde_json::from_value(serde_json::json!({
+            "image": "nginx",
+            "name": "web",
+            "ports": [{ "host": 80, "container": 80, "public": true }],
+        }))
+        .expect("`public` is a field a caller can set");
+        assert!(asked.ports[0].public);
     }
 
     /// There is no field for a raw flag, and there must not be one. This test is

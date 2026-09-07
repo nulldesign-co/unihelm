@@ -385,11 +385,12 @@ impl PkgBackend for AptBackend {
             DistroError::InvalidName(format!("repo `{}` needs a suite on this family", repo.id))
         })?;
 
-        // apt reads armored keys from a `.asc` given to `Signed-By`, so there is
-        // no need to dearmor — and no need for `apt-key`, which is deprecated
+        // The key goes in beside the sources file, scoped to this repository by
+        // `Signed-By` below — never through `apt-key`, which is deprecated
         // precisely because it made every key trusted for every repository.
-        let key_path = PathBuf::from(KEYRING_DIR).join(format!("{}.asc", repo.file_stem()));
-        write_root_file(&key_path, key_material, 0o644)?;
+        // `write_apt_key` picks the extension from the bytes; see its docs for
+        // why assuming one broke every PHP install.
+        let key_path = write_apt_key(Path::new(KEYRING_DIR), &repo.file_stem(), key_material, log)?;
 
         // deb822 format: it is the one that lets `Signed-By` scope a key to a
         // single repository.
@@ -437,22 +438,13 @@ impl PkgBackend for AptBackend {
 
     async fn remove_repo(&self, repo_id: &str) -> Result<()> {
         let stem = format!("unihelm-{repo_id}");
-        for path in [
-            PathBuf::from(APT_SOURCES_DIR).join(format!("{stem}.sources")),
-            PathBuf::from(KEYRING_DIR).join(format!("{stem}.asc")),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(DistroError::PackageFailed(format!(
-                        "{}: {e}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(())
+        // Both spellings of the keyring, because `add_repo` writes whichever one
+        // the key material called for. Hardcoding `.asc` here left a `.gpg` key
+        // in /etc/apt/keyrings forever, for a repository the panel had reported
+        // as removed.
+        let mut paths = vec![PathBuf::from(APT_SOURCES_DIR).join(format!("{stem}.sources"))];
+        paths.extend(apt_key_paths(Path::new(KEYRING_DIR), &stem));
+        unlink_all(&paths)
     }
 }
 
@@ -715,23 +707,12 @@ impl PkgBackend for DnfBackend {
     }
 
     async fn remove_repo(&self, repo_id: &str) -> Result<()> {
+        // rpm keys carry no extension, so there is only ever one name to unlink.
         let stem = format!("unihelm-{repo_id}");
-        for path in [
+        unlink_all(&[
             PathBuf::from(YUM_REPOS_DIR).join(format!("{stem}.repo")),
             PathBuf::from(RPM_GPG_DIR).join(format!("RPM-GPG-KEY-{stem}")),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(DistroError::PackageFailed(format!(
-                        "{}: {e}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(())
+        ])
     }
 }
 
@@ -748,6 +729,86 @@ fn deb_arch() -> &'static str {
         "aarch64" => "arm64",
         other => other,
     }
+}
+
+/// Both names an apt signing key can have.
+///
+/// `add_repo` writes exactly one of these — which one depends on the key the
+/// vendor served — so anything that cleans up after it has to consider both.
+fn apt_key_paths(keyring_dir: &Path, stem: &str) -> [PathBuf; 2] {
+    [
+        keyring_dir.join(format!("{stem}.asc")),
+        keyring_dir.join(format!("{stem}.gpg")),
+    ]
+}
+
+/// Save a repository signing key under the extension its bytes call for.
+///
+/// apt does not sniff a keyring named in `Signed-By:`; it reads `.asc` as
+/// ASCII-armored and `.gpg` as binary, and a mismatch is not a warning but a
+/// repository apt refuses as unsigned. This used to hardcode `.asc`, and Surý
+/// publishes packages.sury.org/php/apt.gpg as *binary* OpenPGP: the panel
+/// verified the key, wrote it, said the repository was added, and every PHP
+/// version was then uninstallable with `NO_PUBKEY` on the next `apt update`.
+/// The armour check is the whole fix — `Signed-By` interpolates the path this
+/// returns, so the sources file follows.
+fn write_apt_key(
+    keyring_dir: &Path,
+    stem: &str,
+    key_material: &[u8],
+    log: &dyn LogSink,
+) -> Result<PathBuf> {
+    let armored = crate::pgp::looks_armored(key_material);
+    let path = keyring_dir.join(format!("{stem}.{}", if armored { "asc" } else { "gpg" }));
+    write_root_file(&path, key_material, 0o644)?;
+    log.line(&format!(
+        "wrote {} ({})",
+        path.display(),
+        if armored {
+            "ASCII-armored OpenPGP"
+        } else {
+            "binary OpenPGP"
+        }
+    ));
+
+    // A vendor that changes format — or a server that was set up by the build
+    // that always wrote `.asc` — would otherwise keep an unparseable keyring
+    // sitting next to the good one, for the next operator to debug.
+    for stale in apt_key_paths(keyring_dir, stem) {
+        if stale == path {
+            continue;
+        }
+        match std::fs::remove_file(&stale) {
+            Ok(()) => log.line(&format!(
+                "removed {}, which held this key in the other format",
+                stale.display()
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Not fatal: the key apt will actually read is already in place.
+            // Saying so beats a silent leftover.
+            Err(e) => log.line(&format!("could not remove {}: {e}", stale.display())),
+        }
+    }
+
+    Ok(path)
+}
+
+/// Unlink managed files, treating "already gone" as done rather than as an
+/// error — removing a repository twice is not a failure.
+fn unlink_all(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(DistroError::PackageFailed(format!(
+                    "{}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write a root-owned config file, creating its directory if needed.
@@ -925,6 +986,83 @@ mod tests {
             repo(&["573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"]).file_stem(),
             "unihelm-nginx"
         );
+    }
+
+    /// Raw binary OpenPGP, the shape packages.sury.org/php/apt.gpg is served in.
+    ///
+    /// The bytes need only be un-armored: by the time key material reaches the
+    /// writer, `verify_pinned` has already decided it is the right key.
+    fn binary_key() -> Vec<u8> {
+        let mut body = vec![4]; // v4 public key packet
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(1); // RSA
+        body.extend_from_slice(&8u16.to_be_bytes());
+        body.push(0xAB);
+        let mut packet = vec![0xC6, body.len() as u8];
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// The armored form, as PostgreSQL and MongoDB publish it.
+    fn armored_key() -> Vec<u8> {
+        b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQENBGaSURYBCAC0\n=Ab12\n-----END PGP PUBLIC KEY BLOCK-----\n".to_vec()
+    }
+
+    #[test]
+    fn a_binary_signing_key_is_stored_as_gpg_and_an_armored_one_as_asc() {
+        // apt reads a `Signed-By:` keyring by extension, not by sniffing. When
+        // this assumed `.asc`, Surý's binary key was unreadable and every PHP
+        // version failed to install with `NO_PUBKEY` — while the panel reported
+        // the repository as added.
+        let dir = tempfile::tempdir().unwrap();
+
+        let binary =
+            write_apt_key(dir.path(), "unihelm-php-sury", &binary_key(), &NullLog).unwrap();
+        assert_eq!(
+            binary.file_name().unwrap(),
+            "unihelm-php-sury.gpg",
+            "binary key material must not be given an armored extension"
+        );
+        assert_eq!(
+            std::fs::read(&binary).unwrap(),
+            binary_key(),
+            "the key is stored verbatim; only its name is chosen"
+        );
+
+        let armored = write_apt_key(dir.path(), "unihelm-pgdg", &armored_key(), &NullLog).unwrap();
+        assert_eq!(armored.file_name().unwrap(), "unihelm-pgdg.asc");
+    }
+
+    #[test]
+    fn re_adding_a_repository_in_the_other_format_leaves_no_unreadable_key_behind() {
+        // The upgrade path off the broken build: the server already has a `.asc`
+        // holding binary bytes, and apt must not be left with two candidate
+        // keyrings when the correct one is written.
+        let dir = tempfile::tempdir().unwrap();
+        let stale =
+            write_apt_key(dir.path(), "unihelm-php-sury", &armored_key(), &NullLog).unwrap();
+        let fresh = write_apt_key(dir.path(), "unihelm-php-sury", &binary_key(), &NullLog).unwrap();
+
+        assert!(fresh.exists());
+        assert!(!stale.exists(), "{} survived the rewrite", stale.display());
+    }
+
+    #[test]
+    fn removing_a_repository_unlinks_the_keyring_under_either_extension() {
+        // Removal used to hardcode `.asc`, so a binary key stayed in
+        // /etc/apt/keyrings forever after the panel said the repo was gone.
+        for material in [binary_key(), armored_key()] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = write_apt_key(dir.path(), "unihelm-php-sury", &material, &NullLog).unwrap();
+            assert!(key.exists());
+
+            unlink_all(&apt_key_paths(dir.path(), "unihelm-php-sury")).unwrap();
+            assert!(!key.exists(), "{} survived removal", key.display());
+        }
+
+        // Removing a repository that was never added is not a failure.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(unlink_all(&apt_key_paths(dir.path(), "unihelm-absent")).is_ok());
     }
 
     #[test]

@@ -619,6 +619,90 @@ mod tests {
         }
     }
 
+    /// A symlink in one tenant's document root must not serve another tenant's
+    /// files.
+    ///
+    /// The web server account is in every tenant's group so it can traverse
+    /// their site directories, so Apache's `+FollowSymLinks` made
+    /// `ln -s /home/other_tenant/sites/x/public/.env .` a working URL — any
+    /// customer who could write a file could read another tenant's, while the
+    /// panel presented the two as isolated. nginx follows any symlink by
+    /// default and had the same hole with nothing written down at all.
+    ///
+    /// `-FollowSymLinks` has to be explicit, which is why this asserts on the
+    /// whole token and not merely on the absence of a `+`: `Options` merges with
+    /// the enclosing block, Debian's stock `<Directory />` grants FollowSymLinks,
+    /// and a directory that ends up with both follows the link unchecked.
+    #[test]
+    fn neither_template_follows_a_symlink_out_of_the_tenant_it_belongs_to() {
+        for ctx in [php_site(), {
+            let mut static_site = php_site();
+            static_site.site_type = SiteType::Static.as_str();
+            static_site
+        }] {
+            let apache = directives_only(&render_apache(&ctx));
+            for line in apache.lines().map(str::trim) {
+                assert!(
+                    !line.starts_with("Options ")
+                        || line
+                            .split_whitespace()
+                            .all(|t| t != "FollowSymLinks" && t != "+FollowSymLinks"),
+                    "this directory follows a symlink whoever owns its target: {line}"
+                );
+            }
+            assert!(
+                apache.contains("Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch"),
+                "the document root does not restrict symlinks to an owner match:\n{apache}"
+            );
+
+            // nginx had the same exposure by default and gets the same rule.
+            // `from=$document_root` checks only below the root; the components
+            // above it are the panel's own and are not a tenant's to plant.
+            let nginx = directives_only(&render_site(&ctx));
+            assert!(
+                nginx.contains("disable_symlinks if_not_owner from=$document_root;"),
+                "nginx follows a planted symlink into another tenant's files:\n{nginx}"
+            );
+        }
+    }
+
+    /// The companion to `a_htaccess_cannot_re_grant_what_the_vhost_denied`, for
+    /// the other half of what an override hands back.
+    ///
+    /// The owner check above is worth nothing if a one-line `.htaccess` — which
+    /// the customer, or a compromised plugin, can write — is allowed to say
+    /// `Options +FollowSymLinks`. `Options=` names exactly which options a
+    /// `.htaccess` may set, and FollowSymLinks was in that list.
+    #[test]
+    fn a_htaccess_can_only_be_given_the_owner_matched_symlink_option() {
+        for ctx in [php_site(), {
+            let mut static_site = php_site();
+            static_site.site_type = SiteType::Static.as_str();
+            static_site
+        }] {
+            let out = directives_only(&render_apache(&ctx));
+            let line = out
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("AllowOverride"))
+                .unwrap_or_else(|| panic!("no AllowOverride:\n{out}"));
+            let overridable = line
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("Options="))
+                .unwrap_or_else(|| panic!("no Options= list to check: {line}"));
+            assert!(
+                !overridable.split(',').any(|opt| opt == "FollowSymLinks"),
+                "a one-line .htaccess turns unrestricted symlinks back on: {line}"
+            );
+            assert!(
+                overridable
+                    .split(',')
+                    .any(|opt| opt == "SymLinksIfOwnerMatch"),
+                "a .htaccess cannot even keep the owner-matched form: {line}"
+            );
+        }
+    }
+
     /// nginx: `location ~ /\.(?!well-known)` and the dangerous-extension list.
     #[test]
     fn apache_denies_dotfiles_and_leftovers_the_way_nginx_does() {

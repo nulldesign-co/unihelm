@@ -259,6 +259,76 @@ fn mysql_account(user: &DbName) -> String {
     format!("'{}'@'localhost'", user.as_str())
 }
 
+/// Escape the `LIKE` metacharacters in a database name.
+///
+/// MySQL and MariaDB match the database part of a database-level `GRANT` as a
+/// pattern, not as a name: `_` matches any single character, `%` any run of
+/// them. `DbName::parse` allows `_`, so `shop_db` is an ordinary name here.
+///
+/// `%` is escaped as well. `DbName` cannot produce one today — the assertion
+/// below says so — but the escaping is written for the alphabet this function
+/// might be handed, not the one it happens to get, because whoever widens the
+/// newtype will not come looking for this function.
+fn escape_like_metacharacters(name: &DbName) -> String {
+    debug_assert!(
+        !name.as_str().bytes().any(|b| b == b'`' || b == b'\\'),
+        "DbName widened to allow backticks or backslashes; the quoting here no longer holds"
+    );
+    name.as_str().replace('_', "\\_").replace('%', "\\%")
+}
+
+/// Render a [`DbName`] for the **database position of a MySQL `GRANT`**, which
+/// is a pattern position and nothing like an identifier position.
+///
+/// This existed as a bare `{}.*` and gave every tenant privileges on their
+/// neighbours' data: `GRANT ALL PRIVILEGES ON shop_db.*` grants on everything
+/// matching `shop?db`, so a customer creating `shop_db` on a shared host was
+/// silently handed `shopadb`, `shop1db` and the rest — full access, invisible
+/// in the panel, and no error anywhere to notice it by.
+///
+/// Backticks alone do not disarm the pattern; the escape has to go *inside*
+/// them, which is the form the MySQL manual prescribes: `` `shop\_db` ``.
+fn mysql_grant_pattern(name: &DbName) -> String {
+    format!("`{}`", escape_like_metacharacters(name))
+}
+
+/// The `mysql.db` predicate matching every privilege row this panel could have
+/// written for `name`.
+///
+/// `mysql.db.Db` holds the grant's *pattern*, stored exactly as the statement
+/// spelled it — so a grant written by [`mysql_grant_pattern`] leaves the eight
+/// characters `shop\_db` there, which `Db = 'shop_db'` walks straight past.
+/// Missing that row would undo what the cleanup in [`sql_drop_db`] exists for:
+/// MySQL keeps privilege rows after a `DROP DATABASE`, so the next tenant
+/// handed the same name inherits them. Grants written before the escaping (and
+/// any made by hand) carry the bare name, so both forms are matched.
+///
+/// The backslash is spelled `0x5C` because a backslash *inside a literal* means
+/// one thing under `NO_BACKSLASH_ESCAPES` and another without it — the very
+/// ambiguity [`quote_str`] refuses to inherit — while a hex literal means the
+/// same byte under every `sql_mode`.
+fn mysql_db_privilege_match(name: &DbName) -> String {
+    let bare = quote_name(name);
+    let escaped = escape_like_metacharacters(name);
+    if escaped == name.as_str() {
+        // Nothing to escape, so the grant wrote the bare name and one form is
+        // the whole story.
+        return format!("Db = {bare}");
+    }
+    // `shop\_db` becomes CONCAT('shop', 0x5C, '_db'): the chunks between the
+    // backslashes, quoted, with the backslash itself supplied as a hex literal.
+    let mut args: Vec<String> = Vec::new();
+    for (i, chunk) in escaped.split('\\').enumerate() {
+        if i > 0 {
+            args.push("0x5C".to_string());
+        }
+        if !chunk.is_empty() {
+            args.push(format!("'{chunk}'"));
+        }
+    }
+    format!("Db IN ({bare}, CONCAT({}))", args.join(", "))
+}
+
 pub fn sql_db_exists(engine: DbEngine, name: &DbName) -> String {
     match engine {
         DbEngine::Mysql => format!(
@@ -292,13 +362,18 @@ pub fn sql_user_exists(engine: DbEngine, user: &DbName) -> String {
 /// PostgreSQL expresses ownership in the CREATE itself (`OWNER`), which is the
 /// strong form: the owner holds every privilege on the database. MySQL has no
 /// per-database owner, so the closest equivalent is `GRANT ALL ON name.*`.
+///
+/// The two MySQL statements name the same database in two different languages:
+/// CREATE takes an identifier, so the name goes in as written, while GRANT
+/// takes a pattern and goes through [`mysql_grant_pattern`]. Swapping them
+/// would create a database with a literal backslash in its name.
 pub fn sql_create_db(engine: DbEngine, name: &DbName, owner: Option<&DbName>) -> String {
     match (engine, owner) {
         (DbEngine::Mysql, None) => format!("CREATE DATABASE {};\n", name.as_str()),
         (DbEngine::Mysql, Some(user)) => format!(
             "CREATE DATABASE {};\nGRANT ALL PRIVILEGES ON {}.* TO {};\n",
             name.as_str(),
-            name.as_str(),
+            mysql_grant_pattern(name),
             mysql_account(user)
         ),
         (DbEngine::Postgres, None) => format!("CREATE DATABASE {};\n", pg_ident(name)),
@@ -319,14 +394,19 @@ pub fn sql_drop_db(engine: DbEngine, name: &DbName) -> String {
         // inherits whatever the last one's users were granted on it. The
         // privilege tables are cleared explicitly, and FLUSH makes the running
         // server forget the in-memory copy it would otherwise keep serving.
+        //
+        // Only mysql.db holds a pattern (hence mysql_db_privilege_match, which
+        // also matches the escaped spelling a database-level GRANT stores);
+        // table- and column-level grants cannot be patterns, so those rows carry
+        // the bare name. DROP DATABASE itself names an identifier, unescaped.
         DbEngine::Mysql => format!(
             "DROP DATABASE IF EXISTS {};\n\
-             DELETE FROM mysql.db WHERE Db = {};\n\
+             DELETE FROM mysql.db WHERE {};\n\
              DELETE FROM mysql.tables_priv WHERE Db = {};\n\
              DELETE FROM mysql.columns_priv WHERE Db = {};\n\
              FLUSH PRIVILEGES;\n",
             name.as_str(),
-            quote_name(name),
+            mysql_db_privilege_match(name),
             quote_name(name),
             quote_name(name)
         ),
@@ -375,7 +455,7 @@ pub fn sql_grant(engine: DbEngine, name: &DbName, user: &DbName) -> String {
     match engine {
         DbEngine::Mysql => format!(
             "GRANT ALL PRIVILEGES ON {}.* TO {};\n",
-            name.as_str(),
+            mysql_grant_pattern(name),
             mysql_account(user)
         ),
         DbEngine::Postgres => format!(
@@ -1275,7 +1355,7 @@ mod tests {
         let owner = DbName::parse("shop_rw").unwrap();
         assert_eq!(
             sql_create_db(DbEngine::Mysql, &name, Some(&owner)),
-            "CREATE DATABASE shop;\nGRANT ALL PRIVILEGES ON shop.* TO 'shop_rw'@'localhost';\n"
+            "CREATE DATABASE shop;\nGRANT ALL PRIVILEGES ON `shop`.* TO 'shop_rw'@'localhost';\n"
         );
         assert_eq!(
             sql_create_db(DbEngine::Postgres, &name, Some(&owner)),
@@ -1850,7 +1930,56 @@ mod tests {
         assert_eq!(out["granted"], true);
         assert_eq!(
             sh.recorded()[0].sql,
-            "GRANT ALL PRIVILEGES ON shop.* TO 'shop_rw'@'localhost';\n"
+            "GRANT ALL PRIVILEGES ON `shop`.* TO 'shop_rw'@'localhost';\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_on_an_underscored_name_stays_inside_the_tenants_own_database() {
+        // The reported case, end to end: MySQL reads a GRANT's database part as
+        // a pattern, so a tenant creating `shop_db` was granted everything
+        // matching `shop?db` — their neighbours' databases on a shared server.
+        let (reg, _, customer, sh) = setup().await;
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.user.create",
+            json!({ "username": "shop_rw", "engine": "mysql" }),
+        )
+        .await
+        .unwrap();
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "shop_db", "engine": "mysql", "owner": "shop_rw" }),
+        )
+        .await
+        .unwrap();
+
+        // Both halves of the owner-binding batch, each in its own language: an
+        // identifier for CREATE, an escaped pattern for GRANT.
+        assert_eq!(
+            sh.recorded().last().unwrap().sql,
+            "CREATE DATABASE shop_db;\n\
+             GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
+        );
+        sh.clear();
+
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.grant",
+            json!({ "database": "shop_db", "username": "shop_rw" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sh.recorded()[0].sql,
+            "GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
         );
     }
 
@@ -1936,5 +2065,73 @@ mod tenancy_tests {
                 );
             }
         }
+    }
+
+    /// The database part of a MySQL GRANT is a `LIKE` pattern, so `_` matches
+    /// any single character. Granting on a bare `shop_db` therefore granted
+    /// `shop1db`, `shopAdb` and every other neighbour on a shared host — full
+    /// privileges on another customer's data, with nothing in the panel to show
+    /// for it.
+    #[test]
+    fn a_mysql_grant_escapes_the_underscore_that_would_match_other_tenants_databases() {
+        let name = DbName::parse("shop_db").unwrap();
+        let user = DbName::parse("shop_rw").unwrap();
+
+        assert_eq!(
+            sql_grant(DbEngine::Mysql, &name, &user),
+            "GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
+        );
+        // db.create binds an owner with a grant of its own, walking into the
+        // same trap from the other direction.
+        assert_eq!(
+            sql_create_db(DbEngine::Mysql, &name, Some(&user)),
+            "CREATE DATABASE shop_db;\n\
+             GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
+        );
+    }
+
+    /// The escape belongs in the GRANT and nowhere else: CREATE and DROP name
+    /// an identifier, and `CREATE DATABASE shop\_db` would make a database with
+    /// a backslash in its name that nothing else in the panel could address.
+    #[test]
+    fn create_and_drop_name_the_database_literally_not_as_a_pattern() {
+        let name = DbName::parse("shop_db").unwrap();
+
+        assert_eq!(
+            sql_create_db(DbEngine::Mysql, &name, None),
+            "CREATE DATABASE shop_db;\n"
+        );
+        assert!(
+            sql_drop_db(DbEngine::Mysql, &name).starts_with("DROP DATABASE IF EXISTS shop_db;\n"),
+            "{}",
+            sql_drop_db(DbEngine::Mysql, &name)
+        );
+    }
+
+    /// The privilege cleanup has to find the row the escaped grant actually
+    /// wrote. MySQL stores a database-level grant's pattern verbatim, so the
+    /// grant above leaves `shop\_db` in mysql.db and a `Db = 'shop_db'`
+    /// predicate walks past it — handing the privileges to the next tenant
+    /// given that name, which is exactly what this cleanup exists to stop.
+    #[test]
+    fn dropping_a_database_clears_the_escaped_privilege_rows_as_well() {
+        let sql = sql_drop_db(DbEngine::Mysql, &DbName::parse("shop_db").unwrap());
+
+        assert!(
+            sql.contains(
+                "DELETE FROM mysql.db WHERE Db IN ('shop_db', CONCAT('shop', 0x5C, '_db'));"
+            ),
+            "the escaped grant row survives the drop:\n{sql}"
+        );
+        // Table- and column-level grants cannot be patterns, so those rows hold
+        // the bare name and keep the bare predicate.
+        assert!(
+            sql.contains("DELETE FROM mysql.tables_priv WHERE Db = 'shop_db';"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DELETE FROM mysql.columns_priv WHERE Db = 'shop_db';"),
+            "{sql}"
+        );
     }
 }

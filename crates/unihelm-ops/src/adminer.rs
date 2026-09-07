@@ -21,13 +21,16 @@
 //!
 //! 1. Downloads the pinned Adminer release (single PHP file) over HTTPS and
 //!    refuses to install it unless its SHA-256 matches [`ADMINER_SHA256`].
-//! 2. Installs it root-owned 0644 at `/var/lib/unihelm/adminer/adminer.php` —
-//!    the pool that executes the file must never be able to replace it.
-//! 3. Creates a dedicated FPM pool on the **highest installed PHP version**
-//!    (from `stack_components`), running as the panel's own `unihelm` user —
-//!    not a tenant, not the web server user — with `open_basedir` locked to
+//! 2. Makes sure the dedicated [`RUNTIME_USER`] system account exists — the
+//!    uid boundary between a database browser and the panel's own database.
+//! 3. Installs the script root-owned 0644 at
+//!    `/var/lib/unihelm/adminer/adminer.php` — the pool that executes the file
+//!    must never be able to replace it.
+//! 4. Creates a dedicated FPM pool on the **highest installed PHP version**
+//!    (from `stack_components`), running as [`RUNTIME_USER`] — not a tenant,
+//!    not the panel, not the web server user — with `open_basedir` locked to
 //!    the Adminer directory plus `/tmp`.
-//! 4. Renders the loopback-only nginx server block. Both files go through the
+//! 5. Renders the loopback-only nginx server block. Both files go through the
 //!    config engine: validate before reload, roll back on failure, revisions
 //!    recorded.
 
@@ -76,11 +79,22 @@ pub const ADMINER_SHA256: &str = "1815c03f26e21d533e729c0b09bc69a59c902a6440409d
 /// source, without the operator reading this file.
 pub const ADMINER_PIN_PROVENANCE: &str = "single-source";
 
-/// The account the Adminer pool runs as: the panel's own unprivileged user
-/// (created by the installer), so a compromise of Adminer lands in the same
-/// sandbox as the panel's web process — not in any tenant's files, and not in
-/// the web server's.
-const RUNTIME_USER: &str = "unihelm";
+/// The account the Adminer pool runs as: an unprivileged system account that
+/// owns nothing but this feature.
+///
+/// It used to be `unihelm` — the account `unihelm-web` runs as, and the owner
+/// of `/var/lib/unihelm` (0750) and of `panel.db` inside it (0640). Running the
+/// Adminer pool as that uid left `open_basedir` and `disable_functions` as the
+/// only thing between a PHP database browser and every session token and admin
+/// password hash the panel holds. Those are interpreter settings, not kernel
+/// ones: one PHP escape, or one later edit to this pool's ini, and Adminer
+/// reads the panel's own database. A separate uid puts that boundary back in
+/// the kernel, where a wrong line in a config file cannot undo it.
+///
+/// Created by the installer on a fresh install and by [`ensure_runtime_user`]
+/// on the enable path, so a server installed before this existed gains the
+/// account by enabling Adminer rather than by reinstalling.
+const RUNTIME_USER: &str = "unihelm-adminer";
 
 /// The site-key used for the pool file name (`unihelm-adminer.conf`) and the
 /// pool/section name. No collision with tenant pools is possible: those are
@@ -242,13 +256,17 @@ pub fn adminer_pool_context(php: PhpVersion, nginx_user: &str) -> PoolContext {
         name: POOL_KEY.into(),
         site_domain: "adminer (panel database browser)".into(),
         php_version: php.as_str().into(),
-        // The panel's own user: not a tenant (Adminer must not inherit any
-        // tenant's file access), not the web server user (nginx's user must
-        // stay a pure consumer of sockets, never an executor of PHP).
+        // Adminer's own account: not a tenant (Adminer must not inherit any
+        // tenant's file access), not the panel (see RUNTIME_USER — that was
+        // the defect), not the web server user (nginx's user must stay a pure
+        // consumer of sockets, never an executor of PHP).
         user: RUNTIME_USER.into(),
         group: RUNTIME_USER.into(),
         socket: paths::fpm_socket(POOL_KEY, php),
         socket_owner: RUNTIME_USER.into(),
+        // The one thing that must *not* move to the dedicated account: nginx
+        // opens this socket as its own user, and a socket it cannot open is a
+        // 502 on every request.
         socket_group: nginx_user.into(),
 
         // An idle admin tool must cost nothing; four workers is plenty for
@@ -375,7 +393,138 @@ async fn php_present(ctx: &OpContext, version: PhpVersion) -> bool {
         .unwrap_or(false)
 }
 
-/// `chown -R unihelm:unihelm` on a scratch directory, loudly non-fatal.
+/// Does an account or a group of this name already resolve?
+///
+/// `getent`, not `/etc/passwd`: an operator whose accounts come from LDAP or
+/// SSSD has no line in the file, and creating a second `unihelm-adminer` over
+/// the top of theirs is worse than reusing it.
+async fn nss_entry_exists(database: &str, name: &str) -> bool {
+    Cmd::new("getent")
+        .args([database, "--"])
+        .arg(name)
+        .run()
+        .await
+        .map(|out| out.success())
+        .unwrap_or(false)
+}
+
+/// Create [`RUNTIME_USER`] and its group if they are not already there.
+///
+/// Idempotent by inspection rather than by swallowing a `useradd` failure:
+/// enabling twice, or enabling on a server whose installer already made the
+/// account, has to converge instead of erroring.
+///
+/// The group is created first and passed with `--gid`, rather than letting
+/// `useradd --user-group` make both: `--user-group` *refuses* when the group
+/// already exists without the account, which is exactly the half-made state a
+/// hand-run `userdel` leaves behind — and the whole point here is that a
+/// second enable cannot fail.
+///
+/// Fatal when it cannot be done, unlike [`chown_runtime_dir`]. The pool file
+/// names this account; without the uid `php-fpm -t` refuses the pool, the
+/// config engine rolls it back, and the operator is handed a validation error
+/// that never mentions the missing account. A refusal that says which account
+/// is missing and how to make it is worth more than that.
+async fn ensure_runtime_user(ctx: &OpContext) -> Result<()> {
+    let nologin = match ctx.distro().info.family {
+        unihelm_distro::Family::Debian => "/usr/sbin/nologin",
+        unihelm_distro::Family::Rhel => "/sbin/nologin",
+    };
+    let refusal = |what: &str, e: unihelm_distro::DistroError| {
+        UnihelmError::new(
+            ErrorCode::CommandFailed,
+            format!(
+                "Adminer runs as its own `{RUNTIME_USER}` system account so that a \
+                 compromised database browser cannot read the panel's own database, \
+                 and creating that {what} failed: {e}. Nothing was installed or \
+                 configured. Create it by hand — `groupadd --system {RUNTIME_USER}` \
+                 then `useradd --system --gid {RUNTIME_USER} --no-create-home \
+                 --shell {nologin} {RUNTIME_USER}` — and enable Adminer again."
+            ),
+        )
+    };
+
+    if !nss_entry_exists("group", RUNTIME_USER).await {
+        Cmd::new("groupadd")
+            .args(["--system", "--"])
+            .arg(RUNTIME_USER)
+            .run_checked()
+            .await
+            .map_err(|e| refusal("group", e))?;
+        ctx.log(format!("created the {RUNTIME_USER} group"));
+    }
+
+    if nss_entry_exists("passwd", RUNTIME_USER).await {
+        ctx.log(format!("account {RUNTIME_USER} already exists"));
+        return Ok(());
+    }
+
+    // `--system` (no aging, low uid), no home, no shell: this account exists
+    // to be one pool's `user =` and nothing else. Nobody logs in as Adminer.
+    Cmd::new("useradd")
+        .args([
+            "--system",
+            "--gid",
+            RUNTIME_USER,
+            "--no-create-home",
+            "--shell",
+            nologin,
+            "--comment",
+            "Unihelm Adminer",
+        ])
+        .arg("--")
+        .arg(RUNTIME_USER)
+        .run_checked()
+        .await
+        .map_err(|e| refusal("account", e))?;
+    ctx.log(format!("created the {RUNTIME_USER} system account"));
+    Ok(())
+}
+
+/// Add `o+x` to the directories *above* Adminer's own so a worker running as
+/// [`RUNTIME_USER`] can reach them.
+///
+/// `/var/lib/unihelm` and `/var/log/unihelm` are 0750 `unihelm:unihelm`. That
+/// cost nothing while the pool ran as `unihelm`; the moment it runs as its own
+/// uid, every path resolution into `.../adminer` stops at the parent, and what
+/// the operator gets is a panel that says "enabled" over an Adminer that
+/// answers 502 with `Permission denied` in a log nobody reads. `stack.rs` does
+/// the same thing for nginx and the ACME webroot, for the same reason.
+///
+/// `o+x` grants traversal, not listing: `panel.db` (0640) and every private
+/// key (0600) stay unreadable to this account either way — which is the entire
+/// point of giving it a separate uid.
+///
+/// Fatal, unlike the chowns below: a runtime user that cannot reach its own
+/// script is not a degraded Adminer, it is one that never answers.
+fn grant_runtime_traversal(dirs: &[PathBuf]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for dir in dirs {
+        // Absent is not a failure: the parents are created by the installer,
+        // and on a development root they may simply not be there yet.
+        let Ok(metadata) = std::fs::metadata(dir) else {
+            continue;
+        };
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode & 0o001 != 0 {
+            continue;
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o001)).map_err(
+            |e| {
+                UnihelmError::internal(format!(
+                    "could not make {} traversable for {RUNTIME_USER}: {e} — Adminer \
+                     cannot reach its own directory without it",
+                    dir.display()
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// `chown -R unihelm-adminer:unihelm-adminer` on a scratch directory, loudly
+/// non-fatal.
 ///
 /// Non-fatal for the same reason `open_web_ports` is: on a real server (agent
 /// runs as root) this succeeds; on a rooted dev instance it cannot, and
@@ -626,7 +775,10 @@ impl TypedOperation for Enable {
             }
         };
 
-        // 2. Install. The agent runs as root, so files it creates are
+        // 2. The account, before anything is chowned to it or names it.
+        ensure_runtime_user(ctx).await?;
+
+        // 3. Install. The agent runs as root, so files it creates are
         //    root-owned; 0644 lets the pool read the script without ever
         //    being able to modify it. The scratch dir is the one place the
         //    runtime user may write.
@@ -638,12 +790,21 @@ impl TypedOperation for Enable {
         std::fs::create_dir_all(paths::adminer_log_dir()).map_err(|e| {
             UnihelmError::internal(format!("could not create the adminer log dir: {e}"))
         })?;
+        // Both scratch trees sit under directories owned by the *panel*
+        // account, so the dedicated uid needs a path through them before the
+        // chowns below are worth anything.
+        grant_runtime_traversal(
+            &[paths::adminer_dir(), paths::adminer_log_dir()]
+                .iter()
+                .filter_map(|dir| dir.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>(),
+        )?;
         chown_runtime_dir(ctx, &paths::adminer_tmp_dir()).await;
-        // PHP workers (running as unihelm) write php-error.log here.
+        // PHP workers (running as RUNTIME_USER) write php-error.log here.
         chown_runtime_dir(ctx, &paths::adminer_log_dir()).await;
         ctx.log(format!("installed {}", script_path.display()));
 
-        // 3. The pool. Same serialisation key and validators as tenant pools
+        // 4. The pool. Same serialisation key and validators as tenant pools
         //    on this PHP version, so concurrent site work cannot interleave.
         std::fs::create_dir_all(paths::fpm_socket_dir()).map_err(|e| {
             UnihelmError::internal(format!("could not create the FPM socket dir: {e}"))
@@ -704,7 +865,7 @@ impl TypedOperation for Enable {
             }
         }
 
-        // 4. The vhost, last: nothing is served until everything behind it
+        // 5. The vhost, last: nothing is served until everything behind it
         //    exists.
         ctx.config()
             .apply(ApplyRequest {
@@ -932,8 +1093,15 @@ mod tests {
 
     // --- the pool ---------------------------------------------------------
 
+    /// Whole directive lines, so `unihelm` cannot pass an assertion by being a
+    /// prefix of `unihelm-adminer` — the exact confusion this file's account
+    /// change is about.
+    fn has_line(rendered: &str, line: &str) -> bool {
+        rendered.lines().any(|l| l.trim() == line)
+    }
+
     #[test]
-    fn the_adminer_pool_runs_as_the_panel_user_inside_its_own_basedir() {
+    fn the_adminer_pool_runs_as_its_own_account_inside_its_own_basedir() {
         let set = TemplateSet::load().unwrap();
         let pool = adminer_pool_context(PhpVersion::V84, "nginx");
         let rendered = set
@@ -941,13 +1109,14 @@ mod tests {
             .unwrap();
         let out = directives_only(&rendered);
 
-        // The user: the panel's own account. Never a tenant, never nginx.
-        assert!(out.contains("user  = unihelm"), "{out}");
-        assert!(out.contains("group = unihelm"));
+        // The user: Adminer's own account. Never a tenant, never nginx, and
+        // never the panel's (see the next test).
+        assert!(has_line(&out, "user  = unihelm-adminer"), "{out}");
+        assert!(has_line(&out, "group = unihelm-adminer"), "{out}");
         // nginx can reach the socket, nothing else can.
-        assert!(out.contains("listen.owner = unihelm"));
-        assert!(out.contains("listen.group = nginx"));
-        assert!(out.contains("listen.mode  = 0660"));
+        assert!(has_line(&out, "listen.owner = unihelm-adminer"), "{out}");
+        assert!(has_line(&out, "listen.group = nginx"), "{out}");
+        assert!(has_line(&out, "listen.mode  = 0660"), "{out}");
 
         // The basedir is the whole isolation story for this pool: the
         // adminer directory (script + scratch) plus /tmp, and nothing that
@@ -962,6 +1131,79 @@ mod tests {
         assert!(out.contains("php_admin_flag[allow_url_fopen] = off"));
         // And not a command runner.
         assert!(out.contains("shell_exec"));
+    }
+
+    #[test]
+    fn the_adminer_pool_never_runs_as_the_account_that_owns_the_panel_database() {
+        // The defect: this pool ran as `unihelm`, the account `unihelm-web`
+        // runs as and the owner of /var/lib/unihelm (0750) and panel.db
+        // (0640). Only `open_basedir` and `disable_functions` — PHP settings,
+        // not kernel ones — stood between a database browser and every session
+        // token and admin password hash. Asserted on the context *and* on the
+        // rendered pool, because both halves have to name the same account for
+        // the uid boundary to exist at all.
+        let pool = adminer_pool_context(PhpVersion::V84, "nginx");
+        for (field, value) in [
+            ("user", &pool.user),
+            ("group", &pool.group),
+            ("socket_owner", &pool.socket_owner),
+        ] {
+            assert_eq!(value, RUNTIME_USER, "{field} must be the dedicated account");
+            assert_ne!(
+                value, "unihelm",
+                "{field} must not be the panel's own account: panel.db is 0640 unihelm:unihelm"
+            );
+        }
+        // nginx opens the socket as itself; moving this to the dedicated
+        // account too would 502 every request.
+        assert_eq!(pool.socket_group, "nginx");
+
+        let set = TemplateSet::load().unwrap();
+        let out = directives_only(
+            &set.render("php/pool.conf", &serde_json::json!({ "pool": pool }))
+                .unwrap(),
+        );
+        assert!(!has_line(&out, "user  = unihelm"), "{out}");
+        assert!(!has_line(&out, "group = unihelm"), "{out}");
+        assert!(!has_line(&out, "listen.owner = unihelm"), "{out}");
+    }
+
+    #[test]
+    fn granting_traversal_lets_the_runtime_user_through_without_letting_it_list() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // /var/lib/unihelm as the installer leaves it: the panel's own, and
+        // opaque to every other account. Adminer's directory is inside it, so
+        // without this the dedicated uid cannot even open adminer.php.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("unihelm");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        grant_runtime_traversal(std::slice::from_ref(&parent)).unwrap();
+
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o751,
+            "expected traverse-only for other, got {mode:o}"
+        );
+        assert_eq!(
+            mode & 0o004,
+            0,
+            "traversal must not become a listing: panel.db's directory stays opaque"
+        );
+
+        // Idempotent, and it never widens a mode that already allows traversal.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        grant_runtime_traversal(std::slice::from_ref(&parent)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        // A parent that is not there yet is not a failure — enable creates the
+        // tree it needs a moment later.
+        grant_runtime_traversal(&[dir.path().join("absent")]).unwrap();
     }
 
     #[test]

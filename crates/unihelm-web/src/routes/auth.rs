@@ -14,7 +14,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{
     CurrentUser, check_rate_limits, clearing_cookie, client_ip, cookie_secure, request_id,
-    session_cookie, verify_or_burn,
+    session_cookie, verify_or_burn_under_budget,
 };
 use crate::error::{ApiError, ApiErrorBody, ApiResult};
 use crate::state::SharedState;
@@ -82,7 +82,7 @@ impl UserView {
         (status = 200, description = "Signed in; the session cookie rides on this response", body = LoginResponse),
         (status = 401, description = "`invalid_credentials`", body = ApiErrorBody),
         (status = 403, description = "`account_suspended`", body = ApiErrorBody),
-        (status = 429, description = "`rate_limited`: too many attempts from this IP or for this account", body = ApiErrorBody),
+        (status = 429, description = "`rate_limited`: too many attempts from this IP or for this account, or too many password checks already running", body = ApiErrorBody),
         (status = 501, description = "`not_implemented`: the account requires TOTP, which this build cannot verify", body = ApiErrorBody),
     ),
 )]
@@ -104,7 +104,21 @@ pub async fn login(
         .find_user_for_login(&username)
         .await
         .map_err(ApiError::from)?;
-    let password_ok = verify_or_burn(user.as_ref(), &body.password);
+    // Only the stored hash crosses to the blocking thread; the account row is
+    // still needed here afterwards. `None` burns a dummy hash for the same
+    // cost, so this call takes the same time either way.
+    //
+    // A refusal here returns before `record_login_attempt`, deliberately: a
+    // login the panel declined to check is not a failed login, and counting it
+    // would let a burst of concurrent requests spend an account's failure
+    // budget and lock the operator out.
+    let password_ok = verify_or_burn_under_budget(
+        &state.password_verifications,
+        user.as_ref().map(|u| u.pass_hash.clone()),
+        body.password,
+    )
+    .await
+    .map_err(|e| e.with_request_id(request_id.clone()))?;
 
     let Some(user) = user.filter(|_| password_ok) else {
         state

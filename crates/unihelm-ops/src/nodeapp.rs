@@ -66,7 +66,9 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use unihelm_config::apply::{ApplyOutcome, ApplyRequest, Reloader, Validator, managed_for};
+use unihelm_config::apply::{
+    ApplyOutcome, ApplyRequest, Reloader, Validator, managed_for, managed_secret_for,
+};
 use unihelm_config::paths;
 use unihelm_core::{
     AppName, Domain, ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantPath,
@@ -776,7 +778,21 @@ async fn apply_app_unit_at(
     let context = AppUnitContext::new(app, name, user, interpreter, env, memory_max_mb);
     ctx.config()
         .apply(ApplyRequest {
-            file: managed_for(path),
+            // 0600, not the 0644 `managed_for` hands out. This file holds every
+            // `Environment=` line the tenant configured — database passwords,
+            // API keys — and it is the *only* place those values are stored;
+            // `carried_environment` reads them back out of it precisely because
+            // nothing else has them. Until this was fixed the unit was
+            // world-readable, so on a shared server any tenant with a shell
+            // could read every other tenant's credentials with one `cat`.
+            // systemd parses units as root, so the bits are not missed.
+            //
+            // It is not retroactive. A unit written by an earlier release keeps
+            // its 0644 until something rewrites it — the next `app.update`, a
+            // runtime change, or a delete-and-recreate. Apps already on a server
+            // stay exposed until then, and an operator who wants them closed
+            // sooner has to chmod the files in /etc/systemd/system themselves.
+            file: managed_secret_for(path),
             template: "systemd/node-app.service",
             context: serde_json::json!({ "app": context }),
             service: SYSTEMD_SERVICE,
@@ -1543,16 +1559,25 @@ async fn rollback_app(
 /// Remove the unit file and its slice drop-in, forgetting their revisions.
 async fn remove_unit_files(ctx: &OpContext, user: &LinuxUser, name: &AppName) {
     let unit_file = unit_file_name(user, name);
-    let paths = [
-        app_unit_path(user, name),
-        paths::systemd_dropin(&unit_file, "unihelm-slice.conf"),
+    // Each path paired with the managed file it was *written* through, because
+    // `remove` puts the file back at `ManagedFile::mode` when systemd objects to
+    // the removal. The unit's must therefore be the same 0600 one
+    // `apply_app_unit_at` uses: a plain `managed_for` here would restore a
+    // tenant's secrets at 0644 on the one path nobody watches, undoing the fix
+    // without saying a word. The slice drop-in is `slices.rs`'s file, holds a
+    // slice name and nothing private, and stays on `managed_for` — restoring it
+    // at anything else would be this module quietly changing another's mode.
+    let files = [
+        managed_secret_for(app_unit_path(user, name)),
+        managed_for(paths::systemd_dropin(&unit_file, "unihelm-slice.conf")),
     ];
 
-    for path in &paths {
+    for file in &files {
+        let path = &file.path;
         match ctx
             .config()
             .remove(
-                &managed_for(path),
+                file,
                 SYSTEMD_SERVICE,
                 &SkipValidation,
                 &DaemonReload {
@@ -2602,6 +2627,122 @@ mod tests {
             "unit files carry the managed header: {on_disk}"
         );
         assert!(on_disk.contains("[Service]"));
+    }
+
+    /// The permission bits of a file, without the file-type bits.
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// A `daemon-reload` that refuses, so the restore half of `remove` runs.
+    struct RefuseReload;
+
+    #[async_trait]
+    impl Reloader for RefuseReload {
+        fn name(&self) -> &'static str {
+            "systemctl daemon-reload"
+        }
+
+        async fn reload(&self) -> std::result::Result<(), String> {
+            Err("Failed to reload daemon: connection refused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unit_holding_a_tenants_secrets_is_written_readable_only_by_root() {
+        // The `Environment=` lines are the app's database password and API keys,
+        // and this file is the only copy of them — `carried_environment` reads
+        // them back out of it. At the 0644 `managed_for` hands out, which is what
+        // this wrote until it was fixed, every tenant on a shared server could
+        // read every other tenant's credentials with one `cat`.
+        //
+        // What is asserted is what a write does *now*. A unit written by an
+        // earlier release keeps its 0644 until something rewrites it, so this
+        // fix reaches an existing app only when it is next updated.
+        let (ctx, _rec) = ctx(Family::Debian).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(unit_file_name(&user(), &name()));
+
+        // `/bin/sh` for the same reason as the test above: `systemd-analyze
+        // verify` refuses an ExecStart that does not exist, and CI has systemd.
+        apply_app_unit_at(
+            &ctx,
+            &path,
+            &app_row(20_000, "apps/blog/server.js"),
+            &name(),
+            &user(),
+            Some(Path::new("/bin/sh")),
+            vec![environment_line(
+                "DATABASE_URL",
+                "postgres://u:hunter2@localhost/db",
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("hunter2"),
+            "the fixture has to actually carry a secret for the mode to matter"
+        );
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "an app unit stores tenant secrets and must not be world-readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_systemd_refuses_puts_the_unit_back_root_only() {
+        // `ConfigEngine::remove` restores the file at `ManagedFile::mode` when
+        // the service objects, so the removal path has to name the same 0600
+        // file the write does. Pointed at `managed_for` — as it was — a
+        // daemon-reload that failed mid-delete would rewrite the tenant's
+        // secrets world-readable and report nothing but the reload error, which
+        // is the silent-loss shape this panel is not allowed to have.
+        let (ctx, _rec) = ctx(Family::Debian).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(unit_file_name(&user(), &name()));
+
+        apply_app_unit_at(
+            &ctx,
+            &path,
+            &app_row(20_000, "apps/blog/server.js"),
+            &name(),
+            &user(),
+            Some(Path::new("/bin/sh")),
+            vec![environment_line(
+                "DATABASE_URL",
+                "postgres://u:hunter2@localhost/db",
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = ctx
+            .config()
+            .remove(
+                &managed_secret_for(&path),
+                SYSTEMD_SERVICE,
+                &SkipValidation,
+                &RefuseReload,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("connection refused"),
+            "the reloader's own words survive: {err}"
+        );
+
+        assert!(path.exists(), "a refused removal restores the unit");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("hunter2"));
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the restored unit must not be looser than the one that was removed"
+        );
     }
 
     #[tokio::test]

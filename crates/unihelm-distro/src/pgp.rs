@@ -393,7 +393,14 @@ fn fingerprint_of(body: &[u8]) -> Option<KeyFingerprint> {
 // ASCII armor
 // ---------------------------------------------------------------------------
 
-fn looks_armored(data: &[u8]) -> bool {
+/// Is this an ASCII-armored block rather than raw binary OpenPGP?
+///
+/// Public because the *name* a key is saved under has to agree with its
+/// contents: apt reads a keyring named in `Signed-By:` according to the file's
+/// extension, so [`crate::pkg`] asks this before choosing `.asc` or `.gpg`.
+/// Guessing instead of asking is what made every PHP install fail — Surý serves
+/// a binary key from a URL ending in `.gpg`, and it was written to a `.asc`.
+pub fn looks_armored(data: &[u8]) -> bool {
     data.starts_with(b"-----BEGIN PGP")
         || data.windows(14).take(4096).any(|w| w == b"-----BEGIN PGP")
 }
@@ -725,6 +732,26 @@ mod tests {
             64,
             "a v6 fingerprint is SHA-256"
         );
+    }
+
+    #[test]
+    fn armored_and_binary_key_material_are_told_apart() {
+        // `pkg.rs` names the keyring file from this answer, and apt parses that
+        // file by its extension — so a wrong answer here is a repository apt
+        // rejects as unsigned, not a cosmetic detail.
+        use base64::Engine;
+        let binary = new_format_packet(6, &v4_key_body(1, 0x5A));
+        assert!(!looks_armored(&binary));
+
+        let armored = format!(
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n{}\n-----END PGP PUBLIC KEY BLOCK-----\n",
+            base64::engine::general_purpose::STANDARD.encode(&binary)
+        );
+        assert!(looks_armored(armored.as_bytes()));
+
+        // Some vendors prepend a comment line before the block.
+        let with_preamble = format!("# fetched from the vendor\n{armored}");
+        assert!(looks_armored(with_preamble.as_bytes()));
     }
 
     #[test]

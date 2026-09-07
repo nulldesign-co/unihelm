@@ -25,6 +25,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError, api, endpoints, type CreateContainerRequest } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
@@ -215,7 +216,9 @@ const fetchContainerLogs = (id: string) =>
  *
  * The lists are textareas of one entry per line rather than repeating field
  * rows: somebody setting up a container usually has these in front of them
- * already, in exactly this shape, from a compose file or a README.
+ * already, in exactly this shape, from a compose file or a README. The one
+ * thing a line cannot carry is who may reach the port, so that is a toggle per
+ * mapping underneath — see `PortVisibility`.
  */
 function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = useTranslation();
@@ -223,31 +226,32 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
   const [image, setImage] = useState("");
   const [name, setName] = useState("");
   const [ports, setPorts] = useState("");
+  // Which mappings the operator has deliberately opened, keyed by the line they
+  // are written on rather than by position: editing a line drops its entry, so
+  // a mapping that changes under an open dialog falls back to the private
+  // default instead of inheriting a decision made about a different port.
+  const [publicPorts, setPublicPorts] = useState<Record<string, boolean>>({});
   const [env, setEnv] = useState("");
   const [volumes, setVolumes] = useState("");
   const [restart, setRestart] = useState<CreateContainerRequest["restart"]>("unless-stopped");
   const [error, setError] = useState<string | null>(null);
 
-  const lines = (text: string) =>
-    text
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
+  const parsedPorts = parsePorts(ports);
 
   const create = useMutation({
     mutationFn: () =>
       endpoints.createContainer({
         image: image.trim(),
         name: name.trim(),
-        ports: lines(ports).map((line) => {
-          const udp = line.endsWith("/udp");
-          const [host, container] = line.replace(/\/(udp|tcp)$/, "").split(":");
-          return {
-            host: Number(host),
-            container: Number(container),
-            udp,
-          };
-        }),
+        // Every line is sent, including one that parsed to nothing: the agent
+        // refuses a malformed mapping by name, and dropping it here would create
+        // the container without the port and call that a success.
+        ports: parsedPorts.map((p) => ({
+          host: p.host,
+          container: p.container,
+          udp: p.udp,
+          public: publicPorts[p.line] ?? false,
+        })),
         env: lines(env).map((line) => {
           const at = line.indexOf("=");
           return { key: line.slice(0, at), value: line.slice(at + 1) };
@@ -264,6 +268,7 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
       setImage("");
       setName("");
       setPorts("");
+      setPublicPorts({});
       setEnv("");
       setVolumes("");
     },
@@ -315,6 +320,12 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
       </Field>
       <p className="-mt-1 mb-3 text-xs text-ink-muted">{t("docker.portsHint")}</p>
 
+      <PortVisibility
+        ports={parsedPorts}
+        opened={publicPorts}
+        onChange={(line, next) => setPublicPorts((prev) => ({ ...prev, [line]: next }))}
+      />
+
       <Field label={t("docker.envLabel")} htmlFor="dk-env">
         <Textarea id="dk-env" rows={2} value={env} onChange={(e) => setEnv(e.target.value)} placeholder="NODE_ENV=production" />
       </Field>
@@ -338,6 +349,88 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
         </Select>
       </Field>
     </Dialog>
+  );
+}
+
+/** One entry per non-empty line, trimmed. The shape every list field here uses. */
+function lines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/** One line of the ports box, read as a mapping. */
+interface ParsedPort {
+  host: number;
+  container: number;
+  udp: boolean;
+  /** The line it came from, which is what the public toggle is keyed by. */
+  line: string;
+}
+
+/**
+ * `host:container`, optionally `/udp` or `/tcp`, one per line.
+ *
+ * Lines that are not a mapping come back with `NaN` rather than being dropped:
+ * the agent names the bad field in its refusal, and a container created quietly
+ * without the port the operator typed is the worse of the two answers.
+ */
+function parsePorts(text: string): ParsedPort[] {
+  return lines(text).map((line) => {
+    const udp = line.endsWith("/udp");
+    const [host, container] = line.replace(/\/(udp|tcp)$/, "").split(":");
+    return { host: Number(host), container: Number(container), udp, line };
+  });
+}
+
+/**
+ * Who may reach each published port — the one control on this page that can
+ * open a hole the Firewall page will not show.
+ *
+ * Docker writes its published-port rule into `PREROUTING`, which is evaluated
+ * before the `INPUT` chain ufw and firewalld use, so a port published on every
+ * interface answers the internet whatever the Firewall page says about it —
+ * and that page, reading the chain the packet never reaches, keeps calling the
+ * port closed. Until 0.7.2 this form had no toggle and always published that
+ * way: every container created here was world-reachable and the panel said
+ * otherwise. Now the agent binds to `127.0.0.1` unless one of these is on.
+ *
+ * Off is the default and stays the default. The label says what turning it on
+ * costs rather than naming the binding, because "bind 0.0.0.0" is a fact about
+ * Docker and "anyone on the internet can reach this" is the decision being
+ * made. A toggle per mapping rather than one for the container: a database and
+ * a web port on the same container are not the same question.
+ */
+function PortVisibility({
+  ports,
+  opened,
+  onChange,
+}: {
+  ports: ParsedPort[];
+  opened: Record<string, boolean>;
+  onChange: (line: string, next: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  // Only mappings that parsed get a toggle. A half-typed line has no port
+  // number to name in the label, and the agent is about to refuse it anyway;
+  // it still travels with the request, and still travels private.
+  const mapped = ports.filter((p) => Number.isFinite(p.host) && Number.isFinite(p.container));
+  if (mapped.length === 0) return null;
+
+  return (
+    <div className="mb-3 rounded-lg border border-border bg-surface-muted/50 px-3 py-1.5">
+      <p className="mt-1.5 text-xs font-medium text-ink">{t("docker.portVisibility")}</p>
+      {mapped.map((p) => (
+        <Switch
+          key={p.line}
+          checked={opened[p.line] ?? false}
+          onChange={(next) => onChange(p.line, next)}
+          label={t("docker.portPublic", { port: p.host, protocol: p.udp ? "UDP" : "TCP" })}
+          description={t("docker.portPublicHint")}
+        />
+      ))}
+    </div>
   );
 }
 

@@ -382,6 +382,10 @@ export const en = {
     },
   },
   docker: {
+    portVisibility: "Who can reach these ports",
+    portPublic: "Open {{port}}/{{protocol}} to the internet",
+    portPublicHint:
+      "Off, the port answers only on this server (127.0.0.1) and you reach it through a site or an SSH tunnel. On, anyone can reach it — and Docker's own rule runs before the firewall, so the Firewall page will not show it and cannot close it.",
     create: "New container",
     createTitle: "Create a container",
     createHint: "It is pulled and started straight away.",

@@ -79,6 +79,22 @@ server {
     root {{ site.document_root }};
     index index.php index.html index.htm;
 
+    # Symlinks only where the link and its target have the same owner.
+    #
+    # nginx follows any symlink by default, and the worker is in every tenant's
+    # group so it can traverse their site directories, so a link planted in one
+    # document root served another tenant's files. That is the exposure spelled
+    # out at length over the Apache template's `Options` line, and it was here
+    # too with nothing written down at all. `from=$document_root` checks only
+    # the components below the root: everything above it was created by the
+    # panel and is not a tenant's to plant, and checking it would cost a stat
+    # per path element on every request for nothing.
+    #
+    # Deliberate behaviour change, and the same one Apache now makes: a deploy
+    # that symlinks a shared vendor, media or release directory owned by another
+    # account stops being served. Copy it, or make the owners match.
+    disable_symlinks if_not_owner from=$document_root;
+
     access_log {{ site.access_log }} combined;
     error_log  {{ site.error_log }} warn;
 

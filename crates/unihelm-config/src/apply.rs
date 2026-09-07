@@ -381,6 +381,12 @@ fn restore(path: &Path, snapshot: &Option<String>, mode: u32) -> Result<()> {
 }
 
 /// A managed file whose comment style follows its extension.
+///
+/// World-readable, because most of what the panel writes is meant to be: an
+/// nginx include is read by nginx, a logrotate stanza by logrotate, and an
+/// operator reading `/etc/nginx/sites-available` is doing their job. Anything
+/// whose *contents* are a secret must not come through here — see
+/// [`managed_secret_for`].
 pub fn managed_for(path: impl Into<PathBuf>) -> ManagedFile {
     let path: PathBuf = path.into();
     let style = match path.extension().and_then(|e| e.to_str()) {
@@ -393,5 +399,23 @@ pub fn managed_for(path: impl Into<PathBuf>) -> ManagedFile {
         path,
         mode: 0o644,
         comment_style: style,
+    }
+}
+
+/// The same, for a file that *stores* a tenant's secrets: root-only, 0600.
+///
+/// The mode is the whole difference. [`managed_for`]'s 0644 is right for
+/// configuration a human is meant to be able to read, and wrong for a file that
+/// is the only copy of a database password — on a shared server every other
+/// tenant has a shell account, and 0644 hands each of them everyone else's
+/// credentials for the cost of a `cat`. That is what happened to Node app units,
+/// which carry every `Environment=` line their tenant configured.
+///
+/// Nothing is lost by tightening it: the daemons that read these files
+/// (systemd above all) read them as root, before dropping privileges.
+pub fn managed_secret_for(path: impl Into<PathBuf>) -> ManagedFile {
+    ManagedFile {
+        mode: 0o600,
+        ..managed_for(path)
     }
 }

@@ -85,6 +85,14 @@ readonly DATA_DIR=/var/lib/unihelm
 readonly LOG_DIR=/var/log/unihelm
 readonly UNIT_DIR=/etc/systemd/system
 readonly SERVICE_USER=unihelm
+# Adminer's php-fpm pool runs as this, never as $SERVICE_USER. $SERVICE_USER
+# owns $DATA_DIR (0750) and panel.db inside it (0640), so a database browser
+# running as it would be one PHP escape away from every session token and admin
+# password hash — a boundary made of `open_basedir` rather than of uids. Made
+# here as well as by `db.adminer.enable` so a fresh server and an upgraded one
+# have the same accounts; the panel's own copy is in
+# crates/unihelm-ops/src/adminer.rs (RUNTIME_USER) and the two must agree.
+readonly ADMINER_USER=unihelm-adminer
 readonly BINARIES=(unihelm-agentd unihelm-web unihelm)
 
 SOURCE_DIR=""
@@ -679,21 +687,38 @@ run_preflight() {
   return 0
 }
 
-create_service_account() {
-  step "Creating the $SERVICE_USER account"
-  if id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    info "already exists"
+# One system account: no shell, no login, no home of its own. `nologin` is in
+# different places on the two families and neither has both, so the second call
+# is the other family's path rather than a failure.
+#
+# The group is made first and passed with --gid instead of letting --user-group
+# make both: --user-group refuses outright when the group already exists without
+# the account, which is what a hand-run `userdel` leaves behind — and re-running
+# this installer over an existing server has to converge, not die.
+create_system_account() { # name, comment, home
+  local name="$1" comment="$2" home="$3"
+  if id -u "$name" >/dev/null 2>&1; then
+    info "$name already exists"
     return 0
   fi
-  # A system account with no shell and no login: it exists to own a socket and
-  # a database file, not to be signed into.
-  useradd --system --user-group --no-create-home \
-    --home-dir "$DATA_DIR" --shell /usr/sbin/nologin \
-    --comment "Unihelm panel" "$SERVICE_USER" 2>/dev/null ||
-    useradd --system --user-group --no-create-home \
-      --home-dir "$DATA_DIR" --shell /sbin/nologin \
-      --comment "Unihelm panel" "$SERVICE_USER"
-  info "created"
+  getent group "$name" >/dev/null 2>&1 || groupadd --system "$name"
+  useradd --system --gid "$name" --no-create-home \
+    --home-dir "$home" --shell /usr/sbin/nologin \
+    --comment "$comment" "$name" 2>/dev/null ||
+    useradd --system --gid "$name" --no-create-home \
+      --home-dir "$home" --shell /sbin/nologin \
+      --comment "$comment" "$name"
+  info "$name created"
+  return 0
+}
+
+create_service_account() {
+  step "Creating the $SERVICE_USER and $ADMINER_USER accounts"
+  # It exists to own a socket and a database file, not to be signed into.
+  create_system_account "$SERVICE_USER" "Unihelm panel" "$DATA_DIR"
+  # And this one exists to be the `user =` of exactly one php-fpm pool, so that
+  # Adminer's uid is not the uid that can read panel.db. See $ADMINER_USER.
+  create_system_account "$ADMINER_USER" "Unihelm Adminer" "$DATA_DIR/adminer"
   return 0
 }
 

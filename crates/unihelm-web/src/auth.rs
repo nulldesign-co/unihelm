@@ -11,7 +11,9 @@
 //! - failed logins are counted per address *and* per account, so neither a
 //!   spray across accounts nor a focus on one gets an unlimited budget;
 //! - an unknown username still costs a full argon2 verification, so response
-//!   time does not tell an attacker which accounts exist.
+//!   time does not tell an attacker which accounts exist;
+//! - and because that verification is expensive on purpose, only a few may run
+//!   at once, off the async runtime — see [`PASSWORD_VERIFY_PERMITS`].
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -19,6 +21,7 @@ use axum::http::{HeaderMap, Method};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use std::net::SocketAddr;
 use time::Duration;
+use tokio::sync::Semaphore;
 use unihelm_core::{AuthContext, ErrorCode, Role, TenantScope};
 use unihelm_db::models::{Session, User};
 use unihelm_db::{Db, password};
@@ -35,6 +38,21 @@ const IP_FAILURE_LIMIT: i64 = 10;
 /// Per-account limit, lower because a targeted attack is the more dangerous one.
 const ACCOUNT_FAILURE_LIMIT: i64 = 5;
 const FAILURE_WINDOW: Duration = Duration::minutes(15);
+
+/// How many argon2 verifications the panel will run at the same time.
+///
+/// Each one costs 19 MiB and two passes over it, and until this existed the
+/// login handler ran them inline on the async runtime with no limit at all. A
+/// few dozen simultaneous POSTs to `/api/auth/login` — which needs no account
+/// and no session — parked every runtime worker on a memory-hard hash and took
+/// the whole panel down with them: not just logins, every request, including
+/// the operator's attempt to look at what was happening.
+///
+/// Four, because the panel targets a 1 GB VPS whose real job is hosting the
+/// sites: ~76 MiB of hashing is a spike that box survives, and anything past
+/// that is refused rather than queued (queueing is the same outage arriving a
+/// few seconds later).
+pub const PASSWORD_VERIFY_PERMITS: usize = 4;
 
 /// The authenticated caller, extracted on every protected route.
 pub struct CurrentUser {
@@ -269,16 +287,39 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
 /// Loopback is the right test rather than "is TLS off": `unihelm cert panel`
 /// renders `proxy_pass https://127.0.0.1:8088`, so nginx keeps talking to a
 /// panel whose own TLS is still on, and it reaches us over loopback either way.
+///
+/// The entry we take is the **last** one, not the first. Trusting the proxy is
+/// not the same as trusting the header it forwards: nginx's
+/// `$proxy_add_x_forwarded_for` and Apache's mod_proxy both *append* the address
+/// they actually saw to whatever the client sent, so the first entry is the
+/// client's own writing and only the last one is the proxy's. Reading the first
+/// meant any caller could put an address at the front and have the panel adopt
+/// it — into the audit trail, into the per-IP login budget, and into the list
+/// Sentinel hands the firewall. Six failed logins with a chosen address in front
+/// were enough to get a bystander, or the operator's own office, banned from the
+/// server. The panel vhosts now pin the header to one hop as well, but this side
+/// has to hold on its own: a vhost only changes on the next render, and the
+/// panel is reachable on 0.0.0.0 without one.
 pub fn client_ip(peer: Option<&SocketAddr>, headers: &HeaderMap) -> String {
     let from_proxy = peer.is_some_and(|a| a.ip().is_loopback());
     if from_proxy
-        && let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(first) = value.split(',').next()
+        // Last header line, then that line's last element: "the proxy appends"
+        // is only true at the very end of the field, and HTTP lets one field
+        // arrive split across several lines.
+        && let Some(value) = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+        && let Some(last) = value.rsplit(',').next()
     {
-        let candidate = first.trim();
+        let candidate = last.trim();
         if !candidate.is_empty() && candidate.parse::<std::net::IpAddr>().is_ok() {
             return candidate.to_string();
         }
+        // The proxy's own entry is unreadable, so there is nothing here we are
+        // entitled to believe. Fall through to the peer rather than reach back
+        // into the part of the chain the client wrote.
     }
     peer.map(|a| a.ip().to_string())
         .unwrap_or_else(|| "unknown".into())
@@ -287,15 +328,61 @@ pub fn client_ip(peer: Option<&SocketAddr>, headers: &HeaderMap) -> String {
 /// Verify a password against an account that may not exist.
 ///
 /// Always performs one argon2 verification, so the timing of "no such user" and
-/// "wrong password" match.
-pub fn verify_or_burn(user: Option<&User>, password_input: &str) -> bool {
-    match user {
-        Some(u) => password::verify_password(password_input, &u.pass_hash),
+/// "wrong password" match. Blocking and CPU-bound — call it through
+/// [`verify_or_burn_under_budget`] rather than from an async context.
+pub fn verify_or_burn(stored_hash: Option<&str>, password_input: &str) -> bool {
+    match stored_hash {
+        Some(hash) => password::verify_password(password_input, hash),
         None => {
             password::verify_dummy(password_input);
             false
         }
     }
+}
+
+/// One [`verify_or_burn`], on a blocking thread and inside the panel's hashing
+/// budget.
+///
+/// Two things here are load-bearing.
+///
+/// **The permit is taken, not waited for.** `try_acquire` fails immediately when
+/// [`PASSWORD_VERIFY_PERMITS`] verifications are already running, and the caller
+/// gets a 429. Queueing instead would let an unauthenticated burst accumulate
+/// arbitrarily much pending argon2 work — the same collapse, just later.
+///
+/// **The burn is inside the permit too.** An unknown username costs a permit,
+/// a blocking thread and a full hash exactly like a known one. Skipping the
+/// dummy verification when the budget is tight would make "no such account"
+/// the fast answer and turn the login form into a username oracle.
+pub async fn verify_or_burn_under_budget(
+    budget: &Semaphore,
+    stored_hash: Option<String>,
+    password_input: String,
+) -> ApiResult<bool> {
+    let _permit = budget.try_acquire().map_err(|_| {
+        ApiError::code(
+            ErrorCode::RateLimited,
+            format!(
+                "the panel is already checking {PASSWORD_VERIFY_PERMITS} passwords at once, \
+                 so this attempt was refused rather than queued. Nothing is wrong with the \
+                 credentials — retry in a few seconds. If it keeps happening, something is \
+                 hammering /api/auth/login; `unihelm audit --action auth.login` shows from where."
+            ),
+        )
+    })?;
+
+    // spawn_blocking, because argon2id at 19 MiB is hundreds of milliseconds of
+    // solid CPU. Run inline it did not merely make this request slow, it parked
+    // an async worker thread — with the runtime's small worker count, a handful
+    // of concurrent logins stalled every other request in the panel.
+    tokio::task::spawn_blocking(move || verify_or_burn(stored_hash.as_deref(), &password_input))
+        .await
+        .map_err(|e| {
+            ApiError::new(unihelm_core::UnihelmError::internal(format!(
+                "the password check did not finish ({e}); no decision was made about these \
+                 credentials, so nothing was signed in. Retry, and check the panel's log."
+            )))
+        })
 }
 
 #[cfg(test)]
@@ -388,11 +475,13 @@ mod tests {
         let proxy: SocketAddr = "127.0.0.1:44444".parse().unwrap();
         let caller: SocketAddr = "198.51.100.9:44444".parse().unwrap();
 
-        // nginx on loopback, which is what `unihelm cert panel` sets up.
+        // nginx on loopback, which is what `unihelm cert panel` sets up. The
+        // proxy's own entry is the last one.
         assert_eq!(
             client_ip(Some(&proxy), &xff("203.0.113.7, 10.0.0.1")),
-            "203.0.113.7"
+            "10.0.0.1"
         );
+        assert_eq!(client_ip(Some(&proxy), &xff("203.0.113.7")), "203.0.113.7");
 
         // The panel's own default is 0.0.0.0 with no proxy at all, so this
         // header is written by whoever is calling. Believing it let an
@@ -411,6 +500,43 @@ mod tests {
         // No peer means no evidence of a proxy, so the header is not trusted.
         assert_eq!(client_ip(None, &xff("203.0.113.7")), "unknown");
         assert_eq!(client_ip(None, &HeaderMap::new()), "unknown");
+    }
+
+    #[test]
+    fn a_forged_forwarded_for_prefix_cannot_choose_whose_address_gets_banned() {
+        let proxy: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+
+        // Exactly what the panel's vhost produced before it was pinned to one
+        // hop: `$proxy_add_x_forwarded_for` appends the address nginx really
+        // saw to whatever the client typed. Reading the front of that list let
+        // the caller nominate an address to be rate limited, audited and
+        // eventually banned — an innocent third party, or the operator's own.
+        let mut forged = HeaderMap::new();
+        forged.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.4, 203.0.113.7"),
+        );
+        assert_eq!(
+            client_ip(Some(&proxy), &forged),
+            "203.0.113.7",
+            "only the proxy's own entry, at the end, is evidence of anything"
+        );
+
+        // The same field split across two lines, which HTTP allows and which
+        // reading only the first header value would have got wrong the same way.
+        let mut split = HeaderMap::new();
+        split.append("x-forwarded-for", HeaderValue::from_static("198.51.100.4"));
+        split.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        assert_eq!(client_ip(Some(&proxy), &split), "203.0.113.7");
+
+        // An unusable last entry is not an invitation to believe the rest of
+        // the chain; the peer stands in instead.
+        let mut junk = HeaderMap::new();
+        junk.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.4, nonsense"),
+        );
+        assert_eq!(client_ip(Some(&proxy), &junk), "127.0.0.1");
     }
 
     #[test]
@@ -475,5 +601,57 @@ mod tests {
         // Not a timing assertion — those are flaky — but a guard that the code
         // path exists and returns false rather than short-circuiting.
         assert!(!verify_or_burn(None, "whatever"));
+    }
+
+    #[tokio::test]
+    async fn a_full_hashing_budget_refuses_a_login_instead_of_queueing_it() {
+        // The unbounded version of this took the panel down: enough concurrent
+        // POSTs to /api/auth/login — no account needed — parked every runtime
+        // worker on a 19 MiB hash and every other request with them.
+        let budget = Semaphore::new(1);
+        let held = budget.try_acquire().unwrap();
+
+        let err = verify_or_burn_under_budget(&budget, None, "whatever".into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.inner.code,
+            ErrorCode::RateLimited,
+            "a full budget must be a 429 the client can retry, not a queued hash"
+        );
+
+        drop(held);
+        assert!(
+            !verify_or_burn_under_budget(&budget, None, "whatever".into())
+                .await
+                .unwrap(),
+            "the permit must come back when the verification finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_username_spends_the_same_budget_as_a_real_one() {
+        // The equality is the point: if "no such account" skipped the permit,
+        // it would answer while a real account was still waiting for one, and
+        // the login form would tell an attacker which usernames exist.
+        let budget = Semaphore::new(1);
+        let held = budget.try_acquire().unwrap();
+
+        let hash = unihelm_db::password::hash_password("correct horse battery staple").unwrap();
+        for stored in [None, Some(hash.clone())] {
+            let err =
+                verify_or_burn_under_budget(&budget, stored, "correct horse battery staple".into())
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.inner.code, ErrorCode::RateLimited);
+        }
+
+        drop(held);
+        assert!(
+            verify_or_burn_under_budget(&budget, Some(hash), "correct horse battery staple".into())
+                .await
+                .unwrap(),
+            "a correct password must still verify once there is room"
+        );
     }
 }

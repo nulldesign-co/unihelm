@@ -61,6 +61,20 @@
     ProxyPreserveHost On
     RequestHeader set X-Forwarded-Proto "https"
 
+    # Drop the client's X-Forwarded-For before proxying, so the panel sees one
+    # hop and not a chain the caller wrote the front of.
+    #
+    # `unset` rather than `set`: mod_proxy_http appends the address it actually
+    # saw to this header on its way out, so removing the incoming one leaves
+    # exactly that single entry, while setting it would only duplicate it. This
+    # is the counterpart of `proxy_set_header X-Forwarded-For $remote_addr` in
+    # nginx/panel.conf.j2 — downstream, that address is the panel's login
+    # budget, its audit trail and what Sentinel hands the firewall to ban, so a
+    # client-supplied prefix was a client-chosen victim. Note that a site vhost
+    # deliberately keeps the chain; the panel is the one place with nothing to
+    # gain from it.
+    RequestHeader unset X-Forwarded-For
+
     # The web terminal and the event stream, before the catch-all below.
     #
     # The terminal is a websocket, so it has to leave through mod_rewrite's [P]

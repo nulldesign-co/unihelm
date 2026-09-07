@@ -13,6 +13,7 @@ use unihelm_core::config::PanelTls;
 mod agent;
 mod auth;
 mod error;
+mod plaintext;
 mod routes;
 mod state;
 mod tls;
@@ -210,6 +211,12 @@ async fn main() -> Result<()> {
             .await
             .context("loading the panel's certificate")?;
         axum_server::from_tcp_rustls(std_listener, acceptor)
+            // 8088 is not 443, so a browser given the panel's address with no
+            // scheme sends plain HTTP into this TLS listener. Handing that to
+            // rustls produced ERR_INVALID_HTTP_RESPONSE, which every operator
+            // read as a dead panel rather than a missing `https://`. This peeks
+            // the first byte and answers those connections itself.
+            .map(|tls| tls.acceptor(plaintext::HttpsRedirect::new()))
             .handle(handle)
             .serve(service)
             .await
