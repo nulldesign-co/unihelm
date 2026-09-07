@@ -255,6 +255,28 @@ fn pg_ident(name: &DbName) -> String {
     format!("\"{}\"", name.as_str())
 }
 
+/// A database name in a MySQL *identifier* position.
+///
+/// The counterpart of [`pg_ident`], and it was missing: `CREATE DATABASE` and
+/// `DROP DATABASE` interpolated the bare name, so a database called `order`,
+/// `group` or `select` — all of which `DbName::parse` accepts, since its
+/// reserved list only holds the engine's own schemas — produced a syntax error
+/// the operator saw as "the panel is broken" rather than "pick another name".
+///
+/// Backticks, not the escaping [`mysql_grant_pattern`] does: a GRANT's database
+/// part is a *pattern* and needs its `_` escaped, an identifier is not and must
+/// not be. Swapping the two creates a database with a literal backslash in its
+/// name.
+fn mysql_ident(name: &DbName) -> String {
+    debug_assert!(
+        name.as_str()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "DbName widened without updating mysql_ident"
+    );
+    format!("`{}`", name.as_str())
+}
+
 fn mysql_account(user: &DbName) -> String {
     format!("'{}'@'localhost'", user.as_str())
 }
@@ -369,10 +391,10 @@ pub fn sql_user_exists(engine: DbEngine, user: &DbName) -> String {
 /// would create a database with a literal backslash in its name.
 pub fn sql_create_db(engine: DbEngine, name: &DbName, owner: Option<&DbName>) -> String {
     match (engine, owner) {
-        (DbEngine::Mysql, None) => format!("CREATE DATABASE {};\n", name.as_str()),
+        (DbEngine::Mysql, None) => format!("CREATE DATABASE {};\n", mysql_ident(name)),
         (DbEngine::Mysql, Some(user)) => format!(
             "CREATE DATABASE {};\nGRANT ALL PRIVILEGES ON {}.* TO {};\n",
-            name.as_str(),
+            mysql_ident(name),
             mysql_grant_pattern(name),
             mysql_account(user)
         ),
@@ -405,7 +427,7 @@ pub fn sql_drop_db(engine: DbEngine, name: &DbName) -> String {
              DELETE FROM mysql.tables_priv WHERE Db = {};\n\
              DELETE FROM mysql.columns_priv WHERE Db = {};\n\
              FLUSH PRIVILEGES;\n",
-            name.as_str(),
+            mysql_ident(name),
             mysql_db_privilege_match(name),
             quote_name(name),
             quote_name(name)
@@ -1340,7 +1362,7 @@ mod tests {
             let n = DbName::parse(name).unwrap();
             assert_eq!(
                 sql_create_db(DbEngine::Mysql, &n, None),
-                format!("CREATE DATABASE {name};\n")
+                format!("CREATE DATABASE `{name}`;\n")
             );
             assert_eq!(
                 sql_db_exists(DbEngine::Postgres, &n),
@@ -1355,7 +1377,7 @@ mod tests {
         let owner = DbName::parse("shop_rw").unwrap();
         assert_eq!(
             sql_create_db(DbEngine::Mysql, &name, Some(&owner)),
-            "CREATE DATABASE shop;\nGRANT ALL PRIVILEGES ON `shop`.* TO 'shop_rw'@'localhost';\n"
+            "CREATE DATABASE `shop`;\nGRANT ALL PRIVILEGES ON `shop`.* TO 'shop_rw'@'localhost';\n"
         );
         assert_eq!(
             sql_create_db(DbEngine::Postgres, &name, Some(&owner)),
@@ -1415,7 +1437,7 @@ mod tests {
             "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'shop_db';\n"
         );
         assert_eq!(jobs[1].argv, mysql_argv(Family::Debian, false));
-        assert_eq!(jobs[1].sql, "CREATE DATABASE shop_db;\n");
+        assert_eq!(jobs[1].sql, "CREATE DATABASE `shop_db`;\n");
         assert!(!jobs[1].secret);
     }
 
@@ -1713,7 +1735,7 @@ mod tests {
         assert_eq!(
             sh.recorded()[0].sql,
             concat!(
-                "DROP DATABASE IF EXISTS keeper;\n",
+                "DROP DATABASE IF EXISTS `keeper`;\n",
                 // MySQL keeps a dropped database's privilege rows, so the next
                 // tenant handed the same name would inherit them.
                 "DELETE FROM mysql.db WHERE Db = 'keeper';\n",
@@ -1963,7 +1985,7 @@ mod tests {
         // identifier for CREATE, an escaped pattern for GRANT.
         assert_eq!(
             sh.recorded().last().unwrap().sql,
-            "CREATE DATABASE shop_db;\n\
+            "CREATE DATABASE `shop_db`;\n\
              GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
         );
         sh.clear();
@@ -2020,7 +2042,7 @@ mod tenancy_tests {
         let name = DbName::parse("shop").unwrap();
         let sql = sql_drop_db(DbEngine::Mysql, &name);
 
-        assert!(sql.contains("DROP DATABASE IF EXISTS shop"));
+        assert!(sql.contains("DROP DATABASE IF EXISTS `shop`"));
         for table in ["mysql.db", "mysql.tables_priv", "mysql.columns_priv"] {
             assert!(
                 sql.contains(&format!("DELETE FROM {table} WHERE Db = 'shop'")),
@@ -2085,7 +2107,7 @@ mod tenancy_tests {
         // same trap from the other direction.
         assert_eq!(
             sql_create_db(DbEngine::Mysql, &name, Some(&user)),
-            "CREATE DATABASE shop_db;\n\
+            "CREATE DATABASE `shop_db`;\n\
              GRANT ALL PRIVILEGES ON `shop\\_db`.* TO 'shop_rw'@'localhost';\n"
         );
     }
@@ -2099,10 +2121,10 @@ mod tenancy_tests {
 
         assert_eq!(
             sql_create_db(DbEngine::Mysql, &name, None),
-            "CREATE DATABASE shop_db;\n"
+            "CREATE DATABASE `shop_db`;\n"
         );
         assert!(
-            sql_drop_db(DbEngine::Mysql, &name).starts_with("DROP DATABASE IF EXISTS shop_db;\n"),
+            sql_drop_db(DbEngine::Mysql, &name).starts_with("DROP DATABASE IF EXISTS `shop_db`;\n"),
             "{}",
             sql_drop_db(DbEngine::Mysql, &name)
         );
