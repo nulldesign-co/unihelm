@@ -216,6 +216,7 @@ impl MockSvc {
                 enabled: Some("enabled".into()),
                 main_pid: Some(4242),
                 memory_bytes: Some(32 * 1024 * 1024),
+                memory_source: None,
                 since: Some("Sat 2026-08-22 10:00:00 UTC".into()),
             },
         );
@@ -243,6 +244,7 @@ impl MockSvc {
                 enabled: None,
                 main_pid: None,
                 memory_bytes: None,
+                memory_source: None,
                 since: None,
             })
             .enabled = Some(enabled.to_string());
@@ -269,6 +271,7 @@ impl SvcBackend for MockSvc {
                 enabled: None,
                 main_pid: None,
                 memory_bytes: None,
+                memory_source: None,
                 since: None,
             }))
     }
@@ -290,6 +293,7 @@ impl SvcBackend for MockSvc {
                 enabled: Some("disabled".into()),
                 main_pid: None,
                 memory_bytes: None,
+                memory_source: None,
                 since: None,
             });
         match action {

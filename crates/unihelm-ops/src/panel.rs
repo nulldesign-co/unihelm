@@ -1,14 +1,20 @@
 //! The panel's own domain and certificate (spec §11.5).
 //!
-//! `unihelm-web` listens on loopback and never faces the internet directly;
-//! the active web server terminates TLS in front of it — `panel.conf` in
-//! whichever of `templates/nginx/` and `templates/apache/` is serving.
-//! Until now that vhost was a manual exercise — point a domain at the server,
-//! write the proxy config yourself, run certbot by hand. This module turns it
-//! into one operation: `panel.tls.issue` records the domain, obtains a Let's
-//! Encrypt certificate over HTTP-01, renders the panel vhost through the
-//! config engine and reloads nginx. The renewal scheduler then keeps the
-//! certificate alive through the same path (spec §10.2).
+//! A fresh install has `unihelm-web` on every interface behind a certificate it
+//! signed for itself, because a panel nobody can look at until they have bought
+//! a domain is a panel nobody can set up. That is the starting state, not the
+//! finished one: this module ends it. `panel.tls.issue` records the domain,
+//! obtains a Let's Encrypt certificate over HTTP-01, renders the panel vhost
+//! through the config engine and reloads whichever web server is serving —
+//! `panel.conf` in whichever of `templates/nginx/` and `templates/apache/` that
+//! is — and then narrows `panel.listen` to loopback, so the vhost it just put
+//! live is the only way in (see [`narrow_listener_to_loopback`]). The renewal
+//! scheduler keeps the certificate alive through the same path (spec §10.2).
+//!
+//! This doc comment used to open "`unihelm-web` listens on loopback and never
+//! faces the internet directly", which stopped being true the day the shipped
+//! default widened to `0.0.0.0:8088` — leaving the file that manages the panel's
+//! exposure describing the opposite of what the panel did.
 
 use std::path::Path;
 
@@ -19,6 +25,8 @@ use unihelm_config::paths;
 use unihelm_core::config::UnihelmConfig;
 use unihelm_core::{Domain, Email, ErrorCode, Permission, Result, UnihelmError};
 use unihelm_db::CertKind;
+use unihelm_distro::fw::{PortRule, Proto};
+use unihelm_distro::svc::{ManagedUnit, SvcAction};
 
 use crate::acme::{self, Directory};
 use crate::registry::{Execution, OpContext, TypedOperation};
@@ -64,6 +72,19 @@ pub fn panel_upstream() -> Upstream {
     upstream_from(Path::new(unihelm_core::config::paths::CONFIG))
 }
 
+/// The port the panel falls back to when its configuration cannot say.
+const DEFAULT_PANEL_PORT: u16 = 8088;
+
+/// `panel.listen`, as the file says, or the default the panel would itself have
+/// bound to if it could not read that file either.
+fn configured_listen(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| UnihelmConfig::from_toml(&t).ok())
+        .map(|c| c.panel.listen)
+        .unwrap_or_else(|| UnihelmConfig::default().panel.listen)
+}
+
 /// The TCP port `unihelm-web` listens on, as its own configuration says.
 ///
 /// Read from the config file rather than assumed, because an operator who moved
@@ -71,15 +92,39 @@ pub fn panel_upstream() -> Upstream {
 /// default is used when the file cannot be read, which is the same port the
 /// panel would itself have bound to in that case.
 pub fn panel_listen_port() -> u16 {
-    let text = std::fs::read_to_string(unihelm_core::config::paths::CONFIG).ok();
-    let listen = text
-        .and_then(|t| UnihelmConfig::from_toml(&t).ok())
-        .map(|c| c.panel.listen)
-        .unwrap_or_else(|| UnihelmConfig::default().panel.listen);
-    listen
+    configured_listen(Path::new(unihelm_core::config::paths::CONFIG))
         .parse::<std::net::SocketAddr>()
         .map(|a| a.port())
-        .unwrap_or(8088)
+        .unwrap_or(DEFAULT_PANEL_PORT)
+}
+
+/// The panel's port, but only while the network can still reach the panel on it.
+///
+/// `None` once [`narrow_listener_to_loopback`] has run: the panel is still bound
+/// to that port, and `panel_listen_port` still reports it, but only this machine
+/// can dial it. The distinction is the firewall's, and it is two decisions:
+/// `fw.enable` opens this port so that switching a firewall on cannot lock the
+/// operator out, and `fw.port.close` refuses to close it for the same reason.
+/// Both are answers to "can the panel still be reached here", not "which port is
+/// it bound to" — and once the answer is no, opening the port admits nothing and
+/// refusing to close it defends nothing while telling the operator, wrongly,
+/// that closing it would lock them out.
+///
+/// A listen value that cannot be read or cannot be parsed counts as reachable.
+/// Being unsure that the operator has another way in is not a reason to take
+/// this one away.
+pub fn panel_port_reachable_from_network() -> Option<u16> {
+    reachable_port(&configured_listen(Path::new(
+        unihelm_core::config::paths::CONFIG,
+    )))
+}
+
+fn reachable_port(listen: &str) -> Option<u16> {
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => None,
+        Ok(addr) => Some(addr.port()),
+        Err(_) => Some(DEFAULT_PANEL_PORT),
+    }
 }
 
 fn upstream_from(path: &Path) -> Upstream {
@@ -355,6 +400,12 @@ impl TypedOperation for Issue {
             domain.as_str()
         ));
 
+        // Last, and only here: the vhost is live, reloaded and certificated, so
+        // the wide listener the installer left behind is now a second front
+        // door rather than the only one. See `narrow_listener_to_loopback`.
+        narrow_listener_to_loopback(ctx, Path::new(unihelm_core::config::paths::CONFIG), &domain)
+            .await;
+
         Ok(IssueOutput {
             certificate_id: record.id,
             domain,
@@ -365,7 +416,225 @@ impl TypedOperation for Issue {
     }
 }
 
-/// Make `domain` the panel's domain of record, handing back the one it replaced.
+/// Bring the panel's own listener down to loopback, now that its vhost is the
+/// way in.
+///
+/// The installer binds the panel to every interface and `fw.enable` opens that
+/// port deliberately, because until a domain exists that address is the only way
+/// to reach the panel at all. The moment this operation succeeds that stops
+/// being true: the vhost answers on 443 with a certificate browsers trust, and
+/// the direct port becomes a second front door onto the same login form,
+/// presenting a self-signed certificate — the warning administrators are taught
+/// to click through, which is what makes intercepting the panel's login worth
+/// attempting. So the listener follows the vhost down, and the hole the panel
+/// opened for itself is closed behind it.
+///
+/// **Only once the vhost is actually serving.** Reaching this line means a CA
+/// fetched an HTTP-01 challenge from this machine on this name, the web server's
+/// own validator accepted the vhost, and the server reloaded onto it. A failed
+/// apply or a failed reload returns long before here and leaves the listener
+/// exactly as it was, because a panel that narrows its address on the strength
+/// of a vhost that did not come up is a panel nobody can reach.
+///
+/// **Nothing here can fail the operation.** The certificate is issued and the
+/// vhost is live by the time it runs; turning a firewall hiccup into a failed
+/// `panel.tls.issue` would report that none of that happened. Every way this
+/// can stop early says so in the task log instead, and names the file, the key
+/// and the value that put things back.
+async fn narrow_listener_to_loopback(ctx: &OpContext, config_path: &Path, domain: &Domain) {
+    let path = config_path.display();
+
+    // The address the vhost is proxying to, for the messages below that hand the
+    // job back to the operator. Every one of those means this file could not be
+    // read well enough to say which port the panel is on — and a loopback
+    // address on the wrong port is a panel the vhost cannot reach, so guessing
+    // one would be worse than saying nothing. This is not a guess: it is
+    // `upstream_from` reading the same file the same way the render read it
+    // minutes ago, fallback and all, so it is the address the live vhost dials.
+    let dialled = upstream_from(config_path).address;
+
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) => {
+            ctx.log(format!(
+                "could not read {path} ({e}), so `panel.listen` was left alone and the \
+                 panel is still answering on the address it started with. The vhost \
+                 proxies to {dialled} — set `panel.listen = \"{dialled}\"` there and run \
+                 `systemctl restart unihelm-web` to close the direct port."
+            ));
+            return;
+        }
+    };
+    let current = match UnihelmConfig::from_toml(&text) {
+        Ok(config) => config.panel.listen,
+        Err(e) => {
+            ctx.log(format!(
+                "{path} does not parse ({e}), so `panel.listen` was left alone rather than \
+                 rewritten from a file the panel does not understand; the direct port is \
+                 still open. Fix the file, set `panel.listen = \"{dialled}\"` — what the \
+                 vhost proxies to — and run `systemctl restart unihelm-web`."
+            ));
+            return;
+        }
+    };
+    let Ok(addr) = current.parse::<std::net::SocketAddr>() else {
+        // Which address to narrow *to* is the port, and the port is the thing
+        // this line failed to yield.
+        ctx.log(format!(
+            "`panel.listen` in {path} is `{current}`, which is not an address:port, so it \
+             was left alone rather than replaced with a port nothing agrees on; the panel \
+             is still on whatever address it started with. The vhost proxies to {dialled} \
+             — set `panel.listen = \"{dialled}\"` in {path} and run \
+             `systemctl restart unihelm-web` to close the direct port."
+        ));
+        return;
+    };
+    if addr.ip().is_loopback() {
+        // Renewals run this same operation every sixty days. The listener is
+        // already where this function would put it, and restarting the panel to
+        // rewrite a line into the value it already holds is an outage nobody
+        // asked for.
+        return;
+    }
+
+    let loopback = if addr.is_ipv6() {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    // The same port, deliberately: the vhost proxies to it (`panel_upstream`
+    // resolves the very same address), and moving the port as well would break
+    // the vhost that was just put live.
+    let narrowed = std::net::SocketAddr::new(loopback, addr.port()).to_string();
+
+    let rewritten = match UnihelmConfig::rewrite_panel_listen(&text, &narrowed) {
+        Ok(text) => text,
+        Err(e) => {
+            ctx.log(format!(
+                "`panel.listen` is still `{current}`: it could not be rewritten ({e}). \
+                 Set `panel.listen = \"{narrowed}\"` in {path} and run \
+                 `systemctl restart unihelm-web` to close the direct port."
+            ));
+            return;
+        }
+    };
+
+    // The mode the file already has, not one of ours. `/etc/unihelm/config.toml`
+    // is world-readable by design — the CLI reads it as the operator — and
+    // silently tightening or loosening that during a certificate renewal is not
+    // this function's decision to make.
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(config_path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o644)
+    };
+    if let Err(e) = unihelm_config::managed::write_atomic(config_path, &rewritten, mode) {
+        ctx.log(format!(
+            "`panel.listen` is still `{current}`: {path} could not be written ({e}). \
+             Set `panel.listen = \"{narrowed}\"` there by hand and run \
+             `systemctl restart unihelm-web`."
+        ));
+        return;
+    }
+
+    ctx.log(format!(
+        "narrowed `panel.listen` to {narrowed} in {path}: the panel is reached through \
+         its own vhost now, and answering on {current} as well left a second way in \
+         carrying a certificate no browser trusts. To put it back, set \
+         `panel.listen = \"{current}\"` in {path} and run `systemctl restart unihelm-web`."
+    ));
+
+    close_panel_port_rule(ctx, addr.port()).await;
+
+    // Said before the restart, because the restart is what cuts the connection
+    // this line is travelling down. The task log survives it; the operator's
+    // page does not.
+    ctx.log(format!(
+        "restarting the panel so it binds {narrowed} — this page will lose its \
+         connection and comes back at https://{}/. If that address does not answer \
+         from where you are, put `panel.listen` back as above.",
+        domain.as_str()
+    ));
+
+    let unit = ManagedUnit::UnihelmWeb.unit_name(ctx.distro().info.family);
+    if let Err(e) = ctx.distro().svc.action(&unit, SvcAction::Restart).await {
+        ctx.log(format!(
+            "{path} now says {narrowed}, but the panel could not be restarted ({e}), so \
+             it is still bound to {current} until something restarts it: run \
+             `systemctl restart unihelm-web`"
+        ));
+    }
+}
+
+/// Close the hole the panel opened for its own port — and only that one.
+///
+/// `fw.enable` opens the panel's port unconditionally before it starts a
+/// default-deny firewall, marked with [`crate::fwops::PANEL_RULE_COMMENT`],
+/// because a firewall that shuts the door it was switched on through is a
+/// lockout. Once the listener is on loopback that rule admits traffic to
+/// nothing, and a hole nobody remembers the reason for is one nobody closes.
+///
+/// A rule the panel did not open is left where it is, whatever it points at:
+/// an operator who opened this port for something of their own is told, not
+/// overruled.
+async fn close_panel_port_rule(ctx: &OpContext, port: u16) {
+    let recorded = match ctx.db().fw_rules().await {
+        Ok(rules) => rules,
+        Err(e) => {
+            ctx.log(format!(
+                "could not read the firewall rules the panel recorded ({e}); check \
+                 whether {port}/tcp is still open from the firewall page"
+            ));
+            return;
+        }
+    };
+    let Some(record) = recorded.iter().find(|r| {
+        r.port == port && r.proto == "tcp" && r.comment == crate::fwops::PANEL_RULE_COMMENT
+    }) else {
+        if recorded.iter().any(|r| r.port == port && r.proto == "tcp") {
+            ctx.log(format!(
+                "left the firewall rule for {port}/tcp alone: the panel did not open it. \
+                 Nothing listens there now, so close it from the firewall page if it was \
+                 only ever for reaching the panel."
+            ));
+        }
+        return;
+    };
+
+    let rule = PortRule {
+        port,
+        proto: Proto::Tcp,
+        // From the record, not assumed: the backend matches a rule on its
+        // source too, and closing "from anywhere" would miss a narrower one.
+        source: record.source.clone(),
+        comment: record.comment.clone(),
+    };
+    if let Err(e) = ctx.distro().fw.close_port(&rule).await {
+        ctx.log(format!(
+            "{port}/tcp is still open: the firewall would not close it ({e}). Nothing \
+             listens there any more, so close it from the firewall page."
+        ));
+        return;
+    }
+    // Backend first, record second — `fw.port.close`'s ordering, so a forgotten
+    // record can never outlive a rule the firewall still enforces.
+    if let Err(e) = ctx
+        .db()
+        .forget_fw_rule(port, "tcp", record.source.as_deref())
+        .await
+    {
+        ctx.log(format!(
+            "closed {port}/tcp, but the panel's record of it could not be cleared ({e}); \
+             the firewall page will report it as drift until it is"
+        ));
+        return;
+    }
+    ctx.log(format!(
+        "closed {port}/tcp — the panel had opened it for itself and nothing listens there now"
+    ));
+}
+
 /// Write the panel's own vhost for one particular web server.
 ///
 /// Used by `webserver.switch`, which has to move this vhost with every other
@@ -698,6 +967,29 @@ mod tests {
         assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
     }
 
+    /// The firewall asks "can the panel still be reached on this port", and
+    /// after the narrowing the answer is no while the port is unchanged.
+    ///
+    /// `fw.enable` opens this port unconditionally and `fw.port.close` refuses
+    /// to close it, both to keep the operator from shutting the door they came
+    /// in through. Against a loopback listener the first reopens the hole this
+    /// operation just closed, and the second refuses with "closing it would lock
+    /// you out of the panel" — which is no longer true, and is the panel telling
+    /// the operator something false about their own server.
+    #[test]
+    fn the_panels_port_stops_counting_as_reachable_once_it_is_on_loopback() {
+        assert_eq!(reachable_port("0.0.0.0:8088"), Some(8088));
+        assert_eq!(reachable_port("[::]:9443"), Some(9443));
+        assert_eq!(reachable_port("203.0.113.10:8088"), Some(8088));
+
+        assert_eq!(reachable_port("127.0.0.1:8088"), None);
+        assert_eq!(reachable_port("[::1]:9443"), None);
+
+        // Unsure is not the same as unreachable: a config nobody can parse must
+        // not cost the operator the one address they have.
+        assert_eq!(reachable_port("not an address"), Some(8088));
+    }
+
     async fn domain_of_record(db: &unihelm_db::Db) -> Option<String> {
         db.get_setting(unihelm_db::panel::DOMAIN_KEY).await.unwrap()
     }
@@ -793,6 +1085,249 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidInput, "for input {hostile:?}");
         }
+    }
+
+    // -- narrowing the listener once the vhost is live ----------------------
+
+    /// An `OpContext` over a *recorded* mock distro and a task log, built
+    /// directly (as `nodeapp` and `slices` do) because these tests assert on
+    /// what the narrowing did: which unit it restarted, which port it closed,
+    /// and what it told the operator.
+    async fn narrowing_ctx() -> (OpContext, unihelm_distro::mock::SharedRecorder) {
+        use std::sync::Arc;
+        use unihelm_core::{Role, TaskId, TenantScope, UserId};
+        use unihelm_distro::mock::{RecordingLog, mock_distro_with_recorder};
+
+        let (distro, rec) = mock_distro_with_recorder(unihelm_distro::Family::Debian);
+        let db = unihelm_db::Db::open_memory().await.unwrap();
+        let services = Arc::new(
+            crate::registry::Services::new(distro, db, unihelm_db::MasterKey::generate())
+                .expect("templates compile"),
+        );
+        let auth = unihelm_core::AuthContext::from_role(
+            UserId(1),
+            Role::Admin,
+            TenantScope::Global,
+            "req-test",
+        );
+        let ctx = OpContext::new(services, auth)
+            .with_task(TaskId::new(), Arc::new(RecordingLog(rec.clone())));
+        (ctx, rec)
+    }
+
+    fn log_text(rec: &unihelm_distro::mock::SharedRecorder) -> String {
+        rec.lock().expect("recorder").log_lines.join("\n")
+    }
+
+    fn restarted_units(rec: &unihelm_distro::mock::SharedRecorder) -> Vec<String> {
+        rec.lock()
+            .expect("recorder")
+            .service_actions
+            .iter()
+            .filter(|(_, action)| *action == SvcAction::Restart)
+            .map(|(unit, _)| unit.clone())
+            .collect()
+    }
+
+    /// A config file with the shape the installer leaves behind: the panel on
+    /// every interface, and an operator comment above it.
+    fn config_with_listen(dir: &Path, listen: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[panel]\n# reachable while there was no domain\nlisten = \"{listen}\"\n\
+                 secure_cookies = true\n\n[agent]\nworkers = 4\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn panel_domain() -> Domain {
+        Domain::parse("panel.example.com").unwrap()
+    }
+
+    /// The defect: after `panel.tls.issue` put a real vhost live, the panel was
+    /// still bound to 0.0.0.0:8088 with a firewall hole in front of it — two
+    /// ways into the same login form, one of them presenting a certificate no
+    /// browser trusts, which is the warning administrators learn to click past.
+    #[tokio::test]
+    async fn the_listener_narrows_to_loopback_once_the_vhost_is_serving() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "0.0.0.0:8088");
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let parsed = UnihelmConfig::from_toml(&after).unwrap();
+        assert_eq!(parsed.panel.listen, "127.0.0.1:8088");
+        // The port does not move: the vhost that was just put live proxies to it.
+        assert_eq!(parsed.agent.workers, 4, "the rest of the file is untouched");
+        assert!(
+            after.contains("# reachable while there was no domain"),
+            "the operator's comments survive: {after}"
+        );
+
+        // The panel has to be restarted to pick it up, and the operator is
+        // reading this from a page that is about to drop.
+        assert_eq!(restarted_units(&rec), vec!["unihelm-web.service"]);
+        let log = log_text(&rec);
+        assert!(log.contains("this page will lose its connection"), "{log}");
+        assert!(log.contains("https://panel.example.com/"), "{log}");
+        // Reversible in one sentence: which file, which key, which value.
+        assert!(log.contains("panel.listen = \"0.0.0.0:8088\""), "{log}");
+        assert!(log.contains(&path.display().to_string()), "{log}");
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_listener_narrows_to_the_ipv6_loopback_on_its_own_port() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "[::]:9443");
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        let parsed = UnihelmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.panel.listen, "[::1]:9443");
+        assert_eq!(restarted_units(&rec), vec!["unihelm-web.service"]);
+    }
+
+    /// Renewals come through `panel.tls.issue` too, every sixty days. A panel
+    /// already behind its vhost must not be restarted to be told what it
+    /// already says.
+    #[tokio::test]
+    async fn a_panel_already_on_loopback_is_left_alone_and_never_restarted() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "127.0.0.1:8088");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(restarted_units(&rec).is_empty());
+        assert_eq!(log_text(&rec), "", "there is nothing to report");
+    }
+
+    /// A config the panel cannot read or cannot parse is one it must not
+    /// rewrite: the file it would be guessing at is the file `unihelm-web`
+    /// reads at startup, and a panel that will not start cannot be fixed from
+    /// inside the panel.
+    #[tokio::test]
+    async fn a_config_the_panel_cannot_read_is_reported_not_rewritten() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        narrow_listener_to_loopback(&ctx, &dir.path().join("absent.toml"), &panel_domain()).await;
+        assert!(restarted_units(&rec).is_empty());
+        // Handing the job back is only useful with the value to hand back: the
+        // address the vhost proxies to, not "a loopback address".
+        let log = log_text(&rec);
+        assert!(log.contains("panel.listen = \"127.0.0.1:8088\""), "{log}");
+        assert!(log.contains("systemctl restart unihelm-web"), "{log}");
+
+        let (ctx, rec) = narrowing_ctx().await;
+        let path = dir.path().join("broken.toml");
+        let broken = "[panel]\nlisten = \"0.0.0.0:8088\"\nno_such_key = 1\n";
+        std::fs::write(&path, broken).unwrap();
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert!(restarted_units(&rec).is_empty());
+        let log = log_text(&rec);
+        assert!(log.contains("does not parse"), "{log}");
+        assert!(log.contains("panel.listen = \"127.0.0.1:8088\""), "{log}");
+    }
+
+    /// `listen = = =` is not a parse failure — the config reader takes the
+    /// second `=` as the start of the value and hands back `= =`, so the file
+    /// loads and only the address is nonsense. That branch went untested
+    /// because a test aiming at the parse failure landed here instead; it must
+    /// still refuse, and refuse with the address the vhost is really dialling
+    /// rather than a port invented on the spot.
+    #[tokio::test]
+    async fn a_listen_value_that_is_not_an_address_is_refused_with_the_vhosts_own_upstream() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonsense-listen.toml");
+        std::fs::write(&path, "[panel]\nlisten = = =\n").unwrap();
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[panel]\nlisten = = =\n"
+        );
+        assert!(restarted_units(&rec).is_empty());
+        let log = log_text(&rec);
+        assert!(log.contains("not an address:port"), "{log}");
+        // The same fallback `upstream_from` used to render the vhost, so the
+        // operator is told to write the address the vhost actually proxies to.
+        assert_eq!(upstream_from(&path).address, "127.0.0.1:8088");
+        assert!(log.contains("panel.listen = \"127.0.0.1:8088\""), "{log}");
+        assert!(log.contains("systemctl restart unihelm-web"), "{log}");
+    }
+
+    /// The hole `fw.enable` opens for the panel's own port has no reason to
+    /// outlive the listener behind it.
+    #[tokio::test]
+    async fn the_firewall_rule_the_panel_opened_for_itself_is_closed_with_it() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "0.0.0.0:8088");
+
+        let rule = PortRule::anywhere(8088, Proto::Tcp, crate::fwops::PANEL_RULE_COMMENT);
+        ctx.distro().fw.open_port(&rule).await.unwrap();
+        ctx.db()
+            .record_fw_rule(8088, "tcp", None, crate::fwops::PANEL_RULE_COMMENT)
+            .await
+            .unwrap();
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        assert_eq!(
+            rec.lock().expect("recorder").closed_ports,
+            vec![rule],
+            "the panel's own rule is closed"
+        );
+        assert!(
+            ctx.db().fw_rules().await.unwrap().is_empty(),
+            "and forgotten, so the firewall page does not report it as drift"
+        );
+        assert!(
+            log_text(&rec).contains("closed 8088/tcp"),
+            "{}",
+            log_text(&rec)
+        );
+    }
+
+    /// A rule with somebody else's comment on it is somebody else's rule. The
+    /// panel says what it noticed and leaves the ruleset as it found it.
+    #[tokio::test]
+    async fn a_firewall_rule_the_operator_wrote_is_reported_and_left_alone() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "0.0.0.0:8088");
+
+        ctx.db()
+            .record_fw_rule(8088, "tcp", None, "my own tunnel")
+            .await
+            .unwrap();
+
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+
+        assert!(
+            rec.lock().expect("recorder").closed_ports.is_empty(),
+            "the panel must not close a rule it did not open"
+        );
+        assert_eq!(ctx.db().fw_rules().await.unwrap().len(), 1);
+        let log = log_text(&rec);
+        assert!(
+            log.contains("left the firewall rule for 8088/tcp alone"),
+            "{log}"
+        );
     }
 
     #[tokio::test]

@@ -191,6 +191,36 @@ must be absolute and canonical, and it may not be under `/home` — a tree a
 tenant can rewrite between the moment it is verified and the moment it is copied
 would make the whole signature check theatre.
 
+### Where to stage a plugin
+
+**Not `/tmp`, and not `/var/tmp`.** If you have been staging plugins there, this
+is the paragraph that matters to you: both are writable by every account on the
+server, so between the panel checking the payload's digests and copying it into
+place, any local account — a compromised site, a tenant with SSH, a stray cron —
+could replace a file in the tree. The panel would then install and start, as
+root, something it never verified. That is not a theoretical ordering problem;
+it is the ordinary way this kind of check is defeated.
+
+The rule the panel enforces is simple, and it applies to the staging directory
+**and every directory above it up to `/`**: owned by root, and not writable by
+group or world. A root-owned `/tmp/plugins` is not enough — `/tmp` still lets a
+stranger rename it away and leave their own `plugins` in its place. The refusal
+names the exact directory that failed, because it is usually an ancestor you did
+not think of as part of the plugin.
+
+Make one staging directory once and reuse it:
+
+```sh
+install -d -o root -g root -m 755 /var/lib/unihelm/staging
+# unpack or copy the plugin tree under it, as root
+POST /api/plugins { "source": "/var/lib/unihelm/staging/acme-dns" }
+```
+
+`/opt`, `/srv` and `/root` work equally well if they are root-owned and not
+group-writable on your machine (`ls -ld` will tell you). The check is skipped
+only when the agent itself is unprivileged — a development instance, which
+cannot complete an install anyway.
+
 **Installing is not starting.** A freshly installed plugin is **disabled**: the
 unit is written, the account exists, the tree is in place, and nothing is
 running. An operator can read the manifest the panel accepted before any of that

@@ -35,11 +35,15 @@
 //!    from the host's passwd through `getpwnam` — see [`Account::lookup`]. Skip
 //!    it and every file the application writes into the tenant's own home is
 //!    owned by root: the file manager cannot open it, SFTP cannot replace it,
-//!    and the tenant cannot deploy again. The host's `/etc/passwd` and
-//!    `/etc/group` come in read-only for the same reason the design document
-//!    gives for FPM: the container does not create accounts, it names the ones
-//!    the host already has, so a program that calls `getpwuid(geteuid())` — git,
-//!    `Dir.home`, `os.path.expanduser` — gets an answer instead of an error.
+//!    and the tenant cannot deploy again. That uid still needs a *name*, or a
+//!    program calling `getpwuid(geteuid())` — git, `Dir.home`,
+//!    `os.path.expanduser` — fails on an application that is otherwise fine. So
+//!    a `passwd` and a `group` come in read-only, and they are **the panel's
+//!    own, holding three accounts** — see [`accounts_an_app_container_needs`].
+//!    They used to be the host's whole `/etc/passwd` and `/etc/group`, which
+//!    handed every tenant's code the login name, uid and home path of every
+//!    other hosting customer on the machine: a customer list, readable by any
+//!    one of them, in exchange for one uid the container already knew.
 //! 2. **The port is already allocated.** See above; [`AppContainer::plan`] takes
 //!    it off the row and [`run_argv`] publishes exactly that number.
 //! 3. **`docker run` exiting zero means it started, not that it stayed up.** An
@@ -371,16 +375,18 @@ impl Account {
     /// anything an operator has configured — work here exactly as they do for
     /// every other program on the box.
     pub fn lookup(user: &LinuxUser) -> Result<Self> {
-        let (uid, gid) = passwd_entry(user.as_str()).ok_or_else(|| {
-            UnihelmError::new(
-                ErrorCode::NotFound,
-                format!(
-                    "the Linux account `{}` does not exist on this server, so there is no \
-                     uid to run the application's container as.",
-                    user.as_str()
-                ),
-            )
-        })?;
+        let (uid, gid) = passwd_record(user.as_str())
+            .map(|record| (record.uid, record.gid))
+            .ok_or_else(|| {
+                UnihelmError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "the Linux account `{}` does not exist on this server, so there is \
+                         no uid to run the application's container as.",
+                        user.as_str()
+                    ),
+                )
+            })?;
         Self::checked(user, uid, gid)
     }
 
@@ -408,22 +414,335 @@ impl Account {
     }
 }
 
-/// The same helper [`crate::wordpress`] and [`crate::fsops`] each keep a copy of.
+// ---------------------------------------------------------------------------
+// The accounts the container is allowed to see
+// ---------------------------------------------------------------------------
+//
+// The container needs a `passwd` and a `group` so that the uid it runs as has a
+// name. It does **not** need the host's, and mounting the host's is what this
+// section exists to stop: `/etc/passwd` on a shared hosting box is the customer
+// list — every tenant's login, uid and home path — and a read-only mount of it
+// inside tenant-authored code hands that list to every one of them. Read-only
+// stopped them changing it; nothing stopped them reading it.
+//
+// So the panel writes a pair of its own, holding the three accounts an
+// application container has any use for, and mounts those instead.
+
+/// The superuser. Present in the container's passwd because a great deal of
+/// tooling looks it up unconditionally, and absent from it means uid 0 has no
+/// name — not that uid 0 is unreachable, which the `--user` flag and
+/// `no-new-privileges` above are what decide.
+const ROOT_ACCOUNT: &str = "root";
+
+/// The conventional "nobody in particular" account. Runtimes and libraries that
+/// want an unprivileged identity to name look for exactly this one.
+const NOBODY_ACCOUNT: &str = "nobody";
+
+/// Where a container's own account files live.
+///
+/// One directory per container, under the panel's state rather than in `/etc`:
+/// these are generated files the panel rewrites, not configuration an operator
+/// edits. Root-owned and [`ACCOUNT_DIR_MODE`], for [`paths::engine_config_dir`]'s
+/// reason — a tenant who could write their container's passwd could map their
+/// own account name onto another tenant's uid.
+fn account_dir(container: &ContainerRef) -> PathBuf {
+    paths::state_dir()
+        .join("containers")
+        .join(container.as_str())
+}
+
+/// `0700 root:root`: unreachable by path to every unprivileged account on the
+/// host, while Docker — which resolves a bind mount as root — reaches it fine.
+const ACCOUNT_DIR_MODE: u32 = 0o700;
+
+/// The mode the two files are written with.
+///
+/// World-readable *inode*, unreachable *path*. It has to be readable inside the
+/// container, where the application runs as the tenant's own uid and not as
+/// root, and every account database on every Unix is 0644 for that reason.
+const ACCOUNT_FILE_MODE: u32 = 0o644;
+
+/// One account as the host's own name service knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdRecord {
+    name: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+    shell: String,
+}
+
+/// One group as the host's own name service knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupRecord {
+    name: String,
+    gid: u32,
+    /// Supplementary members. Filtered before rendering — see
+    /// [`render_account_files`] — because a group line that listed every tenant
+    /// would put back exactly the customer list this section removes.
+    members: Vec<String>,
+}
+
+/// The only account names an application container has any use for.
+///
+/// Pure, and it is the whole of the fix: root so uid 0 has a name, `nobody` so
+/// an unprivileged identity has one, and the tenant this container runs for.
+/// Everything else on the host is another customer.
+fn accounts_an_app_container_needs(user: &LinuxUser) -> Vec<String> {
+    vec![
+        ROOT_ACCOUNT.to_string(),
+        NOBODY_ACCOUNT.to_string(),
+        user.as_str().to_string(),
+    ]
+}
+
+/// Resolve account names into the `passwd` and `group` text a container gets.
+///
+/// `getpwnam`/`getgrnam` rather than parsing `/etc/passwd`, so an operator's
+/// LDAP or sssd accounts resolve here exactly as they do everywhere else on the
+/// box — and so this keeps the design document's promise unchanged: *the
+/// container does not create accounts, it names ones the host already has.*
+///
+/// A name that resolves to neither a user nor a group is left out rather than
+/// invented. A container whose passwd named a uid nobody has would be the panel
+/// writing a fact that is not true, and the honest failure — `getpwuid` finds
+/// nothing — is the one the caller already handles.
+fn render_account_files(names: &[String]) -> (String, String) {
+    let mut users: Vec<PasswdRecord> = Vec::new();
+    let mut groups: Vec<GroupRecord> = Vec::new();
+
+    for name in names {
+        if let Some(user) = passwd_record(name) {
+            // The account's own primary group, or its gid has no name inside
+            // the container and `id` prints a bare number.
+            if let Some(primary) = group_by_gid(user.gid) {
+                push_group(&mut groups, primary);
+            }
+            push_user(&mut users, user);
+        }
+        // Asked as a group as well as a user, because the two namespaces are
+        // separate: `nginx` is a group an FPM pool names without any process
+        // ever running as the `nginx` user.
+        if let Some(group) = group_record(name) {
+            push_group(&mut groups, group);
+        }
+    }
+
+    // Root is the one entry that is synthesised when the lookup comes back
+    // empty. uid 0 is root by definition on every Unix, so writing the line is
+    // not an invention; a container with no root entry at all, on a host whose
+    // NSS is momentarily not answering, is a container where half the standard
+    // tooling errors out for a reason nobody would guess.
+    if !users.iter().any(|u| u.uid == 0) {
+        push_user(
+            &mut users,
+            PasswdRecord {
+                name: ROOT_ACCOUNT.to_string(),
+                uid: 0,
+                gid: 0,
+                home: "/root".to_string(),
+                shell: "/sbin/nologin".to_string(),
+            },
+        );
+    }
+    if !groups.iter().any(|g| g.gid == 0) {
+        push_group(
+            &mut groups,
+            GroupRecord {
+                name: ROOT_ACCOUNT.to_string(),
+                gid: 0,
+                members: Vec::new(),
+            },
+        );
+    }
+
+    // A group's member list is a second copy of the customer list: on a host
+    // where an operator has added tenants to a shared group, rendering it whole
+    // would leak the names this whole section removes. Only members the
+    // container already knows about survive, so `initgroups` still resolves
+    // every membership that can matter to it.
+    let known: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
+    for group in &mut groups {
+        group.members.retain(|m| known.contains(&m.as_str()));
+    }
+
+    // Sorted so two runs on one machine produce byte-identical files: the FPM
+    // sibling of this code rewrites them under a running master, and a file
+    // that churned on every write would make a real change impossible to spot
+    // in a diff.
+    users.sort_by_key(|u| u.uid);
+    groups.sort_by_key(|g| g.gid);
+
+    (
+        users.iter().map(passwd_line).collect(),
+        groups.iter().map(group_line).collect(),
+    )
+}
+
+fn push_user(users: &mut Vec<PasswdRecord>, record: PasswdRecord) {
+    if !users.iter().any(|u| u.name == record.name) {
+        users.push(record);
+    }
+}
+
+fn push_group(groups: &mut Vec<GroupRecord>, record: GroupRecord) {
+    if !groups.iter().any(|g| g.name == record.name) {
+        groups.push(record);
+    }
+}
+
+/// One `passwd` line.
+///
+/// The GECOS field is left empty on purpose. On a host where an operator filled
+/// it in it carries a person's real name and contact details, and nothing inside
+/// a container has ever needed it.
+fn passwd_line(record: &PasswdRecord) -> String {
+    format!(
+        "{}:x:{}:{}::{}:{}\n",
+        record.name, record.uid, record.gid, record.home, record.shell
+    )
+}
+
+fn group_line(record: &GroupRecord) -> String {
+    format!(
+        "{}:x:{}:{}\n",
+        record.name,
+        record.gid,
+        record.members.join(",")
+    )
+}
+
+/// Write a container's own `passwd` and `group`.
+///
+/// **In place, never through a rename.** A bind-mounted *file* is the inode, not
+/// the path: a write-and-rename would leave the running container holding the
+/// old file forever while the host showed the new one, which is the shape of
+/// silent failure this codebase treats as its worst. Truncating and writing
+/// keeps the inode, so a container reads what was written.
+fn write_account_files(dir: &Path, passwd: &str, group: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| UnihelmError::internal(format!("could not create {}: {e}", dir.display())))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(ACCOUNT_DIR_MODE)).map_err(
+        |e| {
+            UnihelmError::internal(format!(
+                "could not set {:04o} on {}: {e}",
+                ACCOUNT_DIR_MODE,
+                dir.display()
+            ))
+        },
+    )?;
+
+    for (name, body) in [("passwd", passwd), ("group", group)] {
+        let path = dir.join(name);
+        // Refused rather than followed, and refused rather than replaced:
+        // nothing in this module removes a path, so a link somebody planted
+        // here is reported and left for them to deal with.
+        if std::fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidPath,
+                format!(
+                    "{} is a symlink; refusing to write this container's account file \
+                     through it",
+                    path.display()
+                ),
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(ACCOUNT_FILE_MODE)
+            .open(&path)
+            .map_err(|e| {
+                UnihelmError::internal(format!("could not open {}: {e}", path.display()))
+            })?;
+        file.write_all(body.as_bytes()).map_err(|e| {
+            UnihelmError::internal(format!("could not write {}: {e}", path.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The same helper [`crate::wordpress`] and [`crate::fsops`] each keep a copy
+/// of, widened to the fields a `passwd` line has.
 ///
 /// Duplicated rather than hoisted for their stated reason: hoisting it means
-/// editing a shared module mid-wave, and three copies of six lines that call one
-/// libc function is a smaller problem than two agents rewriting one file.
-fn passwd_entry(username: &str) -> Option<(u32, u32)> {
+/// editing a shared module mid-wave, and copies of a few lines that call one
+/// libc function are a smaller problem than two agents rewriting one file.
+fn passwd_record(username: &str) -> Option<PasswdRecord> {
     let c_name = std::ffi::CString::new(username).ok()?;
     // SAFETY: `getpwnam` returns a pointer into a static buffer owned by libc;
-    // we read it immediately and copy out the two integers we need.
+    // we read it immediately and copy every field out before anything else can
+    // call into the same buffer.
     unsafe {
         let pw = libc::getpwnam(c_name.as_ptr());
         if pw.is_null() {
             return None;
         }
-        Some(((*pw).pw_uid, (*pw).pw_gid))
+        Some(PasswdRecord {
+            name: c_string((*pw).pw_name),
+            uid: (*pw).pw_uid,
+            gid: (*pw).pw_gid,
+            home: c_string((*pw).pw_dir),
+            shell: c_string((*pw).pw_shell),
+        })
     }
+}
+
+fn group_record(name: &str) -> Option<GroupRecord> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: as above, for `getgrnam`.
+    unsafe {
+        let gr = libc::getgrnam(c_name.as_ptr());
+        read_group(gr)
+    }
+}
+
+fn group_by_gid(gid: u32) -> Option<GroupRecord> {
+    // SAFETY: as above, for `getgrgid`.
+    unsafe {
+        let gr = libc::getgrgid(gid);
+        read_group(gr)
+    }
+}
+
+/// # Safety
+///
+/// `gr` is null or a pointer libc owns and has just filled; everything is copied
+/// out before returning.
+unsafe fn read_group(gr: *mut libc::group) -> Option<GroupRecord> {
+    if gr.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut members = Vec::new();
+        let mut cursor = (*gr).gr_mem;
+        // `gr_mem` is a NULL-terminated array of C strings.
+        while !cursor.is_null() && !(*cursor).is_null() {
+            members.push(c_string(*cursor));
+            cursor = cursor.add(1);
+        }
+        Some(GroupRecord {
+            name: c_string((*gr).gr_name),
+            gid: (*gr).gr_gid,
+            members,
+        })
+    }
+}
+
+/// # Safety
+///
+/// `ptr` is null or a NUL-terminated C string libc owns.
+unsafe fn c_string(ptr: *const libc::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +802,13 @@ pub struct AppContainer {
     labels: Vec<String>,
     /// What to call this application in a sentence.
     label: String,
+    /// The account names this container's own `passwd` and `group` may hold.
+    /// See [`accounts_an_app_container_needs`].
+    accounts: Vec<String>,
+    /// The panel's `passwd` for this container, mounted at `/etc/passwd`.
+    passwd_file: PathBuf,
+    /// The panel's `group` for this container, mounted at `/etc/group`.
+    group_file: PathBuf,
 }
 
 impl AppContainer {
@@ -557,6 +883,9 @@ impl AppContainer {
         let slice = crate::slices::slice_file_name(user);
         let cgroup_parent = paths::systemd_unit(&slice).exists().then_some(slice);
 
+        let accounts = accounts_an_app_container_needs(user);
+        let account_dir = account_dir(&container);
+
         Ok(Self {
             container,
             image: reference,
@@ -574,6 +903,9 @@ impl AppContainer {
                 format!("{LABEL_PORT}={port}"),
             ],
             label: format!("{} ({})", name.as_str(), user.as_str()),
+            accounts,
+            passwd_file: account_dir.join("passwd"),
+            group_file: account_dir.join("group"),
         })
     }
 
@@ -746,16 +1078,20 @@ fn run_argv(plan: &AppContainer) -> Vec<String> {
         format!("{0}:{0}", plan.app_dir.display()),
         "--workdir".to_string(),
         plan.app_dir.display().to_string(),
-        // The host's accounts, read-only, exactly as the design document
-        // specifies for FPM: the container does not create users, it names the
-        // ones the host has. Without this the uid above has no passwd entry and
-        // anything calling `getpwuid` fails on an application that is otherwise
-        // fine. Read-only is not decoration — a writable bind of the host's
-        // passwd inside a tenant's container is the whole machine.
+        // Accounts, read-only — and **the panel's own pair, not the host's**.
+        // Without them the uid above has no passwd entry and anything calling
+        // `getpwuid` fails on an application that is otherwise fine; with the
+        // host's, every tenant's code could read every other hosting customer's
+        // login name, uid and home path straight out of `/etc/passwd`. These
+        // hold root, `nobody` and this one tenant — see
+        // [`accounts_an_app_container_needs`], and [`create_planned`] writes
+        // them before the container exists. Read-only is not decoration either:
+        // a writable bind of an account database into tenant-authored code is
+        // the pool's identity for somebody else to choose.
         "--volume".to_string(),
-        "/etc/passwd:/etc/passwd:ro".to_string(),
+        format!("{}:/etc/passwd:ro", plan.passwd_file.display()),
         "--volume".to_string(),
-        "/etc/group:/etc/group:ro".to_string(),
+        format!("{}:/etc/group:ro", plan.group_file.display()),
         // 127.0.0.1 inside a container is the container. An application talking
         // to a containerised database needs a name for the host, and this is
         // Docker's own.
@@ -1249,6 +1585,21 @@ const MAX_LOG_LINES: u32 = 2_000;
 async fn create_planned(ctx: &OpContext, plan: &AppContainer) -> Result<StartOutput> {
     let docker = docker_program()?;
     check_bind_source(&plan.app_dir)?;
+
+    // Before the pull, because a refusal that costs nothing should not first
+    // cost a quarter of an hour of download — and before the run, because
+    // Docker creates a *directory* where a bind-mount source file is missing,
+    // and a directory at `/etc/passwd` is a container in which nothing can
+    // resolve a name at all.
+    let (passwd, group) = render_account_files(&plan.accounts);
+    write_account_files(&account_dir(&plan.container), &passwd, &group)?;
+    ctx.log(format!(
+        "{} gets its own /etc/passwd and /etc/group holding {} account(s) — {} — rather \
+         than the host's, which would list every other tenant on this server",
+        plan.container,
+        plan.accounts.len(),
+        plan.accounts.join(", ")
+    ));
 
     ctx.log(format!("docker pull {}", plan.image.as_str()));
     run_checked(&docker, &pull_argv(&plan.image), PULL_BUDGET).await?;
@@ -2011,22 +2362,156 @@ mod tests {
         );
     }
 
-    /// The host's accounts, read-only. Writable, a bind of the host's passwd
-    /// inside a tenant's container would be the whole machine; absent, the uid
-    /// above has no name and anything calling `getpwuid` fails on an application
-    /// that is otherwise fine.
+    /// The container gets accounts, read-only, and they are **the panel's own**.
+    ///
+    /// The host's `/etc/passwd` used to be mounted here. Read-only stopped a
+    /// tenant changing it and did nothing at all about reading it: every
+    /// application on the box could list every other hosting customer's login
+    /// name, uid and home path — a customer roster handed to each customer.
+    /// Absent altogether is not the answer either; the uid the container runs as
+    /// would have no name and anything calling `getpwuid` would fail.
     #[test]
-    fn the_hosts_accounts_come_in_read_only() {
-        let argv = run_argv(&plan(AppRuntime::Node, None));
-        for mount in ["/etc/passwd:/etc/passwd:ro", "/etc/group:/etc/group:ro"] {
+    fn the_accounts_that_come_in_are_the_panels_own_and_not_the_hosts() {
+        let resolved = plan(AppRuntime::Node, None);
+        let argv = run_argv(&resolved);
+        let mounts: Vec<&String> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--volume")
+            .map(|w| &w[1])
+            .collect();
+
+        for (source, target) in [
+            (&resolved.passwd_file, "/etc/passwd"),
+            (&resolved.group_file, "/etc/group"),
+        ] {
+            let mount = format!("{}:{target}:ro", source.display());
+            assert!(mounts.contains(&&mount), "{mount} missing from {argv:?}");
+            // The panel writes these; they are not a path inside /etc that an
+            // operator or a package could be editing under us.
             assert!(
-                argv.windows(2).any(|w| w[0] == "--volume" && w[1] == mount),
-                "{mount} missing from {argv:?}"
+                source.starts_with(paths::state_dir()),
+                "{} is not the panel's own file",
+                source.display()
             );
         }
+
+        // The two mounts the fix removes, in every spelling that would restore
+        // them.
+        for leak in [
+            "/etc/passwd:/etc/passwd:ro",
+            "/etc/group:/etc/group:ro",
+            "/etc/passwd:/etc/passwd",
+            "/etc/group:/etc/group",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == leak),
+                "`{leak}` puts the whole host account list back inside a tenant's \
+                 container: {argv:?}"
+            );
+        }
+    }
+
+    /// Three accounts, and the tenant's own is the only one of them that names
+    /// anybody. Another tenant on the same server must never appear.
+    #[test]
+    fn an_application_container_is_told_about_three_accounts_and_no_customers() {
+        let mine = user();
+        let neighbour = LinuxUser::parse("uh_zzz99999").unwrap();
+        let names = accounts_an_app_container_needs(&mine);
+
+        assert_eq!(names, vec!["root", "nobody", "uh_abc12345"]);
         assert!(
-            !argv.iter().any(|a| a == "/etc/passwd:/etc/passwd"),
-            "a writable passwd mount is root on this machine: {argv:?}"
+            !names.iter().any(|n| n == neighbour.as_str()),
+            "another tenant reached this container's passwd: {names:?}"
+        );
+        // And the plan carries exactly that list to the writer, so the argv and
+        // the file cannot disagree about who the container may see.
+        assert_eq!(plan(AppRuntime::Node, None).accounts, names);
+    }
+
+    /// The rendered files are passwd(5) and group(5), and neither carries a
+    /// field the container has no use for.
+    #[test]
+    fn the_rendered_account_files_say_only_what_a_container_needs() {
+        let record = PasswdRecord {
+            name: "uh_abc12345".to_string(),
+            uid: 1007,
+            gid: 1007,
+            home: "/home/uh_abc12345".to_string(),
+            shell: "/usr/sbin/nologin".to_string(),
+        };
+        assert_eq!(
+            passwd_line(&record),
+            "uh_abc12345:x:1007:1007::/home/uh_abc12345:/usr/sbin/nologin\n"
+        );
+        // The GECOS field is empty: on a host where an operator filled it in it
+        // is somebody's real name and phone number, and nothing in a container
+        // has ever read it.
+        assert_eq!(passwd_line(&record).split(':').nth(4), Some(""));
+
+        assert_eq!(
+            group_line(&GroupRecord {
+                name: "uh_abc12345".to_string(),
+                gid: 1007,
+                members: vec![],
+            }),
+            "uh_abc12345:x:1007:\n"
+        );
+    }
+
+    /// Root always has a name in the container, even where the host's name
+    /// service cannot be asked. A passwd with no uid 0 breaks a surprising
+    /// amount of ordinary tooling for a reason nobody would guess from the
+    /// error.
+    #[test]
+    fn root_is_in_the_file_even_when_nothing_resolves() {
+        // A name no name service can answer for, so the lookups all miss and
+        // only the synthesised entries are left.
+        let (passwd, group) = render_account_files(&["uh_no_such_account_here".to_string()]);
+        assert!(passwd.starts_with("root:x:0:0:"), "{passwd}");
+        assert!(group.starts_with("root:x:0:"), "{group}");
+        // And the name that did not resolve is not invented into existence: a
+        // passwd line naming a uid nobody has would be the panel writing down
+        // something untrue.
+        assert!(!passwd.contains("uh_no_such_account_here"), "{passwd}");
+    }
+
+    /// A bind-mounted file is the inode, not the path. Writing a new file and
+    /// renaming it over this one would leave a running container reading the old
+    /// content forever while the host showed the new — the FPM sibling of this
+    /// code rewrites these files under a live master, and that failure would be
+    /// invisible until a site 502'd.
+    #[test]
+    fn rewriting_the_account_files_keeps_the_inode_the_container_holds() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().join("unihelm-app-uh_abc12345-blog");
+        write_account_files(&dir, "root:x:0:0::/root:/sbin/nologin\n", "root:x:0:\n").unwrap();
+        let first = std::fs::metadata(dir.join("passwd")).unwrap().ino();
+
+        write_account_files(
+            &dir,
+            "root:x:0:0::/root:/sbin/nologin\nuh_abc12345:x:1007:1007::/home/uh_abc12345:/x\n",
+            "root:x:0:\n",
+        )
+        .unwrap();
+        let second = std::fs::metadata(dir.join("passwd")).unwrap();
+
+        assert_eq!(first, second.ino(), "the file was replaced, not rewritten");
+        assert_eq!(second.mode() & 0o777, ACCOUNT_FILE_MODE);
+        assert!(
+            std::fs::read_to_string(dir.join("passwd"))
+                .unwrap()
+                .contains("uh_abc12345"),
+            "the rewrite did not land"
+        );
+        // The directory is root's alone on the host: a tenant who could write
+        // their own container's passwd could give their account name another
+        // tenant's uid.
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().mode() & 0o777,
+            ACCOUNT_DIR_MODE
         );
     }
 

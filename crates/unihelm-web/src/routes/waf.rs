@@ -47,13 +47,19 @@ use crate::state::SharedState;
 /// `blockers` array explaining why — nginx comes from nginx.org, which ships no
 /// ModSecurity module. That is the honest answer and it is the *point* of this
 /// endpoint: the UI renders the blockers rather than a switch that would fail.
+///
+/// `web_server` carries what actually serves the machine's sites, and it is the
+/// field a client must branch on before it draws anything: on an Apache server
+/// every one of these settings is a record of an intention that inspects no
+/// request, so `enabled: true` beside `available: false` is a warning, not a
+/// green light.
 #[utoipa::path(
     get,
     path = "/api/waf",
     tag = "waf",
     security(("session_cookie" = [])),
     responses(
-        (status = 200, description = "Module and Core Rule Set state, the blockers that stop the WAF from being enabled here, the per-site policies and the exclusion list", body = serde_json::Value),
+        (status = 200, description = "The web server that actually serves this machine, the module and Core Rule Set state, the blockers that stop the WAF from being enabled here, the per-site policies and the exclusion list", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied`: needs `server_manage`", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
@@ -105,7 +111,7 @@ pub struct EnableRequest {
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
         (status = 404, description = "`not_found`: no such site", body = ApiErrorBody),
-        (status = 409, description = "`conflict`: this server has no loadable ModSecurity module, or a per-site policy was asked for before the WAF was enabled server-wide. The message names exactly what is missing.", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: this machine serves with Apache or OpenLiteSpeed, which read none of the nginx configuration the WAF is written as; or the server has no loadable ModSecurity module; or a per-site policy was asked for before the WAF was enabled server-wide. The message names exactly what is missing.", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
     ),
 )]

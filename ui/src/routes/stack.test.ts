@@ -36,12 +36,15 @@ import {
   defaultVersionFor,
   groupByCategory,
   hostHoldsEntry,
+  installBlocked,
   planFor,
   portIncumbentFor,
+  rowError,
   runtimeOf,
   serviceControlFor,
   servingState,
   sideBySideIn,
+  soleVersion,
   supportFor,
   uncataloguedRuntimes,
 } from "./stack";
@@ -523,6 +526,107 @@ describe("where an install goes", () => {
     expect(plan.runtime).toBe("host");
     expect(plan.support).toBe("host");
     expect(plan.dockerMissing).toBe(false);
+  });
+});
+
+describe("how long the button stays locked after a click", () => {
+  /** Nothing in the way: the row's only reason to be disabled is its own work. */
+  const clear = { busy: false, starting: false };
+
+  it("stays locked for as long as the agent is working on the row", () => {
+    // The defect: the only lock was the mutation's pending flag, and that
+    // clears the moment the 202 comes back — while the install it started runs
+    // for minutes afterwards. Every click in that window made another task, and
+    // the agent refused each one with `already being installed`, so pressing
+    // Install twice bought a column of red rows and no second install.
+    const running = [row({ component: "php", status: "installing", version: "8.4" })];
+    const plan = planFor(php, running, "8.5");
+    expect(plan.working).toBe(true);
+    expect(installBlocked(plan, clear)).toBe(true);
+  });
+
+  it("stays locked across the gap between the 202 and the first poll that agrees", () => {
+    // The status the poll reads is written *after* the task starts, so for a
+    // poll interval after the 202 the agent still reports the row idle. A lock
+    // that opens there is the same defect with a smaller window, and it opens
+    // exactly where an operator who saw nothing happen clicks again.
+    const plan = planFor(php, [], "8.5");
+    expect(plan.working).toBe(false);
+    expect(installBlocked(plan, { busy: false, starting: true })).toBe(true);
+  });
+
+  it("arms again on a row nothing is happening to", () => {
+    // The lock has to be about this row: an install running on PHP is no reason
+    // the operator cannot start one on MariaDB, and a page-wide freeze would
+    // put every button behind the slowest thing on the machine.
+    const running = [row({ component: "php", status: "installing", version: "8.4" })];
+    expect(installBlocked(planFor(mariadb, running, "11.8", "host"), clear)).toBe(false);
+  });
+
+  it("keeps refusing the clicks the agent would refuse", () => {
+    // The conditions that were already here, unchanged by the lock: a version
+    // that is on the machine, and one whose install the agent would turn down.
+    expect(installBlocked(planFor(php, [row({ component: "php", version: "8.3" })], "8.3"), clear)).toBe(
+      true,
+    );
+    expect(installBlocked(planFor(mariadb, [], "11.8", "container"), clear)).toBe(true);
+    expect(installBlocked(planFor(php, [], "8.5"), { busy: true, starting: false })).toBe(true);
+    expect(installBlocked(planFor(php, [], "8.5"), clear)).toBe(false);
+  });
+});
+
+describe("what a failed install puts on the row", () => {
+  it("shows the first line and holds the rest back", () => {
+    // An apt failure is a screenful, and it used to be printed into the row
+    // whole: one broken row pushed every other entry on the page below the
+    // fold, so the operator scrolled through somebody else's dependency chain
+    // to reach the thing they came to install.
+    const apt = [
+      "E: Unable to locate package php8.5-fpm",
+      "The following packages have unmet dependencies:",
+      " php8.5-fpm : Depends: php8.5-common (= 8.5.0-1) but it is not going to be installed",
+      "E: Sub-process /usr/bin/dpkg returned an error code (1)",
+    ].join("\n");
+    const shown = rowError(apt);
+    expect(shown.summary).toBe("E: Unable to locate package php8.5-fpm");
+    // The whole message, not the tail: it is what gets pasted into a search box
+    // or a support ticket, and half of it is not what the package manager said.
+    expect(shown.details).toBe(apt);
+  });
+
+  it("contains a single enormous line too", () => {
+    // The other shape apt failures take. Wrapping one of these inside the row
+    // is the same page pushed off screen by different means.
+    const long = `E: ${"dependency ".repeat(60)}`;
+    const shown = rowError(long);
+    expect(shown.summary.length).toBeLessThan(200);
+    expect(shown.summary.endsWith("…")).toBe(true);
+    expect(shown.details).toBe(long.trim());
+  });
+
+  it("hides nothing behind a disclosure when there is nothing to hide", () => {
+    // A click that reveals the second half of a short sentence costs more than
+    // it saves, and a trailing newline is not a second half.
+    expect(rowError("404 from the vendor repository")).toEqual({
+      summary: "404 from the vendor repository",
+      details: null,
+    });
+    expect(rowError("404 from the vendor repository\n").details).toBeNull();
+  });
+});
+
+describe("whether the version is a choice at all", () => {
+  it("draws no menu for an entry the catalogue has one version of", () => {
+    // Most of the catalogue is this shape, and a `<Select>` with one option is
+    // a control that cannot be changed: the operator opens it for the
+    // alternatives it promises and reads the row as broken when there are none.
+    expect(soleVersion(nginx)?.version).toBe("stable");
+    expect(soleVersion(docker)?.version).toBe("stable");
+  });
+
+  it("draws one wherever there is something to pick between", () => {
+    expect(soleVersion(php)).toBeNull();
+    expect(soleVersion(mariadb)).toBeNull();
   });
 });
 

@@ -316,6 +316,193 @@ pub async fn delete(
     .await
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AliasRequest {
+    /// The extra name this site should answer to, e.g. `www.example.com`.
+    pub domain: String,
+}
+
+/// Attach another domain to an existing site.
+///
+/// There is no `redirect` field although the column exists: nothing renders it
+/// into a vhost, and the panel does not accept settings it cannot honour — see
+/// `site.alias.add` and the `www_policy` refusal next to it.
+#[utoipa::path(
+    post,
+    path = "/api/sites/{id}/aliases",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "Site id")),
+    request_body = AliasRequest,
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 400, description = "`invalid_domain`", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site in this tenant's scope", body = ApiErrorBody),
+        (status = 409, description = "`domain_already_exists`, or the site is not ready for one", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn alias_add(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    current: CurrentUser,
+    Json(body): Json<AliasRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::SiteManage)
+        .map_err(ApiError::from)?;
+
+    // Parsed here for the same reason `create` parses: the agent checks it
+    // again because it does not trust us, but a bad name gets `UNI-1201` with
+    // the field highlighted instead of a task that fails a second later.
+    let domain = unihelm_core::Domain::parse(&body.domain)
+        .map_err(|e| ApiError::new(e.with_field("domain")))?;
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "site.alias.add",
+        &id.to_string(),
+        json!({ "domain": domain.as_str() }),
+    )
+    .await?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "site.alias.add",
+        alias_input(id, &domain),
+    )
+    .await
+}
+
+/// Detach a domain from a site.
+///
+/// The alias travels in the path rather than a body: a `DELETE` with a body is
+/// awkward for every client, and the name is the identity of the thing being
+/// removed. It is parsed as a domain before it goes anywhere, so a path segment
+/// that is not one is a 400 rather than a task.
+#[utoipa::path(
+    delete,
+    path = "/api/sites/{id}/aliases/{alias}",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(
+        ("id" = i64, Path, description = "Site id"),
+        ("alias" = String, Path, description = "The alias to detach"),
+    ),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 400, description = "`invalid_domain`", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site, or the name is not one of its aliases", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn alias_remove(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, alias)): Path<(i64, String)>,
+    current: CurrentUser,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::SiteManage)
+        .map_err(ApiError::from)?;
+
+    let domain =
+        unihelm_core::Domain::parse(&alias).map_err(|e| ApiError::new(e.with_field("domain")))?;
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "site.alias.remove",
+        &id.to_string(),
+        json!({ "domain": domain.as_str() }),
+    )
+    .await?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "site.alias.remove",
+        alias_input(id, &domain),
+    )
+    .await
+}
+
+/// The operation input both alias routes send.
+///
+/// The id is the path's and the domain is the normalised parse, never the raw
+/// string the client sent: `Shop.Example.COM.` and `shop.example.com` name one
+/// alias, and sending both spellings to the agent would make the remove miss
+/// the row the add wrote.
+fn alias_input(id: i64, domain: &unihelm_core::Domain) -> serde_json::Value {
+    json!({ "site_id": id, "domain": domain.as_str() })
+}
+
+/// Run a site's provisioning again, for one that never finished.
+#[utoipa::path(
+    post,
+    path = "/api/sites/{id}/reprovision",
+    tag = "sites",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "Site id")),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such site in this tenant's scope", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: a provisioning task is already running", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn reprovision(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    current: CurrentUser,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::SiteManage)
+        .map_err(ApiError::from)?;
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "site.reprovision",
+        &id.to_string(),
+        json!({}),
+    )
+    .await?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "site.reprovision",
+        json!({ "site_id": id }),
+    )
+    .await
+}
+
 /// Has somebody edited this site's generated vhost?
 #[utoipa::path(
     get,
@@ -375,4 +562,70 @@ async fn audit(
         .await
         .map_err(ApiError::from)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule this module owns for the alias routes: the site id is the
+    /// path's, and the name that travels is the *normalised* domain.
+    ///
+    /// `site_aliases.domain` stores what the agent was given, and the removal
+    /// matches on it exactly. Forwarding the raw string would let
+    /// `Shop.Example.COM.` be attached as one spelling and then be unfindable
+    /// under the one the panel shows — a remove button that reports success and
+    /// detaches nothing, or a 404 on a name the page is displaying.
+    #[test]
+    fn an_alias_reaches_the_agent_normalised_and_under_the_paths_site_id() {
+        let domain = unihelm_core::Domain::parse("  Shop.Example.COM. ").expect("a real domain");
+        let input = alias_input(7, &domain);
+
+        assert_eq!(input["site_id"], json!(7));
+        assert_eq!(input["domain"], json!("shop.example.com"));
+        assert_eq!(
+            input.as_object().map(|o| o.len()),
+            Some(2),
+            "nothing else belongs in an alias request: {input}"
+        );
+    }
+
+    /// The body carries the name and nothing else. `redirect` is deliberately
+    /// absent: no template renders it, and a stored setting nothing honours is
+    /// the defect `site.update` refuses `www_policy` for.
+    #[test]
+    fn an_alias_request_carries_only_the_domain() {
+        let body: AliasRequest =
+            serde_json::from_value(json!({ "domain": "www.example.com", "redirect": true }))
+                .expect("the request shape parses");
+        assert_eq!(body.domain, "www.example.com");
+
+        let domain = unihelm_core::Domain::parse(&body.domain).expect("a real domain");
+        let input = alias_input(1, &domain);
+        assert!(
+            !input.as_object().expect("object").contains_key("redirect"),
+            "a flag the vhost cannot render must not reach the agent: {input}"
+        );
+    }
+
+    /// The names a client can put in a path segment that are not domains. Each
+    /// has to be a 400 with the field named, not a task that fails later — and
+    /// `..` and an absolute path are the two that would otherwise reach the
+    /// agent as a `domain`.
+    #[test]
+    fn a_path_segment_that_is_not_a_domain_never_becomes_an_alias() {
+        for bad in [
+            "",
+            "..",
+            "/etc/nginx",
+            "localhost",
+            "192.0.2.1",
+            "a b.example",
+        ] {
+            assert!(
+                unihelm_core::Domain::parse(bad).is_err(),
+                "accepted `{bad}` as an alias"
+            );
+        }
+    }
 }

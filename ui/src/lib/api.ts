@@ -324,6 +324,43 @@ export interface ContainerPortMap {
   host: number;
   container: number;
   udp: boolean;
+  /**
+   * Bind the host side to every interface instead of to `127.0.0.1`.
+   *
+   * The create form has sent this since 0.7.2 and this type did not declare it,
+   * so the one field on the page that can open a port to the internet was
+   * outside the type system: a rename or a typo on the sending side would have
+   * been dropped by serde on the agent, silently publishing on loopback a port
+   * the operator had deliberately opened — or, had the default gone the other
+   * way, the reverse. Optional, because absent means private and every caller
+   * that has never heard of it should keep getting that.
+   */
+  public?: boolean;
+}
+
+/** What `docker.image.pull` and `docker.image.remove` take. */
+export interface ImageRequest {
+  /** `nginx`, `redis:7`, `ghcr.io/owner/app:v1`. Validated by the agent. */
+  image: string;
+}
+
+/** What `docker.image.remove` answers with. */
+export interface ImageRemoved {
+  image: string;
+  id: string;
+  /**
+   * Docker's own `Untagged:` and `Deleted:` lines.
+   *
+   * An image with two tags is untagged rather than deleted and no space comes
+   * back until the last tag goes, so these lines are what explains a removal
+   * that reclaimed nothing.
+   */
+  removed: string[];
+}
+
+/** What `docker.volume.remove` answers with. */
+export interface VolumeRemoved {
+  volume: string;
 }
 
 export interface CreateContainerRequest {
@@ -1097,6 +1134,38 @@ export const endpoints = {
    */
   createContainer: (body: CreateContainerRequest) =>
     api.post<TaskAccepted>("/api/server/docker/containers", body),
+  /**
+   * Fetch an image. A task, because a pull is minutes on a small VPS's uplink.
+   *
+   * Addressed in the body rather than the path, here and for the removal below:
+   * `ghcr.io/owner/app:v1` carries slashes and colons, and a path parameter
+   * holding one is a percent-encoding problem at every client that calls it.
+   */
+  pullImage: (body: ImageRequest) =>
+    api.post<TaskAccepted>("/api/server/docker/images/pull", body),
+  /**
+   * Delete an image. Immediate, so the refusal reaches the page.
+   *
+   * An image a container is built on comes back 409 with that container named,
+   * rather than being force-removed: the container would keep running with no
+   * image to restart from, and would die at the next reboot for a reason nobody
+   * would connect to this button.
+   */
+  removeImage: (body: ImageRequest) =>
+    api.post<ImageRemoved>("/api/server/docker/images/remove", body),
+  /**
+   * Reclaim the disk dangling layers eat. A task; the log names what went and
+   * how much came back.
+   */
+  pruneImages: (dryRun = false) =>
+    api.post<TaskAccepted>("/api/server/docker/images/prune", { dry_run: dryRun }),
+  /**
+   * Delete a volume. Immediate, for the same reason the image removal is: both
+   * refusals name what is in the way, and one an operator has to poll for reads
+   * as a failed request rather than as an answer.
+   */
+  removeVolume: (name: string) =>
+    api.del<VolumeRemoved>(`/api/server/docker/volumes/${encodeURIComponent(name)}`),
   runtimes: () => api.get<RuntimeListResponse>("/api/runtimes"),
   /**
    * Point a bare command name at one installed version.

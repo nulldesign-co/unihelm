@@ -19,7 +19,7 @@ use unihelm_config::paths;
 use unihelm_core::{
     Domain, ErrorCode, Permission, PhpVersion, Result, SiteId, SubscriptionId, UnihelmError,
 };
-use unihelm_db::sites::{NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPolicy};
+use unihelm_db::sites::{DomainOwner, NewSite, Site, SiteStatus, SiteType, SiteUpdate, WwwPolicy};
 
 use crate::nginx_survey;
 use crate::provision;
@@ -358,7 +358,9 @@ async fn provision_site(
 
     provision::ensure_tenant_user(ctx, linux_user, &subscription.home_dir, false).await?;
     provision::ensure_site_dirs(&distro, linux_user, &domain, log).await?;
-    provision::write_placeholder(linux_user, &domain).await?;
+    if document_root_is_empty(&paths::site_public(linux_user.as_str(), domain.as_str())) {
+        provision::write_placeholder(linux_user, &domain).await?;
+    }
 
     // 2. The FPM pool, before the vhost that points at its socket.
     if let Some(version) = site.php_version {
@@ -373,6 +375,33 @@ async fn provision_site(
     render_logrotate(ctx, site, linux_user).await?;
 
     Ok(())
+}
+
+/// Has anything been put in this site's document root yet?
+///
+/// The holding page is a courtesy for a root nobody has uploaded to. Every
+/// caller of [`provision_site`] can now be a *second* run over a root that is
+/// not new — `site.create` reclaiming a failed row, and `site.reprovision` —
+/// and `site.create`'s unwind deliberately leaves the tenant's directory alone
+/// when provisioning fails, so what is in there is theirs.
+///
+/// `write_placeholder` only declines when `index.html` is already present,
+/// which is the wrong question on a retry: a static site uploaded as
+/// `index.htm`, or an application whose entry point is anywhere else, would
+/// have had the panel's "Upload your files to replace this page" dropped in
+/// beside it — and nginx's `index index.php index.html index.htm;` prefers the
+/// panel's file to the tenant's. The panel would then report the site as live,
+/// which it would be, serving the wrong page.
+fn document_root_is_empty(root: &Path) -> bool {
+    match std::fs::read_dir(root) {
+        Ok(mut entries) => entries.next().is_none(),
+        // Absent means nothing has been uploaded — the ordinary first create,
+        // where `ensure_site_dirs` has just made the tree. Any other error is
+        // a root we cannot see into, and writing into one of those blind is
+        // exactly what this guard exists to stop.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 /// Render and activate a site's PHP-FPM pool.
@@ -1304,6 +1333,522 @@ fn check_php_overrides(overrides: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// site.alias.add / site.alias.remove
+// ---------------------------------------------------------------------------
+
+/// The other names a site answers to.
+///
+/// `unihelm-db` has had `aliases`, `add_alias` and `remove_alias` since the
+/// first release and nothing above them ever called the last two: the only way
+/// an alias was ever written was `site.create`'s `with_www` flag. So attaching
+/// `www.example.com` — or a second brand's domain, or a subdomain — to a site
+/// that already existed was impossible from the panel, the API and the command
+/// line alike, and the only route to it was deleting the site and building it
+/// again, certificate and files included.
+///
+/// Both operations end in a vhost re-render through `webserver::active`, so
+/// they work on an Apache machine too, and both put the row back if that render
+/// is refused. A stored alias that is not in the rendered `server_name` is a
+/// name the panel says it serves and does not.
+///
+/// There is deliberately no `redirect` input, although the column exists.
+/// `render_vhost_inner` collects aliases as `.map(|a| a.domain)` and the
+/// templates emit one `server_name` line, so nothing renders the flag — and
+/// accepting a setting nothing renders is the `www_policy` defect `site.update`
+/// already refuses by name.
+pub struct AliasAdd;
+
+#[derive(Debug, Deserialize)]
+pub struct AliasAddInput {
+    pub site_id: i64,
+    /// Validated by `Domain`'s own deserializer, which is the same parse
+    /// `site.create` puts a new site's domain through: `Shop.Example.COM.`
+    /// arrives normalised, and an IP address never arrives at all.
+    pub domain: Domain,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AliasAddOutput {
+    pub site_id: i64,
+    pub domain: String,
+    pub alias: String,
+    /// Every name the site answers to now, primary first — what went into
+    /// `server_name`.
+    pub server_names: Vec<String>,
+    /// True when the alias was already attached and this run only re-rendered.
+    /// Reported rather than hidden, so a retry is not read as an attachment
+    /// that happened this time.
+    pub already_attached: bool,
+    /// The site has a live certificate that does not name the alias, so nginx
+    /// will offer the primary name's certificate for it and every browser will
+    /// refuse the connection. Nothing here fixes that — issuing is `cert.issue`
+    /// — so it is said out loud instead of being found by a customer.
+    pub certificate_needs_reissue: bool,
+}
+
+#[async_trait]
+impl TypedOperation for AliasAdd {
+    type Input = AliasAddInput;
+    type Output = AliasAddOutput;
+
+    const NAME: &'static str = "site.alias.add";
+    const PERMISSION: Permission = Permission::SiteManage;
+    // A vhost render, a validation and a web-server reload: past the immediate
+    // budget. Idempotent because an alias this site already holds converges on
+    // a re-render rather than colliding with itself.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let db = ctx.db().clone();
+        let site = site_for_alias_change(ctx, SiteId(input.site_id)).await?;
+        let linux_user = site_linux_user(ctx, &site).await?;
+        let alias = input.domain;
+
+        if alias.as_str() == site.domain {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "`{}` is the site's own name; an alias is an *additional* name",
+                    site.domain
+                ),
+            )
+            .with_field("domain"));
+        }
+
+        // Global, not the caller's scope, for the reason `retryable_site`
+        // gives: a name held by a tenant this caller cannot see is still held,
+        // and two vhosts claiming one `server_name` is resolved by nginx's
+        // parse order — a silent outage for whichever of the two loses.
+        let owner = db
+            .domain_owner(alias.as_str())
+            .await
+            .map_err(UnihelmError::from)?;
+
+        let already_attached = match owner {
+            Some(DomainOwner::Alias { site_id, .. }) if site_id == site.id => {
+                ctx.log(format!("{alias} is already an alias of {}", site.domain));
+                true
+            }
+            Some(DomainOwner::Site { domain, .. }) => {
+                return Err(UnihelmError::new(
+                    ErrorCode::DomainAlreadyExists,
+                    format!(
+                        "`{domain}` is already a site on this server. One name can only be \
+                         served by one vhost; delete that site, or pick another name."
+                    ),
+                )
+                .with_field("domain"));
+            }
+            Some(DomainOwner::Alias { domain, .. }) => {
+                return Err(UnihelmError::new(
+                    ErrorCode::DomainAlreadyExists,
+                    format!(
+                        "`{domain}` is already an alias of another site. Remove it there \
+                         before attaching it here."
+                    ),
+                )
+                .with_field("domain"));
+            }
+            None => {
+                // The same guard a new site gets: a hand-written vhost already
+                // answering for this name would be shadowed by ours, silently,
+                // because `conf.d` is read before `sites-enabled`. `is_ours`
+                // skips files the panel wrote, so this site cannot refuse
+                // itself.
+                refuse_foreign_vhost(&alias, false)?;
+                db.sites(ctx.scope())
+                    .add_alias(site.id, &alias, false)
+                    .await
+                    .map_err(UnihelmError::from)?;
+                ctx.log(format!("attached {alias} to {}", site.domain));
+                false
+            }
+        };
+
+        // The row is written; a render the web server refuses must not leave it
+        // behind. The config engine puts back the file it replaced, so the
+        // server goes on answering for the old list of names — and a stored
+        // alias missing from that list is the panel claiming a name it does not
+        // serve. Every later render of this site would fail the same way too.
+        if let Err(e) = render_vhost(ctx, &site, &linux_user).await {
+            if !already_attached
+                && let Err(undo) = db
+                    .sites(ctx.scope())
+                    .remove_alias(site.id, alias.as_str())
+                    .await
+            {
+                ctx.log(format!(
+                    "could not take {alias} back off {} after the refused render: {undo}",
+                    site.domain
+                ));
+            }
+            return Err(e);
+        }
+
+        let certificate_needs_reissue = db
+            .active_certificate_for_site(site.id)
+            .await
+            .map_err(UnihelmError::from)?
+            .is_some_and(|cert| {
+                !cert
+                    .domains
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(alias.as_str()))
+            });
+        if certificate_needs_reissue {
+            ctx.log(format!(
+                "the certificate does not cover {alias}: HTTPS to it will be refused by \
+                 browsers until the certificate is issued again"
+            ));
+        }
+
+        Ok(AliasAddOutput {
+            site_id: site.id.get(),
+            server_names: db
+                .sites(ctx.scope())
+                .server_names(site.id)
+                .await
+                .map_err(UnihelmError::from)?,
+            domain: site.domain,
+            alias: alias.as_str().to_string(),
+            already_attached,
+            certificate_needs_reissue,
+        })
+    }
+}
+
+pub struct AliasRemove;
+
+#[derive(Debug, Deserialize)]
+pub struct AliasRemoveInput {
+    pub site_id: i64,
+    pub domain: Domain,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AliasRemoveOutput {
+    pub site_id: i64,
+    pub domain: String,
+    pub alias: String,
+    /// Every name the site answers to after the removal, primary first.
+    pub server_names: Vec<String>,
+}
+
+#[async_trait]
+impl TypedOperation for AliasRemove {
+    type Input = AliasRemoveInput;
+    type Output = AliasRemoveOutput;
+
+    const NAME: &'static str = "site.alias.remove";
+    const PERMISSION: Permission = Permission::SiteManage;
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let db = ctx.db().clone();
+        let site = site_for_alias_change(ctx, SiteId(input.site_id)).await?;
+        let linux_user = site_linux_user(ctx, &site).await?;
+        let alias = input.domain;
+
+        // Read the row before deleting it, for two reasons: an alias that is
+        // not this site's is refused before anything is touched rather than
+        // after a `DELETE` that matched nothing, and the `redirect` flag is
+        // known if the render below has to be undone.
+        let existing = db
+            .sites(ctx.scope())
+            .aliases(site.id)
+            .await
+            .map_err(UnihelmError::from)?
+            .into_iter()
+            .find(|a| a.domain.eq_ignore_ascii_case(alias.as_str()))
+            .ok_or_else(|| {
+                UnihelmError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "`{alias}` is not an alias of `{}`. Reporting it as removed would \
+                         be the panel confirming work it did not do.",
+                        site.domain
+                    ),
+                )
+                .with_field("domain")
+            })?;
+
+        db.sites(ctx.scope())
+            .remove_alias(site.id, &existing.domain)
+            .await
+            .map_err(UnihelmError::from)?;
+        ctx.log(format!("detached {} from {}", existing.domain, site.domain));
+
+        // Symmetrical with the add: the engine restores the previous vhost on a
+        // refused validation, so the web server is still answering for the name
+        // this row says is gone. Put it back rather than let the two disagree.
+        if let Err(e) = render_vhost(ctx, &site, &linux_user).await {
+            match Domain::parse(&existing.domain) {
+                Ok(domain) => {
+                    if let Err(undo) = db
+                        .sites(ctx.scope())
+                        .add_alias(site.id, &domain, existing.redirect)
+                        .await
+                    {
+                        ctx.log(format!(
+                            "could not put {domain} back on {} after the refused render: {undo}",
+                            site.domain
+                        ));
+                    }
+                }
+                Err(undo) => ctx.log(format!(
+                    "could not put {} back on {} after the refused render: {undo}",
+                    existing.domain, site.domain
+                )),
+            }
+            return Err(e);
+        }
+
+        Ok(AliasRemoveOutput {
+            site_id: site.id.get(),
+            server_names: db
+                .sites(ctx.scope())
+                .server_names(site.id)
+                .await
+                .map_err(UnihelmError::from)?,
+            domain: site.domain,
+            alias: existing.domain,
+        })
+    }
+}
+
+/// The site an alias change may act on, or a refusal that says what to do next.
+///
+/// A vhost is rendered from every one of a site's names at once, so an alias
+/// change is a whole-vhost rewrite. On a site that is still provisioning that
+/// races the task already writing the file; on a site that never finished there
+/// is no vhost to add a name to, and rendering one would quietly bring the site
+/// up while its row still said `failed`. Both are refused, and the failed one
+/// names the operation that does fix it.
+async fn site_for_alias_change(ctx: &OpContext, id: SiteId) -> Result<Site> {
+    let site = ctx
+        .db()
+        .sites(ctx.scope())
+        .by_id(id)
+        .await
+        .map_err(UnihelmError::from)?
+        .ok_or_else(|| UnihelmError::not_found("site"))?;
+
+    match site.status {
+        SiteStatus::Active | SiteStatus::Suspended => Ok(site),
+        SiteStatus::Provisioning => Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "`{}` is still being provisioned; wait for that task to finish before \
+                 changing the names it answers to",
+                site.domain
+            ),
+        )),
+        SiteStatus::Failed => Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "`{}` never finished provisioning, so there is no vhost to add a name to. \
+                 Re-provision it first (`site.reprovision`), then add the alias.",
+                site.domain
+            ),
+        )),
+    }
+}
+
+/// The Linux account a site's files and pool belong to.
+async fn site_linux_user(ctx: &OpContext, site: &Site) -> Result<unihelm_core::LinuxUser> {
+    let subscription = ctx
+        .db()
+        .subscriptions(&unihelm_core::TenantScope::Global)
+        .by_id(site.subscription_id)
+        .await
+        .map_err(UnihelmError::from)?
+        .ok_or_else(|| UnihelmError::internal("the site's subscription is missing"))?;
+    unihelm_core::LinuxUser::parse(&subscription.linux_user)
+}
+
+// ---------------------------------------------------------------------------
+// site.reprovision
+// ---------------------------------------------------------------------------
+
+/// Finish a site whose creation stopped halfway.
+///
+/// `site.create` leaves a failed attempt as a row marked `failed` so the panel
+/// can say what went wrong. Until now nothing could act on that row: the only
+/// way forward was to delete the site and create it again, and the retry hidden
+/// inside `site.create` — `reclaim_failed_site` — could only be reached by
+/// typing the same domain into the create form a second time, which the site
+/// detail page has no field for. The Configuration-drift card said "No vhost
+/// exists on disk. Saving any setting writes it again", and saving a setting
+/// needs a setting to change.
+///
+/// This runs exactly what creation runs, in the same order and through the same
+/// web-server seam, and every step of it converges: the account, the directory
+/// tree, the pool, the vhost and the logrotate stanza are all idempotent. The
+/// one step that was not is the holding page, which is why
+/// [`document_root_is_empty`] now guards it — `site.create`'s unwind
+/// deliberately leaves the tenant's files alone, and a retry that papered over
+/// them with "Upload your files to replace this page" would undo that while
+/// reporting the site as live.
+pub struct Reprovision;
+
+#[derive(Debug, Deserialize)]
+pub struct ReprovisionInput {
+    pub site_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReprovisionOutput {
+    pub site_id: i64,
+    pub domain: String,
+    pub document_root: String,
+    pub linux_user: String,
+    /// What the row said before this ran, so the caller can tell a repaired
+    /// site from a re-rendered working one.
+    pub previous_status: String,
+    /// The document root already held something, so the holding page was not
+    /// written over it.
+    pub kept_existing_files: bool,
+    pub next_steps: Vec<String>,
+}
+
+#[async_trait]
+impl TypedOperation for Reprovision {
+    type Input = ReprovisionInput;
+    type Output = ReprovisionOutput;
+
+    const NAME: &'static str = "site.reprovision";
+    const PERMISSION: Permission = Permission::SiteManage;
+    // Idempotent where `site.create` is not: every step converges, and nothing
+    // here creates a row or claims a domain.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let db = ctx.db().clone();
+        let id = SiteId(input.site_id);
+        let site = db
+            .sites(ctx.scope())
+            .by_id(id)
+            .await
+            .map_err(UnihelmError::from)?
+            .ok_or_else(|| UnihelmError::not_found("site"))?;
+
+        // A task is already writing this site's files. Two of them rendering
+        // one vhost is how a half-written file gets validated and activated.
+        if site.status == SiteStatus::Provisioning {
+            return Err(UnihelmError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "`{}` is already being provisioned; wait for that task to finish. If it \
+                     is not running any more, delete the site and create it again.",
+                    site.domain
+                ),
+            ));
+        }
+
+        let subscription = db
+            .subscriptions(&unihelm_core::TenantScope::Global)
+            .by_id(site.subscription_id)
+            .await
+            .map_err(UnihelmError::from)?
+            .ok_or_else(|| UnihelmError::internal("the site's subscription is missing"))?;
+
+        // The same refusal `site.create` gives, rather than a run that renders
+        // the maintenance page and then reports the site as active: suspension
+        // is read by `render_vhost_mode` from the subscription, so this would
+        // otherwise "succeed" into a 503.
+        if !subscription.status.can_serve() {
+            return Err(UnihelmError::new(
+                ErrorCode::AccountSuspended,
+                format!(
+                    "the subscription that owns `{}` is suspended; unsuspend it before \
+                     re-provisioning its sites",
+                    site.domain
+                ),
+            ));
+        }
+
+        let linux_user = unihelm_core::LinuxUser::parse(&subscription.linux_user)?;
+
+        // The check `site.create` runs, for the reason it runs it: without the
+        // pool socket the vhost renders, the web server reloads, and every
+        // request 502s with nothing in the panel explaining why. The PHP a site
+        // was created on can be gone by the time it is repaired.
+        if let Some(version) = site.php_version {
+            require_php_installed(ctx, version).await?;
+        }
+
+        // A hand-written vhost may have claimed this name in the meantime, and
+        // ours would shadow it without nginx saying a word. `is_ours` skips the
+        // panel's own files, so a site that is already serving cannot refuse
+        // its own repair.
+        let domain = Domain::parse(&site.domain)?;
+        refuse_foreign_vhost(&domain, false)?;
+
+        let kept_existing_files =
+            !document_root_is_empty(&paths::site_public(linux_user.as_str(), domain.as_str()));
+
+        let previous = site.status;
+        db.set_site_status(site.id, SiteStatus::Provisioning)
+            .await
+            .map_err(UnihelmError::from)?;
+        ctx.log(format!(
+            "re-provisioning {} (was {})",
+            site.domain,
+            previous.as_str()
+        ));
+        if kept_existing_files {
+            ctx.log("the document root already has files in it; leaving them alone");
+        }
+
+        match provision_site(ctx, &site, &linux_user).await {
+            Ok(()) => {
+                db.set_site_status(site.id, SiteStatus::Active)
+                    .await
+                    .map_err(UnihelmError::from)?;
+                ctx.log(format!("{} is live", site.domain));
+
+                Ok(ReprovisionOutput {
+                    site_id: site.id.get(),
+                    domain: site.domain.clone(),
+                    document_root: site.root_dir.clone(),
+                    linux_user: subscription.linux_user,
+                    previous_status: previous.as_str().to_string(),
+                    kept_existing_files,
+                    next_steps: vec![
+                        format!("Check that {} resolves to this server", site.domain),
+                        "Issue a certificate if this site does not have one yet".into(),
+                    ],
+                })
+            }
+            Err(e) => {
+                // Back to what the row said, not to `failed`. The config engine
+                // restores the file it replaced, so a site that was serving is
+                // still being served — and marking it failed would be the panel
+                // reporting an outage that did not happen. A site that was
+                // already failed stays failed, which is the truth as well.
+                if let Err(revert) = db.set_site_status(site.id, previous).await {
+                    ctx.log(format!(
+                        "could not restore {}'s status after the failed re-provision: {revert}",
+                        site.domain
+                    ));
+                }
+                ctx.log(format!("re-provisioning failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // site.delete
 // ---------------------------------------------------------------------------
 
@@ -2042,5 +2587,353 @@ mod body_size_tests {
         ] {
             assert!(check_body_size(bad).is_err(), "accepted nonsense: {bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::registry::testing::{auth_for, registry};
+    use unihelm_core::{Role, TenantScope};
+    use unihelm_db::sites::NewSite;
+
+    /// A site owned by `sub`, active unless told otherwise.
+    async fn seed(
+        db: &unihelm_db::Db,
+        sub: &unihelm_db::subscriptions::Subscription,
+        domain: &str,
+        status: SiteStatus,
+    ) -> Site {
+        let site = db
+            .create_site(NewSite {
+                subscription_id: sub.id,
+                domain: Domain::parse(domain).unwrap(),
+                site_type: SiteType::Static,
+                php_version: None,
+                root_dir: format!("/home/{}/sites/{domain}/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+        db.set_site_status(site.id, status).await.unwrap();
+        db.sites(&TenantScope::Global)
+            .by_id(site.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn context(reg: &crate::registry::OpRegistry, user: unihelm_core::UserId) -> OpContext {
+        OpContext::new(reg.services().clone(), auth_for(user, Role::Admin))
+    }
+
+    /// The whole reason the collision check is not left to the `INSERT`: two
+    /// vhosts claiming one `server_name` is resolved by nginx's parse order,
+    /// so taking another customer's domain as an alias is the same outage as
+    /// creating a duplicate site — and it must be refused before the row.
+    #[tokio::test]
+    async fn an_alias_that_is_another_customers_site_is_refused_and_names_it() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let mine = db.create_subscription(customer).await.unwrap();
+        let theirs = db.create_subscription(admin).await.unwrap();
+        let site = seed(&db, &mine, "example.com", SiteStatus::Active).await;
+        seed(&db, &theirs, "other.example", SiteStatus::Active).await;
+
+        let err = AliasAdd
+            .run(
+                &context(&reg, admin),
+                AliasAddInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("other.example").unwrap(),
+                },
+            )
+            .await
+            .expect_err("took another customer's domain");
+
+        assert_eq!(err.code, ErrorCode::DomainAlreadyExists);
+        assert_eq!(err.field.as_deref(), Some("domain"));
+        assert!(err.detail.contains("other.example"), "{}", err.detail);
+        assert!(
+            db.sites(&TenantScope::Global)
+                .aliases(site.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused alias must not be stored"
+        );
+    }
+
+    /// The same check, for a name that is already somebody else's alias rather
+    /// than somebody else's site.
+    #[tokio::test]
+    async fn an_alias_that_is_another_sites_alias_is_refused_and_says_where_it_lives() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let mine = db.create_subscription(customer).await.unwrap();
+        let theirs = db.create_subscription(admin).await.unwrap();
+        let site = seed(&db, &mine, "example.com", SiteStatus::Active).await;
+        let other = seed(&db, &theirs, "other.example", SiteStatus::Active).await;
+        db.sites(&TenantScope::Global)
+            .add_alias(other.id, &Domain::parse("shop.example").unwrap(), false)
+            .await
+            .unwrap();
+
+        let err = AliasAdd
+            .run(
+                &context(&reg, admin),
+                AliasAddInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("shop.example").unwrap(),
+                },
+            )
+            .await
+            .expect_err("stole another site's alias");
+
+        assert_eq!(err.code, ErrorCode::DomainAlreadyExists);
+        assert!(err.detail.contains("another site"), "{}", err.detail);
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .aliases(other.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the other site must keep its alias"
+        );
+    }
+
+    /// `server_name example.com example.com;` is a duplicate nginx warns about
+    /// and the panel would have to explain; the site's own name is not an
+    /// additional name for it.
+    #[tokio::test]
+    async fn a_site_cannot_be_its_own_alias() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = seed(&db, &sub, "example.com", SiteStatus::Active).await;
+
+        let err = AliasAdd
+            .run(
+                &context(&reg, admin),
+                AliasAddInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("example.com").unwrap(),
+                },
+            )
+            .await
+            .expect_err("accepted the site's own name");
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("domain"));
+    }
+
+    /// A failed site has no vhost, so there is nothing to add a name to — and
+    /// rendering one here would bring the site up while its row still said
+    /// `failed`. The refusal has to point at the operation that does fix it,
+    /// or it is the same dead end the operator was already in.
+    #[tokio::test]
+    async fn an_alias_on_a_failed_site_is_refused_and_names_the_way_out() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = seed(&db, &sub, "example.com", SiteStatus::Failed).await;
+
+        let err = AliasAdd
+            .run(
+                &context(&reg, admin),
+                AliasAddInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("www.example.com").unwrap(),
+                },
+            )
+            .await
+            .expect_err("added a name to a site with no vhost");
+
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(
+            err.detail.contains("site.reprovision"),
+            "the refusal must name the operation that unblocks it: {}",
+            err.detail
+        );
+    }
+
+    /// Reporting a removal that removed nothing is the panel confirming work it
+    /// did not do — the defect class this project treats as top severity.
+    #[tokio::test]
+    async fn removing_an_alias_that_was_never_attached_is_refused_not_reported_as_done() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = seed(&db, &sub, "example.com", SiteStatus::Active).await;
+
+        let err = AliasRemove
+            .run(
+                &context(&reg, admin),
+                AliasRemoveInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("www.example.com").unwrap(),
+                },
+            )
+            .await
+            .expect_err("reported a removal that did not happen");
+
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.field.as_deref(), Some("domain"));
+        assert!(err.detail.contains("www.example.com"), "{}", err.detail);
+    }
+
+    /// Naming another site's alias must not detach it: the removal is keyed on
+    /// the site as well as the name, and the refusal comes before the delete.
+    #[tokio::test]
+    async fn removing_another_sites_alias_does_not_touch_it() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let mine = db.create_subscription(customer).await.unwrap();
+        let theirs = db.create_subscription(admin).await.unwrap();
+        let site = seed(&db, &mine, "example.com", SiteStatus::Active).await;
+        let other = seed(&db, &theirs, "other.example", SiteStatus::Active).await;
+        db.sites(&TenantScope::Global)
+            .add_alias(other.id, &Domain::parse("shop.example").unwrap(), false)
+            .await
+            .unwrap();
+
+        let err = AliasRemove
+            .run(
+                &context(&reg, admin),
+                AliasRemoveInput {
+                    site_id: site.id.get(),
+                    domain: Domain::parse("shop.example").unwrap(),
+                },
+            )
+            .await
+            .expect_err("detached an alias from a site that did not own it");
+
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .aliases(other.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// An alias is not a wildcard, an IP address or a bare label. The parse is
+    /// `Domain`'s, so it is the same one `site.create` puts a domain through.
+    #[test]
+    fn an_alias_must_be_a_domain_before_it_reaches_the_operation() {
+        let ok: AliasAddInput =
+            serde_json::from_str(r#"{"site_id":1,"domain":"Shop.Example.COM."}"#).unwrap();
+        assert_eq!(ok.domain.as_str(), "shop.example.com");
+
+        for bad in ["", "localhost", "192.0.2.1", "*.example.com", "-x.example"] {
+            let raw = serde_json::json!({ "site_id": 1, "domain": bad }).to_string();
+            assert!(
+                serde_json::from_str::<AliasAddInput>(&raw).is_err(),
+                "accepted `{bad}` as an alias"
+            );
+        }
+    }
+
+    /// A second task is already rewriting this site's files; the two would race
+    /// over one vhost.
+    #[tokio::test]
+    async fn reprovisioning_a_site_that_is_mid_provision_is_refused() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = seed(&db, &sub, "example.com", SiteStatus::Provisioning).await;
+
+        let err = Reprovision
+            .run(
+                &context(&reg, admin),
+                ReprovisionInput {
+                    site_id: site.id.get(),
+                },
+            )
+            .await
+            .expect_err("raced the provisioning task");
+
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .by_id(site.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SiteStatus::Provisioning,
+            "a refused re-provision must not have moved the row"
+        );
+    }
+
+    /// Re-provisioning a suspended tenant's site would render the maintenance
+    /// page and then mark the row active: a site the panel calls live and the
+    /// visitor gets a 503 from. `site.create` refuses the same thing.
+    #[tokio::test]
+    async fn reprovisioning_a_suspended_subscriptions_site_is_refused() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = seed(&db, &sub, "example.com", SiteStatus::Failed).await;
+        db.set_subscription_status(
+            sub.id,
+            unihelm_db::subscriptions::SubscriptionStatus::Suspended,
+            Some("unpaid"),
+        )
+        .await
+        .unwrap();
+
+        let err = Reprovision
+            .run(
+                &context(&reg, admin),
+                ReprovisionInput {
+                    site_id: site.id.get(),
+                },
+            )
+            .await
+            .expect_err("re-provisioned a suspended tenant's site");
+
+        assert_eq!(err.code, ErrorCode::AccountSuspended);
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .by_id(site.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SiteStatus::Failed
+        );
+    }
+
+    /// The holding page says "Upload your files to replace this page". Dropping
+    /// it into a root that already has files puts it in front of them —
+    /// `index index.php index.html index.htm;` prefers it to a tenant's
+    /// `index.htm` — and the panel would then report a live site serving the
+    /// wrong page. `site.create`'s unwind leaves those files alone on purpose;
+    /// a retry must not undo that.
+    #[test]
+    fn the_holding_page_is_only_written_into_an_empty_document_root() {
+        let root = tempfile::tempdir().unwrap();
+
+        let fresh = root.path().join("public");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert!(document_root_is_empty(&fresh));
+
+        // Never created: the ordinary first create, before `ensure_site_dirs`.
+        assert!(document_root_is_empty(&root.path().join("never-made")));
+
+        // A static site the tenant uploaded, with no `index.html` for
+        // `write_placeholder`'s own check to catch.
+        std::fs::write(fresh.join("index.htm"), "<h1>real site</h1>").unwrap();
+        assert!(!document_root_is_empty(&fresh));
+
+        // And an application whose entry point is not an index file at all.
+        let app = root.path().join("app");
+        std::fs::create_dir_all(app.join("vendor")).unwrap();
+        assert!(!document_root_is_empty(&app));
     }
 }

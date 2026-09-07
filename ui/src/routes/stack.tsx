@@ -96,6 +96,16 @@ const DISTRO_VERSION = "distro";
 /** The catalogue entry that installs the container runtime everything else needs. */
 const DOCKER_SLUG = "docker";
 
+/**
+ * How long the page waits for the agent's status to catch up with a click.
+ *
+ * Two things lean on it — the fast poll and the row lock — and both are waiting
+ * for the same event, so they wait the same length of time. It is a fallback,
+ * not a timer anything normally reaches: a task writes its status within a poll
+ * or two, and this is only what happens when one dies before it ever does.
+ */
+const SETTLE_GRACE_MS = 15_000;
+
 /** Where the Docker row can be linked to from a row that is waiting on it. */
 function entryAnchor(slug: string): string {
   return `stack-entry-${slug}`;
@@ -189,6 +199,21 @@ export function supportFor(entry: CatalogueEntry): RuntimeSupport {
  */
 export function modeIsPerVersion(entry: CatalogueEntry): boolean {
   return entry.side_by_side && supportFor(entry) === "either";
+}
+
+/**
+ * The entry's only version, when the catalogue has exactly one for it.
+ *
+ * Most of the catalogue is this shape — one nginx, one Docker, one Memcached —
+ * and the row used to draw a `<Select>` for it anyway. A menu with one option
+ * in it is a control that cannot be changed: it looks like a decision the
+ * operator has to make, they open it looking for the alternatives it promises,
+ * and the row reads as broken when there are none. Drawn as text instead, with
+ * the label kept, so a row that has a choice and a row that has none still
+ * stand the same height on the page.
+ */
+export function soleVersion(entry: CatalogueEntry): CatalogueVersion | null {
+  return entry.versions.length === 1 ? entry.versions[0]! : null;
 }
 
 /**
@@ -603,6 +628,80 @@ export function planFor(
 }
 
 /**
+ * Whether the row's primary button can be pressed.
+ *
+ * Its own function because it is the difference between one install and a
+ * column of failed ones. The only lock used to be the mutation's pending flag,
+ * which clears the moment the 202 comes back — while the install it started
+ * runs for minutes afterwards. Every click in that window made another task,
+ * and the agent refused each one with `already being installed`, so a stream of
+ * red rows was the whole of the operator's answer to pressing Install twice.
+ *
+ * Two things hold the lock, and it takes both. `plan.working` is the agent's
+ * own answer and lasts as long as the work does, but it cannot start on its
+ * own: the status the poll reads is written *after* the task starts, so between
+ * the 202 and the first poll that sees `installing` there is nothing holding
+ * the row at all — and a lock that opens for one poll interval is the same
+ * defect with a smaller window. `starting` covers exactly that gap.
+ *
+ * The rest are the conditions that were already here: `none` means the chooser
+ * resolved to nothing in the catalogue, and the other three are clicks the
+ * agent would refuse, which the callouts under the row explain.
+ */
+export function installBlocked(
+  plan: RowPlan,
+  { busy, starting }: { busy: boolean; starting: boolean },
+): boolean {
+  return (
+    busy ||
+    plan.working ||
+    starting ||
+    plan.action === "held" ||
+    plan.action === "none" ||
+    plan.dockerMissing ||
+    plan.hostIncumbent ||
+    plan.portIncumbent !== null
+  );
+}
+
+/** Longest first line a row draws before the rest goes behind the disclosure. */
+const ERROR_SUMMARY_CHARS = 160;
+
+export interface RowError {
+  /** The one line the row itself shows. */
+  summary: string;
+  /** The whole message, when the summary is not all of it; `null` when it is. */
+  details: string | null;
+}
+
+/**
+ * A failed row's error, split into what the row shows and what it holds back.
+ *
+ * An apt failure is a screenful — the package, the dependency chain, the
+ * mirror it could not reach, sometimes a dpkg log — and it used to be printed
+ * into the row whole. One broken row pushed every other entry on the page below
+ * the fold, so an operator whose PHP install failed had to scroll past the
+ * wreckage to reach the thing they came to install next.
+ *
+ * The disclosure holds the *whole* text rather than the tail: it is what gets
+ * pasted into a search box or a support ticket, and a message reassembled from
+ * a shortened first line and a remainder is not the message the package manager
+ * wrote. A one-line error gets no disclosure at all — hiding half a sentence
+ * behind a click would cost more than it saves.
+ */
+export function rowError(text: string): RowError {
+  const full = text.trim();
+  const firstLine = (full.split("\n", 1)[0] ?? "").trim();
+  // A single enormous line is the other shape apt failures take, and wrapping
+  // it inside the row is the same page pushed off screen by different means.
+  const summary =
+    firstLine.length > ERROR_SUMMARY_CHARS
+      ? `${firstLine.slice(0, ERROR_SUMMARY_CHARS).trimEnd()}…`
+      : firstLine;
+  return { summary, details: summary === full ? null : full };
+}
+
+/**
  * `slug@version@mode`, the identity of a row — and of a mutation in flight.
  *
  * The mode is part of it because one version can be on the machine twice, once
@@ -641,6 +740,21 @@ export function StackPage() {
   // reload and it is suddenly underway. That reload was doing the work.
   const [justActed, setJustActed] = useState(false);
 
+  // Rows whose task the agent has accepted but whose status has not caught up.
+  //
+  // Keyed on the catalogue slug rather than on slug@version@mode: the agent
+  // runs one package manager at a time and refuses a second operation on the
+  // same component, so while PHP 8.4 is installing there is nothing useful a
+  // click on PHP 8.3's Remove could do either. See [`installBlocked`] for what
+  // this is holding the row against.
+  const [starting, setStarting] = useState<Record<string, true>>({});
+  const holdRow = (slug: string) => setStarting((current) => ({ ...current, [slug]: true }));
+  const releaseRow = (slug: string) =>
+    setStarting((current) => {
+      const { [slug]: _released, ...rest } = current;
+      return rest;
+    });
+
   const stack = useQuery({
     queryKey: ["stack"],
     queryFn: endpoints.stack,
@@ -667,9 +781,35 @@ export function StackPage() {
     // Nothing is running and nothing has started: give it a few seconds, then
     // fall back to the slow poll rather than hammering forever if the task
     // failed before it ever wrote a status.
-    const timer = setTimeout(() => setJustActed(false), 15_000);
+    const timer = setTimeout(() => setJustActed(false), SETTLE_GRACE_MS);
     return () => clearTimeout(timer);
   }, [justActed, stack.data]);
+
+  // Hand each held row over to the agent's own status, which then holds it for
+  // as long as the work takes — or let it go if nothing ever arrives. A task
+  // that died before it could write a status must not leave a row that can
+  // never be tried again: that is the opposite defect and just as much a dead
+  // end, and it is why this cannot simply latch until `working` has been seen.
+  useEffect(() => {
+    const held = Object.keys(starting);
+    if (held.length === 0) return;
+    const working = new Set(
+      (stack.data?.components ?? [])
+        .filter((c) => c.status === "installing" || c.status === "removing")
+        .map((c) => c.component),
+    );
+    const handedOver = held.filter((slug) => working.has(slug));
+    if (handedOver.length > 0) {
+      setStarting((current) => {
+        const next = { ...current };
+        for (const slug of handedOver) delete next[slug];
+        return next;
+      });
+      return;
+    }
+    const timer = setTimeout(() => setStarting({}), SETTLE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [starting, stack.data]);
 
   const settle = {
     onSuccess: () => {
@@ -917,6 +1057,7 @@ export function StackPage() {
                       selected={selected}
                       index={index}
                       busy={busy}
+                      starting={starting[entry.slug] === true}
                       acting={acting}
                       controlling={controlling}
                       dockerAnchor={dockerAnchor}
@@ -951,14 +1092,30 @@ export function StackPage() {
                         });
                       }}
                       onInstall={() =>
-                        install.mutate({
-                          component: entry.slug,
-                          version: selected,
-                          runtime: plan.runtime,
-                        })
+                        install.mutate(
+                          {
+                            component: entry.slug,
+                            version: selected,
+                            runtime: plan.runtime,
+                          },
+                          {
+                            // Held from the 202, not from the click. A request
+                            // that never reached the agent started no task, so
+                            // the row has to arm again at once — the operator
+                            // has an error to read and something to try.
+                            onSuccess: () => holdRow(entry.slug),
+                            onError: () => releaseRow(entry.slug),
+                          },
+                        )
                       }
                       onRemove={(version, rowRuntime) =>
-                        remove.mutate({ component: entry.slug, version, runtime: rowRuntime })
+                        remove.mutate(
+                          { component: entry.slug, version, runtime: rowRuntime },
+                          {
+                            onSuccess: () => holdRow(entry.slug),
+                            onError: () => releaseRow(entry.slug),
+                          },
+                        )
                       }
                       onControl={(action, version) =>
                         (action === "start" ? startService : stopService).mutate({
@@ -1243,6 +1400,7 @@ function EntryRow({
   selected,
   index,
   busy,
+  starting,
   acting,
   controlling,
   dockerAnchor,
@@ -1265,6 +1423,11 @@ function EntryRow({
   selected: string;
   index: number;
   busy: boolean;
+  /**
+   * This row's own task has been accepted and the agent's status has not caught
+   * up with it yet. See [`installBlocked`].
+   */
+  starting: boolean;
   /** `slug@version@mode` of the mutation in flight, if any. */
   acting: string | null;
   /** `slug@version` of the start or stop in flight, if any. */
@@ -1332,6 +1495,12 @@ function EntryRow({
   // it is what found it — and read once so the sentence and its title cannot
   // be built from two different answers.
   const held = contestedPort(entry);
+  // The agent is busy with this entry, whether or not its status says so yet.
+  // Every control on the row answers to it: a Remove pressed while an install
+  // of the same component is running is refused exactly as a second Install is.
+  const locked = plan.working || starting;
+  // The one version there is, when the catalogue offers no choice at all.
+  const sole = soleVersion(entry);
 
   return (
     <li
@@ -1384,6 +1553,7 @@ function EntryRow({
                   row={row}
                   support={plan.support}
                   busy={busy}
+                  locked={locked}
                   pending={acting === rowKey(entry.slug, row.version, runtimeOf(row))}
                   control={serviceControlFor(entry, row)}
                   controlPending={controlling === `${entry.slug}@${row.version}`}
@@ -1403,10 +1573,15 @@ function EntryRow({
             <p className="mt-2.5 text-sm text-ink-subtle">{t("stack.notInstalled")}</p>
           )}
 
-          {plan.working ? (
+          {locked ? (
             // An install runs for minutes behind a 3s poll. A bar that keeps
             // sweeping says the agent is still working on it; a disabled button
             // on its own is indistinguishable from a page that has stopped.
+            //
+            // `locked`, not `plan.working`: the seconds between the 202 and the
+            // first poll that reports the row working are precisely when the
+            // operator is wondering whether the click did anything, and a row
+            // that goes quiet there is what a second click is an answer to.
             <div
               className="shimmer mt-2.5 h-0.5 w-40 max-w-full rounded-full bg-accent-soft"
               aria-hidden
@@ -1424,11 +1599,27 @@ function EntryRow({
                 one on the host — the row would otherwise have no way back. */}
             {plan.offered.length === 0 ? (
               <p className="max-w-56 text-end text-xs text-ink-muted">{t("stack.allInstalled")}</p>
+            ) : sole ? (
+              // Most of the catalogue has exactly one version, and a menu with
+              // one option in it is a control that cannot be changed: the
+              // operator opens it looking for the choice it implies, finds
+              // nothing, and reads the row as broken. The label stays — "which
+              // version am I about to get" is still the question — and it keeps
+              // the chooser's height so the rows do not step up and down the
+              // page as the eye runs over them.
+              <div className="min-w-44 flex-1 space-y-1.5">
+                <span className="block text-xs font-medium text-ink-muted">
+                  {t("stack.chooseVersion")}
+                </span>
+                <p className="flex h-9 items-center text-sm text-ink">
+                  {/* Not "recommended": one version out of one is not a
+                      recommendation, it is the only thing on offer. End of life
+                      and the version's own note stay — those are still facts
+                      about what the button is about to install. */}
+                  {optionLabel(sole, label(sole.version), t, true)}
+                </p>
+              </div>
             ) : (
-              // Rendered even when there is one version to pick: the label is
-              // where "which version am I about to get" is answered, and a row
-              // that answers it only sometimes is a row the operator has to
-              // read twice.
               <div className="min-w-44 flex-1 space-y-1.5">
                 <label htmlFor={chooserId} className="block text-xs font-medium text-ink-muted">
                   {t("stack.chooseVersion")}
@@ -1473,18 +1664,7 @@ function EntryRow({
               <Button
                 variant={plan.action === "replace" || eol ? "outline" : "primary"}
                 loading={installing}
-                // `none` here means the chooser resolved to nothing in the
-                // catalogue, so there is no version to send. The other two are
-                // clicks that would reach the agent and be refused there; the
-                // callouts below say what to do about them instead.
-                disabled={
-                  busy ||
-                  plan.action === "held" ||
-                  plan.action === "none" ||
-                  plan.dockerMissing ||
-                  plan.hostIncumbent ||
-                  plan.portIncumbent !== null
-                }
+                disabled={installBlocked(plan, { busy, starting })}
                 onClick={onInstall}
                 aria-label={t(
                   plan.action === "replace"
@@ -1696,9 +1876,11 @@ function optionLabel(
   version: CatalogueVersion,
   label: string,
   t: (key: string) => string,
+  /** This is the entry's only version, drawn as text rather than as an option. */
+  alone = false,
 ): string {
   const marks = [
-    version.eol ? t("stack.eol") : version.recommended ? t("stack.recommended") : null,
+    version.eol ? t("stack.eol") : !alone && version.recommended ? t("stack.recommended") : null,
     version.note || null,
   ].filter(Boolean);
   return marks.length === 0 ? label : `${label} — ${marks.join(", ")}`;
@@ -1715,6 +1897,7 @@ function InstalledChip({
   row,
   support,
   busy,
+  locked,
   pending,
   control,
   controlPending,
@@ -1729,6 +1912,8 @@ function InstalledChip({
   /** Which modes the entry allows — decides whether "where" is worth saying. */
   support: RuntimeSupport;
   busy: boolean;
+  /** The agent is already working on this entry, so no second click can land. */
+  locked: boolean;
   pending: boolean;
   /** Start or stop, or `null` where the panel cannot name this one's unit. */
   control: ServiceControl | null;
@@ -1758,6 +1943,8 @@ function InstalledChip({
   // same three characters on this chip otherwise, and only one of them is a
   // Remove somebody can take back.
   const sites = sitesUsing(row);
+  // What the package manager said, in two parts. See [`rowError`].
+  const failure = row.last_error ? rowError(row.last_error) : null;
 
   return (
     <li className="inline-flex flex-col gap-1">
@@ -1849,7 +2036,10 @@ function InstalledChip({
             variant="ghost"
             size="sm"
             loading={pending}
-            disabled={busy}
+            // `locked` as well as `busy`: the agent refuses a second operation
+            // on a component it is already working on, so a Remove pressed
+            // while this entry installs buys a failed task and nothing else.
+            disabled={busy || locked}
             onClick={onRemove}
             aria-label={t(
               runtime === "container" ? "stack.removeAriaContainer" : "stack.removeAria",
@@ -1874,8 +2064,30 @@ function InstalledChip({
         </span>
       ) : null}
       {disagrees ? <span className="text-xs text-warning">{t("stack.notRunning")}</span> : null}
-      {row.last_error ? (
-        <span className="max-w-md font-mono text-xs break-words text-danger">{row.last_error}</span>
+      {failure && failure.summary !== "" ? (
+        // The summary in the row, the rest inside a box that scrolls on its
+        // own. An apt failure used to be dumped here whole, and one of them
+        // pushed every entry below it off the screen — so the operator scrolled
+        // through somebody else's dependency chain to reach the next thing they
+        // wanted to install. Nothing is lost: the disclosure holds the whole
+        // message, which is what an operator needs to fix the install.
+        <>
+          <span className="max-w-md font-mono text-xs break-words text-danger">
+            {failure.summary}
+          </span>
+          {failure.details ? (
+            // A native `<details>`: it is keyboard-operable, it is announced as
+            // a disclosure, and it needs no state on this row.
+            <details className="max-w-md">
+              <summary className="cursor-pointer text-xs text-ink-muted transition-colors hover:text-ink">
+                {t("stack.errorDetails")}
+              </summary>
+              <pre className="mt-1 max-h-40 overflow-auto rounded-md border border-border bg-canvas p-2 font-mono text-xs break-words whitespace-pre-wrap text-danger select-all">
+                {failure.details}
+              </pre>
+            </details>
+          ) : null}
+        </>
       ) : null}
     </li>
   );

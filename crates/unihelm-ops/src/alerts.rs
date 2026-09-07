@@ -638,15 +638,20 @@ pub struct TelegramConfig {
     pub chat_id: String,
 }
 
-/// Reject a webhook URL that is not a URL we would ever POST to.
+/// Reject a webhook URL that is not a URL we would ever POST to, on its
+/// spelling alone: a non-HTTP scheme, an embedded newline (header injection),
+/// whitespace, or an absurd length.
 ///
-/// Private and loopback addresses are *not* blocked, and that is a decision
-/// rather than an oversight: only an admin holding `ServerManage` can add a
-/// channel, that admin already has root on this machine, and forbidding
-/// `http://127.0.0.1:9000/hook` would break the common and legitimate case of
-/// relaying through something local. What is blocked is the part an admin could
-/// get wrong by pasting: a non-HTTP scheme, an embedded newline (header
-/// injection), or an absurd length.
+/// **Where it points is checked separately**, by
+/// [`crate::dns::ensure_outbound_destination`]. This function used to carry a
+/// comment arguing that loopback and private addresses were fine to allow
+/// because only a `ServerManage` admin — who already has root here — can add a
+/// channel. That argument had a hole: it is the *panel* that makes the request,
+/// from inside the network, so the URL field was an offer of the panel's own
+/// network position. `http://169.254.169.254/latest/meta-data/iam/security-credentials/`
+/// in that field had the panel fetch a cloud instance's credentials and deliver
+/// them to whoever was listening. Relaying through something local, the case
+/// the permissiveness protected, is what closing that costs.
 fn validate_webhook(config: &WebhookConfig) -> Result<()> {
     let url = config.url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -726,7 +731,15 @@ fn validate_telegram(config: &TelegramConfig) -> Result<()> {
 ///
 /// The plaintext exists only inside this function; the caller gets a ciphertext
 /// and the database never sees anything else (spec §12 rule 6).
-fn seal_config(ctx: &OpContext, kind: ChannelKind, config: &serde_json::Value) -> Result<String> {
+///
+/// Async because the destination guard resolves the host: a channel URL is
+/// stored once and POSTed to for as long as the panel runs, so the one place
+/// worth spending a DNS lookup is the moment it is accepted.
+async fn seal_config(
+    ctx: &OpContext,
+    kind: ChannelKind,
+    config: &serde_json::Value,
+) -> Result<String> {
     let plaintext = match kind {
         ChannelKind::Webhook => {
             let parsed: WebhookConfig = serde_json::from_value(config.clone()).map_err(|e| {
@@ -737,6 +750,7 @@ fn seal_config(ctx: &OpContext, kind: ChannelKind, config: &serde_json::Value) -
                 .with_field("config")
             })?;
             validate_webhook(&parsed)?;
+            crate::dns::ensure_outbound_destination(parsed.url.trim(), "config.url").await?;
             serde_json::to_string(&parsed)
         }
         ChannelKind::Telegram => {
@@ -780,6 +794,15 @@ async fn deliver(
         ChannelKind::Webhook => {
             let config: WebhookConfig = serde_json::from_str(&opened)
                 .map_err(|e| format!("its stored configuration is not a webhook config: {e}"))?;
+            // Re-checked on the way out for the same reason the Telegram token
+            // below is: a row that predates the guard, or was hand-edited or
+            // restored, must not be able to aim the panel at its own network.
+            // One resolution per notification is the price; a failure here is
+            // reported as this channel failing, which `notify` already treats
+            // as non-fatal.
+            crate::dns::ensure_outbound_destination(config.url.trim(), "config.url")
+                .await
+                .map_err(|e| e.detail)?;
             let body = serde_json::to_string(payload)
                 .map_err(|e| format!("the payload would not serialise: {e}"))?;
             (config.url, body)
@@ -1493,7 +1516,7 @@ impl TypedOperation for ChannelsSet {
                     UnihelmError::new(ErrorCode::InvalidInput, "a new channel needs its `config`")
                         .with_field("config")
                 })?;
-                let sealed = seal_config(ctx, kind, &config)?;
+                let sealed = seal_config(ctx, kind, &config).await?;
                 ctx.db()
                     .create_notify_channel(kind, &label, &sealed, input.enabled.unwrap_or(true))
                     .await
@@ -1518,11 +1541,10 @@ impl TypedOperation for ChannelsSet {
                     )
                     .with_field("kind"));
                 }
-                let sealed = input
-                    .config
-                    .as_ref()
-                    .map(|c| seal_config(ctx, existing.kind, c))
-                    .transpose()?;
+                let sealed = match input.config.as_ref() {
+                    Some(c) => Some(seal_config(ctx, existing.kind, c).await?),
+                    None => None,
+                };
                 ctx.db()
                     .update_notify_channel(id, label.as_deref(), sealed.as_deref(), input.enabled)
                     .await
@@ -2092,12 +2114,105 @@ mod tests {
             })
             .is_ok()
         );
-        // Loopback is allowed on purpose — see validate_webhook's comment.
+        // This check is about spelling only, so loopback passes it. Where the
+        // URL points is the destination guard's question, pinned below by
+        // `a_channel_pointed_inside_this_network_is_refused_with_the_address_named`.
         assert!(
             validate_webhook(&WebhookConfig {
                 url: "http://127.0.0.1:9000/hook".into()
             })
             .is_ok()
+        );
+    }
+
+    /// Issue 60: the channel URL was checked for its scheme and nothing else,
+    /// so an admin — or anyone who reached the settings page — could have the
+    /// panel fetch a cloud instance's IAM credentials and deliver them, or
+    /// probe the private network from inside it. Every one of these was
+    /// accepted and stored before the destination guard existed.
+    #[tokio::test]
+    async fn a_channel_pointed_inside_this_network_is_refused_with_the_address_named() {
+        let (_reg, ctx) = admin_ctx().await;
+        for inward in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://127.0.0.1:9000/hook",
+            "http://10.1.2.3/hook",
+            "http://192.168.0.1/hook",
+            "https://[::1]/hook",
+            // The v4-mapped spelling of loopback: the same request, and the
+            // one an address-shaped denylist misses.
+            "https://[::ffff:127.0.0.1]/hook",
+        ] {
+            let err = seal_config(&ctx, ChannelKind::Webhook, &json!({ "url": inward }))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "accepted {inward}");
+            assert_eq!(err.field.as_deref(), Some("config.url"));
+        }
+
+        // And the refusal names the address, because "invalid URL" for a URL
+        // that looks fine is a message nobody can act on.
+        let err = seal_config(
+            &ctx,
+            ChannelKind::Webhook,
+            &json!({ "url": "http://169.254.169.254/latest/meta-data/" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.detail.contains("169.254.169.254"),
+            "the refusal must say where it resolved to: {}",
+            err.detail
+        );
+
+        // A publicly routable destination is still accepted.
+        assert!(
+            seal_config(&ctx, ChannelKind::Webhook, &json!({ "url": REACHABLE }))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A row that predates the guard — or was hand-edited, or restored from a
+    /// backup taken before it — must not be POSTed to either.
+    #[tokio::test]
+    async fn a_stored_channel_that_points_inward_is_not_delivered_to() {
+        let (_reg, ctx) = admin_ctx().await;
+        let id = add_channel(
+            &ctx,
+            ChannelKind::Webhook,
+            "ops",
+            json!({ "url": REACHABLE }),
+        )
+        .await;
+
+        // Reseal it behind the validator's back, the way a direct sqlite
+        // session or an older panel version leaves it.
+        let sealed = ctx
+            .master_key()
+            .seal_str(r#"{"url":"http://169.254.169.254/latest/meta-data/"}"#)
+            .unwrap();
+        ctx.db()
+            .update_notify_channel(id, None, Some(&sealed), None)
+            .await
+            .unwrap();
+
+        let transport = RecordingTransport::default();
+        let payload = NotificationPayload {
+            panel: "Unihelm".into(),
+            rule: "disk_pct".into(),
+            message: "filesystem / is 94.0% full".into(),
+            state: "raised".into(),
+            at: "2026-08-26T09:00:00Z".into(),
+        };
+        assert_eq!(
+            notify(&ctx, &transport, &payload).await,
+            0,
+            "a channel pointing inside the network must not be delivered to"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "nothing may leave the box for an internal destination"
         );
     }
 
@@ -2166,13 +2281,27 @@ mod tests {
         (reg, ctx)
     }
 
+    /// A webhook URL the destination guard accepts, and two of them because one
+    /// test needs two channels.
+    ///
+    /// IP literals, so no test here depends on the machine having a working
+    /// resolver — the guard short-circuits DNS for an address. They come from
+    /// 198.18.0.0/15 (RFC 2544 benchmarking) rather than the RFC 5737
+    /// documentation ranges every other fixture in this tree uses, because
+    /// `is_globally_routable` refuses documentation space — which is the guard
+    /// doing its job, not a mistake to work around elsewhere.
+    const REACHABLE: &str = "https://198.18.0.7/h";
+    const REACHABLE_2: &str = "https://198.18.0.8/h";
+
     async fn add_channel(
         ctx: &OpContext,
         kind: ChannelKind,
         label: &str,
         config: serde_json::Value,
     ) -> i64 {
-        let sealed = seal_config(ctx, kind, &config).expect("the fixture config is valid");
+        let sealed = seal_config(ctx, kind, &config)
+            .await
+            .expect("the fixture config is valid");
         ctx.db()
             .create_notify_channel(kind, label, &sealed, true)
             .await
@@ -2187,7 +2316,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://hooks.example.test/abc" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
 
@@ -2202,7 +2331,7 @@ mod tests {
         assert_eq!(notify(&ctx, &transport, &payload).await, 1);
 
         let sent = transport.sent();
-        assert_eq!(sent[0].0, "https://hooks.example.test/abc");
+        assert_eq!(sent[0].0, REACHABLE);
         // The wire shape is somebody's integration; pin it.
         assert_eq!(
             transport.bodies()[0],
@@ -2265,7 +2394,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "good",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
         // A row whose sealed blob was written under a different master key.
@@ -2277,7 +2406,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "also good",
-            json!({ "url": "https://b.test/h" }),
+            json!({ "url": REACHABLE_2 }),
         )
         .await;
 
@@ -2303,7 +2432,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
         ctx.db()
@@ -2330,7 +2459,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
 
@@ -2404,7 +2533,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
 
@@ -2525,7 +2654,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
 
@@ -2946,7 +3075,7 @@ mod tests {
             &ctx,
             ChannelKind::Webhook,
             "ops",
-            json!({ "url": "https://a.test/h" }),
+            json!({ "url": REACHABLE }),
         )
         .await;
 

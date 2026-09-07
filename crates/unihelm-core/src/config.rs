@@ -33,7 +33,9 @@ pub struct UnihelmConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PanelConfig {
     /// Where `unihelm-web` listens. Bind to a loopback address and put the panel
-    /// behind its own managed vhost if you want it on 443.
+    /// behind its own managed vhost if you want it on 443 — which is what
+    /// `panel.tls.issue` does, narrowing this to loopback itself once that
+    /// vhost is serving.
     pub listen: String,
     pub database: PathBuf,
     pub state_dir: PathBuf,
@@ -68,9 +70,13 @@ pub enum PanelTls {
     /// Serve plain HTTP.
     ///
     /// Correct only behind a proxy that terminates TLS and sets
-    /// `X-Forwarded-Proto` — which is what `unihelm cert panel <domain>` sets up,
-    /// and it switches this off for you. On its own it means passwords cross the
-    /// network in the clear.
+    /// `X-Forwarded-Proto` — which is what `unihelm cert panel <domain>` sets
+    /// up. It does **not** switch this off for you, whatever this comment used
+    /// to say: the vhost proxies to whatever the panel is serving, and a
+    /// self-signed certificate on a loopback hop costs nothing, while a panel
+    /// that had silently moved to plain HTTP would be one misconfigured proxy
+    /// away from serving its login form in the clear. On its own, off the
+    /// loopback interface, this means passwords cross the network unencrypted.
     Off,
 }
 
@@ -105,9 +111,13 @@ pub enum LogFormat {
 impl Default for PanelConfig {
     fn default() -> Self {
         Self {
-            // Loopback by default: exposing a brand-new panel to the internet
-            // should be a decision somebody typed, not what happens if they
-            // don't (spec §12 rule 8).
+            // All interfaces, because a fresh install has no domain and no
+            // other way to be looked at; `tls` below is what keeps that safe.
+            // This comment read "loopback by default" for as long as the value
+            // was not loopback — a line of prose asserting the opposite of the
+            // line under it, in the file the rest of the panel reads to find
+            // out where it listens. `panel.tls.issue` narrows this to loopback
+            // once a vhost serves the panel under a real name.
             listen: "0.0.0.0:8088".into(),
             database: PathBuf::from(paths::DATABASE),
             state_dir: PathBuf::from(paths::STATE_DIR),
@@ -175,6 +185,24 @@ impl UnihelmConfig {
                 format: LogFormat::Text,
             },
         }
+    }
+
+    /// Rewrite `panel.listen` in a config document, leaving every other byte of
+    /// it — comments, key order, the operator's own edits — where it was.
+    ///
+    /// `panel.tls.issue` narrows the listener to loopback once the panel's own
+    /// vhost is serving it, and one changed setting should be one changed line.
+    /// Serialising a parsed [`UnihelmConfig`] back out would have been shorter
+    /// and would have deleted every comment in the file, including the ones
+    /// explaining choices the operator made and this panel never asked about.
+    ///
+    /// The result is parsed again before it is handed back, and a rewrite that
+    /// does not read back as the value asked for is an error rather than a
+    /// file: `/etc/unihelm/config.toml` is what `unihelm-web` reads at startup,
+    /// and a document it cannot parse is a panel that does not come up — a
+    /// lockout with no way back in through the panel itself.
+    pub fn rewrite_panel_listen(text: &str, listen: &str) -> Result<String, String> {
+        toml_lite::set_panel_listen(text, listen)
     }
 
     /// Sanity-check a loaded config before anything acts on it.
@@ -280,6 +308,93 @@ mod toml_lite {
         }
 
         Ok(cfg)
+    }
+
+    /// Write one `panel.listen` value into a document the rest of which is
+    /// none of our business. See [`super::UnihelmConfig::rewrite_panel_listen`].
+    pub fn set_panel_listen(text: &str, listen: &str) -> Result<String, String> {
+        // Only an address:port is ever written. The value goes into the file
+        // verbatim, so a `#` or a newline smuggled in through it would comment
+        // out the rest of the line or invent a key — caught here rather than at
+        // the next startup, when the panel would be the thing failing to parse.
+        if listen.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "`{listen}` is not an address:port, so it will not be written to the config"
+            ));
+        }
+        let replacement = format!("listen = \"{listen}\"");
+
+        let mut out = String::with_capacity(text.len() + replacement.len() + 16);
+        let mut table = String::new();
+        let mut replaced = false;
+        let mut panel_header_line: Option<usize> = None;
+
+        for (index, raw) in text.lines().enumerate() {
+            let line = strip_comment(raw).trim();
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                table = name.trim().to_string();
+                if table == "panel" && panel_header_line.is_none() {
+                    panel_header_line = Some(index);
+                }
+            } else if table == "panel"
+                && line.split_once('=').map(|(k, _)| k.trim()) == Some("listen")
+            {
+                // Every occurrence, not just the first: the parser above takes
+                // the last value it reads, so a file that says `listen` twice
+                // and has one of them rewritten still starts on the old
+                // address — the change would look applied and do nothing.
+                let indent = &raw[..raw.len() - raw.trim_start().len()];
+                out.push_str(indent);
+                out.push_str(&replacement);
+                out.push('\n');
+                replaced = true;
+                continue;
+            }
+            out.push_str(raw);
+            out.push('\n');
+        }
+
+        if !replaced {
+            // A `[panel]` table with no `listen` line was running on the
+            // default; state it rather than leaving the table looking as though
+            // nothing changed. With no `[panel]` table at all there is one to
+            // add, at the end, where it cannot land inside somebody else's.
+            out = match panel_header_line {
+                Some(header) => {
+                    let mut rebuilt = String::with_capacity(out.len() + replacement.len() + 1);
+                    for (index, raw) in text.lines().enumerate() {
+                        rebuilt.push_str(raw);
+                        rebuilt.push('\n');
+                        if index == header {
+                            rebuilt.push_str(&replacement);
+                            rebuilt.push('\n');
+                        }
+                    }
+                    rebuilt
+                }
+                None => {
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("\n[panel]\n");
+                    out.push_str(&replacement);
+                    out.push('\n');
+                    out
+                }
+            };
+        }
+
+        // The proof, not the intention: what was written parses, and parses to
+        // the address that was asked for.
+        let parsed = super::UnihelmConfig::from_toml(&out)
+            .map_err(|e| format!("the rewritten config would not parse ({e})"))?;
+        if parsed.panel.listen != listen {
+            return Err(format!(
+                "the rewritten config reads back as `{}`, not `{listen}`",
+                parsed.panel.listen
+            ));
+        }
+        Ok(out)
     }
 
     /// Strip a trailing `#` comment, respecting quotes.
@@ -436,6 +551,100 @@ format = "text"
                 .secure_cookies
         );
         assert!(UnihelmConfig::from_toml("[panel]\nsecure_cookies = yes").is_err());
+    }
+
+    /// The operator's file comes back as their file, with one line different.
+    ///
+    /// `panel.tls.issue` narrows the listener after it puts the panel's vhost
+    /// live, and it does that to a file a human wrote and will read again. A
+    /// rewrite that dropped their comments — or the settings this parser does
+    /// not model yet — would be the panel helping itself to the whole document.
+    #[test]
+    fn rewriting_the_listen_address_changes_that_line_and_nothing_else() {
+        let before = include_str!("../../../installer/config.toml.example");
+        let after = UnihelmConfig::rewrite_panel_listen(before, "127.0.0.1:8088")
+            .expect("the shipped example can be narrowed");
+
+        assert_eq!(
+            UnihelmConfig::from_toml(&after).unwrap().panel.listen,
+            "127.0.0.1:8088"
+        );
+        assert!(after.contains("listen = \"127.0.0.1:8088\""), "{after}");
+        assert!(!after.contains("0.0.0.0:8088"), "{after}");
+
+        // Every other line survives byte for byte, comments included.
+        let dropped: Vec<&str> = before
+            .lines()
+            .filter(|l| !l.starts_with("listen = "))
+            .filter(|l| !after.lines().any(|k| k == *l))
+            .collect();
+        assert!(dropped.is_empty(), "these lines were lost: {dropped:?}");
+    }
+
+    #[test]
+    fn rewriting_keeps_the_port_and_only_touches_the_panel_table() {
+        let text = "[panel]\nlisten = \"0.0.0.0:9001\"\n\n[agent]\nworkers = 4\n";
+        let after = UnihelmConfig::rewrite_panel_listen(text, "127.0.0.1:9001").unwrap();
+        let parsed = UnihelmConfig::from_toml(&after).unwrap();
+        assert_eq!(parsed.panel.listen, "127.0.0.1:9001");
+        assert_eq!(parsed.agent.workers, 4);
+
+        // A `listen` under another table is that table's business.
+        let other = "[panel]\nlisten = \"0.0.0.0:8088\"\n[log]\nlevel = \"info\"\n";
+        let after = UnihelmConfig::rewrite_panel_listen(other, "127.0.0.1:8088").unwrap();
+        assert_eq!(after.matches("listen = ").count(), 1, "{after}");
+    }
+
+    /// The parser takes the last value it reads. A rewrite that changed only
+    /// the first of two `listen` lines would look applied, restart the panel,
+    /// and leave it on exactly the address it was told to leave.
+    #[test]
+    fn a_config_that_names_listen_twice_has_both_lines_rewritten() {
+        let text = "[panel]\nlisten = \"0.0.0.0:8088\"\nsecure_cookies = true\nlisten = \"0.0.0.0:8088\"\n";
+        let after = UnihelmConfig::rewrite_panel_listen(text, "127.0.0.1:8088").unwrap();
+        assert_eq!(after.matches("127.0.0.1:8088").count(), 2, "{after}");
+        assert_eq!(
+            UnihelmConfig::from_toml(&after).unwrap().panel.listen,
+            "127.0.0.1:8088"
+        );
+    }
+
+    #[test]
+    fn a_config_that_never_named_listen_gets_the_line_it_was_missing() {
+        // Running on the default is not the same as saying so, and after a
+        // narrowing the file has to say so or the next restart undoes it.
+        let with_table = UnihelmConfig::rewrite_panel_listen(
+            "[panel]\nsecure_cookies = true\n",
+            "127.0.0.1:8088",
+        )
+        .unwrap();
+        assert_eq!(
+            UnihelmConfig::from_toml(&with_table).unwrap().panel.listen,
+            "127.0.0.1:8088"
+        );
+        assert!(with_table.contains("secure_cookies = true"), "{with_table}");
+
+        let without_table =
+            UnihelmConfig::rewrite_panel_listen("[log]\nlevel = \"info\"\n", "127.0.0.1:8088")
+                .unwrap();
+        let parsed = UnihelmConfig::from_toml(&without_table).unwrap();
+        assert_eq!(parsed.panel.listen, "127.0.0.1:8088");
+        assert_eq!(parsed.log.level, "info");
+    }
+
+    /// Nothing is written that the panel could not read back. A config file
+    /// `unihelm-web` cannot parse is a panel that will not start, and there is
+    /// no way to fix that from inside the panel.
+    #[test]
+    fn a_rewrite_that_would_not_parse_is_refused_rather_than_returned() {
+        assert!(UnihelmConfig::rewrite_panel_listen("[panel]\n", "not-an-address").is_err());
+        assert!(
+            UnihelmConfig::rewrite_panel_listen("[panel]\n", "127.0.0.1:8088\"\nrm = \"x").is_err(),
+            "a value that could break out of its quotes must never be written"
+        );
+        // The file was already broken before we touched it — say so instead of
+        // saving a second broken version of it.
+        assert!(UnihelmConfig::rewrite_panel_listen("listen = = =", "127.0.0.1:8088").is_err());
     }
 
     #[test]

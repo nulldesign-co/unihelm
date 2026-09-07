@@ -255,6 +255,9 @@ impl OpRegistry {
         registry.register(crate::site::Update);
         registry.register(crate::site::Delete);
         registry.register(crate::site::Drift);
+        registry.register(crate::site::Reprovision);
+        registry.register(crate::site::AliasAdd);
+        registry.register(crate::site::AliasRemove);
         registry.register(crate::cert::Issue);
         registry.register(crate::cert::List);
         registry.register(crate::panel::Issue);
@@ -355,6 +358,10 @@ impl OpRegistry {
         registry.register(crate::docker::Remove);
         registry.register(crate::docker::Logs);
         registry.register(crate::docker::Create);
+        registry.register(crate::docker::ImagePull);
+        registry.register(crate::docker::ImageRemove);
+        registry.register(crate::docker::ImagePrune);
+        registry.register(crate::docker::VolumeRemove);
         registry.register(crate::runtime_default::SetDefault);
         registry.register(crate::webserver::Switch);
         registry.register(crate::webserver::Gaps);

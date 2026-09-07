@@ -422,6 +422,179 @@ pub async fn docker_create(
     ops::invoke(&state, &current.auth, "docker.create", body).await
 }
 
+// ---------------------------------------------------------------------------
+// Images and volumes
+// ---------------------------------------------------------------------------
+
+/// Which image to pull or remove.
+///
+/// **In a body, not in the path**, and that is not a style choice: an image
+/// reference is `ghcr.io/owner/app:v1` — slashes and colons — and a path
+/// parameter carrying one is a percent-encoding problem at every client that
+/// ever calls it. A volume name has no such trouble and stays in the path
+/// below, where it reads as the resource it is.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImageRequest {
+    /// `nginx`, `redis:7`, `ghcr.io/owner/app:v1`. Validated by the operation.
+    pub image: String,
+}
+
+/// Fetch an image, or confirm the tag is already at this digest.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/images/pull",
+    tag = "server",
+    request_body = ImageRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 202, description = "Queued; poll the task", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not an image reference", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_image_pull(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Json(body): Json<ImageRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // A task: a pull is minutes on the uplink a cheap VPS actually has, and the
+    // operator should watch it rather than a spinner.
+    ops::invoke(
+        &state,
+        &current.auth,
+        "docker.image.pull",
+        json!({ "image": body.image }),
+    )
+    .await
+}
+
+/// Delete an image. One a container still needs is refused, with the container
+/// named.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/images/remove",
+    tag = "server",
+    request_body = ImageRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 200, description = "Removed, with Docker's untagged and deleted lines", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not an image reference", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such image", body = ApiErrorBody),
+        (status = 409, description = "`dependents_exist`: a container is built on it", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_image_remove(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Json(body): Json<ImageRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // Immediate, so the refusal naming the container reaches the page that
+    // asked rather than a task log the operator has to go and open.
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "docker.image.remove",
+        json!({ "image": body.image }),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
+/// Whether to delete or only to list.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct PruneRequest {
+    /// List what would go and delete nothing. Absent means delete.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Reclaim the disk that dangling image layers eat.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/images/prune",
+    tag = "server",
+    request_body = PruneRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    responses(
+        (status = 202, description = "Queued; the task reports what went and how much came back", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_image_prune(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Json(body): Json<PruneRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // A task: deleting tens of gigabytes of layers off a slow disk is minutes,
+    // and the list of what went belongs in a log that outlives the page.
+    ops::invoke(
+        &state,
+        &current.auth,
+        "docker.image.prune",
+        json!({ "dry_run": body.dry_run }),
+    )
+    .await
+}
+
+/// Delete a volume. One a container references, or one holding an engine's
+/// databases, is refused.
+#[utoipa::path(
+    delete,
+    path = "/api/server/docker/volumes/{name}",
+    tag = "server",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("name" = String, Path, description = "Volume name")),
+    responses(
+        (status = 200, description = "Removed", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a volume name", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such volume", body = ApiErrorBody),
+        (status = 409, description = "`conflict` / `dependents_exist`: it holds an engine's data, or a container mounts it", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_volume_remove(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // Immediate, for the reason the image removal is: both refusals name what
+    // is in the way, and a refusal an operator has to poll for is a refusal
+    // they will read as a failed request.
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "docker.volume.remove",
+        json!({ "volume": name }),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +635,40 @@ mod tests {
     fn an_empty_body_is_forwarded_empty_rather_than_guessed_at() {
         let asked: InstallRuntime = serde_json::from_value(json!({})).unwrap();
         assert_eq!(install_args(&asked), json!({}));
+    }
+
+    /// Why the image endpoints take their reference in a body while the volume
+    /// endpoint keeps its name in the path.
+    ///
+    /// An image reference carries slashes and colons — `ghcr.io/owner/app:v1`
+    /// is one token with four of them — so a path parameter holding one has to
+    /// be percent-encoded by every client that ever calls it, and a client that
+    /// forgets does not get an error: it addresses a different route. A volume
+    /// name has no such characters, so it stays where it reads as the resource
+    /// it is.
+    #[test]
+    fn a_registry_qualified_image_reaches_the_handler_whole() {
+        for reference in [
+            "nginx",
+            "redis:7",
+            "ghcr.io/owner/app:v1",
+            "registry.example.com:5000/team/app@sha256:aaaa",
+        ] {
+            let asked: ImageRequest = serde_json::from_value(json!({ "image": reference }))
+                .unwrap_or_else(|e| panic!("`{reference}` is what the page sends: {e}"));
+            assert_eq!(asked.image, reference);
+        }
+    }
+
+    /// A prune with no body is a prune, not a listing. An operator who pressed
+    /// the button and got a list back would reasonably believe the disk had
+    /// been reclaimed, which is the panel reporting something that did not
+    /// happen.
+    #[test]
+    fn a_prune_defaults_to_deleting_rather_than_listing() {
+        let bare: PruneRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(!bare.dry_run);
+        let asked: PruneRequest = serde_json::from_value(json!({ "dry_run": true })).unwrap();
+        assert!(asked.dry_run);
     }
 }

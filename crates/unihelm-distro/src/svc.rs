@@ -4,6 +4,8 @@
 //! but it still lives behind [`SvcBackend`] because the *unit names* differ
 //! between families and no feature module should have to know that.
 
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_core::PhpVersion;
@@ -222,6 +224,24 @@ impl UnitState {
     }
 }
 
+/// Which number [`UnitStatus::memory_bytes`] is carrying.
+///
+/// The two measure different things and are not comparable, so the reading says
+/// which one it is instead of leaving every caller to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    /// `anon` from the unit's own `memory.stat` — the anonymous pages its
+    /// processes actually hold. This is what "the service is using X" means.
+    Anonymous,
+    /// systemd's `MemoryCurrent`, used when the unit's `memory.stat` could not
+    /// be read: cgroup v1, a unit with no cgroup because it is not running, or
+    /// a `/sys/fs/cgroup` this process cannot see. It is the cgroup's whole
+    /// charge, page cache included, so it reads high by however much the unit
+    /// happens to have read off disk.
+    CgroupTotal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitStatus {
     pub unit: String,
@@ -231,8 +251,20 @@ pub struct UnitStatus {
     /// `enabled`, `disabled`, `static`, `masked`, …
     pub enabled: Option<String>,
     pub main_pid: Option<u32>,
-    /// Resident memory of the unit's cgroup, when systemd reports it.
+    /// Memory the unit is using, in bytes. Read [`Self::memory_source`] before
+    /// putting two of these next to each other; `None` means nothing could be
+    /// read at all.
+    ///
+    /// This doc used to say "resident memory" while the field carried
+    /// `MemoryCurrent` verbatim, and that sentence is why the mistake lasted:
+    /// under cgroup v2 that charge includes the page cache the unit has
+    /// touched, so a database that had just read a large table reported
+    /// gigabytes on the dashboard beside Docker's 40 MB, and the two numbers
+    /// were being compared as though they measured the same thing.
     pub memory_bytes: Option<u64>,
+    /// Which reading [`Self::memory_bytes`] is, so a fallback is visible rather
+    /// than silently mixed in with the real thing.
+    pub memory_source: Option<MemorySource>,
     /// ISO-8601 timestamp of the last start, as systemd printed it.
     pub since: Option<String>,
 }
@@ -284,22 +316,19 @@ impl SvcBackend for SystemdBackend {
         // `systemctl show` is the machine-readable form; `status` is for humans
         // and its output is explicitly not a stable interface.
         let out = Cmd::new("systemctl")
-            .args([
-                "show",
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=UnitFileState",
-                "--property=MainPID",
-                "--property=MemoryCurrent",
-                "--property=ActiveEnterTimestamp",
-                "--",
-                unit.as_str(),
-            ])
+            .arg("show")
+            .args(SHOW_PROPERTIES)
+            .args(["--", unit.as_str()])
             .run()
             .await?;
 
-        Ok(parse_systemctl_show(unit.as_str(), &out.stdout))
+        let mut status = parse_systemctl_show(unit.as_str(), &out.stdout);
+        // `MemoryCurrent` is the cgroup's charge, not the unit's own memory.
+        // The split between the two is in the cgroup's `memory.stat`, and
+        // `ControlGroup` is systemd telling us where that cgroup is.
+        let memory_stat = show_property(&out.stdout, "ControlGroup").and_then(read_memory_stat);
+        apply_memory_stat(&mut status, memory_stat.as_deref());
+        Ok(status)
     }
 
     async fn action(&self, unit: &UnitName, action: SvcAction) -> Result<()> {
@@ -376,6 +405,90 @@ impl SvcBackend for SystemdBackend {
     }
 }
 
+/// The properties `status` asks systemd for.
+///
+/// `ControlGroup` is in this list so the memory reading can find the unit's own
+/// `memory.stat`. Dropping it does not fail anything — it silently puts every
+/// unit back on the cgroup charge, which is exactly how the page cache came to
+/// be reported as memory in the first place.
+const SHOW_PROPERTIES: &[&str] = &[
+    "--property=LoadState",
+    "--property=ActiveState",
+    "--property=SubState",
+    "--property=UnitFileState",
+    "--property=MainPID",
+    "--property=MemoryCurrent",
+    "--property=ControlGroup",
+    "--property=ActiveEnterTimestamp",
+];
+
+/// One `key=value` line out of `systemctl show` output. Empty values are `None`:
+/// systemd prints the key with nothing after it for a property it has no answer
+/// for, such as `ControlGroup` on a unit that is not running.
+fn show_property(stdout: &str, key: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// `/sys/fs/cgroup` plus systemd's cgroup path for the unit, cgroup v2 layout.
+///
+/// systemd reports `ControlGroup` as an absolute path *inside* the hierarchy
+/// (`/system.slice/nginx.service`), so the leading slash is trimmed rather than
+/// used to join. On a cgroup v1 host nothing exists at the result, which is one
+/// of the cases the [`MemorySource::CgroupTotal`] fallback covers.
+fn memory_stat_path(control_group: &str) -> Option<PathBuf> {
+    let relative = control_group.trim().trim_start_matches('/');
+    // The path comes from systemd rather than from a request, but the agent is
+    // root: a `..` in it would still open a file under `/sys` that this has no
+    // business reading, so it is refused instead of trusted.
+    if relative.is_empty() || relative.split('/').any(|seg| seg.is_empty() || seg == "..") {
+        return None;
+    }
+    Some(
+        Path::new("/sys/fs/cgroup")
+            .join(relative)
+            .join("memory.stat"),
+    )
+}
+
+/// The unit's own `memory.stat`, or `None` if it is not there to be read.
+///
+/// A blocking read inside an async fn on purpose: cgroup files are answered out
+/// of kernel memory with no device behind them, and the container path reads its
+/// cgroup the same way. Every failure is a `None` and a visible fallback — a
+/// status call must not fail over a memory column.
+fn read_memory_stat(control_group: String) -> Option<String> {
+    std::fs::read_to_string(memory_stat_path(&control_group)?).ok()
+}
+
+/// Replace the cgroup charge with the unit's anonymous memory, when its
+/// `memory.stat` could be read.
+///
+/// When it could not, `MemoryCurrent` stays exactly where it was — still
+/// labelled [`MemorySource::CgroupTotal`], so the caller can say so.
+fn apply_memory_stat(status: &mut UnitStatus, memory_stat: Option<&str>) {
+    if let Some(anon) = memory_stat.and_then(anon_bytes) {
+        status.memory_bytes = Some(anon);
+        status.memory_source = Some(MemorySource::Anonymous);
+    }
+}
+
+/// `anon` out of a cgroup v2 `memory.stat`.
+///
+/// The key is matched whole. The same file carries `anon_thp`, `inactive_anon`
+/// and `active_anon`, so a `starts_with`/`contains` test would return whichever
+/// of them the kernel happened to print first.
+fn anon_bytes(memory_stat: &str) -> Option<u64> {
+    memory_stat
+        .lines()
+        .find_map(|line| match line.split_once(' ') {
+            Some(("anon", value)) => value.trim().parse().ok(),
+            _ => None,
+        })
+}
+
 /// Parse `systemctl show` key=value output.
 fn parse_systemctl_show(unit: &str, stdout: &str) -> UnitStatus {
     let mut load_state = String::new();
@@ -412,6 +525,10 @@ fn parse_systemctl_show(unit: &str, stdout: &str) -> UnitStatus {
         enabled: (!unit_file_state.is_empty()).then_some(unit_file_state),
         main_pid,
         memory_bytes,
+        // What `systemctl show` alone can offer, until `apply_memory_stat` has
+        // a better number. Labelled here rather than at the call site so no
+        // path can produce a reading with no source on it.
+        memory_source: memory_bytes.map(|_| MemorySource::CgroupTotal),
         since,
     }
 }
@@ -546,6 +663,7 @@ mod tests {
         assert_eq!(s.enabled.as_deref(), Some("enabled"));
         assert_eq!(s.main_pid, Some(1234));
         assert_eq!(s.memory_bytes, Some(52_428_800));
+        assert_eq!(s.memory_source, Some(MemorySource::CgroupTotal));
         assert!(s.is_active());
     }
 
@@ -568,5 +686,180 @@ mod tests {
         );
         let s = parse_systemctl_show("x.service", &out);
         assert_eq!(s.memory_bytes, None);
+        assert_eq!(
+            s.memory_source, None,
+            "no reading means no source to name either"
+        );
+    }
+
+    /// A real cgroup v2 `memory.stat`, as `mariadb.service` writes it after the
+    /// unit has read a table off disk: 1 MiB of anonymous memory, 11 MiB of
+    /// page cache. `MemoryCurrent` for this cgroup is the sum plus kernel
+    /// overhead, which is the number the panel used to print.
+    const MEMORY_STAT_V2: &str = "\
+anon 1093632
+file 12312576
+kernel 1466368
+kernel_stack 65536
+pagetables 143360
+percpu 1440
+sock 0
+vmalloc 0
+shmem 0
+file_mapped 4083712
+file_dirty 0
+file_writeback 0
+swapcached 0
+anon_thp 2097152
+file_thp 0
+shmem_thp 0
+inactive_anon 4096
+active_anon 1089536
+inactive_file 8228864
+active_file 4083712
+unevictable 0
+slab_reclaimable 786432
+slab_unreclaimable 442368
+";
+
+    /// cgroup v1's `memory.stat`, which names the same quantity `rss` and has
+    /// no `anon` line at all.
+    const MEMORY_STAT_V1: &str = "\
+cache 12312576
+rss 1093632
+rss_huge 0
+shmem 0
+mapped_file 4083712
+dirty 0
+writeback 0
+pgpgin 4711
+pgpgout 1204
+inactive_anon 0
+active_anon 1093632
+inactive_file 8228864
+active_file 4083712
+";
+
+    fn status_with_memory_current(bytes: u64) -> UnitStatus {
+        parse_systemctl_show(
+            "mariadb.service",
+            &format!(
+                "LoadState=loaded\nActiveState=active\nSubState=running\nMemoryCurrent={bytes}\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn anon_is_read_whole_and_not_from_a_key_that_merely_contains_anon() {
+        assert_eq!(anon_bytes(MEMORY_STAT_V2), Some(1_093_632));
+        // `anon_thp` comes before `inactive_anon`/`active_anon` in the file and
+        // is the value a prefix match would have taken.
+        assert_ne!(anon_bytes(MEMORY_STAT_V2), Some(2_097_152));
+        assert_eq!(anon_bytes(MEMORY_STAT_V1), None);
+        assert_eq!(anon_bytes(""), None);
+        assert_eq!(anon_bytes("anon not-a-number\n"), None);
+    }
+
+    #[test]
+    fn memory_stat_anon_replaces_the_cgroup_charge_and_the_reading_says_which() {
+        let mut s = status_with_memory_current(13_697_024);
+        assert_eq!(s.memory_bytes, Some(13_697_024));
+        assert_eq!(s.memory_source, Some(MemorySource::CgroupTotal));
+
+        apply_memory_stat(&mut s, Some(MEMORY_STAT_V2));
+
+        // The page cache this unit had touched was twelve times its own memory,
+        // and the dashboard was printing the sum next to other units' sums.
+        assert_eq!(s.memory_bytes, Some(1_093_632));
+        assert_eq!(s.memory_source, Some(MemorySource::Anonymous));
+    }
+
+    #[test]
+    fn memory_stat_without_an_anon_line_keeps_the_charge_and_stays_labelled_a_charge() {
+        let mut s = status_with_memory_current(13_697_024);
+        apply_memory_stat(&mut s, Some(MEMORY_STAT_V1));
+        assert_eq!(s.memory_bytes, Some(13_697_024));
+        assert_eq!(
+            s.memory_source,
+            Some(MemorySource::CgroupTotal),
+            "a fallback the caller cannot see is the same defect with a different number"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_memory_stat_leaves_the_reading_and_its_label_alone() {
+        let mut s = status_with_memory_current(13_697_024);
+        apply_memory_stat(&mut s, None);
+        assert_eq!(s.memory_bytes, Some(13_697_024));
+        assert_eq!(s.memory_source, Some(MemorySource::CgroupTotal));
+
+        // A unit with no reading at all gains none from a missing file.
+        let mut none =
+            parse_systemctl_show("x.service", "LoadState=loaded\nActiveState=inactive\n");
+        apply_memory_stat(&mut none, None);
+        assert_eq!(none.memory_bytes, None);
+        assert_eq!(none.memory_source, None);
+    }
+
+    #[test]
+    fn status_asks_systemd_for_the_cgroup_the_memory_reading_needs() {
+        assert!(
+            SHOW_PROPERTIES.contains(&"--property=ControlGroup"),
+            "without it every unit falls back to the cgroup charge, silently"
+        );
+        assert!(SHOW_PROPERTIES.contains(&"--property=MemoryCurrent"));
+    }
+
+    #[test]
+    fn control_group_is_taken_from_show_output_and_absent_when_systemd_has_none() {
+        let running = "MainPID=1234\nControlGroup=/system.slice/nginx.service\nMemoryCurrent=100\n";
+        assert_eq!(
+            show_property(running, "ControlGroup").as_deref(),
+            Some("/system.slice/nginx.service")
+        );
+        // systemd prints the bare key for a unit that is not running.
+        assert_eq!(
+            show_property("ControlGroup=\nMainPID=0\n", "ControlGroup"),
+            None
+        );
+        assert_eq!(show_property(running, "MemoryPeak"), None);
+    }
+
+    #[test]
+    fn memory_stat_path_stays_under_the_cgroup_root() {
+        assert_eq!(
+            memory_stat_path("/system.slice/nginx.service"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/system.slice/nginx.service/memory.stat"
+            ))
+        );
+        assert_eq!(
+            memory_stat_path("/unihelm-uh_abc.slice/unihelm-app-uh_abc-blog.service"),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/unihelm-uh_abc.slice/unihelm-app-uh_abc-blog.service/memory.stat"
+            ))
+        );
+        for refused in ["", "/", "   ", "/system.slice/../../../etc/shadow"] {
+            assert_eq!(
+                memory_stat_path(refused),
+                None,
+                "expected `{refused}` to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn serialised_status_names_which_memory_number_it_is_carrying() {
+        // The dashboard puts these side by side, so the JSON it reads has to
+        // carry the distinction the field type makes.
+        let mut s = status_with_memory_current(13_697_024);
+        let total = serde_json::to_value(&s).unwrap();
+        assert_eq!(total["memory_bytes"], 13_697_024_u64);
+        assert_eq!(total["memory_source"], "cgroup_total");
+
+        apply_memory_stat(&mut s, Some(MEMORY_STAT_V2));
+        let anon = serde_json::to_value(&s).unwrap();
+        assert_eq!(anon["memory_bytes"], 1_093_632_u64);
+        assert_eq!(anon["memory_source"], "anonymous");
     }
 }

@@ -209,6 +209,13 @@ pub struct PostureFacts {
     pub firewall: FirewallFacts,
     /// Non-loopback listeners on [`MYSQL_PORT`].
     pub mysql_listeners: Observed<Vec<PublicListener>>,
+    /// The port `panel.listen` names, read from the configuration rather than
+    /// assumed: an operator who moved the panel off 8088 is exactly the one a
+    /// hard-coded port would report a clean bill of health to.
+    pub panel_port: u16,
+    /// Non-loopback listeners on [`PostureFacts::panel_port`] — the panel's own
+    /// direct address, which stops being the way in the moment its vhost is up.
+    pub panel_listeners: Observed<Vec<PublicListener>>,
     pub panel_tls: PanelTlsFacts,
     pub sites: Vec<SiteCertFact>,
     pub sentinel_enabled: bool,
@@ -625,10 +632,14 @@ pub async fn gather(distro: &Distro, db: &Db) -> Result<PostureFacts> {
         });
     }
 
+    let panel_port = crate::panel::panel_listen_port();
+
     Ok(PostureFacts {
         sshd: gather_sshd().await,
         firewall,
         mysql_listeners: gather_listeners(MYSQL_PORT),
+        panel_port,
+        panel_listeners: gather_listeners(panel_port),
         panel_tls,
         sites,
         sentinel_enabled: SentinelSettings::load(db).await.enabled,
@@ -835,12 +846,13 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
     // -- Panel TLS ----------------------------------------------------------
     match facts.panel_tls.days_remaining {
         // No certificate, and no domain to put one on. The panel ships bound to
-        // loopback (`listen = "127.0.0.1:8088"`), and until somebody publishes it
-        // under a name there is nothing for a CA to attest and no browser warning
-        // for an administrator to learn to click through — they reach it through
-        // an SSH tunnel. Reporting High here fired on every fresh install, which
-        // teaches exactly the habit the rest of this module exists to prevent:
-        // that a High finding is something you scroll past.
+        // every interface with a self-signed certificate, and until somebody
+        // publishes it under a name there is nothing for a CA to attest —
+        // reaching it means clicking through the warning or an SSH tunnel, and
+        // that is the deliberate trade a fresh install makes. Reporting High
+        // here fired on every fresh install, which teaches exactly the habit the
+        // rest of this module exists to prevent: that a High finding is
+        // something you scroll past.
         None if facts.panel_tls.domain.is_none() => {}
         None => findings.push(Finding {
             id: "panel.tls_missing",
@@ -883,6 +895,69 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
             subject: facts.panel_tls.domain.clone(),
         }),
         Some(_) => {}
+    }
+
+    // -- The panel's own port, after it has a vhost -------------------------
+    //
+    // Only once the panel is published: the direct address is how a fresh
+    // install is reached at all, and calling that a finding would put a warning
+    // on every new server for doing what the installer told it to. What is
+    // worth saying is the state issue 83 describes — a panel with a trusted
+    // certificate on its own domain that is *also* still answering on an IP
+    // with a self-signed one. `panel.tls.issue` now narrows the listener itself
+    // when it puts the vhost live; this catches the servers that were published
+    // before it did, and any that were widened again afterwards.
+    if let (Some(domain), Some("active")) = (
+        facts.panel_tls.domain.as_deref(),
+        facts.panel_tls.status.as_deref(),
+    ) {
+        let port = facts.panel_port;
+        match &facts.panel_listeners {
+            Observed::Unavailable { reason } => findings.push(Finding {
+                id: "panel.exposure_unknown",
+                severity: Severity::Unknown,
+                title: "Whether the panel still answers on its own port is unknown".into(),
+                risk: "The panel is published under a domain, so its direct port \
+                       should no longer be accepting connections from the network. \
+                       Listening sockets could not be enumerated, so that could not \
+                       be confirmed."
+                    .into(),
+                remedy: format!("Check by hand: `ss -ltnp sport = :{port}`. ({reason})"),
+                subject: None,
+            }),
+            Observed::Known(listeners) if !listeners.is_empty() => {
+                let addresses = listeners
+                    .iter()
+                    .map(|l| format!("{}:{}", l.address, l.port))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding {
+                    id: "panel.direct_port_open",
+                    severity: Severity::Medium,
+                    title: format!("The panel answers on {addresses} as well as on {domain}"),
+                    risk: "That address serves the same login form as the domain \
+                           does, but with the certificate the panel signed for \
+                           itself, so anyone reaching it is asked to click through \
+                           a browser warning. Clicking through is the habit an \
+                           attacker intercepting the panel's login needs an \
+                           administrator to already have."
+                        .into(),
+                    // The evidence here is a domain and a certificate row, not a
+                    // request that came back — so the operator is told to check
+                    // the way in before closing the way in they are using.
+                    remedy: format!(
+                        "Check that https://{domain}/ answers first: it is the only \
+                         way in afterwards. Then set `panel.listen = \
+                         \"127.0.0.1:{port}\"` in /etc/unihelm/config.toml — the \
+                         vhost already proxies there — run `systemctl restart \
+                         unihelm-web`, and close {port}/tcp on the firewall page. \
+                         Renewing the panel's certificate does all of this for you."
+                    ),
+                    subject: Some(addresses),
+                });
+            }
+            Observed::Known(_) => {}
+        }
     }
 
     // -- Sites without certificates ----------------------------------------
@@ -1041,6 +1116,10 @@ mod tests {
                 active: Some(true),
             },
             mysql_listeners: Observed::Known(Vec::new()),
+            panel_port: 8088,
+            // Published and narrowed: the panel is reached through its vhost,
+            // and its own port answers on loopback only.
+            panel_listeners: Observed::Known(Vec::new()),
             panel_tls: PanelTlsFacts {
                 domain: Some("panel.example.com".into()),
                 days_remaining: Some(70),
@@ -1140,6 +1219,9 @@ mod tests {
         facts.mysql_listeners = Observed::Unavailable {
             reason: "no /proc".into(),
         };
+        facts.panel_listeners = Observed::Unavailable {
+            reason: "no /proc".into(),
+        };
         facts.security_updates = Observed::Unavailable {
             reason: "dnf timed out".into(),
         };
@@ -1152,6 +1234,7 @@ mod tests {
                 "ssh.unknown",
                 "firewall.unknown",
                 "mariadb.exposure_unknown",
+                "panel.exposure_unknown",
                 "updates.unknown"
             ]
         );
@@ -1476,18 +1559,89 @@ Obsoleting Packages
 
     #[test]
     fn a_panel_that_was_never_published_is_not_asked_for_a_certificate() {
-        // The shipped config binds the panel to loopback, so a fresh install has
-        // no domain and no certificate. Reporting that as High fired on every
-        // first run of `security.posture`, for a panel reachable only through an
-        // SSH tunnel — no browser warning, nothing for a CA to attest. A High
-        // finding that is wrong out of the box teaches operators to scroll past
-        // High findings.
+        // A fresh install has no domain and no certificate: it is reached on its
+        // own address, over the certificate it signed for itself, because a
+        // panel you cannot look at until you have bought a domain is not a panel
+        // you can set up. Reporting that as High fired on every first run of
+        // `security.posture`, and a High finding that is wrong out of the box
+        // teaches operators to scroll past High findings.
         let mut facts = clean();
         facts.panel_tls.domain = None;
+        facts.panel_tls.status = None;
         facts.panel_tls.days_remaining = None;
+        facts.panel_listeners = Observed::Known(vec![PublicListener {
+            address: "0.0.0.0".into(),
+            port: 8088,
+        }]);
+        let findings = evaluate(&facts);
+        let found = ids(&findings);
         assert!(
-            !ids(&evaluate(&facts)).contains(&"panel.tls_missing"),
+            !found.contains(&"panel.tls_missing"),
             "a panel with no domain has nothing to certify"
+        );
+        assert!(
+            !found.contains(&"panel.direct_port_open"),
+            "and its own port is the only way in, not a second one"
+        );
+    }
+
+    /// Issue 83: a panel published under a real name, still answering on the
+    /// address and port the installer left it on.
+    ///
+    /// Both doors reach the same login form, but the direct one presents a
+    /// certificate signed by nobody — so the operator is trained to click
+    /// through the warning that would otherwise be the only sign of an
+    /// interception. `panel.tls.issue` narrows the listener itself now; this is
+    /// what reports the servers that were published before it did.
+    #[test]
+    fn a_published_panel_still_answering_on_its_own_port_is_reported() {
+        let mut facts = clean();
+        facts.panel_listeners = Observed::Known(vec![PublicListener {
+            address: "203.0.113.10".into(),
+            port: 8088,
+        }]);
+        let findings = evaluate(&facts);
+        assert_eq!(ids(&findings), vec!["panel.direct_port_open"]);
+        assert!(
+            findings[0].title.contains("203.0.113.10:8088"),
+            "{findings:?}"
+        );
+        // The remedy is the exact edit, not "consider restricting access".
+        assert!(
+            findings[0]
+                .remedy
+                .contains("panel.listen = \"127.0.0.1:8088\""),
+            "{}",
+            findings[0].remedy
+        );
+        // And it sends the operator to confirm the remaining door before they
+        // shut the one they are standing in. An active certificate row is not a
+        // request that came back.
+        assert!(
+            findings[0]
+                .remedy
+                .contains("https://panel.example.com/ answers first"),
+            "{}",
+            findings[0].remedy
+        );
+    }
+
+    #[test]
+    fn the_remedy_names_the_port_the_panel_actually_listens_on() {
+        // An operator who moved the panel off 8088 is exactly the one a
+        // hard-coded 8088 in this advice would send to the wrong line.
+        let mut facts = clean();
+        facts.panel_port = 9443;
+        facts.panel_listeners = Observed::Known(vec![PublicListener {
+            address: "203.0.113.10".into(),
+            port: 9443,
+        }]);
+        let findings = evaluate(&facts);
+        assert!(
+            findings[0].remedy.contains("127.0.0.1:9443")
+                && findings[0].remedy.contains("9443/tcp"),
+            "{}",
+            findings[0].remedy
         );
     }
 

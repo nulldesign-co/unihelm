@@ -64,6 +64,20 @@
 //! ended is never taken as a request to end the session — only an explicit
 //! `close` message is. Sessions nobody comes back to are reaped by the agent's
 //! idle sweep.
+//!
+//! # A hole in the output is named, never hidden
+//!
+//! The agent's event broadcast is bounded, so a socket that cannot keep up with
+//! a burst of output — a build, a `cat` of a large file — has frames dropped out
+//! from under it to make room. This loop used to answer that with a bare
+//! `continue`: the browser then rendered the surviving frames end to end, so a
+//! log read through the terminal came out with pieces missing and *looked* like
+//! the file. Somebody reading it got a wrong answer and had no way to know.
+//!
+//! So lag is counted, logged, and sent down the socket as a `lagged` state the
+//! terminal draws as a visible break. Nothing here retries: the channel is
+//! bounded and the frames are already gone, so there is nothing to ask for. A
+//! gap the operator can see is the whole point.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -541,7 +555,24 @@ async fn bridge(
         loop {
             let frame = match events.recv().await {
                 Ok(frame) => frame,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The frames are gone; the only thing left to do with them
+                    // is say so. See the module docs for what the old silent
+                    // `continue` cost.
+                    tracing::warn!(
+                        session = %session,
+                        skipped,
+                        "a terminal socket fell behind the agent broadcast; output was dropped"
+                    );
+                    if sink
+                        .send(Message::Text(lag_notice(skipped).to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             let Some(payload) = socket_payload(&frame.kind, session, viewer) else {
@@ -613,6 +644,31 @@ async fn bridge(
     // The socket is done; the shell is not. Only the explicit `close` above
     // ends a session, so a reload reconnects to the same shell.
     downstream.abort();
+}
+
+/// What the browser is told when the broadcast dropped frames under this socket.
+///
+/// Carried in `detail` — the same field a refusal uses — so the terminal can
+/// print the server's own sentence and the count travels without the wire
+/// protocol growing a field for one message kind.
+///
+/// The wording is hedged on purpose, and the hedge is the honest part. This
+/// process multiplexes every browser and every task over one broadcast, so
+/// `skipped` counts *events*, not this shell's bytes, and some of them will have
+/// belonged to another session entirely. "May be missing" is the strongest claim
+/// the panel can actually support; "you lost 142 lines" would be the same class
+/// of lie as saying nothing.
+fn lag_notice(skipped: u64) -> serde_json::Value {
+    json!({
+        "type": "state",
+        "status": "lagged",
+        "detail": format!(
+            "the panel's event stream fell behind and dropped {skipped} \
+             message{}; some output above may be missing",
+            if skipped == 1 { "" } else { "s" },
+        ),
+        "user": serde_json::Value::Null,
+    })
 }
 
 /// Should this agent event go down this socket, and as what?
@@ -1000,6 +1056,37 @@ mod tests {
             line: "installing".into(),
         };
         assert!(socket_payload(&kind, Uuid::new_v4(), UserId(7)).is_none());
+    }
+
+    #[test]
+    fn a_socket_that_fell_behind_tells_the_browser_how_much_it_missed() {
+        // The loop used to `continue` here, so a burst of output arrived with
+        // holes in it and the screen looked whole. The browser now gets a state
+        // message it already knows how to draw as a break in the stream, and the
+        // number is in it so "a frame or two" and "four thousand" are not the
+        // same sentence.
+        let notice = lag_notice(142);
+        assert_eq!(notice["type"], "state");
+        assert_eq!(
+            notice["status"], "lagged",
+            "the client switches on this string to draw the gap"
+        );
+        let detail = notice["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("142"), "the count must reach the operator");
+        assert!(
+            detail.contains("may be missing"),
+            "one broadcast carries every session, so this socket cannot claim \
+             the dropped frames were its own: {detail}"
+        );
+        // `user` is null rather than absent: the client's state message has the
+        // field on every variant, and a missing key is a shape it has not been
+        // told to expect.
+        assert!(notice["user"].is_null());
+
+        // One dropped frame is still a gap, and it must not read as "1 messages".
+        let one = lag_notice(1);
+        let detail = one["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("1 message;"), "{detail}");
     }
 
     /// Same shape a handshake arrives in, minus the header plumbing.

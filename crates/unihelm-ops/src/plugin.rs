@@ -48,7 +48,7 @@
 //!   running sidecar, a changed manifest and a changed extension set, and
 //!   getting that half-right is worse than not offering it.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration as StdDuration;
 
@@ -786,10 +786,14 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
 
 /// A source path an operator may stage a plugin at.
 ///
-/// Absolute, traversal-free, and **never inside `/home`**. That last rule is
-/// the one worth stating: a tree staged in a tenant's home is a tree the
-/// tenant can rewrite between the moment it is verified and the moment it is
-/// copied, which would turn the whole signature check into theatre.
+/// Absolute, traversal-free, never inside `/home`, and never under a directory
+/// somebody other than root can write to. The last two rules are the same rule:
+/// a tree anyone else can rewrite between the moment it is verified and the
+/// moment it is copied turns the whole signature check into theatre.
+///
+/// `/home` alone was not enough. `/tmp` and `/var/tmp` are absolute, canonical
+/// and outside every tenant home, so they passed every check here and are
+/// writable by every account on the machine — see `refuse_shared_staging`.
 pub fn validate_source(source: &str) -> Result<PathBuf> {
     let path = Path::new(source);
     if !path.is_absolute() {
@@ -824,7 +828,94 @@ pub fn validate_source(source: &str) -> Result<PathBuf> {
         )
         .with_field("source"));
     }
+    // SAFETY: `geteuid` reads a property of this process and cannot fail.
+    refuse_shared_staging(path, unsafe { libc::geteuid() } == 0)?;
     Ok(path.to_path_buf())
+}
+
+/// Refuse a staging path that anyone but root can write into.
+///
+/// The path rules above stop at the *shape* of the path, which let `/tmp` and
+/// `/var/tmp` through: both are absolute, canonical and outside `/home`, and
+/// both are writable by every account on the machine. Between [`verify_tree`]
+/// hashing the payload and `install_tree` copying it, any local account could
+/// swap a listed file for one of its own — and what the agent then copied into
+/// a root-owned directory and started as a service was code nobody had
+/// verified. Time-of-check to time-of-use, ending as root.
+///
+/// Every ancestor is checked, not only the directory named: a root-owned
+/// `/tmp/staging` buys nothing when `/tmp` lets a stranger rename it away and
+/// leave their own `staging` in its place. The sticky bit those two carry is
+/// not accepted as a mitigation — it narrows the trick rather than removing it,
+/// and "root owns every step of this path and nobody else can write to it" is a
+/// property an operator can confirm with one `ls -ld` and this code can state
+/// without an asterisk.
+///
+/// `agent_is_root` is the condition under which the race exists at all. An
+/// unprivileged agent (`--dev`, this crate's tests) has no root-owned install to
+/// race into — `plugin.install` cannot get past `useradd` — and every scratch
+/// directory it stages from is its own. It is a parameter rather than something
+/// read here so the production answer stays testable without running the suite
+/// as root.
+fn refuse_shared_staging(source: &Path, agent_is_root: bool) -> Result<()> {
+    if !agent_is_root {
+        return Ok(());
+    }
+    for directory in source.ancestors() {
+        let meta = match std::fs::metadata(directory) {
+            Ok(meta) => meta,
+            // A directory that is not there yet cannot be swapped, and whoever
+            // creates it has to get past its parent — which this loop reaches
+            // on the next turn. `metadata` follows symlinks on purpose: what
+            // matters is the permissions of the directory the path lands in,
+            // not of a link some earlier step already vouched for.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidPath,
+                    format!(
+                        "could not read the permissions of `{}` ({e}), so the panel \
+                         cannot tell who may write to the plugin source. A plugin is \
+                         installed and run as root; a path that cannot be checked is \
+                         not one to install from.",
+                        directory.display()
+                    ),
+                )
+                .with_field("source"));
+            }
+        };
+
+        let mode = meta.mode() & 0o7777;
+        let problem = if meta.uid() != 0 {
+            format!("is owned by uid {}, not by root", meta.uid())
+        } else if mode & 0o002 != 0 {
+            format!("is writable by every account on this server (mode {mode:04o})")
+        } else if mode & 0o020 != 0 {
+            format!("is writable by group {} (mode {mode:04o})", meta.gid())
+        } else {
+            continue;
+        };
+
+        // Naming the directory is the whole point of this refusal. "Permission
+        // denied" would send an operator to the plugin tree, chmod it, and find
+        // nothing changed — the problem is three levels up in a path they did
+        // not think of as part of the plugin.
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidPath,
+            format!(
+                "`{}` {problem}, so the plugin tree could be replaced between the \
+                 moment its digests are checked and the moment it is installed and \
+                 run as root. Stage the plugin somewhere only root can write — \
+                 `install -d -o root -g root -m 755 {}` — and install from there. \
+                 `/tmp` and `/var/tmp` are shared with every account on the server \
+                 and never qualify (docs/plugins.md).",
+                directory.display(),
+                paths::data_dir().join("staging").display(),
+            ),
+        )
+        .with_field("source"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +1957,94 @@ mod tests {
             "the installed directory is not a staging area"
         );
         assert!(validate_source("/opt/staged/acme-dns").is_ok());
+    }
+
+    /// The shared temp directories passed every rule above — absolute,
+    /// canonical, outside `/home` — and every account on the server can write to
+    /// them. Staging there meant anything on the box could swap a file between
+    /// the digest check and the copy, and the panel would install and start what
+    /// it had not verified, as root.
+    #[test]
+    fn a_plugin_cannot_be_staged_where_every_account_can_write() {
+        for shared in [
+            "/tmp/acme-dns",
+            "/tmp",
+            "/var/tmp/acme-dns",
+            "/var/tmp/nested/deeper/acme-dns",
+        ] {
+            let err = refuse_shared_staging(Path::new(shared), true)
+                .expect_err("a world-writable path is not a staging area");
+            assert_eq!(err.code, ErrorCode::InvalidPath, "on {shared}");
+            assert_eq!(err.field.as_deref(), Some("source"), "on {shared}");
+            assert!(
+                err.detail.contains("/tmp"),
+                "the refusal has to name the directory: {}",
+                err.detail
+            );
+            assert!(
+                err.detail.contains("install -d -o root"),
+                "and say where to stage instead: {}",
+                err.detail
+            );
+        }
+
+        // The directory named is the ancestor that is actually shared, not the
+        // path the operator typed. That is the whole reason this refusal is not
+        // "permission denied": the problem is three levels up, in a directory
+        // nobody thinks of as part of the plugin.
+        let err = refuse_shared_staging(Path::new("/var/tmp/nested/deeper/acme-dns"), true)
+            .expect_err("/var/tmp is shared by every account");
+        assert!(
+            err.detail.contains("`/var/tmp`"),
+            "the shared ancestor has to be the one named: {}",
+            err.detail
+        );
+    }
+
+    /// A path only root can write to stays installable, which is the whole
+    /// point: the fix must not leave an operator with nowhere to stage. A
+    /// directory that does not exist yet is not an obstacle either — it cannot
+    /// be swapped, and its parent is checked on the next turn of the walk.
+    #[test]
+    fn a_root_owned_staging_path_is_still_accepted() {
+        assert!(refuse_shared_staging(Path::new("/opt/staged/acme-dns"), true).is_ok());
+        assert!(refuse_shared_staging(Path::new("/"), true).is_ok());
+    }
+
+    /// The check is about somebody *else* being able to write, and an
+    /// unprivileged agent has no root-owned install to race into — it cannot get
+    /// past `useradd`. Skipping it there is what keeps a scratch directory
+    /// usable in development, and it is decided by this flag rather than by
+    /// where the suite happens to be running.
+    #[test]
+    fn an_unprivileged_agent_is_not_held_to_a_root_owned_staging_path() {
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(refuse_shared_staging(scratch.path(), false).is_ok());
+        assert!(refuse_shared_staging(Path::new("/tmp/acme-dns"), false).is_ok());
+    }
+
+    /// A directory owned by a tenant is refused by name even when its mode looks
+    /// tidy: 0755 stops the rest of the world, not the account that owns it, and
+    /// that account is the one that would do the swapping.
+    #[test]
+    fn a_staging_directory_owned_by_somebody_other_than_root_is_refused() {
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: `geteuid` reads a property of this process and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            // Running the suite as root makes the temporary directory root's
+            // own, so the condition this test needs cannot be built here — and
+            // a test that cannot build its condition must not claim to have
+            // checked it.
+            return;
+        }
+        let err = refuse_shared_staging(scratch.path(), true)
+            .expect_err("a directory another account owns is not a staging area");
+        assert!(
+            err.detail.contains("not by root"),
+            "the refusal has to say what is wrong with it: {}",
+            err.detail
+        );
     }
 
     // -- minisign ------------------------------------------------------------

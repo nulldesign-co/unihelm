@@ -31,6 +31,10 @@ const PAGES = [
   "../routes/cron.tsx",
   "../routes/alerts.tsx",
   "../routes/files.tsx",
+  "../routes/tasks.tsx",
+  "../routes/terminal.tsx",
+  "../routes/firewall.tsx",
+  "../routes/site-detail.tsx",
 ];
 
 /** Every `t("literal")` in a file. Template-literal keys are handled below. */

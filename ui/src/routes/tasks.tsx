@@ -29,19 +29,82 @@ import { useEventStream } from "@/lib/events";
  * page whose rows behaved subtly differently from the drawer's would be the
  * exact opposite of transparency.
  */
-const PAGE_SIZE = 50;
-
 const STATUSES: TaskStatus[] = ["queued", "running", "ok", "failed", "cancelled"];
+
+/**
+ * How many rows a page of history may hold.
+ *
+ * It was fifty, hard-coded, with no control — so an operator scanning a month of
+ * installs paged through it fifty at a time and one reading on a phone got fifty
+ * whether or not the device could show them. Fifty stays the default because it
+ * is what this page has always done; the rest are here because "fifty, always"
+ * is not an answer to "show me more".
+ */
+export const PAGE_SIZES = [25, 50, 100, 200] as const;
+
+export const DEFAULT_PAGE_SIZE = 50;
+
+/** Which page of the history is on screen, and how big a page is. */
+export interface Pagination {
+  /** Zero-based; `page + 1` is what the label shows. */
+  page: number;
+  /** Rows asked for, which is also what "there is more" is measured against. */
+  size: number;
+}
+
+/**
+ * Where a page-size change lands: the first page of the new size.
+ *
+ * A page index means nothing without the size it was counted in — page 4 of
+ * fifty starts at row 151, and of a hundred at row 301. Carrying the index
+ * across the change drops the reader past the end of a short history onto an
+ * empty page, which on this screen reads as "that is everything" rather than
+ * "you moved". Returning the whole pagination is what keeps the two in step:
+ * there is no way to change the size here and forget the reset.
+ */
+export function firstPageOf(size: number): Pagination {
+  return { page: 0, size };
+}
+
+/**
+ * The size behind a `<select>` value, or the default.
+ *
+ * The value is a string off a DOM event, and `limit=NaN` is a query the server
+ * answers with a 400 — a history page that went blank because somebody's
+ * extension touched the option list would look exactly like a history page with
+ * nothing in it.
+ */
+export function pageSizeFrom(raw: string): number {
+  const size = Number(raw);
+  return PAGE_SIZES.some((offered) => offered === size) ? size : DEFAULT_PAGE_SIZE;
+}
+
+/**
+ * The rows this page covers, 1-based, for the "Tasks X–Y" label.
+ *
+ * Counted from the size actually in use, not a constant: with the size fixed at
+ * fifty, the label was right by accident. `rows` is what came back rather than
+ * what was asked for, because the last page is short and a label counting to the
+ * full page size would name tasks that are not on screen.
+ */
+export function pageWindow(pagination: Pagination, rows: number): { from: number; to: number } {
+  const first = pagination.page * pagination.size;
+  return { from: first + 1, to: first + rows };
+}
 
 export function TasksPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [filters, setFilters] = useState<TaskQuery>({});
-  const [page, setPage] = useState(0);
+  const [pagination, setPagination] = useState<Pagination>(firstPageOf(DEFAULT_PAGE_SIZE));
   const [expanded, setExpanded] = useState<string | null>(null);
   const [lagged, setLagged] = useState(false);
 
-  const query: TaskQuery = { ...filters, limit: PAGE_SIZE, offset: page * PAGE_SIZE };
+  const query: TaskQuery = {
+    ...filters,
+    limit: pagination.size,
+    offset: pagination.page * pagination.size,
+  };
 
   const tasks = useQuery({
     queryKey: ["tasks", query],
@@ -61,12 +124,12 @@ export function TasksPage() {
 
   const setFilter = (patch: Partial<TaskQuery>) => {
     setFilters((current) => ({ ...current, ...patch }));
-    setPage(0);
+    setPagination((current) => ({ ...current, page: 0 }));
   };
 
   const clearFilters = () => {
     setFilters({});
-    setPage(0);
+    setPagination((current) => ({ ...current, page: 0 }));
   };
 
   const list = tasks.data?.tasks ?? [];
@@ -203,30 +266,54 @@ export function TasksPage() {
         </Card>
       )}
 
-      <nav className="flex items-center justify-between gap-3" aria-label={t("tasks.pagination")}>
-        <Button variant="secondary" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+      <nav
+        className="flex flex-wrap items-center justify-between gap-3"
+        aria-label={t("tasks.pagination")}
+      >
+        <Button
+          variant="secondary"
+          disabled={pagination.page === 0}
+          onClick={() => setPagination((p) => ({ ...p, page: p.page - 1 }))}
+        >
           {t("tasks.previous")}
         </Button>
         {/* No total comes back with a page, so position is given as the range
             this page covers — "Page 3" on its own says nothing about where
-            the reader is in the history. */}
-        <p className="text-center text-xs text-ink-subtle">
-          <span className="tnum block font-medium">{t("tasks.page", { page: page + 1 })}</span>
+            the reader is in the history. The size sits with the range it
+            governs: "Tasks 101–200" and "100 per page" are one fact, and a
+            control for it parked among the filters would read as another thing
+            that changes which tasks match. */}
+        <div className="flex flex-col items-center gap-1.5 text-center text-xs text-ink-subtle">
+          <span className="tnum font-medium">
+            {t("tasks.page", { page: pagination.page + 1 })}
+          </span>
           {list.length > 0 ? (
-            <span className="tnum block">
-              {t("tasks.showing", {
-                from: page * PAGE_SIZE + 1,
-                to: page * PAGE_SIZE + list.length,
-              })}
-            </span>
+            <span className="tnum">{t("tasks.showing", pageWindow(pagination, list.length))}</span>
           ) : null}
-        </p>
+          <span className="flex items-center gap-2">
+            <label htmlFor="tasks-page-size">{t("tasks.perPage")}</label>
+            <Select
+              id="tasks-page-size"
+              className="h-7 w-auto py-0 text-xs"
+              value={String(pagination.size)}
+              onChange={(event) => setPagination(firstPageOf(pageSizeFrom(event.target.value)))}
+            >
+              {PAGE_SIZES.map((size) => (
+                <option key={size} value={size}>
+                  {size}
+                </option>
+              ))}
+            </Select>
+          </span>
+        </div>
         <Button
           variant="secondary"
           // The API answers with a page, not a count, so "there is more" is
-          // "this page is full" — one fewer query on every render.
-          disabled={list.length < PAGE_SIZE}
-          onClick={() => setPage((p) => p + 1)}
+          // "this page is full" — one fewer query on every render. Measured
+          // against the chosen size, or asking for 200 and getting 200 would
+          // still look like the end of the history.
+          disabled={list.length < pagination.size}
+          onClick={() => setPagination((p) => ({ ...p, page: p.page + 1 }))}
         >
           {t("tasks.next")}
         </Button>

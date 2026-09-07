@@ -35,9 +35,6 @@ import { staggerStyle, useCountUp } from "@/lib/motion";
 import { useSession } from "@/lib/session";
 import { cn, formatBytes, formatPercent, formatUptime } from "@/lib/utils";
 
-/** The CI-enforced panel memory budget (spec §3). */
-const RSS_BUDGET_BYTES = 80 * 1024 * 1024;
-
 /** A disk this full is a problem the operator should be told about, not shown. */
 const DISK_ALARM_PCT = 90;
 
@@ -148,7 +145,11 @@ export function DashboardPage() {
                   value={formatUptime(metrics.uptime_seconds)}
                   detail={`${t("dashboard.load")} ${metrics.load.one.toFixed(2)} / ${metrics.load.five.toFixed(2)} / ${metrics.load.fifteen.toFixed(2)}`}
                 />
-                <PanelFootprint index={3} total={metrics.panel.total_rss_bytes} />
+                <PanelFootprint
+                  index={3}
+                  total={metrics.panel.total_rss_bytes}
+                  machineTotal={metrics.memory.total_bytes}
+                />
               </div>
 
               {metrics.disks.length > 0 ? (
@@ -255,7 +256,7 @@ interface Problem {
  * gathers the answer from the data already on screen, so it costs no extra
  * request, and every entry names the page that can act on it.
  */
-function collectProblems({
+export function collectProblems({
   t,
   locale,
   overview,
@@ -272,7 +273,12 @@ function collectProblems({
   if (!overview) return problems;
 
   if (!overview.agent_online) {
-    problems.push({ id: "agent", label: t("dashboard.health.agentOffline"), to: "/" });
+    // `null`, like the other two that have nowhere to send anybody. This one
+    // was left pointing at `"/"` when they were fixed — a chevron and a hover
+    // lift on a link to the page the reader is already standing on, and a type
+    // error besides, since `Problem.to` never allowed `"/"`. The callout
+    // directly under the banner is where this problem is actually explained.
+    problems.push({ id: "agent", label: t("dashboard.health.agentOffline"), to: null });
   }
 
   const failed = services?.services.filter((service) => service.state === "failed").length ?? 0;
@@ -312,10 +318,16 @@ function collectProblems({
     problems.push({ id: "firewall", label: t("dashboard.health.firewallOff"), to: "/firewall" });
   }
 
-  const rss = overview.metrics?.panel.total_rss_bytes ?? null;
-  if (rss !== null && rss > RSS_BUDGET_BYTES) {
-    problems.push({ id: "budget", label: t("dashboard.health.panelOverBudget"), to: null });
-  }
+  // The panel's own memory is deliberately *not* here. It used to be: an 80 MB
+  // CI regression gate, pushed into the amber "needs attention" banner the
+  // moment the panel went over it. The operator who reads that banner has no
+  // idea it is a build gate — they read "the panel is over budget" on a machine
+  // with gigabytes free as their server running out of memory, and there was
+  // nothing on any page they could do about it, because there is nothing to do.
+  // Everything else in this list is a condition on their server that they can
+  // act on. A number the people who write this panel have to keep down is a
+  // fact about the build, and it belongs on the footprint card and nowhere
+  // else — see [`PanelFootprint`].
 
   return problems;
 }
@@ -608,15 +620,33 @@ function Stat({
 }
 
 /**
- * The panel's own memory use, shown next to the budget it is held to.
+ * The panel's own memory use, against the memory the machine actually has.
  *
- * Putting this on the dashboard is a deliberate promise: the number that this
- * project exists to beat is visible to every operator, not buried in CI.
+ * Putting this on the dashboard stays a deliberate promise: the number this
+ * project exists to keep small is visible to every operator rather than buried
+ * in CI. What it is measured against is what changed, and that was the defect.
+ * The 80 MB figure is a regression gate for the people who write this panel,
+ * and stating an operator's server against it produced a full meter, a red
+ * "Over budget" badge and an entry in the attention banner — three ways of
+ * saying "something is wrong here" about a machine with gigabytes free, and
+ * nothing anywhere the operator could press about it.
+ *
+ * Against the machine's own total it says the one thing an operator can use:
+ * how much of their server this panel is costing them. The meter reads near
+ * empty on any real machine, which is the honest answer and the point.
  */
-function PanelFootprint({ total, index }: { total: number | null; index: number }) {
+function PanelFootprint({
+  total,
+  machineTotal,
+  index,
+}: {
+  total: number | null;
+  /** The server's own memory, the denominator this is stated against. */
+  machineTotal: number;
+  index: number;
+}) {
   const { t, i18n } = useTranslation();
-  const within = total === null ? null : total <= RSS_BUDGET_BYTES;
-  const pct = total === null ? 0 : (total / RSS_BUDGET_BYTES) * 100;
+  const pct = total === null || machineTotal <= 0 ? 0 : (total / machineTotal) * 100;
   const animated = useCountUp(total ?? 0);
 
   return (
@@ -631,18 +661,13 @@ function PanelFootprint({ total, index }: { total: number | null; index: number 
         {formatBytes(total === null ? null : animated, i18n.language)}
       </p>
       <p className="mt-0.5 text-xs text-ink-muted">
-        {t("dashboard.panelFootprintHint", { budget: formatBytes(RSS_BUDGET_BYTES, i18n.language) })}
+        {t("dashboard.panelFootprintShare", {
+          total: formatBytes(machineTotal, i18n.language),
+        })}
       </p>
       <div className="mt-3">
         <Meter value={pct} label={t("dashboard.panelFootprint")} />
       </div>
-      {within !== null ? (
-        <div className="mt-3">
-          <Badge tone={within ? "success" : "danger"} dot>
-            {within ? t("dashboard.withinBudget") : t("dashboard.overBudget")}
-          </Badge>
-        </div>
-      ) : null}
     </Card>
   );
 }

@@ -1,34 +1,50 @@
 //! What Docker is running on this machine, and the lifecycle of what is
 //! already on it.
 //!
-//! The line this module draws is between **acting on a container that exists**
-//! and **bringing a new one into being**, and it is drawn there for a reason
-//! rather than out of caution.
+//! The line this module draws is not between reading and writing — it manages
+//! containers, images and volumes — but around the **shape** of what may be
+//! asked for, and it is drawn there for a reason rather than out of caution.
 //!
-//! **Creating is not here, and is not coming.** No `docker run`, no
-//! `docker create`, nothing that takes an image plus flags. The panel's whole
-//! security model is that a tenant reaches their own files and nothing else,
-//! enforced by Linux users, directory modes and per-tenant FPM pools; Docker
-//! sits outside all of it. A container started with `-v /:/host`, or with the
-//! daemon socket mounted, is root on the machine — so an operation that accepts
-//! arbitrary run arguments is a root shell with extra steps, whatever the
-//! button above it says. There is no flag allow-list short enough to be safe
-//! and long enough to be useful, which is why this is a boundary and not a
-//! to-do.
+//! **Creating is a form, not `docker run`.** [`Create`] takes an image, a name,
+//! ports, environment, named volumes and a restart policy, and there is no
+//! field for a raw flag. The panel's whole security model is that a tenant
+//! reaches their own files and nothing else, enforced by Linux users, directory
+//! modes and per-tenant FPM pools; Docker sits outside all of it. A container
+//! started with `-v /:/host`, or with the daemon socket mounted, is root on the
+//! machine — so an operation that accepted arbitrary run arguments would be a
+//! root shell with extra steps, whatever the button above it said. There is no
+//! flag allow-list short enough to be safe and long enough to be useful, which
+//! is why the shape of the input is the boundary rather than a check inside it.
 //!
-//! **Start, stop, restart, remove and a log tail are here**, because the flags
-//! were chosen by whoever created the container and nothing below changes them.
-//! These are the things an operator needs at 3am, and the alternative to having
-//! them in the panel is an SSH session — which is strictly more privilege than
-//! the four verbs below.
+//! **Start, stop, restart, remove and a log tail** act on what is already
+//! there, and the flags it runs under were chosen by whoever created it —
+//! nothing below changes them. These are the things an operator needs at 3am,
+//! and the alternative to having them in the panel is an SSH session, which is
+//! strictly more privilege.
 //!
-//! Three properties hold the acting half up:
+//! **Images and volumes are managed here too**, because a panel that can only
+//! ever add to a disk is not managing it: `docker.image.pull`,
+//! `docker.image.remove`, `docker.image.prune` and `docker.volume.remove`. On a
+//! small VPS the dangling layers left behind by a few image upgrades are the
+//! difference between a working server and a full one, and until these existed
+//! the only way to reclaim that space was an SSH session.
 //!
-//! 1. Every operation names its target with a [`ContainerRef`], which is
-//!    validated on the way in, so no free-form string reaches an argv.
-//! 2. Removing a running container **refuses**. It is never forced; see
-//!    [`Remove`].
-//! 3. Most of what is here was not put here by the panel. A container serving
+//! Four properties hold all of it up:
+//!
+//! 1. Every operation names its target with a [`ContainerRef`], an [`ImageRef`]
+//!    or a [`VolumeRef`], each validated on the way in, so no free-form string
+//!    reaches an argv.
+//! 2. Anything still in use **refuses**, and names what is using it. A running
+//!    container is not force-removed (see [`Remove`]), an image a container
+//!    still needs is not `rmi -f`'d (see [`ImageRemove`]) and a volume a
+//!    container still references is not deleted (see [`VolumeRemove`]) —
+//!    Docker's own `-f` in those places takes a running service, or somebody's
+//!    database, with it.
+//! 3. Deleting says what it deleted. [`ImagePrune`] names the images before it
+//!    removes them and reports the space Docker actually reclaimed, because
+//!    "reclaimed 3.2 GB" is the whole value of the operation and a bare "done"
+//!    is indistinguishable from having deleted nothing.
+//! 4. Most of what is here was not put here by the panel. A container serving
 //!    somebody's production site looks exactly like one an operator is
 //!    finished with, so these need `ServerManage` and the UI confirms before
 //!    anything stops.
@@ -38,6 +54,7 @@
 //! not here" is a useful answer and an error is not; the acting operations do
 //! error, because there is nothing else they could truthfully return.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -174,10 +191,44 @@ pub struct Image {
     pub size: String,
 }
 
+/// One volume, and the three things that make an orphan tellable from a
+/// keepsake.
+///
+/// A volume outliving its container is this panel's own design — `docker rm`
+/// here never passes `--volumes`, precisely so a containerised database is not
+/// destroyed by somebody tidying up containers. The cost of that decision is
+/// that a name and a driver cannot say whether a volume is a deliberate
+/// keepsake or the residue of a container deleted a year ago, and an operator
+/// looking at a full disk has to guess. These three fields are what stops the
+/// guessing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Volume {
     pub name: String,
     pub driver: String,
+    /// What it occupies, in Docker's own words — `1.093GB` — from
+    /// `docker system df`.
+    ///
+    /// `None` when that accounting could not be had: it is a separate, slower
+    /// command than `volume ls`, and reporting `0B` for a volume nobody
+    /// measured would invite somebody to delete a database on the strength of
+    /// a number the panel made up.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// The containers that mount it, running or stopped.
+    ///
+    /// `None` — not an empty list — when the question could not be asked.
+    /// "Nothing uses this" reads as permission to delete it and "the panel
+    /// could not tell" does not, and collapsing the two into `[]` is the
+    /// difference between an orphan and somebody's data.
+    #[serde(default)]
+    pub used_by: Option<Vec<String>>,
+    /// The engine container this panel installed that keeps its data here.
+    ///
+    /// Deleting this volume is deleting every database in that engine, so the
+    /// page says whose it is before offering the button. Read from the panel's
+    /// own engine registry, which is the only thing that knows.
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,8 +263,9 @@ impl TypedOperation for List {
     const PERMISSION: Permission = Permission::ServerRead;
     const EXECUTION: Execution = Execution::Immediate;
 
-    async fn run(&self, _ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
-        let Ok(docker) = unihelm_distro::exec::resolve_program(DOCKER) else {
+    async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        let found = inventory().await;
+        let Some(docker) = found.docker else {
             return Ok(ListOutput {
                 installed: false,
                 daemon_running: false,
@@ -225,13 +277,11 @@ impl TypedOperation for List {
                 ),
             });
         };
-        let docker = docker.to_string_lossy().into_owned();
 
         // Installed but not answering is a different situation from not
         // installed, and an operator debugging one does not want to be told the
         // other.
-        let ping = run_docker(&docker, &["info", "--format", "{{.ServerVersion}}"]).await;
-        if ping.is_none() {
+        if !found.daemon_running {
             return Ok(ListOutput {
                 installed: true,
                 daemon_running: false,
@@ -246,15 +296,93 @@ impl TypedOperation for List {
             });
         }
 
+        // The panel's own engine registry, so a volume holding somebody's
+        // databases can say whose before anybody is offered a delete button. A
+        // registry that will not parse is not a reason to fail the inventory —
+        // the containers and images below are still true — but it is a reason
+        // to stop claiming that none of these volumes belongs to an engine,
+        // which is why it becomes the note rather than a silence.
+        let (engines, note) = match crate::engine::registry(ctx.db()).await {
+            Ok(found) => (found, None),
+            Err(e) => (
+                crate::engine::EngineRegistry::new(),
+                Some(format!(
+                    "The volumes below cannot say which of them hold a database: the panel's \
+                     engine registry could not be read ({e}). Until that is fixed, treat every \
+                     volume here as something's data."
+                )),
+            ),
+        };
+
         Ok(ListOutput {
             installed: true,
             daemon_running: true,
-            containers: containers(&docker).await,
+            containers: found.containers,
             images: images(&docker).await,
-            volumes: volumes(&docker).await,
-            note: None,
+            volumes: volumes(&docker, &engines).await,
+            note,
         })
     }
+}
+
+/// Whether Docker is here, whether it is answering, and what containers it has.
+///
+/// **The cheap half of `docker.list`, and it is separate on purpose.** The full
+/// list pays `docker system df`, which walks every volume's directory to size
+/// it — seconds on a machine with a large one, which is a price worth paying to
+/// let an operator tell an orphan volume from somebody's database. It is not a
+/// price worth paying on [`crate::engine`]'s status read, which renders none of
+/// those columns and is an immediate operation behind the Databases page's
+/// first paint. Before this split, adding the volume accounting to `docker.list`
+/// would have put those seconds on every engine status call.
+pub(crate) struct Inventory {
+    /// `None` when there is no `docker` on the machine at all.
+    pub(crate) docker: Option<String>,
+    /// False when Docker is installed but its daemon is not answering.
+    pub(crate) daemon_running: bool,
+    pub(crate) containers: Vec<Container>,
+}
+
+pub(crate) async fn inventory() -> Inventory {
+    let Ok(path) = unihelm_distro::exec::resolve_program(DOCKER) else {
+        return Inventory {
+            docker: None,
+            daemon_running: false,
+            containers: Vec::new(),
+        };
+    };
+    let docker = path.to_string_lossy().into_owned();
+
+    if run_docker(&docker, &["info", "--format", "{{.ServerVersion}}"])
+        .await
+        .is_none()
+    {
+        return Inventory {
+            docker: Some(docker),
+            daemon_running: false,
+            containers: Vec::new(),
+        };
+    }
+
+    let containers = containers(&docker).await;
+    Inventory {
+        docker: Some(docker),
+        daemon_running: true,
+        containers,
+    }
+}
+
+/// Just the names, for a caller that only has to know whether a volume is still
+/// there — no size, no mount list, and none of the cost of either.
+pub(crate) async fn volume_names(docker: &str) -> Vec<String> {
+    let Some(text) = run_docker(docker, &["volume", "ls", "--quiet"]).await else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -671,6 +799,18 @@ fn is_timestamp(token: &str) -> bool {
     b.len() >= 20 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && token.contains('T')
 }
 
+/// Whether a container of this name is on the machine, running or not.
+///
+/// One `docker inspect` rather than the whole inventory. [`crate::engine`]'s
+/// install used to answer this by listing every container, image and volume on
+/// the server and scanning the names — which since the volume record grew a
+/// size means `docker system df`, a command that walks each volume's directory.
+/// Paying that to find out whether one name is taken is a minute of an
+/// operator's install spent on an answer nobody reads.
+pub(crate) async fn container_exists(docker: &str, name: &ContainerRef) -> bool {
+    inspect(docker, name).await.is_ok()
+}
+
 /// The `docker` binary, or the reason there is nothing to act on.
 ///
 /// `docker.list` answers "not installed" as data because an inventory of
@@ -799,7 +939,21 @@ async fn images(docker: &str) -> Vec<Image> {
         .collect()
 }
 
-async fn volumes(docker: &str) -> Vec<Volume> {
+/// Every volume, with the two things Docker knows about it and the one thing
+/// only the panel does.
+///
+/// Three sources, deliberately, rather than one:
+///
+/// - `volume ls` is the list. It is the cheap command and the authority on what
+///   exists.
+/// - `system df -v` is the size. It is a *separate* command because it is the
+///   expensive one — Docker walks each volume's directory to answer — and its
+///   failure or timeout must cost a size, not the whole page.
+/// - `ps --all` is who mounts it, which `volume ls` cannot say at all. One
+///   shell-out for the whole table rather than one `--filter volume=` per
+///   volume, because a machine with forty volumes would otherwise pay forty
+///   round trips to draw one page.
+async fn volumes(docker: &str, engines: &crate::engine::EngineRegistry) -> Vec<Volume> {
     let Some(text) = run_docker(
         docker,
         &["volume", "ls", "--format", "{{.Name}}\t{{.Driver}}"],
@@ -809,13 +963,100 @@ async fn volumes(docker: &str) -> Vec<Volume> {
         return Vec::new();
     };
 
+    let sizes = volume_sizes(docker).await;
+    let users = volume_users(docker).await;
+
     rows(&text, 2)
         .into_iter()
         .map(|r| Volume {
+            size: sizes.as_ref().and_then(|m| m.get(&r[0]).cloned()),
+            // `used_by` is only ever a list when `docker ps` answered. Mapping a
+            // missing answer onto "no containers" would put an orphan badge on
+            // a volume a running database is writing to.
+            used_by: users
+                .as_ref()
+                .map(|m| m.get(&r[0]).cloned().unwrap_or_default()),
+            engine: engines
+                .values()
+                .find(|record| record.volume.as_deref() == Some(r[0].as_str()))
+                .map(|record| record.container.clone()),
             name: r[0].clone(),
             driver: r[1].clone(),
         })
         .collect()
+}
+
+/// What each volume occupies, from `docker system df`.
+///
+/// `None` when the command did not answer — it is the slow one on this page and
+/// the ten-second budget can genuinely expire against a large volume, so its
+/// absence has to be tellable from a volume of zero bytes.
+async fn volume_sizes(docker: &str) -> Option<BTreeMap<String, String>> {
+    let text = run_docker(
+        docker,
+        &[
+            "system",
+            "df",
+            // Without `-v` the answer is one summary row per object type, which
+            // is a total and not a per-volume size.
+            "-v",
+            "--format",
+            "{{range .Volumes}}{{.Name}}\t{{.Size}}\n{{end}}",
+        ],
+    )
+    .await?;
+
+    Some(
+        rows(&text, 2)
+            .into_iter()
+            .map(|r| (r[0].clone(), r[1].clone()))
+            .collect(),
+    )
+}
+
+/// Read `docker ps`'s mount column into "which containers hold this volume".
+///
+/// Its own function so a test can hold it: the two rules below are each one
+/// line and each invisible in their absence.
+fn mounts_to_users(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows(text, 2) {
+        for mount in row[1].split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            // A bind mount is a path and is nobody's volume. Skipping it keeps
+            // `/var/www` out of a map keyed by volume name — and, more to the
+            // point, keeps a volume that happens to share a container with a
+            // bind mount from being credited with the bind mount's user.
+            if mount.starts_with('/') {
+                continue;
+            }
+            map.entry(mount.to_string())
+                .or_default()
+                .push(row[0].clone());
+        }
+    }
+    map
+}
+
+/// Which containers mount each volume, running or stopped.
+///
+/// A stopped container counts. It is exactly the case that makes a volume look
+/// like an orphan — the container is not in `docker ps` and the volume is still
+/// its data — and it is also the case Docker itself refuses a `volume rm` for.
+async fn volume_users(docker: &str) -> Option<BTreeMap<String, Vec<String>>> {
+    let text = run_docker(
+        docker,
+        &[
+            "ps",
+            "--all",
+            "--format",
+            // `.Mounts` is Docker's own list of what this container has
+            // attached: named volumes by name, bind mounts by host path.
+            "{{.Names}}\t{{.Mounts}}",
+        ],
+    )
+    .await?;
+
+    Some(mounts_to_users(&text))
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +1113,81 @@ impl TryFrom<String> for ImageRef {
     type Error = UnihelmError;
     fn try_from(value: String) -> Result<Self> {
         Self::parse(&value)
+    }
+}
+
+impl fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A Docker volume, named the one way this module will accept.
+///
+/// Docker's volume-name grammar is the container one, and the same leading
+/// character rule applies for the same reason: `-f` in the volume position of
+/// `docker volume rm` is an option, not a volume.
+///
+/// The distinction this type carries is the one [`validate_volume`] was written
+/// for and now delegates here so there is a single grammar rather than two that
+/// can drift: **a name is not a path**. `/`, `.` at the front, `..` anywhere —
+/// each of those is a bind mount, which is a piece of this server's filesystem
+/// handed to a container, which is the thing this module does not do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct VolumeRef(String);
+
+impl VolumeRef {
+    pub fn parse(input: &str) -> Result<Self> {
+        let s = input.trim();
+        if s.is_empty() || s.len() > 128 {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "a volume name must be 1-128 bytes",
+            )
+            .with_field("volume"));
+        }
+        if !s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric()) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "a volume name must start with a letter or a digit",
+            )
+            .with_field("volume"));
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                "a volume name may only contain letters, digits, underscore, dot and hyphen",
+            )
+            .with_field("volume"));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for VolumeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for VolumeRef {
+    type Error = UnihelmError;
+    fn try_from(value: String) -> Result<Self> {
+        Self::parse(&value)
+    }
+}
+
+impl From<VolumeRef> for String {
+    fn from(v: VolumeRef) -> String {
+        v.0
     }
 }
 
@@ -1038,6 +1354,39 @@ impl TypedOperation for Create {
             .with_field("name"));
         }
 
+        // Every host port this form asks for, checked against what is already
+        // published, **before** the image is pulled.
+        //
+        // Without this the first thing that noticed a clash was Docker, minutes
+        // into a pull, and its answer named an endpoint id and a driver rather
+        // than the port — so an operator whose Valkey already had 6379 learned
+        // that "driver failed programming external connectivity" and nothing
+        // about which of their two forms to change. The check is a pre-flight
+        // and not a lock: something can still take a port between here and the
+        // run, which is why `run_failure` below still translates Docker's own
+        // refusal rather than assuming this pass makes one impossible.
+        let published = published_ports(&docker).await;
+        for p in &input.ports {
+            if let Some(taken) = published
+                .iter()
+                .find(|held| held.host == p.host && held.udp == p.udp)
+            {
+                return Err(UnihelmError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "host port {}{} is already published by the container `{}`. \
+                         Publish this one on a different host port, or stop `{}` first. \
+                         Nothing has been created.",
+                        p.host,
+                        proto(p.udp),
+                        taken.container,
+                        taken.container
+                    ),
+                )
+                .with_field("ports"));
+            }
+        }
+
         let args = create_argv(&input)?;
 
         ctx.log(format!(
@@ -1072,10 +1421,36 @@ impl TypedOperation for Create {
             .map_err(|e| UnihelmError::internal(e.to_string()))?;
 
         if !out.success() {
-            return Err(UnihelmError::new(
-                ErrorCode::CommandFailed,
-                format!("docker run failed: {}", out.failure_text()),
-            ));
+            let text = out.failure_text();
+
+            // `docker run` creates the container and *then* starts it, so a
+            // failure at the start — a port already allocated is the usual one
+            // — leaves it on the machine in `created`. Until this swept, the
+            // operator's second attempt failed on the *name* as well as the
+            // port, and the message they got was about the name: it sent them
+            // hunting for a container they never successfully made. The name
+            // was free a moment ago (checked above), so anything wearing it now
+            // is this run's own wreckage and nobody else's container.
+            let swept = sweep_failed_run(ctx, &docker, &input.name).await;
+
+            // Whichever container is holding the port, so the refusal names it
+            // rather than leaving the operator to run `docker ps` themselves.
+            let holder = allocated_port(&text).and_then(|port| {
+                published
+                    .iter()
+                    .find(|held| held.host == port)
+                    .map(|held| held.container.clone())
+            });
+
+            let err = run_failure(&text, input.name.as_str(), holder.as_deref(), swept);
+            // The ports box is the field an operator has to change, and only
+            // when the failure really was a port; a `field` on any other
+            // failure would point the form at the wrong input.
+            return Err(if err.code == ErrorCode::Conflict {
+                err.with_field("ports")
+            } else {
+                err
+            });
         }
 
         let id = out.trimmed_stdout().to_string();
@@ -1168,24 +1543,12 @@ fn validate_env_key(key: &str) -> Result<()> {
 /// a container name; anything containing a `/` in the source position is a path,
 /// which is to say a bind mount, which is the thing this operation does not do.
 fn validate_volume(v: &VolumeMount) -> Result<()> {
-    if v.volume.is_empty() || v.volume.len() > 128 {
-        return Err(UnihelmError::new(
-            ErrorCode::InvalidInput,
-            "a volume name must be 1-128 bytes",
-        )
-        .with_field("volumes"));
-    }
-    if !v
-        .volume
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
-        || !v
-            .volume
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphanumeric())
-    {
-        return Err(UnihelmError::new(
+    // One grammar, in [`VolumeRef`], rather than a second copy here. The
+    // wording is still this call site's, because "not a volume name" is a thin
+    // answer where the operator has just typed a path and the reason they must
+    // not is the whole point of the field.
+    VolumeRef::parse(&v.volume).map_err(|_| {
+        UnihelmError::new(
             ErrorCode::InvalidInput,
             format!(
                 "`{}` is not a volume name. This creates containers with named \
@@ -1194,8 +1557,8 @@ fn validate_volume(v: &VolumeMount) -> Result<()> {
                 v.volume
             ),
         )
-        .with_field("volumes"));
-    }
+        .with_field("volumes")
+    })?;
     if !v.path.starts_with('/') || v.path.contains("..") || v.path.len() > 255 {
         return Err(UnihelmError::new(
             ErrorCode::InvalidInput,
@@ -1204,6 +1567,795 @@ fn validate_volume(v: &VolumeMount) -> Result<()> {
         .with_field("volumes"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+/// What the two single-image operations take, and all they take.
+#[derive(Debug, Deserialize)]
+pub struct ImageInput {
+    pub image: ImageRef,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImagePullOutput {
+    pub image: String,
+    /// The digest Docker resolved the reference to, which is the only thing
+    /// that says *which* `nginx:latest` this now is.
+    pub id: String,
+    /// What it occupies, in bytes.
+    ///
+    /// `None` rather than 0 when Docker answered in a shape this build cannot
+    /// read: an image reported as occupying nothing is a lie about a disk, and
+    /// a disk is the thing this operation exists to manage.
+    pub size_bytes: Option<u64>,
+    /// True when the tag was already at this digest and nothing was fetched.
+    ///
+    /// Reported rather than glossed over: "pulled" and "already had it" are
+    /// different answers to "did my update arrive", and a panel that says
+    /// `pulled` for both is telling somebody their image is new when it is the
+    /// one they have been running for a year.
+    pub already_current: bool,
+}
+
+/// `docker.image.pull` — fetch an image, or confirm it is already current.
+pub struct ImagePull;
+
+#[async_trait::async_trait]
+impl TypedOperation for ImagePull {
+    type Input = ImageInput;
+    type Output = ImagePullOutput;
+
+    const NAME: &'static str = "docker.image.pull";
+    const PERMISSION: Permission = Permission::ServerManage;
+    // Minutes on a slow link, and the operator should see the pull rather than
+    // a spinner — the same reason `docker.create` is a task.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        // Re-running a pull that half-finished is what an operator would do by
+        // hand, and Docker resumes from the layers it already has.
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let docker = docker_program()?;
+
+        // The same [`ImageRef`] the create form validates against, not a second
+        // parser: this is the one field that names something the server will
+        // fetch, and two grammars for it would be two things to keep in step.
+        ctx.log(format!("docker pull {}", input.image));
+
+        let out = run_raw(&docker, &pull_argv(&input.image), PULL_BUDGET).await?;
+        if !out.success() {
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                out.failure_text(),
+            ));
+        }
+
+        // Docker's own closing line — "Status: Image is up to date for
+        // nginx:latest" or "Status: Downloaded newer image for nginx:latest" —
+        // quoted into the task log, because it is the sentence that says which
+        // of the two happened.
+        let status = status_line(out.trimmed_stdout());
+        if let Some(line) = &status {
+            ctx.log(line.clone());
+        }
+
+        let (id, size_bytes) = image_identity(&docker, &input.image).await?;
+        Ok(ImagePullOutput {
+            image: input.image.as_str().to_string(),
+            id,
+            size_bytes,
+            already_current: status.is_some_and(|l| l.contains("up to date")),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageRemoveOutput {
+    pub image: String,
+    pub id: String,
+    /// Docker's own `Untagged:` and `Deleted:` lines.
+    ///
+    /// An image with two tags is *untagged* rather than deleted, and no space
+    /// comes back until the last tag goes. Reporting the lines verbatim is how
+    /// an operator who expected a gigabyte back finds out why they did not get
+    /// it.
+    pub removed: Vec<String>,
+}
+
+/// `docker.image.remove` — delete an image nothing is running.
+///
+/// **An image a container still needs is refused, and the container is named.**
+/// Docker's own answer to this is `rmi -f`, which untags the image out from
+/// under a running service: the container keeps running on an image that no
+/// longer has a name, and the next restart — a reboot, a `restart: always`
+/// after an OOM kill — finds nothing to start from. That is a service that dies
+/// hours later for a reason nobody will connect to a button pressed this
+/// morning, so this refuses instead and says which container to deal with
+/// first.
+pub struct ImageRemove;
+
+#[async_trait::async_trait]
+impl TypedOperation for ImageRemove {
+    type Input = ImageInput;
+    type Output = ImageRemoveOutput;
+
+    const NAME: &'static str = "docker.image.remove";
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let docker = docker_program()?;
+        let (id, _) = image_identity(&docker, &input.image).await?;
+
+        let users = containers_using_image(&docker, &input.image).await;
+        if !users.is_empty() {
+            return Err(UnihelmError::new(
+                ErrorCode::DependentsExist,
+                format!(
+                    "`{}` is the image {} {} — remove {} first, or leave the image where \
+                     it is. The panel will not force-remove an image a container is \
+                     built on: the container would keep running with no image to \
+                     restart from.",
+                    input.image,
+                    if users.len() == 1 {
+                        "behind the container"
+                    } else {
+                        "behind the containers"
+                    },
+                    quoted_list(&users),
+                    if users.len() == 1 { "it" } else { "them" },
+                ),
+            )
+            .with_field("image"));
+        }
+
+        ctx.log(format!("docker image rm {}", input.image));
+        let out = run_raw(&docker, &image_remove_argv(&input.image), ACTION_BUDGET).await?;
+        if !out.success() {
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                out.failure_text(),
+            ));
+        }
+
+        Ok(ImageRemoveOutput {
+            image: input.image.as_str().to_string(),
+            id,
+            removed: out
+                .trimmed_stdout()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ImagePruneInput {
+    /// List what would go and delete nothing.
+    ///
+    /// Defaults to false, because an operator who pressed Prune and got a list
+    /// would reasonably believe the disk had been reclaimed. The dry run is for
+    /// somebody who asked for it by name.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImagePruneOutput {
+    pub dry_run: bool,
+    /// The dangling images, named **before** anything is removed.
+    pub candidates: Vec<Image>,
+    /// Docker's own `deleted:` and `untagged:` lines. Empty on a dry run.
+    pub deleted: Vec<String>,
+    /// Docker's own "Total reclaimed space" figure — `0B` when nothing went.
+    ///
+    /// This number is the entire value of the operation. A prune that answers
+    /// "done" is indistinguishable from one that deleted nothing, and an
+    /// operator watching a disk fill needs to know which of those happened.
+    pub reclaimed: String,
+}
+
+/// `docker.image.prune` — reclaim the disk that dangling layers eat.
+///
+/// **Dangling only. Never `--all`.** `docker image prune -a` removes every image
+/// no container currently uses, which includes the one an operator pulled this
+/// morning for a container they have not created yet, and every image behind a
+/// container they have stopped for the weekend. Dangling images — the untagged
+/// leftovers of a rebuild or a re-pull — are the ones nothing can ever refer to
+/// again, and they are what actually fills a small VPS.
+pub struct ImagePrune;
+
+#[async_trait::async_trait]
+impl TypedOperation for ImagePrune {
+    type Input = ImagePruneInput;
+    type Output = ImagePruneOutput;
+
+    const NAME: &'static str = "docker.image.prune";
+    const PERMISSION: Permission = Permission::ServerManage;
+    // Deleting several gigabytes of layers is not a 300 ms answer, and the list
+    // of what went belongs in a log the operator can read afterwards.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        // Nothing is left half-pruned that a second run would make worse: the
+        // second run finds whatever the first did not get to.
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let docker = docker_program()?;
+
+        // Named before anything is deleted, in the task log, so the record of
+        // what a prune took is written even if the prune itself then fails
+        // half-way.
+        let candidates = dangling_images(&docker).await;
+        if candidates.is_empty() {
+            ctx.log("no dangling images on this server; nothing to reclaim");
+        }
+        for image in &candidates {
+            ctx.log(format!(
+                "dangling: {} {} ({})",
+                image.id, image.repository, image.size
+            ));
+        }
+
+        if input.dry_run {
+            ctx.log("dry run: nothing was deleted");
+            return Ok(ImagePruneOutput {
+                dry_run: true,
+                candidates,
+                deleted: Vec::new(),
+                reclaimed: "0B".to_string(),
+            });
+        }
+
+        ctx.log("docker image prune");
+        let out = run_raw(&docker, &prune_argv(), PRUNE_BUDGET).await?;
+        if !out.success() {
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                out.failure_text(),
+            ));
+        }
+
+        let text = out.trimmed_stdout();
+        let reclaimed = reclaimed_space(text);
+        ctx.log(format!("reclaimed {reclaimed}"));
+
+        Ok(ImagePruneOutput {
+            dry_run: false,
+            candidates,
+            deleted: deleted_lines(text),
+            reclaimed,
+        })
+    }
+}
+
+/// How long a pull is given: fifteen minutes, sized on the operator's link.
+///
+/// The same number and the same reasoning as [`crate::engine`]'s budget: a
+/// few hundred megabytes over the 5 Mbit uplink a cheap VPS actually has is
+/// minutes and is not a failure, and a pull killed for being slow throws away
+/// the layers it had already fetched.
+const PULL_BUDGET: Duration = Duration::from_secs(15 * 60);
+
+/// How long a prune is given. Deleting tens of gigabytes of layers off a slow
+/// disk is minutes, and a prune killed part-way leaves the operator unable to
+/// say how much actually came back.
+const PRUNE_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+fn pull_argv(image: &ImageRef) -> Vec<String> {
+    vec!["pull".to_string(), image.as_str().to_string()]
+}
+
+/// Bare `image rm`, and the omission is the point: no `--force`.
+///
+/// `docker rmi -f` untags an image a container is still built on, which leaves
+/// that container running on something it can never be restarted from. The
+/// refusal in [`ImageRemove`] is what replaces it.
+fn image_remove_argv(image: &ImageRef) -> Vec<String> {
+    vec![
+        "image".to_string(),
+        "rm".to_string(),
+        image.as_str().to_string(),
+    ]
+}
+
+/// `--force` here is **not** `rm -f`: it is Docker's "do not ask me y/N", and
+/// there is no terminal on the other end of this to answer the prompt. What is
+/// deliberately absent is `--all`; see [`ImagePrune`].
+fn prune_argv() -> Vec<String> {
+    vec![
+        "image".to_string(),
+        "prune".to_string(),
+        "--force".to_string(),
+    ]
+}
+
+/// The digest and the byte size of an image that is already here.
+async fn image_identity(docker: &str, image: &ImageRef) -> Result<(String, Option<u64>)> {
+    let out = run_raw(
+        docker,
+        &[
+            "image".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Id}}\t{{.Size}}".to_string(),
+            image.as_str().to_string(),
+        ],
+        BUDGET,
+    )
+    .await?;
+    if !out.success() {
+        let text = out.failure_text();
+        let lower = text.to_ascii_lowercase();
+        // A daemon that is down fails this command too, and reporting that as a
+        // missing image would send an operator looking for something they never
+        // pulled while `docker.service` is what is actually wrong.
+        return Err(
+            if lower.contains("no such image") || lower.contains("no such object") {
+                UnihelmError::not_found(format!("image `{image}`")).with_field("image")
+            } else {
+                UnihelmError::new(ErrorCode::CommandFailed, text.trim().to_string())
+            },
+        );
+    }
+
+    let Some(row) = rows(out.trimmed_stdout(), 2).into_iter().next() else {
+        return Err(UnihelmError::internal(
+            "`docker image inspect` answered in a shape this build does not recognise",
+        ));
+    };
+    Ok((row[0].clone(), row[1].parse().ok()))
+}
+
+/// Which containers are built on this image, running or stopped.
+///
+/// A stopped container counts, and that is the case this exists for: it is
+/// invisible in `docker ps`, it is what an operator forgets, and it is exactly
+/// what a removed image would strand.
+///
+/// Docker's `ancestor` filter answers with containers built on the image *or on
+/// anything derived from it*. Erring wide is the safe direction here — the
+/// worst it costs is a refusal an operator can resolve by removing a container
+/// — and it is Docker's own accounting rather than a second one kept here.
+async fn containers_using_image(docker: &str, image: &ImageRef) -> Vec<String> {
+    let filter = format!("ancestor={}", image.as_str());
+    let Some(text) = run_docker(
+        docker,
+        &["ps", "--all", "--filter", &filter, "--format", "{{.Names}}"],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The untagged leftovers of a rebuild or a re-pull.
+async fn dangling_images(docker: &str) -> Vec<Image> {
+    let Some(text) = run_docker(
+        docker,
+        &[
+            "images",
+            "--filter",
+            "dangling=true",
+            "--format",
+            "{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}",
+        ],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    rows(&text, 4)
+        .into_iter()
+        .map(|r| Image {
+            id: r[0].clone(),
+            repository: r[1].clone(),
+            tag: r[2].clone(),
+            size: r[3].clone(),
+        })
+        .collect()
+}
+
+/// Docker's `Total reclaimed space:` figure, in Docker's own units.
+///
+/// `0B` when the line is absent rather than an empty string, because the field
+/// is what an operator reads to find out whether the operation was worth
+/// pressing, and a blank there reads as a bug rather than as "nothing went".
+fn reclaimed_space(text: &str) -> String {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("Total reclaimed space:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "0B".to_string())
+}
+
+/// The `untagged:` and `deleted:` lines a prune prints, and nothing else.
+///
+/// The rest of the output is a `Deleted Images:` heading, a blank line and the
+/// reclaimed total, none of which is a thing that was deleted.
+fn deleted_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower.starts_with("deleted:") || lower.starts_with("untagged:")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Docker's closing `Status:` line from a pull, which says whether anything was
+/// actually fetched.
+fn status_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("Status:"))
+        .map(str::to_string)
+}
+
+/// `` `a` ``, `` `a` and `b` ``, `` `a`, `b` and `c` `` — a list a person reads.
+fn quoted_list(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volumes
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct VolumeInput {
+    pub volume: VolumeRef,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VolumeRemoveOutput {
+    pub volume: String,
+}
+
+/// `docker.volume.remove` — delete a volume nothing is using.
+///
+/// Two refusals stand in front of this, and both exist because a volume is the
+/// only thing on this page whose deletion cannot be undone by pulling something
+/// again:
+///
+/// 1. **A container still references it.** Named, not forced. Docker refuses
+///    this too, but its message names the volume and not the container, which
+///    leaves the operator to find the container themselves.
+/// 2. **It holds an engine this panel installed.** Deleting it is deleting
+///    every database in that engine while the panel's own registry goes on
+///    saying the engine is there — the panel reporting something that is not
+///    true, which is the one thing it must never do. `engine.remove` with
+///    `delete_data` is the operation that does this properly: it forgets the
+///    record at the same time.
+pub struct VolumeRemove;
+
+#[async_trait::async_trait]
+impl TypedOperation for VolumeRemove {
+    type Input = VolumeInput;
+    type Output = VolumeRemoveOutput;
+
+    const NAME: &'static str = "docker.volume.remove";
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let docker = docker_program()?;
+        volume_exists(&docker, &input.volume).await?;
+
+        let engines = crate::engine::registry(ctx.db()).await?;
+        if let Some(record) = engines
+            .values()
+            .find(|r| r.volume.as_deref() == Some(input.volume.as_str()))
+        {
+            return Err(UnihelmError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "`{}` is where the {} engine `{}` keeps its data — deleting it deletes \
+                     every database in that engine. `engine.remove` with `delete_data` is \
+                     the way to do this: it removes the engine's record at the same time, \
+                     so the panel does not go on reporting an engine whose data is gone.",
+                    input.volume, record.slug, record.container
+                ),
+            )
+            .with_field("volume"));
+        }
+
+        let users = containers_using_volume(&docker, &input.volume).await;
+        if !users.is_empty() {
+            return Err(UnihelmError::new(
+                ErrorCode::DependentsExist,
+                format!(
+                    "`{}` is mounted by {} {} — remove {} first. A volume outlives its \
+                     container here on purpose, so the panel will not delete one out from \
+                     under something that still refers to it.",
+                    input.volume,
+                    if users.len() == 1 {
+                        "the container"
+                    } else {
+                        "the containers"
+                    },
+                    quoted_list(&users),
+                    if users.len() == 1 {
+                        "that container"
+                    } else {
+                        "those containers"
+                    },
+                ),
+            )
+            .with_field("volume"));
+        }
+
+        ctx.log(format!("docker volume rm {}", input.volume));
+        run_checked(&docker, &volume_remove_argv(&input.volume), ACTION_BUDGET).await?;
+
+        Ok(VolumeRemoveOutput {
+            volume: input.volume.as_str().to_string(),
+        })
+    }
+}
+
+fn volume_remove_argv(volume: &VolumeRef) -> Vec<String> {
+    vec![
+        "volume".to_string(),
+        "rm".to_string(),
+        volume.as_str().to_string(),
+    ]
+}
+
+/// Fail with "no such volume" before anything else is decided, so a typo does
+/// not come back as one of the refusals above.
+async fn volume_exists(docker: &str, volume: &VolumeRef) -> Result<()> {
+    let out = run_raw(
+        docker,
+        &[
+            "volume".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Name}}".to_string(),
+            volume.as_str().to_string(),
+        ],
+        BUDGET,
+    )
+    .await?;
+    if out.success() {
+        return Ok(());
+    }
+    let text = out.failure_text();
+    let lower = text.to_ascii_lowercase();
+    Err(
+        if lower.contains("no such volume") || lower.contains("no such object") {
+            UnihelmError::not_found(format!("volume `{volume}`")).with_field("volume")
+        } else {
+            UnihelmError::new(ErrorCode::CommandFailed, text.trim().to_string())
+        },
+    )
+}
+
+/// Which containers mount this volume, running or stopped, from Docker's own
+/// `volume=` filter rather than from a mount list this module re-derived.
+async fn containers_using_volume(docker: &str, volume: &VolumeRef) -> Vec<String> {
+    let filter = format!("volume={}", volume.as_str());
+    let Some(text) = run_docker(
+        docker,
+        &["ps", "--all", "--filter", &filter, "--format", "{{.Names}}"],
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// When a run does not start: which port, and what was left behind
+// ---------------------------------------------------------------------------
+
+/// How a port is spelled in a sentence to an operator.
+fn proto(udp: bool) -> &'static str {
+    if udp { "/udp" } else { "" }
+}
+
+/// One host port a container is currently publishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub(crate) host: u16,
+    pub(crate) udp: bool,
+    pub(crate) container: String,
+}
+
+/// Which container publishes which host port, from Docker's own `ps`.
+///
+/// Running containers only, and that is not an oversight: a stopped container
+/// releases its published ports, so listing `--all` here would refuse a port
+/// nothing is actually holding.
+pub(crate) async fn published_ports(docker: &str) -> Vec<Published> {
+    let Some(text) = run_docker(docker, &["ps", "--format", "{{.Names}}\t{{.Ports}}"]).await else {
+        // No answer is no knowledge, not "nothing is published". The caller
+        // treats an empty list as "we could not tell" and lets Docker be the
+        // backstop, which is the only honest reading.
+        return Vec::new();
+    };
+
+    rows(&text, 2)
+        .into_iter()
+        .flat_map(|r| {
+            let container = r[0].clone();
+            host_ports_in(&r[1])
+                .into_iter()
+                .map(move |(host, udp)| Published {
+                    host,
+                    udp,
+                    container: container.clone(),
+                })
+        })
+        .collect()
+}
+
+/// The host side of every mapping in a `docker ps` ports column.
+///
+/// The column is a comma-separated list of `127.0.0.1:8080->80/tcp`, plus bare
+/// `9000/tcp` entries for ports a container *exposes* but does not publish.
+/// Only the published half matters here — an exposed port holds nothing on the
+/// host — so an entry with no `->` is skipped rather than read as a host port,
+/// which would refuse 9000 to everybody because one container documented it.
+///
+/// The host address is split off at the **last** colon before the arrow, so an
+/// IPv6 bind (`[::]:8080->80/tcp`) yields 8080 rather than a parse failure.
+fn host_ports_in(column: &str) -> Vec<(u16, bool)> {
+    column
+        .split(',')
+        .map(str::trim)
+        .filter_map(|entry| {
+            let (host_side, target) = entry.split_once("->")?;
+            let udp = target.ends_with("/udp");
+            let port = host_side.rsplit(':').next()?;
+            port.trim().parse::<u16>().ok().map(|p| (p, udp))
+        })
+        .collect()
+}
+
+/// The host port Docker refused to bind, read out of its own failure text.
+///
+/// Docker says it like this, on one line with an endpoint id and a driver in
+/// front of it:
+///
+/// ```text
+/// driver failed programming external connectivity on endpoint web (a1b2…):
+/// Bind for 127.0.0.1:6379 failed: port is already allocated
+/// ```
+///
+/// The number is in there and an operator should not have to find it. Anchored
+/// on `port is already allocated` rather than on `Bind for`, so a different
+/// bind failure — a permission denied on a privileged port, say — is not
+/// rewritten into a conflict it is not.
+pub(crate) fn allocated_port(text: &str) -> Option<u16> {
+    if !text.contains("port is already allocated") {
+        return None;
+    }
+    let after = text.split("Bind for ").nth(1)?;
+    let addr = after.split_whitespace().next()?;
+    addr.rsplit(':').next()?.trim().parse::<u16>().ok()
+}
+
+/// What became of the container a failed `docker run` left behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Swept {
+    /// There was nothing on the machine to remove.
+    Nothing,
+    /// The half-made container was removed; its name is free again.
+    Removed,
+    /// It is still there, and the operator has to deal with it. Carries why.
+    Left(String),
+}
+
+/// Remove the container a failed `docker run` created.
+///
+/// Bare `rm`, never `-f`: the run failed at the start, so there is nothing
+/// running to kill, and a force here would be a habit that eventually meets a
+/// container that did start.
+pub(crate) async fn sweep_failed_run(ctx: &OpContext, docker: &str, name: &ContainerRef) -> Swept {
+    let Ok(found) = inspect(docker, name).await else {
+        return Swept::Nothing;
+    };
+    if found.running {
+        // It started after all, so the run failed for some other reason and
+        // this container is not wreckage. Removing it would be this function
+        // deleting something that works.
+        return Swept::Left(format!("`{}` is running", found.name));
+    }
+    let Ok(target) = ContainerRef::parse(&found.id) else {
+        return Swept::Left("Docker returned an id this build cannot parse".to_string());
+    };
+
+    ctx.log(format!(
+        "the run failed after creating {}; removing it so the name is free",
+        found.name
+    ));
+    match run_raw(docker, &Lifecycle::Remove.argv(&target), ACTION_BUDGET).await {
+        Ok(out) if out.success() => Swept::Removed,
+        Ok(out) => Swept::Left(out.failure_text()),
+        Err(e) => Swept::Left(e.to_string()),
+    }
+}
+
+/// Turn a failed `docker run` into a sentence an operator can act on.
+///
+/// Two things are added to Docker's own text, and both are what the raw message
+/// left the operator to work out for themselves: **which host port** is taken,
+/// which Docker buries inside a sentence about endpoint ids, and **what
+/// happened to the container** the failed run created, which Docker does not
+/// mention at all. Docker's words are kept verbatim for every other failure —
+/// they are already written for the person reading them, and paraphrasing would
+/// put a second, worse source of truth in front of the operator.
+pub(crate) fn run_failure(
+    text: &str,
+    container: &str,
+    holder: Option<&str>,
+    swept: Swept,
+) -> UnihelmError {
+    let (code, mut detail) = match allocated_port(text) {
+        Some(port) => {
+            let held = match holder {
+                Some(name) => format!("the container `{name}` is already publishing it"),
+                // Docker knows the port is taken; the panel could not find a
+                // container holding it, which usually means something outside
+                // Docker is listening. Saying that is more use than naming a
+                // container that is not the one.
+                None => "something on this server is already listening on it".to_string(),
+            };
+            (
+                ErrorCode::Conflict,
+                format!(
+                    "`{container}` could not start: host port {port} is already in use — \
+                     {held}. Publish it on a different host port, or free {port} first."
+                ),
+            )
+        }
+        None => (
+            ErrorCode::CommandFailed,
+            format!("`{container}` could not start: {}", text.trim()),
+        ),
+    };
+
+    match swept {
+        // Nothing to say. A sentence about a cleanup that had nothing to clean
+        // reads as though something went wrong twice.
+        Swept::Nothing => {}
+        Swept::Removed => detail.push_str(&format!(
+            " The container Docker had already created was removed, so the name \
+             `{container}` is free to try again."
+        )),
+        Swept::Left(why) => detail.push_str(&format!(
+            " The container `{container}` was created before the failure and could not be \
+             removed ({why}), so this name cannot be reused until `docker rm {container}` \
+             clears it."
+        )),
+    }
+
+    UnihelmError::new(code, detail)
 }
 
 #[cfg(test)]
@@ -1805,5 +2957,415 @@ mod create_tests {
         assert!(parsed.ports.is_empty());
         assert!(parsed.volumes.is_empty());
         assert_eq!(parsed.restart, RestartPolicy::No);
+    }
+}
+
+/// Images, volumes, and the port clash that used to leave wreckage behind.
+///
+/// Everything here was missing rather than wrong. Images and volumes were a
+/// read-only list — an operator could watch a disk fill and had no way to empty
+/// it from the panel — and a `docker run` that failed on a port answered with
+/// Docker's sentence about endpoint ids while leaving the half-made container
+/// on the machine for the next attempt to trip over.
+#[cfg(test)]
+mod image_volume_and_conflict_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // VolumeRef
+    // -----------------------------------------------------------------------
+
+    /// The grammar `validate_volume` used to carry its own copy of. A path in
+    /// the volume position is a bind mount, which is a piece of this server's
+    /// filesystem handed to a container.
+    #[test]
+    fn a_volume_name_is_never_a_path_or_an_option() {
+        for bad in [
+            "/",
+            "/var/lib/docker",
+            "../etc",
+            "./data",
+            "-f",
+            "--force",
+            "",
+            "   ",
+            "app data",
+            "app;rm -rf /",
+            "$(id)",
+            "café",
+        ] {
+            let Err(err) = VolumeRef::parse(bad) else {
+                panic!("`{bad}` reached an argv as a volume");
+            };
+            assert_eq!(err.code, ErrorCode::InvalidInput, "for `{bad}`");
+            assert_eq!(err.field.as_deref(), Some("volume"), "for `{bad}`");
+        }
+
+        for good in ["app_data", "pg-16.data", "unihelm-mariadb-11.8", "v1"] {
+            assert!(VolumeRef::parse(good).is_ok(), "refused volume `{good}`");
+        }
+    }
+
+    /// `validate_volume` still speaks about bind mounts, because that is the
+    /// mistake somebody typing into the create form has just made — it only
+    /// stopped carrying a second copy of the grammar.
+    #[test]
+    fn the_mount_field_still_explains_bind_mounts_while_sharing_one_grammar() {
+        let err = validate_volume(&VolumeMount {
+            volume: "/var/run/docker.sock".into(),
+            path: "/sock".into(),
+        })
+        .expect_err("a path was accepted as a volume name");
+        assert!(
+            err.to_string().contains("bind mount"),
+            "the refusal should say why: {err}"
+        );
+        assert_eq!(err.field.as_deref(), Some("volumes"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The argvs
+    // -----------------------------------------------------------------------
+
+    fn iref(s: &str) -> ImageRef {
+        ImageRef::parse(s).expect("a real image reference")
+    }
+
+    /// Removing an image is never forced. `docker rmi -f` untags an image a
+    /// running container is built on: the container keeps going and its next
+    /// restart finds nothing to start from, hours later, for a reason nobody
+    /// will connect to this button.
+    #[test]
+    fn removing_an_image_forces_nothing() {
+        let argv = image_remove_argv(&iref("nginx:alpine"));
+        assert_eq!(argv, vec!["image", "rm", "nginx:alpine"]);
+        for forbidden in ["-f", "--force", "--no-prune"] {
+            assert!(
+                !argv.iter().any(|a| a == forbidden),
+                "`{forbidden}` turns a removal into something the operator did not ask for"
+            );
+        }
+    }
+
+    /// The one flag that must never appear on a prune, and the one that must.
+    ///
+    /// `--all` removes every image no container currently uses — the one pulled
+    /// this morning for a container not yet created, and every image behind a
+    /// container stopped for the weekend. `--force` here is not `rm -f`: it is
+    /// "do not ask me y/N", and there is no terminal to answer the prompt.
+    #[test]
+    fn a_prune_takes_dangling_images_only() {
+        let argv = prune_argv();
+        assert_eq!(argv, vec!["image", "prune", "--force"]);
+        for forbidden in ["-a", "--all", "--filter"] {
+            assert!(
+                !argv.iter().any(|a| a == forbidden),
+                "`{forbidden}` would delete images the operator still wants"
+            );
+        }
+    }
+
+    #[test]
+    fn a_volume_is_removed_by_name_and_nothing_else() {
+        let argv = volume_remove_argv(&VolumeRef::parse("app_data").unwrap());
+        assert_eq!(argv, vec!["volume", "rm", "app_data"]);
+        assert!(!argv.iter().any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn a_pull_names_the_image_last() {
+        let argv = pull_argv(&iref("ghcr.io/owner/app:v1"));
+        assert_eq!(argv, vec!["pull", "ghcr.io/owner/app:v1"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a prune reports
+    // -----------------------------------------------------------------------
+
+    /// The number that is the whole point of the operation. A prune that
+    /// answers "done" is indistinguishable from one that deleted nothing.
+    #[test]
+    fn the_reclaimed_figure_is_dockers_own_and_never_blank() {
+        let output = "Deleted Images:\n\
+                      untagged: nginx@sha256:aaaa\n\
+                      deleted: sha256:bbbb\n\
+                      deleted: sha256:cccc\n\
+                      \n\
+                      Total reclaimed space: 1.093GB\n";
+        assert_eq!(reclaimed_space(output), "1.093GB");
+        assert_eq!(
+            deleted_lines(output),
+            vec![
+                "untagged: nginx@sha256:aaaa",
+                "deleted: sha256:bbbb",
+                "deleted: sha256:cccc"
+            ]
+        );
+
+        // Docker prints only the total when there was nothing to take.
+        assert_eq!(reclaimed_space("Total reclaimed space: 0B\n"), "0B");
+        assert!(deleted_lines("Total reclaimed space: 0B\n").is_empty());
+
+        // And a shape this build does not recognise must still be a number an
+        // operator can read, not an empty field that looks like a bug.
+        assert_eq!(reclaimed_space(""), "0B");
+        assert_eq!(reclaimed_space("Deleted Images:\n"), "0B");
+    }
+
+    /// The heading and the total are not things that were deleted, and counting
+    /// them would overstate what a prune did.
+    #[test]
+    fn the_deleted_list_holds_only_deletions() {
+        let lines =
+            deleted_lines("Deleted Images:\ndeleted: sha256:aa\n\nTotal reclaimed space: 12MB\n");
+        assert_eq!(lines, vec!["deleted: sha256:aa"]);
+    }
+
+    /// "Pulled" and "already had it" are different answers to "did my update
+    /// arrive", and reporting the first for both tells somebody their image is
+    /// new when it is the one they have been running for a year.
+    #[test]
+    fn a_pull_can_tell_a_fetch_from_an_image_already_current() {
+        let fresh = status_line(
+            "latest: Pulling from library/nginx\n\
+             Digest: sha256:aaaa\n\
+             Status: Downloaded newer image for nginx:latest\n",
+        )
+        .expect("Docker's closing line");
+        assert!(!fresh.contains("up to date"));
+
+        let same = status_line(
+            "latest: Pulling from library/nginx\n\
+             Status: Image is up to date for nginx:latest\n",
+        )
+        .expect("Docker's closing line");
+        assert!(same.contains("up to date"));
+
+        assert_eq!(status_line("no status here\n"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a volume is attached to
+    // -----------------------------------------------------------------------
+
+    /// A stopped container still holds its volume, and it is the case that
+    /// makes a volume look like an orphan: invisible in `docker ps`, still
+    /// somebody's data, and the one Docker itself refuses a `volume rm` for.
+    #[test]
+    fn a_volume_names_every_container_that_mounts_it() {
+        let ps = "shop_web_1\tapp_data,/etc/nginx/conf.d\n\
+                  shop_db_1\tpg_data\n\
+                  old_worker\tapp_data\n";
+        let users = mounts_to_users(ps);
+        assert_eq!(
+            users.get("app_data").map(Vec::as_slice),
+            Some(["shop_web_1".to_string(), "old_worker".to_string()].as_slice())
+        );
+        assert_eq!(
+            users.get("pg_data").map(Vec::as_slice),
+            Some(["shop_db_1".to_string()].as_slice())
+        );
+        // A bind mount is a path on the host and is nobody's volume.
+        assert!(!users.contains_key("/etc/nginx/conf.d"));
+    }
+
+    /// A container with nothing mounted contributes nothing, rather than an
+    /// entry under the empty name.
+    #[test]
+    fn a_container_with_no_mounts_claims_no_volume() {
+        assert!(mounts_to_users("web\t\n").is_empty());
+        assert!(mounts_to_users("").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Ports
+    // -----------------------------------------------------------------------
+
+    /// The pre-flight's whole input: which host ports are actually spoken for.
+    ///
+    /// A bare `9000/tcp` is a port a container *exposes* and does not publish —
+    /// it holds nothing on the host, and reading it as taken would refuse 9000
+    /// to everybody because one container documented it.
+    #[test]
+    fn only_published_mappings_hold_a_host_port() {
+        let column = "127.0.0.1:6379->6379/tcp, 9000/tcp, 0.0.0.0:80->80/tcp, 53->53/udp";
+        assert_eq!(
+            host_ports_in(column),
+            vec![(6379, false), (80, false), (53, true)]
+        );
+        assert!(host_ports_in("").is_empty());
+        assert!(host_ports_in("9000/tcp").is_empty());
+    }
+
+    /// An IPv6 bind address is full of colons, and splitting on the first one
+    /// would take `[` for a port number and lose the mapping entirely — which
+    /// would let the pre-flight wave through a port that is very much taken.
+    #[test]
+    fn an_ipv6_binding_still_yields_its_host_port() {
+        assert_eq!(host_ports_in("[::]:8080->80/tcp"), vec![(8080, false)]);
+        assert_eq!(
+            host_ports_in("[::1]:5432->5432/tcp, 0.0.0.0:5432->5432/tcp"),
+            vec![(5432, false), (5432, false)]
+        );
+    }
+
+    /// Docker buries the port inside a sentence about endpoint ids and driver
+    /// programming. This is the line an operator was left to read.
+    #[test]
+    fn the_port_is_pulled_out_of_dockers_own_sentence() {
+        let text = "docker: Error response from daemon: failed to set up container \
+                    networking: driver failed programming external connectivity on \
+                    endpoint unihelm-redis-7 (9f2c8e0b4a6d): Bind for 127.0.0.1:6379 \
+                    failed: port is already allocated";
+        assert_eq!(allocated_port(text), Some(6379));
+
+        // 0.0.0.0 and IPv6 spellings of the same failure.
+        assert_eq!(
+            allocated_port("Bind for 0.0.0.0:8080 failed: port is already allocated"),
+            Some(8080)
+        );
+        assert_eq!(
+            allocated_port("Bind for [::]:8080 failed: port is already allocated"),
+            Some(8080)
+        );
+    }
+
+    /// A different bind failure is not a conflict, and rewriting it as one
+    /// would send an operator looking for a container holding a port that
+    /// nothing is holding.
+    #[test]
+    fn another_bind_failure_is_not_read_as_a_port_conflict() {
+        assert_eq!(
+            allocated_port("Bind for 0.0.0.0:80 failed: permission denied"),
+            None
+        );
+        assert_eq!(allocated_port("no such image: nginx:nope"), None);
+        assert_eq!(allocated_port(""), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // What the operator is told when a run does not start
+    // -----------------------------------------------------------------------
+
+    /// The defect, in one assertion: the port, the holder, and the fact that
+    /// the name is free to try again.
+    #[test]
+    fn a_port_clash_names_the_port_the_holder_and_the_swept_container() {
+        let err = run_failure(
+            "driver failed programming external connectivity on endpoint unihelm-redis-7 \
+             (9f2c): Bind for 127.0.0.1:6379 failed: port is already allocated",
+            "unihelm-redis-7",
+            Some("unihelm-valkey-8"),
+            Swept::Removed,
+        );
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("6379"), "{}", err.detail);
+        assert!(err.detail.contains("unihelm-valkey-8"), "{}", err.detail);
+        assert!(
+            err.detail.contains("free to try again"),
+            "the operator has to be told the name is reusable: {}",
+            err.detail
+        );
+        // None of Docker's endpoint-id noise survives into the sentence.
+        assert!(!err.detail.contains("9f2c"), "{}", err.detail);
+    }
+
+    /// Nothing in Docker holding the port means something outside Docker is,
+    /// and saying that beats naming a container that is not the one.
+    #[test]
+    fn an_unknown_holder_is_said_to_be_unknown_rather_than_guessed_at() {
+        let err = run_failure(
+            "Bind for 127.0.0.1:6379 failed: port is already allocated",
+            "web",
+            None,
+            Swept::Nothing,
+        );
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(
+            err.detail
+                .contains("something on this server is already listening"),
+            "{}",
+            err.detail
+        );
+        // Nothing was left behind, so nothing is said about a cleanup — a
+        // sentence about tidying up something that was never made reads as a
+        // second failure.
+        assert!(!err.detail.contains("removed"), "{}", err.detail);
+    }
+
+    /// A container that could not be swept is the one case where the operator
+    /// has to do something by hand, so the command is in the message.
+    #[test]
+    fn a_container_that_could_not_be_swept_is_reported_with_the_command_to_clear_it() {
+        let err = run_failure(
+            "Bind for 127.0.0.1:6379 failed: port is already allocated",
+            "web",
+            None,
+            Swept::Left("permission denied".into()),
+        );
+        assert!(err.detail.contains("docker rm web"), "{}", err.detail);
+        assert!(err.detail.contains("permission denied"), "{}", err.detail);
+    }
+
+    /// Every other failure keeps Docker's own words. They are already written
+    /// for the person reading them, and a paraphrase would be a second, worse
+    /// source of truth about a machine the panel cannot see.
+    #[test]
+    fn a_failure_that_is_not_a_port_keeps_dockers_own_sentence() {
+        let err = run_failure(
+            "Unable to find image 'nginx:nope' locally: manifest unknown",
+            "web",
+            None,
+            Swept::Removed,
+        );
+        assert_eq!(err.code, ErrorCode::CommandFailed);
+        assert!(err.detail.contains("manifest unknown"), "{}", err.detail);
+    }
+
+    // -----------------------------------------------------------------------
+    // Lists a person reads
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_list_of_containers_reads_as_a_sentence() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(quoted_list(&names(&["web"])), "`web`");
+        assert_eq!(quoted_list(&names(&["web", "db"])), "`web` and `db`");
+        assert_eq!(
+            quoted_list(&names(&["web", "db", "cache"])),
+            "`web`, `db` and `cache`"
+        );
+        assert_eq!(quoted_list(&[]), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // The volume record
+    // -----------------------------------------------------------------------
+
+    /// The distinction the widened record exists for: "no container uses this"
+    /// is a licence to delete and "the panel could not tell" is not. Collapsing
+    /// the second into an empty list is how somebody deletes a database.
+    #[test]
+    fn a_volume_whose_users_could_not_be_read_is_not_reported_as_unused() {
+        let unknown = Volume {
+            name: "app_data".into(),
+            driver: "local".into(),
+            size: None,
+            used_by: None,
+            engine: None,
+        };
+        let orphan = Volume {
+            used_by: Some(Vec::new()),
+            ..unknown.clone()
+        };
+        assert_ne!(
+            unknown.used_by, orphan.used_by,
+            "an unread answer and an empty one must not serialise the same"
+        );
+
+        let json = serde_json::to_value(&unknown).expect("a volume serialises");
+        assert!(json["used_by"].is_null());
+        assert!(json["size"].is_null());
+        assert!(serde_json::to_value(&orphan).expect("a volume serialises")["used_by"].is_array());
     }
 }

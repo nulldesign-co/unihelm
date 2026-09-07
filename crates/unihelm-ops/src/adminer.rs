@@ -349,26 +349,37 @@ pub fn adminer_vhost_context(php: PhpVersion) -> AdminerVhostContext {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// The newest PHP version the Stack Manager has actually installed.
+/// The newest PHP version the Stack Manager has actually installed, or `None`
+/// when it has installed none.
 ///
 /// From `stack_components`, not from a filesystem probe: the panel's own
 /// bookkeeping decides what the panel maintains. Takes `&Db` rather than the
 /// context so the tests can drive it with an in-memory database.
-pub async fn highest_installed_php(db: &Db) -> Result<PhpVersion> {
+///
+/// Split out of [`highest_installed_php`] so `db.adminer.status` can ask the
+/// same question without inheriting the refusal. A database that cannot be read
+/// is not a server with no PHP, and flattening the two would put "install PHP
+/// first" under a disabled Enable on a machine holding three versions.
+pub async fn newest_installed_php(db: &Db) -> Result<Option<PhpVersion>> {
     let components = db.components().await.map_err(UnihelmError::from)?;
-    components
+    Ok(components
         .iter()
         .filter(|c| c.status == ComponentStatus::Installed)
         .filter_map(|c| c.slug.strip_prefix("php"))
         .filter_map(|v| PhpVersion::parse(v).ok())
-        .max()
-        .ok_or_else(|| {
-            UnihelmError::new(
-                ErrorCode::NotFound,
-                "no PHP version is installed; install one from the Stack Manager first \
-                 — Adminer is a PHP application",
-            )
-        })
+        .max())
+}
+
+/// The newest PHP version the Stack Manager has actually installed, or the
+/// refusal `db.adminer.enable` fails with when there is none.
+pub async fn highest_installed_php(db: &Db) -> Result<PhpVersion> {
+    newest_installed_php(db).await?.ok_or_else(|| {
+        UnihelmError::new(
+            ErrorCode::NotFound,
+            "no PHP version is installed; install one from the Stack Manager first \
+             — Adminer is a PHP application",
+        )
+    })
 }
 
 /// Is this PHP version's FPM really on the machine?
@@ -649,6 +660,18 @@ pub struct StatusOutput {
     /// from a browser, until the authenticated proxy ships.
     pub url: Option<String>,
     pub php_version: Option<String>,
+    /// Whether there is a PHP for Adminer to run on at all — the same question
+    /// [`Enable`] asks, asked the same way.
+    ///
+    /// The two used to disagree, and the disagreement was the whole of the
+    /// defect. This read answered "which PHP" from the Adminer pool files on
+    /// disk, of which a server that has never enabled Adminer has none; the
+    /// enable path reads installed components. So on a fresh server with no PHP
+    /// the status said nothing at all was wrong, the panel armed Enable, and
+    /// the click returned a 202 whose task refused with "no PHP version is
+    /// installed" — a refusal the operator never saw. The button needs the
+    /// answer *before* the click, and only `stack_components` has it.
+    pub php_available: bool,
     pub adminer_version: &'static str,
     /// See [`ADMINER_SHA256`]: the checksum pin has one source and no
     /// upstream signature. The UI shows this the way it shows
@@ -681,10 +704,18 @@ impl TypedOperation for Status {
             .last()
             .map(|(v, _)| v.as_str().to_string());
 
+        // Not derived from `php_version` above: that is the version this
+        // feature's *own* pool runs on, and a server that has never enabled
+        // Adminer has no pool while having every PHP it needs. See the field.
+        // The `?` is deliberate — a database that will not answer is reported
+        // as a failed read, never as a server without PHP.
+        let php_available = newest_installed_php(ctx.db()).await?.is_some();
+
         Ok(StatusOutput {
             enabled,
             url: enabled.then(adminer_url),
             php_version,
+            php_available,
             adminer_version: ADMINER_VERSION,
             pin_provenance: ADMINER_PIN_PROVENANCE,
         })
@@ -1313,6 +1344,65 @@ mod tests {
         let err = highest_installed_php(&db).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(err.detail.contains("Stack Manager"), "{}", err.detail);
+    }
+
+    /// A context over a mock distribution and an empty in-memory database —
+    /// enough for the two reads `db.adminer.status` makes.
+    async fn op_ctx() -> OpContext {
+        use crate::registry::Services;
+        use unihelm_core::{AuthContext, Role, TenantScope, UserId};
+
+        let distro =
+            unihelm_distro::mock::mock_distro_with_recorder(unihelm_distro::Family::Debian).0;
+        let db = Db::open_memory().await.unwrap();
+        let services = Arc::new(
+            Services::new(distro, db, unihelm_db::MasterKey::generate()).expect("templates"),
+        );
+        let auth = AuthContext::from_role(UserId(1), Role::Admin, TenantScope::Global, "req-test");
+        OpContext::new(services, auth)
+    }
+
+    #[tokio::test]
+    async fn the_status_read_answers_about_php_the_way_the_enable_path_decides_it() {
+        let ctx = op_ctx().await;
+
+        // A fresh server with no PHP. The status read used to answer only from
+        // the Adminer pool files on disk, which a server that has never
+        // enabled Adminer has none of — so it reported nothing wrong, the
+        // panel armed Enable, and the 202 it got back carried a task that
+        // refused with "no PHP version is installed". Nothing showed that
+        // refusal: the click simply looked like it had worked.
+        let before = Status.run(&ctx, StatusInput {}).await.unwrap();
+        assert!(
+            !before.php_available,
+            "enable would refuse here, so the status must say so before the click"
+        );
+        assert!(highest_installed_php(ctx.db()).await.is_err());
+
+        assert!(
+            ctx.db()
+                .claim_component("php8.3", ComponentStatus::Installing, "t")
+                .await
+                .unwrap()
+        );
+        ctx.db()
+            .component_installed("php8.3", Some("8.3.14"))
+            .await
+            .unwrap();
+
+        let after = Status.run(&ctx, StatusInput {}).await.unwrap();
+        assert!(
+            after.php_available,
+            "enable would install on PHP 8.3, so the button must arm"
+        );
+        assert_eq!(
+            highest_installed_php(ctx.db()).await.unwrap(),
+            PhpVersion::V83
+        );
+        // The two fields answer different questions and must not be derived
+        // from one another: installing PHP gives Adminer somewhere to run, and
+        // says nothing about which version this feature's own pool is on.
+        assert_eq!(before.php_version, after.php_version);
     }
 
     // --- disable ----------------------------------------------------------

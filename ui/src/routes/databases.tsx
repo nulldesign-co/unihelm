@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import {
   Check,
   Copy,
@@ -15,6 +16,7 @@ import {
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { TaskNotice } from "@/components/task-notice";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -36,6 +38,7 @@ import {
   dbNameProblem,
   DB_ENGINES,
   grantableUsers,
+  type AdminerStatus,
   type DatabaseRow,
   type DbEngine,
   type DbUserRow,
@@ -1139,6 +1142,42 @@ function CreateUserDialog({
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether Adminer's button would only spend a click on a refusal.
+ *
+ * Adminer is a PHP application: the agent installs it on the highest PHP
+ * version the Stack Manager has, and on a server with none it refuses. That
+ * refusal used to arrive *inside the task*, which is the least visible place a
+ * refusal can land — the button was armed on a fresh server, the click came
+ * back 202, and from the operator's side it worked and nothing happened.
+ * `db.adminer.status` now answers the PHP question the same way the enable path
+ * decides it, from installed components, so the row can say it beforehand.
+ *
+ * Only the enable direction is blocked. Disabling removes a vhost and a pool
+ * file and needs no interpreter, which is exactly what a server whose PHP has
+ * since been taken out still has to be able to do.
+ *
+ * Only an explicit `false` counts, and the field is read defensively for the
+ * reason every optional field on this wire is: an agent older than this panel
+ * does not send it, and reading a missing field as "no PHP" would disable
+ * Enable on a machine holding three versions — a refusal that is not even true.
+ * Not knowing therefore leaves the button armed, and the task notice on the
+ * card now carries the agent's own refusal if it turns out we were wrong.
+ */
+export function adminerEnableBlocked(status: AdminerStatusWire | undefined): boolean {
+  return status?.enabled !== true && status?.php_available === false;
+}
+
+/**
+ * The status read as it arrives, including the field this panel's own client
+ * type has not caught up with yet.
+ *
+ * An intersection rather than a change to `AdminerStatus`, which is not this
+ * page's to make; when the field lands there this stops adding anything and
+ * keeps compiling either way.
+ */
+type AdminerStatusWire = AdminerStatus & { php_available?: boolean };
+
+/**
  * Adminer's card.
  *
  * `db.adminer.*` is `ServerManage`, so a reseller holding only `DbManage` gets
@@ -1151,6 +1190,7 @@ function AdminerCard() {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [task, setTask] = useState<string | null>(null);
 
   const allowed = user?.permissions.includes("server_manage") ?? false;
 
@@ -1163,7 +1203,16 @@ function AdminerCard() {
 
   const toggle = useMutation({
     mutationFn: (enable: boolean) => databasesApi.setAdminer(enable),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["adminer"] }),
+    onSuccess: (accepted) => {
+      // Held, not discarded. Both directions are tasks: the 202 says only that
+      // the agent accepted the request, and everything that can go wrong
+      // afterwards — no PHP to run on, a download that failed its checksum, a
+      // pool nginx would not validate — is reported by the task and nowhere
+      // else. Throwing the id away left the operator watching a button stop
+      // spinning while nothing whatever happened.
+      setTask(accepted.task_id);
+      void queryClient.invalidateQueries({ queryKey: ["adminer"] });
+    },
     onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
   });
 
@@ -1178,6 +1227,7 @@ function AdminerCard() {
   if (!allowed) return null;
 
   const enabled = status.data?.enabled ?? false;
+  const cannotEnable = adminerEnableBlocked(status.data);
   // `url` is loopback. The tunnel command is what actually gets a browser to
   // it, so that — not the URL — is the thing with a copy button.
   const port = status.data?.url?.match(/:(\d+)/)?.[1] ?? "8806";
@@ -1196,6 +1246,11 @@ function AdminerCard() {
             variant={enabled ? "outline" : "primary"}
             size="sm"
             loading={status.isPending || toggle.isPending}
+            // Adminer is a PHP application and the agent refuses to install one
+            // without an interpreter. The row below says so and where to go;
+            // arming the button here only spends a click on a task that comes
+            // back red.
+            disabled={cannotEnable}
             onClick={() => {
               setError(null);
               toggle.mutate(!enabled);
@@ -1227,6 +1282,54 @@ function AdminerCard() {
                 </Badge>
               ) : null}
             </div>
+
+            {/* Said on the card rather than left to the task, because it is
+                knowable before the click: the agent decides which PHP to
+                install Adminer on from the components the Stack Manager has
+                installed, and on a fresh server that list is empty. The link is
+                the whole of the answer — there is nothing to fix here. */}
+            {cannotEnable ? (
+              <Callout
+                tone="info"
+                title={t("databases.adminerNeedsPhpTitle")}
+                action={
+                  <Link
+                    to="/stack"
+                    className="font-medium text-accent transition-colors hover:underline"
+                  >
+                    {t("databases.adminerNeedsPhpLink")}
+                  </Link>
+                }
+              >
+                {t("databases.adminerNeedsPhp")}
+              </Callout>
+            ) : null}
+
+            {task ? (
+              // Where the operation's own refusals land. Enabling downloads a
+              // release, verifies it against a pinned checksum, creates an
+              // account, writes a pool and a vhost and reloads two services —
+              // and every one of those can refuse. Without this the card showed
+              // a button that finished and a status that had not changed.
+              <TaskNotice
+                // Keyed on the id: a failed notice stays on the card, so the
+                // next attempt lands on the same mounted component — and its
+                // `onSettled` fires once per mount. Without a key the second
+                // task would settle silently, leaving the badge above it
+                // reporting "Not installed" over an Adminer that is now
+                // serving.
+                key={task}
+                taskId={task}
+                onSettled={(taskStatus) => {
+                  void queryClient.invalidateQueries({ queryKey: ["adminer"] });
+                  // A failed task stays on screen: its message is the reason
+                  // the id is held at all, and clearing the notice as it
+                  // settles would take the sentence away in the instant it
+                  // arrived. The next click replaces it.
+                  if (taskStatus === "ok") setTask(null);
+                }}
+              />
+            ) : null}
 
             {/* Not a link. Adminer binds 127.0.0.1 because nginx cannot check a
                 Unihelm session cookie, so publishing a database login form on a

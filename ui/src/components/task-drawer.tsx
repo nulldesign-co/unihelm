@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, endpoints, type Task, type TaskStatus } from "@/lib/api";
 import { useEventStream } from "@/lib/events";
 import { useFocusTrap } from "@/lib/focus";
+import { cn } from "@/lib/utils";
 
 export const TONE: Record<TaskStatus, "neutral" | "accent" | "success" | "danger" | "warning"> = {
   queued: "neutral",
@@ -154,6 +155,27 @@ export function TaskDrawer({ open, onClose }: { open: boolean; onClose: () => vo
 }
 
 /**
+ * What the server derived this task acted on — `php 8.3`, `shop.example.com`.
+ *
+ * Read off the row defensively rather than through `Task`, because the field is
+ * new: a tab left open across an upgrade, or a panel talking to an agent that
+ * has not learned to send it, gets rows without one. A missing or blank subject
+ * is `null` and the row shows the op name alone, which is what every row showed
+ * before this existed.
+ *
+ * The task's `input` is deliberately *not* consulted here even when it arrives:
+ * it is stored exactly as the caller sent it, so rendering it would put relay
+ * and SFTP passwords on screen. The server picks the naming field; this only
+ * displays it.
+ */
+export function taskSubject(task: Task): string | null {
+  const subject = (task as { subject?: unknown }).subject;
+  if (typeof subject !== "string") return null;
+  const trimmed = subject.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/**
  * One row of the list, used by the drawer and by the history page.
  *
  * `showActions` is off in the drawer on purpose: the drawer is a glance at what
@@ -172,6 +194,7 @@ export function TaskRow({
   showActions?: boolean;
 }) {
   const { t, i18n } = useTranslation();
+  const subject = taskSubject(task);
 
   return (
     <li>
@@ -183,7 +206,18 @@ export function TaskRow({
         <Badge tone={TONE[task.status]} dot={task.status === "running"}>
           {t(`tasks.status.${task.status}`)}
         </Badge>
-        <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{task.op}</span>
+        {/* Six `stack.install` rows were six identical lines. The op still
+            leads — it is what the filter above offers and what a support
+            thread quotes — but the subject beside it is what tells the
+            operator which of the six this one was. */}
+        <span className="flex min-w-0 flex-1 items-baseline gap-2">
+          <span className={cn("truncate font-mono text-xs", subject ? "text-ink-muted" : "text-ink")}>
+            {task.op}
+          </span>
+          {subject ? (
+            <span className="min-w-0 flex-1 truncate text-xs text-ink">{subject}</span>
+          ) : null}
+        </span>
         <time className="shrink-0 text-xs text-ink-subtle" dateTime={task.created_at}>
           {new Date(task.created_at).toLocaleTimeString(i18n.language)}
         </time>
@@ -198,7 +232,8 @@ export function TaskRow({
           aria-valuenow={Math.round(task.progress)}
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-label={task.op}
+          // "restore 43%" is only useful if the label says which restore.
+          aria-label={subject ? `${task.op} ${subject}` : task.op}
           className="mx-5 mb-2 h-1 overflow-hidden rounded-full bg-surface-muted"
         >
           <div

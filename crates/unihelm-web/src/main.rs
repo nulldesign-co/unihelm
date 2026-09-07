@@ -270,6 +270,138 @@ fn csp_header() -> HeaderValue {
     HeaderValue::from_str(&policy).expect("the policy is ascii")
 }
 
+/// Refuse a request whose `Host` is not one this panel answers on.
+///
+/// Any `Host` at all used to be served. Today the only thing that reads the
+/// header is per-host branding, which falls back to the panel default and
+/// treats the value as untrusted, so the immediate damage was small — but "any
+/// Host is served" is the standing precondition for the two attacks that follow
+/// from it: a cache in front of the panel keyed on a forged host, and any
+/// absolute URL built from the header, which is how password-reset links get
+/// sent to somebody else's domain. Closing it now costs one comparison; closing
+/// it after the first such link exists costs an incident.
+///
+/// 421 rather than 404, because 421 is the status that means exactly this — the
+/// request reached a server that does not answer for that authority — and a 404
+/// would tell an operator debugging a proxy that their *path* was wrong.
+///
+/// # The gap this deliberately leaves
+///
+/// **Every IP-literal `Host` is accepted**, not only the addresses this process
+/// can see on itself. A fresh install is reached at `https://<address>:8088`
+/// before any domain exists, and the panel cannot enumerate the addresses it is
+/// actually reached on: behind one-to-one NAT, a floating IP, or an IPv6
+/// privacy address, the address the operator types appears on no local
+/// interface and in no setting. Refusing an address we could not account for
+/// would lock the operator out of their own new server, which is a worse and far
+/// more likely failure than the header forgery this narrows. So an attacker can
+/// still forge an IP-shaped `Host`; they cannot forge a *domain*, which is what
+/// a poisoned cache key and a phishing link both need.
+async fn host_is_served(
+    axum::extract::State(state): axum::extract::State<state::SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let claimed = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        // HTTP/2 has no `Host` line: the authority arrives as a pseudo-header
+        // and hyper puts it in the URI.
+        .or_else(|| request.uri().host().map(str::to_string));
+
+    let Some(claimed) = claimed else {
+        // Nothing was claimed, so there is nothing to forge — the branding
+        // lookup falls back to the panel default and no URL can be built out of
+        // a header that is not there.
+        return next.run(request).await;
+    };
+
+    if host_is_ours(&state, &claimed).await {
+        return next.run(request).await;
+    }
+
+    tracing::warn!(host = %claimed, "refused a request for a Host this panel does not serve");
+    (
+        axum::http::StatusCode::MISDIRECTED_REQUEST,
+        axum::Json(crate::error::ApiErrorBody {
+            code: unihelm_core::ErrorCode::InvalidInput.code(),
+            slug: unihelm_core::ErrorCode::InvalidInput.slug(),
+            message: format!(
+                "this panel does not answer for `{claimed}`. It serves its own domain, any \
+                 white-label login host, localhost, and this server's addresses — point the \
+                 client (or the proxy in front of it) at one of those, or set the panel's \
+                 domain with `unihelm cert panel <domain>`."
+            ),
+            field: Some("Host".into()),
+            request_id: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Is `claimed` a name this panel is served under?
+///
+/// Read per request rather than snapshotted at startup: `unihelm cert panel`
+/// and a reseller's branding both change the answer while the process is
+/// running, and a snapshot would mean the operator who has just attached a
+/// domain is told the panel does not serve it until somebody restarts it. The
+/// cost is a settings lookup — one indexed row — and only for a `Host` that is
+/// neither localhost nor an address.
+async fn host_is_ours(state: &state::AppState, claimed: &str) -> bool {
+    // The same normalisation the branding lookup stores and compares with:
+    // lowercased, port stripped, IPv6 brackets kept, trailing dot removed.
+    // Comparing a raw header against a stored value would make the allowlist
+    // mean "only on the default port", which is precisely the lockout to avoid.
+    let host = unihelm_db::branding::normalize_login_host(claimed);
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" {
+        return true;
+    }
+    // See the note on the gap above: any address, not just ours.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
+    match state
+        .db
+        .get_setting::<String>(unihelm_db::panel::DOMAIN_KEY)
+        .await
+    {
+        Ok(Some(domain)) if unihelm_db::branding::normalize_login_host(&domain) == host => {
+            return true;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Fail open, and say so. A database hiccup must not turn into "the
+            // panel serves nothing": the header is not a credential, and the
+            // worst an accepted forgery does today is show the default logo.
+            tracing::warn!(error = %e, host = %host,
+                "could not read the panel domain; allowing this Host rather than refusing every request");
+            return true;
+        }
+    }
+
+    match state.db.branding_for_login_host(&host).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(error = %e, host = %host,
+                "could not read the branding hosts; allowing this Host rather than refusing every request");
+            true
+        }
+    }
+}
+
 fn build_router(state: state::SharedState) -> Router {
     let security_headers = tower::ServiceBuilder::new()
         // The panel loads nothing from anywhere else, so the policy can be
@@ -294,6 +426,14 @@ fn build_router(state: state::SharedState) -> Router {
     Router::new()
         .merge(routes::api())
         .fallback(ui::serve)
+        // Inside the security headers and the tracing span, outside every
+        // route and the UI fallback: a refusal still carries the panel's
+        // headers, and its warning is logged inside the request's own span, so
+        // it comes out with the same request id as everything else on it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            host_is_served,
+        ))
         .layer(security_headers)
         .layer(CompressionLayer::new())
         // The file manager carries file content in its JSON, so it gets its
@@ -391,5 +531,143 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
         _ = term => tracing::info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+    use unihelm_db::Db;
+
+    async fn state() -> state::SharedState {
+        let db = Db::open_memory().await.expect("in-memory panel database");
+        Arc::new(state::AppState::new(db, UnihelmConfig::default()))
+    }
+
+    /// One request through the whole router, claiming `host`.
+    async fn with_host(state: &state::SharedState, host: &str) -> StatusCode {
+        let request = Request::builder()
+            .uri("/api/branding")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .expect("a valid test request");
+        build_router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("the router answers")
+            .status()
+    }
+
+    /// Issue 58: every `Host` was served. Only branding read the header, so
+    /// nothing was directly exploitable yet — but a cache keyed on a forged
+    /// host, or the first absolute URL built from it (a password-reset link is
+    /// the classic), turns that into somebody else's domain in the panel's own
+    /// mail.
+    #[tokio::test]
+    async fn a_host_this_panel_does_not_serve_is_refused_with_421() {
+        let state = state().await;
+        let status = with_host(&state, "attacker.example").await;
+        assert_eq!(
+            status,
+            StatusCode::MISDIRECTED_REQUEST,
+            "421 is the status that says `not this host`; 404 would send an \
+             operator looking at their paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_the_host_that_was_sent() {
+        let state = state().await;
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/branding")
+                    .header(header::HOST, "attacker.example")
+                    .body(Body::empty())
+                    .expect("a valid test request"),
+            )
+            .await
+            .expect("the router answers");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("a bounded body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("attacker.example"),
+            "an operator debugging a proxy needs to see what was sent: {body}"
+        );
+    }
+
+    /// The lockout this must never cause: a fresh install has no domain and is
+    /// reached at `https://<address>:8088`, and the address it is reached on is
+    /// routinely one this process cannot see on itself — behind NAT, a floating
+    /// IP, or IPv6 privacy addressing.
+    #[tokio::test]
+    async fn an_address_host_always_works_because_that_is_how_a_new_server_is_reached() {
+        let state = state().await;
+        for reachable in [
+            "127.0.0.1:8088",
+            "localhost:8088",
+            "LOCALHOST",
+            "203.0.113.10",
+            "203.0.113.10:8088",
+            "[2001:db8::1]:8088",
+            "[::1]",
+        ] {
+            assert_ne!(
+                with_host(&state, reachable).await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "`{reachable}` must keep working"
+            );
+        }
+    }
+
+    /// Attaching a domain must take effect on the next request, not the next
+    /// restart — otherwise `unihelm cert panel <domain>` hands the operator a
+    /// panel that refuses the domain it has just been given a certificate for.
+    #[tokio::test]
+    async fn the_panel_domain_and_a_branding_login_host_are_both_served() {
+        let state = state().await;
+        assert_eq!(
+            with_host(&state, "panel.example.com").await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+
+        state
+            .db
+            .set_setting(
+                unihelm_db::panel::DOMAIN_KEY,
+                &"panel.example.com".to_string(),
+            )
+            .await
+            .expect("the setting stores");
+        assert_ne!(
+            with_host(&state, "Panel.Example.COM:8443").await,
+            StatusCode::MISDIRECTED_REQUEST,
+            "a hostname is case-insensitive and the port is not part of it"
+        );
+
+        state
+            .db
+            .save_branding(
+                unihelm_db::branding::PANEL_DEFAULT,
+                unihelm_db::BrandingUpdate {
+                    login_host: Some("panel.acme.example".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("branding stores");
+        assert_ne!(
+            with_host(&state, "panel.acme.example").await,
+            StatusCode::MISDIRECTED_REQUEST,
+            "a reseller's white-label login host is one this panel answers on"
+        );
     }
 }

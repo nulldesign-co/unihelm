@@ -29,6 +29,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import {
+  api,
   ApiError,
   endpoints,
   type BanRecord,
@@ -101,6 +102,11 @@ export function FirewallPage() {
           {/* Sentinel needs the backend's *state*, not only its name: a ban it
               records while the firewall is stopped is enforced by nobody. */}
           <SentinelCard backend={firewall.data!.backend} active={firewall.data!.active} />
+          {/* Last, and a different layer: everything above filters packets,
+              this is a rule engine reading HTTP. It reads its own endpoint
+              because it can be unavailable for a reason nothing above it knows
+              about — which web server is answering port 80. */}
+          <WafCard />
         </>
       )}
     </div>
@@ -1565,5 +1571,228 @@ function SentinelForm({
         ) : null}
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// the web application firewall
+// ---------------------------------------------------------------------------
+
+/** One reason the WAF cannot run here, in the agent's own words. */
+export interface WafBlocker {
+  /** Stable and machine-readable; the two sentences beside it are what is shown. */
+  code: string;
+  detail: string;
+  remedy: string;
+}
+
+/**
+ * The part of `waf.status` this card reads.
+ *
+ * Declared here rather than in the shared client because the card decides with
+ * six fields out of a payload that also carries the module search path, the
+ * pinned Core Rule Set checksum and its provenance, every per-site policy and
+ * the exclusion list. Mirroring all of that would be a second copy of the
+ * agent's output free to drift from it; these six are the ones a decision is
+ * made on, and a missing one is a type error here rather than a blank line on
+ * screen.
+ */
+export interface WafStatus {
+  /** What an operator asked for — not, on its own, what is happening. */
+  enabled: boolean;
+  /** Whether this server could run a WAF at all. */
+  available: boolean;
+  /** `nginx`, `apache` or `litespeed`: what actually serves the sites. */
+  web_server: string;
+  blockers: WafBlocker[];
+  /** `detect`, `block` or `off`. */
+  default_mode: string;
+  default_paranoia: number;
+}
+
+const fetchWaf = () => api.get<WafStatus>("/api/waf");
+
+/**
+ * What this card has to say, in the order that matters.
+ *
+ * `claimed` is the state it exists for, and the one the panel used to draw as
+ * an ordinary enabled WAF. The rules are nginx's — written for nginx's
+ * ModSecurity connector, checked with `nginx -t`, activated by reloading nginx
+ * — so on a machine Apache serves, or on one whose connector has gone, the
+ * setting says on and not one request is inspected. That reads worse than
+ * `off`, because `off` is true.
+ */
+export type WafState = "claimed" | "unavailable" | "on" | "off";
+
+export function wafState(status: WafStatus): WafState {
+  if (!status.available) return status.enabled ? "claimed" : "unavailable";
+  return status.enabled ? "on" : "off";
+}
+
+/** A 403 here is a permission this operator does not hold, not a broken WAF. */
+function isForbidden(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403;
+}
+
+function WafCard() {
+  const { t } = useTranslation();
+  const waf = useQuery({ queryKey: ["waf"], queryFn: fetchWaf });
+
+  // Two silences, both deliberate. A build with no `/api/waf` has no WAF to be
+  // honest about, and an operator who manages the firewall but not the server
+  // was never going to be shown this control at all — a red box for either
+  // would be the page inventing a fault out of its own configuration.
+  if (waf.error && (isRouteMissing(waf.error) || isForbidden(waf.error))) return null;
+
+  return (
+    <Card>
+      <CardHeader
+        title={t("firewall.waf.title", { defaultValue: "Web application firewall" })}
+        description={t("firewall.waf.hint", {
+          defaultValue:
+            "ModSecurity and the OWASP Core Rule Set, reading requests before a site answers them.",
+        })}
+      />
+      <CardBody>
+        {waf.isPending ? (
+          <Skeleton className="h-24 w-full rounded-card" />
+        ) : waf.error ? (
+          <Callout tone="danger">
+            {waf.error instanceof ApiError ? waf.error.message : String(waf.error)}
+          </Callout>
+        ) : (
+          <WafBody status={waf.data!} />
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * Four states, four sentences, and a switch on none of them.
+ *
+ * There is deliberately nothing to click here. `waf.enable` refuses on every
+ * server that cannot load the connector and on every server nginx does not
+ * serve, so a toggle would be a control whose only outcome is a refusal — the
+ * same reason the nftables backend gets no start button above.
+ */
+function WafBody({ status }: { status: WafStatus }) {
+  const { t } = useTranslation();
+  const state = wafState(status);
+
+  // The agent's words, verbatim, for the reason the start-firewall refusal is
+  // shown verbatim: each blocker names what is serving, what reads the
+  // configuration and what enabling it anyway would have cost. A sentence
+  // written here could only be a second copy of that, free to go stale.
+  const reasons = status.blockers.map((blocker) => (
+    <p key={blocker.code} className="mt-1">
+      {blocker.detail} {blocker.remedy}
+    </p>
+  ));
+
+  if (state === "claimed") {
+    return (
+      <Callout
+        tone="danger"
+        title={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {t("firewall.waf.claimedTitle", {
+              defaultValue: "The WAF is recorded as on, and nothing is inspecting requests",
+            })}
+            <Badge tone="danger" dot>
+              {t("firewall.waf.badge.claimed", { defaultValue: "Not enforced" })}
+            </Badge>
+          </span>
+        }
+      >
+        <p>
+          {t("firewall.waf.claimedBody", {
+            defaultValue:
+              "This server holds a WAF setting nothing on it can act on. Requests are " +
+              "reaching your sites unexamined, and the mode and paranoia level recorded " +
+              "here are an intention, not a protection.",
+          })}
+        </p>
+        {reasons}
+      </Callout>
+    );
+  }
+
+  if (state === "unavailable") {
+    return (
+      <Callout
+        tone="warning"
+        title={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {t("firewall.waf.unavailableTitle", {
+              defaultValue: "The WAF cannot run on this server",
+            })}
+            <Badge tone="warning" dot>
+              {t("firewall.waf.badge.unavailable", { defaultValue: "Unavailable" })}
+            </Badge>
+          </span>
+        }
+      >
+        <p>
+          {t("firewall.waf.unavailableBody", {
+            defaultValue:
+              "Nothing is broken and nothing is pretending otherwise: the WAF is off, and " +
+              "turning it on here would be refused rather than half done.",
+          })}
+        </p>
+        {reasons}
+      </Callout>
+    );
+  }
+
+  const mode = t(`firewall.waf.mode.${status.default_mode}`, {
+    defaultValue: status.default_mode,
+  });
+
+  if (state === "on") {
+    return (
+      <Callout
+        tone="success"
+        title={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            {t("firewall.waf.onTitle", { defaultValue: "The WAF is inspecting requests" })}
+            <Badge tone="success" dot>
+              {t("firewall.waf.badge.on", { defaultValue: "Enforced" })}
+            </Badge>
+          </span>
+        }
+      >
+        <p>
+          {t("firewall.waf.onBody", {
+            mode,
+            level: status.default_paranoia,
+            defaultValue:
+              "Sites without a policy of their own are handled in {{mode}} mode at paranoia " +
+              "level {{level}}.",
+          })}
+        </p>
+      </Callout>
+    );
+  }
+
+  return (
+    <Callout
+      tone="info"
+      title={
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          {t("firewall.waf.offTitle", { defaultValue: "The WAF is off" })}
+          <Badge dot>{t("firewall.waf.badge.off", { defaultValue: "Off" })}</Badge>
+        </span>
+      }
+    >
+      <p>
+        {t("firewall.waf.offBody", {
+          defaultValue:
+            "No request is being inspected by ModSecurity. This is the shipped state — the " +
+            "rule set has not met this server's traffic yet, and an untuned rule set rejects " +
+            "real visitors as readily as attackers.",
+        })}
+      </p>
+    </Callout>
   );
 }

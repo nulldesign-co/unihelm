@@ -274,6 +274,7 @@ use serde::{Deserialize, Serialize};
 use unihelm_core::{ErrorCode, Permission, Result, UnihelmError};
 use unihelm_distro::Family;
 
+use crate::catalogue;
 use crate::registry::{Execution, OpContext, TypedOperation};
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -422,6 +423,34 @@ enum Plan {
     },
 }
 
+/// The Node majors still worth installing, as an operator reads them:
+/// `26, 24 or 22`.
+///
+/// Taken from the catalogue rather than written out here. Written out, this
+/// sentence said "20, 22 or 24" months after Node 20 went end of life and Node
+/// 26 shipped — and a refusal that names a dead line is worse than one that
+/// names nothing, because somebody will type what it told them to.
+fn node_lines_on_offer() -> String {
+    let lines: Vec<&str> = catalogue::entry("node")
+        .map(|e| {
+            e.versions
+                .iter()
+                .filter(|v| !v.eol)
+                .map(|v| v.version)
+                .collect()
+        })
+        .unwrap_or_default();
+    match lines.split_last() {
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        // Unreachable while Node is catalogued, and a vague clause beats an
+        // invented number if it ever is not: a hint nobody can act on is
+        // annoying, a hint that names a line NodeSource never published sends
+        // the operator to a 404 halfway through an apt update.
+        None => "a major NodeSource still publishes".to_string(),
+    }
+}
+
 /// Work out what installing `runtime` at `version` would mean on this family.
 fn plan(runtime: Runtime, version: Option<&str>, family: Family) -> Result<Plan> {
     match runtime {
@@ -429,15 +458,21 @@ fn plan(runtime: Runtime, version: Option<&str>, family: Family) -> Result<Plan>
             let Some(version) = version else {
                 return Err(UnihelmError::new(
                     ErrorCode::InvalidInput,
-                    "Node needs a major line — 20, 22 or 24. The distribution's own \
-                     `nodejs` is not what this installs.",
+                    format!(
+                        "Node needs a major line — {}. The distribution's own `nodejs` is \
+                         not what this installs.",
+                        node_lines_on_offer()
+                    ),
                 )
                 .with_field("version"));
             };
             let major: u32 = version.parse().map_err(|_| {
                 UnihelmError::new(
                     ErrorCode::InvalidInput,
-                    format!("`{version}` is not a Node major line; use a number, such as 22."),
+                    format!(
+                        "`{version}` is not a Node major line; use a plain major number — {}.",
+                        node_lines_on_offer()
+                    ),
                 )
                 .with_field("version")
             })?;
@@ -445,12 +480,19 @@ fn plan(runtime: Runtime, version: Option<&str>, family: Family) -> Result<Plan>
             // odd ones are current; below 18 is out of support everywhere, and a
             // number in the hundreds is a typo that would otherwise become a 404
             // halfway through an apt update.
+            //
+            // Wider than the catalogue on purpose: `repos::nodesource` builds
+            // the repository from the major, so a line that shipped after this
+            // build still installs here. The catalogue is what the Stack page
+            // offers; this is what the operation will accept from somebody who
+            // knows what they are asking for, and it is the only reason a stale
+            // build is not a dead end.
             if !(18..=40).contains(&major) {
                 return Err(UnihelmError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "Node {major} is not a line anyone ships. Use a current major, \
-                         such as 22."
+                        "Node {major} is not a line anyone ships. Use a current major — {}.",
+                        node_lines_on_offer()
                     ),
                 )
                 .with_field("version"));
@@ -899,6 +941,42 @@ mod tests {
                 Plan::NodeSource {
                     major: major.parse().unwrap()
                 }
+            );
+        }
+    }
+
+    /// The refusal used to spell its own list of majors — "20, 22 or 24" — and
+    /// by the time Node 26 shipped it was telling operators to install a line
+    /// upstream had ended in April. It reads the catalogue now, so the sentence
+    /// and the Stack page cannot say different things.
+    #[test]
+    fn the_majors_a_node_refusal_names_are_the_ones_the_catalogue_still_offers() {
+        let err = plan(Runtime::Node, None, Family::Debian)
+            .expect_err("Node with no major line has to be refused");
+        assert!(
+            err.detail.contains("26, 24 or 22"),
+            "the refusal has to name lines somebody can actually install: {}",
+            err.detail
+        );
+
+        // And it names them because the catalogue does, rather than by
+        // coincidence: every live major appears, every ended one does not.
+        let names = |major: &str| {
+            err.detail
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|token| token == major)
+        };
+        for v in catalogue::entry("node")
+            .expect("node is catalogued")
+            .versions
+        {
+            assert_eq!(
+                names(v.version),
+                !v.eol,
+                "Node {} is {} and the refusal disagrees: {}",
+                v.version,
+                if v.eol { "over" } else { "still shipping" },
+                err.detail
             );
         }
     }

@@ -40,6 +40,21 @@
 //! to load it from — an operator's own build, a distro nginx, the future Unihelm
 //! repo — and it configures, validates and reloads like any other nginx change.
 //!
+//! # And all of it is nginx, on a machine that may not be running nginx
+//!
+//! Every line below writes for nginx: the connector's directives, `nginx -t` as
+//! the validator, an nginx reload as the activation. Unihelm has served with
+//! Apache since 0.7, and none of that reaches httpd. Until 0.7.2 the panel said
+//! so in one direction only — `webserver::server_gaps` warned that switching
+//! *away* from nginx would leave the WAF showing as enabled while nothing
+//! inspected a request — and said nothing in the other: enabling the WAF on a
+//! machine already on Apache ran the whole way through, rendering rules for a
+//! connector httpd does not read and reloading an nginx that was not serving,
+//! then reporting success. The Firewall page showed a protection that was not
+//! there, at the paranoia level somebody had chosen. [`assess`] now takes the
+//! serving web server as its first fact and blocks on anything but nginx, which
+//! is the same refusal path the missing module already used.
+//!
 //! # How per-site policy works without touching a single vhost
 //!
 //! ModSecurity's nginx directives are valid at http, server and location level,
@@ -78,6 +93,7 @@ use unihelm_distro::{Cmd, Family};
 
 use crate::registry::{Execution, OpContext, TypedOperation};
 use crate::services::{NginxValidator, UnitReloader};
+use crate::webserver::WebServer;
 
 // ---------------------------------------------------------------------------
 // The pinned Core Rule Set
@@ -305,6 +321,9 @@ pub struct Blocker {
 /// Everything the panel knows about whether a WAF can run here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Preflight {
+    /// The server that actually serves this machine's sites. First, because it
+    /// decides whether any of the rest is even the right question.
+    pub web_server: WebServer,
     pub module: ModuleState,
     pub load: LoadPlan,
     pub candidates: &'static [ModuleCandidate],
@@ -317,11 +336,59 @@ impl Preflight {
     }
 }
 
-/// Turn the two observed facts into blockers. Pure; see [`preflight`] for the
-/// version that goes to disk.
-pub fn assess(family: Family, module: ModuleState, load: LoadPlan) -> Preflight {
+/// Turn the observed facts into blockers. Pure; see [`preflight`] for the
+/// version that goes to disk and asks the database which server is serving.
+pub fn assess(
+    web_server: WebServer,
+    family: Family,
+    module: ModuleState,
+    load: LoadPlan,
+) -> Preflight {
     let candidates = module_candidates(family);
     let mut blockers = Vec::new();
+
+    // First, and on its own: on a machine nginx does not serve, nothing below
+    // is the right question. The wording is `webserver::server_gaps`', because
+    // it is the same fact read from the other end — that gap warns before a
+    // switch away from nginx, this blocker refuses an enable after one.
+    if web_server != WebServer::Nginx {
+        blockers.push(Blocker {
+            code: "not_nginx",
+            detail: format!(
+                "this machine serves its sites with {name}. The WAF is nginx-only \
+                 end to end: its rules are loaded by nginx's ModSecurity connector, \
+                 checked with `nginx -t` and activated by reloading nginx, and \
+                 {name} reads none of that. Enabling it here would write files \
+                 nothing loads and reload a server that is not serving, while the \
+                 Firewall page showed the WAF as on at the paranoia level you \
+                 chose — with no request being inspected.",
+                name = web_server.display_name()
+            ),
+            remedy: format!(
+                "Switch this machine back to nginx and enable the WAF there, or \
+                 leave it off. {name} can run ModSecurity through a connector of \
+                 its own, but that is a different module with its own \
+                 configuration and Unihelm writes none of it — so there is nothing \
+                 in this build that would inspect a request on an {name} server.",
+                name = web_server.display_name()
+            ),
+        });
+    }
+
+    // The two module blockers are about nginx's module directory and nginx's
+    // own `nginx.conf`, so on a machine nginx does not serve they would send an
+    // operator off to install a connector that still would not be read. Same
+    // rule as the `load` blocker below: report the problem that has to be
+    // solved first, not every problem that exists.
+    if web_server != WebServer::Nginx {
+        return Preflight {
+            web_server,
+            module,
+            load,
+            candidates,
+            blockers,
+        };
+    }
 
     if !module.is_present() {
         let ModuleState::Absent { searched } = &module else {
@@ -382,6 +449,7 @@ pub fn assess(family: Family, module: ModuleState, load: LoadPlan) -> Preflight 
     }
 
     Preflight {
+        web_server,
         module,
         load,
         candidates,
@@ -390,14 +458,25 @@ pub fn assess(family: Family, module: ModuleState, load: LoadPlan) -> Preflight 
 }
 
 /// The preflight against this machine.
-pub fn preflight(family: Family) -> Preflight {
+///
+/// The serving web server is asked for first, and its failure is propagated
+/// rather than assumed away: [`crate::webserver::active`] errors only when the
+/// record exists and cannot be read, and a machine that might be on Apache is
+/// exactly the machine this preflight must not guess about.
+pub async fn preflight(ctx: &OpContext) -> Result<Preflight> {
+    let web_server = crate::webserver::active(ctx).await?;
     let module = module_state();
     let nginx_conf = std::fs::read_to_string(paths::nginx_conf()).unwrap_or_default();
     let dropins = match main_context_include(&nginx_conf) {
         Some(glob) => read_dropins(&glob),
         None => Vec::new(),
     };
-    assess(family, module, plan_module_load(&nginx_conf, &dropins))
+    Ok(assess(
+        web_server,
+        ctx.distro().info.family,
+        module,
+        plan_module_load(&nginx_conf, &dropins),
+    ))
 }
 
 /// Read every file in the directory a main-context include glob names.
@@ -1132,8 +1211,16 @@ pub struct StatusOutput {
     pub enabled: bool,
     /// Whether this server could run a WAF at all. `false` with a populated
     /// `blockers` is the honest answer on a stock Unihelm server today.
+    ///
+    /// `enabled: true` beside `available: false` is the state the Firewall page
+    /// has to shout about rather than draw as a green switch: the setting says
+    /// on, and nothing is inspecting a request.
     pub available: bool,
     pub blockers: Vec<Blocker>,
+    /// What actually serves this machine's sites. Reported even when it is
+    /// nginx, so a client can say "unavailable on Apache" without having to
+    /// parse a blocker's prose to find out which server it means.
+    pub web_server: WebServer,
     pub module: ModuleState,
     pub load: LoadPlan,
     pub candidates: &'static [ModuleCandidate],
@@ -1161,7 +1248,7 @@ impl TypedOperation for Status {
     async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
         let db = ctx.db();
         let settings = WafSettings::load(db).await;
-        let pre = preflight(ctx.distro().info.family);
+        let pre = preflight(ctx).await?;
         let views = site_views(db).await?;
         let exclusions = db.waf_exclusions().await.map_err(UnihelmError::from)?;
 
@@ -1182,6 +1269,7 @@ impl TypedOperation for Status {
             enabled: settings.enabled,
             available: pre.is_available(),
             blockers: pre.blockers.clone(),
+            web_server: pre.web_server,
             module: pre.module.clone(),
             load: pre.load.clone(),
             candidates: pre.candidates,
@@ -1273,8 +1361,10 @@ impl TypedOperation for Enable {
 
         // The preflight comes first and applies to both scopes. Enabling a
         // site's policy on a server whose WAF cannot load would write a rules
-        // file nothing reads and report success.
-        let pre = preflight(ctx.distro().info.family);
+        // file nothing reads and report success — and since 0.7.2 that includes
+        // the case where the machine serves with Apache, where every file below
+        // is written for a connector httpd never opens.
+        let pre = preflight(ctx).await?;
         if !pre.is_available() {
             return Err(refusal(&pre.blockers));
         }
@@ -1673,6 +1763,7 @@ http {
     fn a_missing_module_blocks_enabling_on_both_families_and_names_the_package() {
         for family in [Family::Debian, Family::Rhel] {
             let pre = assess(
+                WebServer::Nginx,
                 family,
                 ModuleState::Absent {
                     searched: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
@@ -1702,6 +1793,7 @@ http {
     #[test]
     fn a_present_module_with_nowhere_to_load_it_is_its_own_blocker() {
         let pre = assess(
+            WebServer::Nginx,
             Family::Rhel,
             ModuleState::Present {
                 path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
@@ -1718,6 +1810,7 @@ http {
     #[test]
     fn a_present_module_with_somewhere_to_load_it_is_available() {
         let pre = assess(
+            WebServer::Nginx,
             Family::Debian,
             ModuleState::Present {
                 path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
@@ -1732,6 +1825,64 @@ http {
              feature must work; the refusal is about this server, not about \
              the implementation"
         );
+    }
+
+    #[test]
+    fn a_machine_that_serves_with_apache_cannot_run_this_waf_however_good_its_module_is() {
+        // The whole point of the fix: a perfect nginx connector on disk, in a
+        // directory nginx would happily load it from, and it is still not a WAF
+        // — because httpd is what answers port 80 and httpd never reads any of
+        // it. Before this, these same three facts made the preflight available
+        // and `waf.enable` went all the way to "success".
+        for server in [WebServer::Apache, WebServer::Litespeed] {
+            let pre = assess(
+                server,
+                Family::Debian,
+                ModuleState::Present {
+                    path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
+                },
+                LoadPlan::Dropin {
+                    path: "/etc/nginx/modules-enabled/50-unihelm-modsecurity.conf".into(),
+                },
+            );
+            assert!(!pre.is_available(), "{server:?}");
+            assert_eq!(
+                pre.blockers.iter().map(|b| b.code).collect::<Vec<_>>(),
+                vec!["not_nginx"],
+                "the serving web server is the problem to solve first; a module \
+                 blocker beside it would send an operator off to install a \
+                 connector that still would not be read"
+            );
+            let text = format!("{:?}", pre.blockers);
+            assert!(
+                text.contains(server.display_name()),
+                "the refusal must name the server that is actually serving: {text}"
+            );
+            assert!(
+                text.contains("no request being inspected"),
+                "and say what enabling it anyway would have cost: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_module_on_apache_reports_the_web_server_not_the_module() {
+        // The stock case an operator on Apache actually meets. Two true
+        // blockers, one of which is unfixable-by-them noise: installing a
+        // connector for an nginx that is not serving changes nothing.
+        let pre = assess(
+            WebServer::Apache,
+            Family::Rhel,
+            ModuleState::Absent {
+                searched: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
+            },
+            LoadPlan::Nowhere,
+        );
+        assert_eq!(
+            pre.blockers.iter().map(|b| b.code).collect::<Vec<_>>(),
+            vec!["not_nginx"]
+        );
+        assert_eq!(pre.web_server, WebServer::Apache);
     }
 
     // -- rendering ----------------------------------------------------------
@@ -1992,6 +2143,82 @@ http {
         let settings = WafSettings::load(&reg.services().db).await;
         assert!(!settings.enabled);
         assert_eq!(settings.default_mode, WafMode::Detect);
+    }
+
+    #[tokio::test]
+    async fn enabling_the_waf_where_apache_is_serving_refuses_and_changes_nothing() {
+        use crate::registry::testing::{auth_for, registry};
+        use unihelm_core::Role;
+
+        let (reg, admin, _) = registry().await;
+        reg.services()
+            .db
+            .set_setting(crate::webserver::WEB_SERVER_SETTING, &WebServer::Apache)
+            .await
+            .unwrap();
+
+        let err = reg
+            .dispatch(
+                "waf.enable",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "mode": "block", "paranoia_level": 3 }),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(
+            err.detail.contains("not_nginx"),
+            "the blocker code the UI keys its help on: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("Apache"),
+            "the refusal must name what is serving: {}",
+            err.detail
+        );
+        assert!(
+            err.detail.contains("ModSecurity connector"),
+            "and why that means the rules would never be read: {}",
+            err.detail
+        );
+
+        // The half that made this worth a release: the setting must not have
+        // moved. `enabled: true` on an Apache machine is the panel reporting a
+        // protection that inspects nothing.
+        let settings = WafSettings::load(&reg.services().db).await;
+        assert!(!settings.enabled);
+        assert_eq!(settings.default_mode, WafMode::Detect);
+    }
+
+    #[tokio::test]
+    async fn status_on_an_apache_machine_reports_unavailable_and_names_the_server() {
+        use crate::registry::testing::{auth_for, registry};
+        use unihelm_core::Role;
+
+        let (reg, admin, _) = registry().await;
+        reg.services()
+            .db
+            .set_setting(crate::webserver::WEB_SERVER_SETTING, &WebServer::Apache)
+            .await
+            .unwrap();
+
+        let out = reg
+            .dispatch(
+                "waf.status",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // The Firewall page draws its card from these three fields, and drawing
+        // a toggle here is exactly what this issue was.
+        assert_eq!(out["available"], serde_json::json!(false));
+        assert_eq!(out["web_server"], serde_json::json!("apache"));
+        assert_eq!(out["blockers"][0]["code"], serde_json::json!("not_nginx"));
     }
 
     #[tokio::test]

@@ -58,16 +58,130 @@ fn default_limit() -> i64 {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListResponse {
-    /// Task rows. The shape is `unihelm_db::models::Task`'s serialization; it is
-    /// deliberately not re-modelled here, so the schema stays honest when the
-    /// model grows a column.
+    /// Task rows: `unihelm_db::models::Task`'s serialization, plus `subject`.
+    /// The row itself is deliberately not re-modelled here, so the schema stays
+    /// honest when the model grows a column.
     #[schema(value_type = Vec<Object>)]
-    pub tasks: Vec<unihelm_db::models::Task>,
+    pub tasks: Vec<TaskView>,
     /// Drives the badge on the task drawer.
     pub active: i64,
     /// Every op name present in this caller's history, so the filter control
     /// only offers choices that would match something.
     pub ops: Vec<String>,
+}
+
+/// A task row as the panel receives it: the stored row, plus the short subject
+/// derived from its input by [`task_subject`].
+///
+/// Flattened rather than nested, so adding the subject did not move every other
+/// field of a row the UI already reads.
+#[derive(Debug, Serialize)]
+pub struct TaskView {
+    #[serde(flatten)]
+    pub task: unihelm_db::models::Task,
+    /// What the task acted on, when the panel can name it. Omitted rather than
+    /// guessed — see [`task_subject`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl TaskView {
+    fn new(task: unihelm_db::models::Task) -> Self {
+        let subject = task_subject(&task.op, &task.input);
+        Self { task, subject }
+    }
+}
+
+/// Longest subject a row will carry. A history row is one line beside the op
+/// name and the timestamp; a tenant path can be far longer than that.
+const SUBJECT_MAX: usize = 60;
+
+/// A short, human name for *what* a task acted on: `php 8.3`, `shop.example.com`.
+///
+/// Ten rows reading `stack.install` are the same three words ten times, and
+/// "which install was that" is the question the history page exists to answer.
+///
+/// Derived here rather than by handing the browser the task's `input`: that
+/// column is stored exactly as the caller sent it, unredacted, so a page that
+/// rendered it would put whatever anybody typed — a relay password, an SFTP
+/// password — on screen next to the op name.
+///
+/// Only fields that *name* the thing are read: a domain, a catalogue slug, a
+/// container, an archive. An operation whose input carries nothing but row ids
+/// gets `None`, and the row goes on showing its op name alone. That is the
+/// honest answer: `site 12` is not a name anybody chose, and a subject invented
+/// from a field that merely happens to be a string would be the panel telling
+/// the operator what a task was when it does not know.
+fn task_subject(op: &str, input: &serde_json::Value) -> Option<String> {
+    match op {
+        // These three take a flattened `StackComponent` — `{"component": "php",
+        // "version": "8.3"}`. The version is the whole difference between two
+        // PHP installs, so it belongs in the subject when one was asked for.
+        "stack.install" | "stack.remove" | "engine.remove" => named_version(input, "component"),
+        "runtime.install" => named_version(input, "runtime"),
+        "site.create" | "panel.tls.issue" => text(input, "domain"),
+        "app.create" | "docker.create" => text(input, "name"),
+        "docker.image.pull" => text(input, "image"),
+        // The WordPress site's own title, which is what the operator typed into
+        // the install form and how they will recognise the install.
+        "wp.install" => text(input, "title"),
+        "wp.plugin.update" => single_plugin(input),
+        "fs.compress" | "fs.extract" => text(input, "archive"),
+        "plugin.install" => text(input, "source"),
+        "plugin.remove" => text(input, "slug"),
+        "webserver.switch" => text(input, "target"),
+        // The relay host. Its neighbouring `password` field is exactly why the
+        // browser is not handed this object to pick a subject out of itself.
+        "mail.relay.set" => text(input, "host"),
+        _ => None,
+    }
+}
+
+/// `<name> <version>`, or the bare name when the caller expressed no preference.
+fn named_version(input: &serde_json::Value, name_key: &str) -> Option<String> {
+    let name = text(input, name_key)?;
+    Some(match text(input, "version") {
+        Some(version) => format!("{name} {version}"),
+        None => name,
+    })
+}
+
+/// The one plugin slug a `wp.plugin.update` names, if it names exactly one.
+///
+/// An empty list means "everything with an update available" and a longer one
+/// has no single subject; both are honestly nameless rather than half-named.
+fn single_plugin(input: &serde_json::Value) -> Option<String> {
+    let [only] = input.get("plugins")?.as_array()?.as_slice() else {
+        return None;
+    };
+    clean(only.as_str()?)
+}
+
+/// One string field of the input, trimmed to something a row can hold.
+fn text(input: &serde_json::Value, key: &str) -> Option<String> {
+    clean(input.get(key)?.as_str()?)
+}
+
+/// A row-sized, single-line form of a raw input value.
+///
+/// Newlines and control characters become spaces: the value reaches the DOM as
+/// text, and a subject that wrapped over three lines would push the rest of the
+/// history off the screen. An over-long one is cut with an ellipsis so the row
+/// says it was cut rather than pretending the short form is the whole name.
+fn clean(raw: &str) -> Option<String> {
+    let collapsed = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    let mut value = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().count() > SUBJECT_MAX {
+        value = value.chars().take(SUBJECT_MAX - 1).collect();
+        value.push('…');
+    }
+    Some(value)
 }
 
 /// Recent tasks in this caller's tenant scope, newest first.
@@ -106,7 +220,10 @@ pub async fn list(
     let tasks = repo
         .list_filtered(&filter, q.limit, q.offset.max(0))
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(TaskView::new)
+        .collect();
     let active = repo.count_active().await.map_err(ApiError::from)?;
     let ops = repo.distinct_ops().await.map_err(ApiError::from)?;
     Ok(Json(ListResponse { tasks, active, ops }))
@@ -135,7 +252,7 @@ fn parse_time(raw: Option<&str>, field: &'static str) -> ApiResult<Option<time::
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Task id (UUID)")),
     responses(
-        (status = 200, description = "The task row (`unihelm_db::models::Task`)", body = serde_json::Value),
+        (status = 200, description = "The task row (`unihelm_db::models::Task`, plus `subject`)", body = serde_json::Value),
         (status = 400, description = "`invalid_input`: not a UUID", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 404, description = "`not_found`: also the answer for another tenant's task", body = ApiErrorBody),
@@ -145,7 +262,7 @@ pub async fn detail(
     State(state): State<SharedState>,
     current: CurrentUser,
     Path(id): Path<String>,
-) -> ApiResult<Json<unihelm_db::models::Task>> {
+) -> ApiResult<Json<TaskView>> {
     let id = parse_task_id(&id)?;
     let task = state
         .db
@@ -156,7 +273,9 @@ pub async fn detail(
         // A task in another tenant is "not found", not "forbidden": whether it
         // exists is itself information.
         .ok_or_else(|| ApiError::not_found("task"))?;
-    Ok(Json(task))
+    // The same subject the list carries: one row rendered two ways, described
+    // two ways, is how the drawer and the history page drift apart.
+    Ok(Json(TaskView::new(task)))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -398,5 +517,146 @@ mod tests {
     fn a_task_id_must_be_a_uuid() {
         assert!(parse_task_id("not-a-uuid").is_err());
         assert!(parse_task_id(&uuid::Uuid::new_v4().to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_stack_operation_is_named_by_its_component_and_version() {
+        // Ten `stack.install` rows were ten identical lines. The version is the
+        // difference between two PHP installs, so it is part of the name.
+        assert_eq!(
+            task_subject(
+                "stack.install",
+                &serde_json::json!({ "component": "php", "version": "8.3" }),
+            )
+            .as_deref(),
+            Some("php 8.3"),
+        );
+        assert_eq!(
+            task_subject("stack.remove", &serde_json::json!({ "component": "redis" })).as_deref(),
+            Some("redis"),
+        );
+        assert_eq!(
+            task_subject(
+                "runtime.install",
+                &serde_json::json!({ "runtime": "node", "version": "22" }),
+            )
+            .as_deref(),
+            Some("node 22"),
+        );
+    }
+
+    #[test]
+    fn a_site_operation_is_named_by_its_domain() {
+        assert_eq!(
+            task_subject(
+                "site.create",
+                &serde_json::json!({ "domain": "shop.example.com", "site_type": "php" }),
+            )
+            .as_deref(),
+            Some("shop.example.com"),
+        );
+    }
+
+    #[test]
+    fn an_operation_the_derivation_does_not_know_is_left_unnamed() {
+        // The row then shows the op name it has always shown. A subject the
+        // panel had to invent would be worse than no subject at all.
+        assert_eq!(task_subject("some.future.op", &serde_json::json!({})), None);
+        // Known op, but the input carries only row ids: still nameless. `site
+        // 12` is not a name anybody chose.
+        assert_eq!(
+            task_subject("site.update", &serde_json::json!({ "site_id": 12 })),
+            None,
+        );
+        // Known op, naming field missing or the wrong shape.
+        assert_eq!(task_subject("site.create", &serde_json::json!({})), None);
+        assert_eq!(
+            task_subject("site.create", &serde_json::json!({ "domain": 12 })),
+            None,
+        );
+        assert_eq!(
+            task_subject("site.create", &serde_json::json!({ "domain": "   " })),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_plugin_update_is_named_only_when_it_names_one_plugin() {
+        // Empty means "everything with an update available" and a longer list
+        // has no single subject; naming one of several would be a lie about
+        // what ran.
+        assert_eq!(
+            task_subject(
+                "wp.plugin.update",
+                &serde_json::json!({ "install_id": 3, "plugins": ["akismet"] }),
+            )
+            .as_deref(),
+            Some("akismet"),
+        );
+        assert_eq!(
+            task_subject(
+                "wp.plugin.update",
+                &serde_json::json!({ "install_id": 3, "plugins": [] }),
+            ),
+            None,
+        );
+        assert_eq!(
+            task_subject(
+                "wp.plugin.update",
+                &serde_json::json!({ "install_id": 3, "plugins": ["akismet", "jetpack"] }),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_subject_is_one_line_and_fits_a_row() {
+        // It lands in a table cell as text: a newline in a WordPress title
+        // would push the rest of the history down the page.
+        assert_eq!(
+            task_subject(
+                "wp.install",
+                &serde_json::json!({ "title": "My\nblog\tabout  things" }),
+            )
+            .as_deref(),
+            Some("My blog about things"),
+        );
+
+        let long = "a".repeat(200);
+        let cut = task_subject("fs.compress", &serde_json::json!({ "archive": long }))
+            .expect("a long archive path is still a name");
+        assert_eq!(cut.chars().count(), SUBJECT_MAX);
+        // Cut, and saying so — a silently shortened path reads as the whole one.
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn the_row_carries_the_subject_beside_the_fields_the_ui_already_reads() {
+        // Flattened, not nested: adding the subject must not move `op` or
+        // `status` out from under the pages that read them.
+        let view = TaskView {
+            task: unihelm_db::models::Task {
+                id: TaskId(uuid::Uuid::new_v4()),
+                op: "stack.install".to_string(),
+                input: serde_json::json!({ "component": "php", "version": "8.3" }),
+                actor_user_id: None,
+                subscription_id: None,
+                status: TaskStatus::Ok,
+                progress: 100,
+                error_code: None,
+                error_detail: None,
+                cancellable: false,
+                idempotent: true,
+                request_id: None,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                started_at: None,
+                finished_at: None,
+            },
+            subject: Some("php 8.3".to_string()),
+        };
+
+        let json = serde_json::to_value(&view).expect("a task row serialises");
+        assert_eq!(json["op"], "stack.install");
+        assert_eq!(json["subject"], "php 8.3");
     }
 }

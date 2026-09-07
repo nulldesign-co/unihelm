@@ -772,6 +772,125 @@ pub fn is_globally_routable(ip: IpAddr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// the outbound destination guard
+// ---------------------------------------------------------------------------
+
+/// Refuse a URL the panel would fetch on somebody else's say-so if its host
+/// lands anywhere but the public internet.
+///
+/// Webhook and alert-channel URLs used to be checked for their scheme and
+/// nothing else, which made the panel a confused deputy: a `server_manage`
+/// holder — or anyone who reached those settings — could point a hook at
+/// `http://169.254.169.254/latest/meta-data/iam/security-credentials/` and have
+/// the panel read a cloud instance's credentials and POST them somewhere, or
+/// walk the private network from inside it one URL at a time. The panel has
+/// network position nobody outside the box does, and that position was on offer
+/// to whatever string was pasted into a settings field.
+///
+/// The test is [`is_globally_routable`] — the same predicate `dns.check` uses to
+/// decide whether a customer's record points somewhere the internet can reach,
+/// deliberately reused rather than restated, because two lists of private
+/// ranges drift apart and the shorter one is the hole. The **resolved**
+/// addresses are tested, not the spelling: `http://internal.example.com/` whose
+/// A record is `127.0.0.1` is the same request as `http://127.0.0.1/`, and a
+/// check on the hostname alone would miss it.
+///
+/// # What this does not stop
+///
+/// It is a check at one moment against one answer. A name that resolves to a
+/// public address here and to `169.254.169.254` when the HTTP client resolves it
+/// a moment later — DNS rebinding, or simply a short TTL and a changed
+/// record — passes this and is then fetched anyway. Closing that needs the
+/// connection itself to be pinned to the address that was checked, which reqwest
+/// does not expose. So this raises the cost of the attack from "paste a URL" to
+/// "control a nameserver and win a race"; it does not make it impossible, and it
+/// should not be described as if it did.
+///
+/// `field` is the input path the caller should highlight — `url` for a webhook,
+/// `config.url` for an alert channel.
+pub async fn ensure_outbound_destination(url: &str, field: &str) -> Result<()> {
+    let refuse = |detail: String| {
+        UnihelmError::new(ErrorCode::InvalidInput, detail).with_field(field.to_string())
+    };
+
+    // A real URL parser rather than string surgery on the authority: a
+    // hand-rolled split gets `http://good.example@169.254.169.254/` wrong, and
+    // getting it wrong here is the whole bypass. `reqwest::Url` is `url::Url`,
+    // which is the parser reqwest itself will apply to the same string — so the
+    // host this check judges is the host the request will be sent to.
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| refuse(format!("`{url}` is not a URL the panel can send to: {e}")))?;
+    let Some(host) = parsed.host_str() else {
+        return Err(refuse(format!(
+            "`{url}` names no host, so there is nothing to deliver to"
+        )));
+    };
+    // `host_str` keeps the brackets on an IPv6 literal (`[::1]`); everything
+    // below wants the address.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let addresses: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => {
+            // The system resolver, on purpose: this must agree with what the
+            // HTTP client will look up, and the panel's own hickory resolver
+            // (used for the DNS advisory, where asking the world's view is the
+            // point) can legitimately answer differently from `getaddrinfo`.
+            let port = parsed.port_or_known_default().unwrap_or(0);
+            tokio::net::lookup_host((bare, port))
+                .await
+                .map_err(|e| {
+                    refuse(format!(
+                        "`{bare}` could not be resolved ({e}), so the panel cannot tell where a \
+                         delivery would go and will not send one; fix the name, or use an address"
+                    ))
+                })?
+                .map(|socket| socket.ip())
+                .collect()
+        }
+    };
+
+    if addresses.is_empty() {
+        return Err(refuse(format!(
+            "`{bare}` resolved to no addresses, so the panel cannot tell where a delivery would go"
+        )));
+    }
+
+    for ip in addresses {
+        if !is_globally_routable(unmap(ip)) {
+            return Err(refuse(format!(
+                "`{bare}` resolves to {ip}, which is not on the public internet. The panel will \
+                 not deliver to a loopback, private, link-local or otherwise internal address — \
+                 that would turn it into a relay into this server's own network. Point this at a \
+                 publicly routable host."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// `::ffff:127.0.0.1` is `127.0.0.1`, and must not be readable as a global v6.
+///
+/// This lives here rather than inside [`is_globally_routable`] because the
+/// advisory's callers feed it addresses that came from A/AAAA records and from
+/// `getifaddrs(3)`, where the v4-mapped spelling does not occur. A URL host is
+/// typed by hand, so here it does — and without this the guard above is two
+/// characters away from being bypassed.
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        // `to_ipv4` covers both `::ffff:a.b.c.d` and the deprecated
+        // `::a.b.c.d`; the v4 predicate then rejects `0.0.0.0/8`, which is what
+        // `::1` and `::` decode to.
+        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // this server's public addresses
 // ---------------------------------------------------------------------------
 
@@ -2444,6 +2563,98 @@ mod tests {
                 "{public} is publicly reachable"
             );
         }
+    }
+
+    // -- the outbound destination guard --------------------------------------
+
+    /// Issue 60: webhook and alert-channel URLs were checked for their scheme
+    /// and nothing else, so the panel would fetch — and deliver the answer
+    /// from — anything reachable from inside the network, including a cloud
+    /// instance's IAM credentials.
+    ///
+    /// Every case here is an IP literal, so the guard answers without a
+    /// resolver and this test is the same on a machine with no network.
+    #[tokio::test]
+    async fn a_destination_off_the_public_internet_is_refused_by_the_address_it_resolved_to() {
+        for inward in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://127.0.0.1:9000/hook",
+            "http://10.0.0.5/hook",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "https://[::1]/hook",
+            "https://[fe80::1]/",
+            "https://[fd00::1]/",
+            // v4-mapped and the deprecated v4-compatible spellings of
+            // loopback: the same socket, written so that a v6 predicate on its
+            // own calls them global.
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:169.254.169.254]/",
+            // Userinfo before the host: string surgery on the authority reads
+            // the host as `example.com` here, which is the whole bypass.
+            "https://example.com@169.254.169.254/",
+        ] {
+            let err = ensure_outbound_destination(inward, "url")
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "accepted {inward}");
+            assert_eq!(err.field.as_deref(), Some("url"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_the_address_so_an_operator_can_act_on_it() {
+        let err = ensure_outbound_destination("http://169.254.169.254/latest/meta-data/", "url")
+            .await
+            .unwrap_err();
+        assert!(
+            err.detail.contains("169.254.169.254"),
+            "`invalid URL` for a URL that looks fine is unactionable: {}",
+            err.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_publicly_routable_destination_is_still_accepted() {
+        for outward in [
+            "https://198.18.0.7/hook",
+            "http://8.8.8.8:8080/hook",
+            "https://[2606:4700::1111]/hook",
+        ] {
+            ensure_outbound_destination(outward, "url")
+                .await
+                .unwrap_or_else(|e| panic!("refused {outward}: {}", e.detail));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_with_no_host_is_refused_rather_than_resolved() {
+        // `file:` never reaches here in practice — the syntactic validators
+        // refuse it first — but the guard must not fall open for a URL whose
+        // authority is empty, because "nothing to check" is not "safe".
+        for hostless in ["file:///etc/shadow", "not a url", "https://"] {
+            assert!(
+                ensure_outbound_destination(hostless, "url").await.is_err(),
+                "accepted {hostless}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v4_mapped_address_is_judged_as_the_v4_address_it_is() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(
+            is_globally_routable(mapped),
+            "the shared predicate reads this as a global v6 — which is why the \
+             guard unmaps before asking it"
+        );
+        assert!(!is_globally_routable(unmap(mapped)));
+        // A genuinely global v6 must survive the round trip untouched.
+        let global: IpAddr = "2606:4700::1111".parse().unwrap();
+        assert_eq!(unmap(global), global);
+        assert!(is_globally_routable(unmap(global)));
     }
 
     // -- the advisory sentence ----------------------------------------------

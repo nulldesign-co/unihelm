@@ -11,6 +11,41 @@
 //! anything that is not in it. What changed is that the table is data, so adding
 //! an engine is an entry rather than a variant threaded through six matches.
 //!
+//! # Why it is compiled in, and what that costs
+//!
+//! [`version`] is the only thing standing between a request and a package
+//! manager, so whatever can edit this list decides what the panel installs as
+//! root. Compiled in, the list ships inside a signed release and changes by
+//! pull request. As `/etc/unihelm/catalogue.toml` it would be a file, and every
+//! account, every stray `chmod` and every bug that could ever write that file
+//! would inherit `apt install <whatever I put here>` on a machine full of other
+//! people's websites. That is the trade, and it is deliberate.
+//!
+//! The price is staleness, and it is a real one: a runtime that shipped last
+//! week is not installable until these lines are edited and a release goes out,
+//! and the operator has no way round it — no override, no "trust me" flag,
+//! because an override would be the config file again with extra steps. Keeping
+//! these lines current is therefore part of cutting a release rather than a
+//! chore that waits for somebody to complain, and adding a version is meant to
+//! cost one line.
+//!
+//! Turning it into configuration is a legitimate thing to want, and it needs
+//! three things this version does not have:
+//!
+//! - a file only root can write, checked before it is read rather than trusted
+//!   because of where it sits — the same rule `plugin.rs` applies to a staging
+//!   directory, for exactly the same reason;
+//! - the repository resolvers generalised. Only NodeSource's is parameterised
+//!   by version today (`repos::nodesource(info, major)`); PGDG on the RHEL
+//!   family resolves one repository tree for one compiled-in major, so a
+//!   catalogue entry there is not free — see the `POSTGRES` list below;
+//! - an audit trail on the file itself, because "who added the entry that
+//!   installed this" has to be answerable months later, and a file edited by
+//!   hand answers nothing.
+//!
+//! Until those exist, a stale entry costs a release and a writable catalogue
+//! costs the machine.
+//!
 //! Most entries install from the distribution's own repositories. That is
 //! deliberate and not laziness: a vendor repository means a signing key this
 //! panel has to pin by fingerprint and keep pinned, and every one of those is a
@@ -344,10 +379,22 @@ const APACHE: &[Version] = &[note(v("distro"), "whatever this release maintains"
 /// PHP from Sury, which is where every version but the distribution's own lives.
 ///
 /// Side by side: each site names its version and gets its own FPM pool.
+///
+/// The notes carry dates rather than words like "current", because a date does
+/// not rot into a lie between releases: an operator reading "until December
+/// 2026" next to a clock knows where they stand, and a reader of this file
+/// knows which line to move next. The recommendation follows active support —
+/// 8.3 has been security-fixes-only since the end of 2025, and "the one to pick
+/// when you have no opinion" should not be a series upstream has stopped
+/// improving.
+///
+/// The end-of-life flags match `PhpVersion::is_eol` in `unihelm-core`, which
+/// the site pages read. Two sources disagreeing about whether somebody's PHP is
+/// supported is worse than either being a month behind.
 const PHP: &[Version] = &[
-    vendor("8.5"),
-    vendor("8.4"),
-    rec(vendor("8.3")),
+    note(vendor("8.5"), "current"),
+    rec(note(vendor("8.4"), "active support until December 2026")),
+    note(vendor("8.3"), "security fixes only, until December 2027"),
     eol(vendor("8.2")),
     eol(vendor("8.1")),
     eol(vendor("8.0")),
@@ -355,10 +402,23 @@ const PHP: &[Version] = &[
 ];
 
 /// Node from NodeSource, one repository per major line.
+///
+/// Even majors become LTS in the October after they ship and are maintained for
+/// three years; odd majors are current for six months and then over. The notes
+/// say which, because the number alone tells an operator nothing about how long
+/// it will be patched — Node 25 and Node 24 are five months apart and one of
+/// them stopped getting fixes in June.
+///
+/// Adding a line here is the whole of adding a line: `repos::nodesource` builds
+/// `deb.nodesource.com/node_<major>.x` from the major, so there is no key to
+/// pin and no tree to verify. This list stopping at 24 was the reason a panel a
+/// few months old could not install a runtime that had already shipped.
 const NODE: &[Version] = &[
-    note(vendor("24"), "current"),
-    rec(note(vendor("22"), "LTS")),
-    note(vendor("20"), "LTS, maintenance"),
+    note(vendor("26"), "current; becomes LTS in October 2026"),
+    eol(note(vendor("25"), "ended June 2026")),
+    rec(note(vendor("24"), "LTS")),
+    note(vendor("22"), "LTS, maintenance until April 2027"),
+    eol(note(vendor("20"), "ended April 2026")),
 ];
 
 const PYTHON: &[Version] = &[rec(note(v("distro"), "whatever this release maintains"))];
@@ -382,23 +442,45 @@ const MARIADB: &[Version] = &[
 /// dropped MongoDB when it left the OSI-approved licences, so the vendor
 /// repository is not a preference, it is the only route.
 const MONGODB: &[Version] = &[
-    rec(note(vendor("8.0"), "current")),
-    note(vendor("7.0"), "previous series, still supported"),
+    rec(note(vendor("8.0"), "the current long-term support series")),
+    // Was "previous series, still supported" until upstream's three years ran
+    // out in August 2026. Left on the list, because a document store is not
+    // something an operator moves in an afternoon, and marked, because the
+    // sentence beside it had become an assurance nobody could honour.
+    eol(note(vendor("7.0"), "ended August 2026")),
 ];
 
 /// MySQL from the distribution.
 ///
 /// Oracle's own repository exists, and its signing key has been rotated in a way
-/// that broke installs across the internet more than once. Ubuntu's `mysql-server`
-/// is 8.0 and maintained for the life of the release, which is the version
-/// almost everybody asking for MySQL wants.
-const MYSQL: &[Version] = &[rec(note(
-    v("distro"),
-    "8.0, maintained by the distribution",
-))];
+/// that broke installs across the internet more than once. `mysql-server` is
+/// maintained for the life of the release, which is what almost everybody asking
+/// for MySQL wants.
+///
+/// The note used to say "8.0". That stopped being true twice over: Oracle ended
+/// 8.0 in April 2026, and releases from Ubuntu 25.10 onwards ship the 8.4 LTS
+/// series instead. Naming a number here was a claim about a package this entry
+/// does not choose — the distribution does — so it says what it can stand
+/// behind, the way Apache and Python do.
+const MYSQL: &[Version] = &[rec(note(v("distro"), "whatever this release maintains"))];
 
+/// PostgreSQL from PGDG.
+///
+/// The list stops at 17 while 18 is upstream's current series, and that is a
+/// packaging limit rather than an oversight worth hiding. On the RHEL family
+/// `repos::pgdg` resolves one repository tree for one compiled-in major
+/// (`repos::POSTGRES_MAJOR`), while the package names come from whatever
+/// version is picked here — so a major this list offers and that constant does
+/// not name adds an archive and then fails to find its packages in it. Debian
+/// and Ubuntu would take 18 today, because there the major is only a package
+/// name.
+///
+/// Offering a version that installs on one family and fails on the other is the
+/// half-working answer this panel refuses, so 18 waits for `pgdg` to take the
+/// major as an argument the way `nodesource` does. 16 and 15 are already in
+/// that position on EL and stop being a lie at the same moment.
 const POSTGRES: &[Version] = &[
-    rec(note(vendor("17"), "current")),
+    rec(note(vendor("17"), "supported until November 2029")),
     vendor("16"),
     vendor("15"),
 ];
@@ -434,6 +516,13 @@ const CONTAINER_FIRST: Install = Install::Either {
 };
 
 /// Everything, in the order a page should show it.
+///
+/// Adding a version is one line above, and it is the **only** way to add one:
+/// anything a caller names that is not here is refused by [`version`] rather
+/// than passed to a package manager. That is why this file is compiled in, and
+/// why a new upstream release is a release of the panel — the reasoning, and
+/// what it would take to make this configuration instead, is at the top of this
+/// file.
 pub const CATALOGUE: &[Entry] = &[
     Entry {
         slug: "nginx",
@@ -705,6 +794,72 @@ mod tests {
                 "{} has no default",
                 e.slug
             );
+        }
+    }
+
+    /// Node's majors, as upstream ships them.
+    ///
+    /// This list stopping at 24 was the whole of the defect: [`version`] is the
+    /// boundary, so a major that is not written here cannot be installed by any
+    /// route the panel offers — and there is no setting an operator can reach to
+    /// say otherwise. A panel a few months old simply refused a runtime that had
+    /// already shipped, and said nothing about why.
+    #[test]
+    fn the_node_line_reaches_the_major_upstream_ships_today() {
+        let node = entry("node").expect("node is catalogued");
+        let offered: Vec<&str> = node.versions.iter().map(|v| v.version).collect();
+        assert_eq!(offered, ["26", "25", "24", "22", "20"]);
+        assert_eq!(default_version("node").unwrap().version, "24");
+        // Newest first, and the newest is not one upstream has finished with.
+        assert!(!node.versions[0].eol);
+    }
+
+    /// The recommendation is what a fresh install gets, so it has to be a series
+    /// upstream is still improving. 8.3 went security-fixes-only at the end of
+    /// 2025 and stayed the recommendation regardless, which quietly started every
+    /// new site one series behind.
+    #[test]
+    fn the_recommended_php_is_a_line_still_in_active_support() {
+        let php = default_version("php").expect("php has a default");
+        assert_eq!(php.version, "8.4");
+        assert!(!php.eol);
+    }
+
+    /// A note is a claim about upstream, and this table is the only place it can
+    /// go stale. Nothing marked end of life may also carry a note that says it is
+    /// supported: the two are shown side by side, and an operator believes the
+    /// friendlier one.
+    #[test]
+    fn nothing_marked_end_of_life_also_claims_to_be_supported() {
+        for e in CATALOGUE {
+            for v in e.versions.iter().filter(|v| v.eol) {
+                for claim in ["current", "still supported", "active support", "maintained"] {
+                    assert!(
+                        !v.note.contains(claim),
+                        "{}/{} is end of life and its note says `{}`",
+                        e.slug,
+                        v.version,
+                        v.note
+                    );
+                }
+            }
+        }
+    }
+
+    /// Only the newest version an entry offers may be called current. The word is
+    /// the first thing read and the last thing updated, and pinning it to the top
+    /// of the list means adding a newer line cannot leave a stale claim under it.
+    #[test]
+    fn only_the_newest_version_offered_is_called_current() {
+        for e in CATALOGUE {
+            for (position, v) in e.versions.iter().enumerate() {
+                assert!(
+                    !v.note.contains("current") || position == 0,
+                    "{} calls {} current while offering something newer",
+                    e.slug,
+                    v.version
+                );
+            }
         }
     }
 

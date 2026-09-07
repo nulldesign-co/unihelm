@@ -75,6 +75,107 @@ The result reports whether the container is actually running, read back from
 Docker: a container can exit the instant it starts, and a successful `docker run`
 does not mean otherwise.
 
+**Every host port is checked before the pull starts.** A clash used to be
+discovered by Docker, minutes in, and reported in Docker's own words — a
+sentence about an endpoint id and "driver failed programming external
+connectivity" with the port buried in the middle of it. The pre-flight names the
+port and the container already publishing it, and refuses before anything is
+fetched. It is a pre-flight and not a lock: something can still take a port
+between the check and the run, which is why the translation below still exists.
+
+**A failed run leaves nothing behind.** `docker run` creates the container and
+*then* starts it, so a bind failure used to leave a container in `created` on the
+machine — and the operator's second attempt then failed on the *name* as well as
+the port, with a message about the name that sent them looking for a container
+they never successfully made. The container is now removed before the error
+returns (bare `rm`, never `-f`: the run failed at the start, so there is nothing
+running to kill), and the error says so, so the operator knows the name is free.
+If it could not be removed, the error says that instead and names the
+`docker rm` that will clear it.
+
+### `docker.image.prune`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `dry_run` *(optional bool, default false)* |
+
+Reclaims the disk that dangling image layers eat — on a small VPS, the
+difference between a working server and a full one.
+
+**Dangling only. Never `--all`.** `docker image prune -a` removes every image no
+container currently uses, which includes the one an operator pulled this morning
+for a container they have not created yet, and every image behind a container
+they stopped for the weekend. Dangling images are the untagged leftovers of a
+rebuild or a re-pull — the ones nothing can refer to again — and they are what
+actually fills the disk. `--force` *is* passed, and it is not `rm -f`: it is
+Docker's "do not ask me y/N", and there is no terminal on the other end to
+answer the prompt.
+
+**It says what it deleted.** The dangling images are listed into the task log
+with their sizes before anything is removed, so the record survives a prune that
+then fails half-way; afterwards the output carries Docker's own `untagged:` and
+`deleted:` lines and its `Total reclaimed space` figure. That figure is the whole
+value of the operation — a prune that answers "done" is indistinguishable from
+one that deleted nothing — so it is reported verbatim, and as `0B` rather than
+blank when nothing went.
+
+`dry_run` lists the candidates and deletes nothing. It defaults to false: an
+operator who pressed Prune and got a list would reasonably believe the disk had
+been reclaimed.
+
+### `docker.image.pull`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task (not cancellable, idempotent) |
+| Input | `image` |
+
+Fetches an image, or confirms the tag is already at this digest.
+
+The same `ImageRef` the create form validates against, not a second parser: this
+is the field that names something the server will fetch and execute, and two
+grammars for it would be two things to keep in step. An image reference cannot
+begin with `-`, and may contain only letters, digits and `. - _ / : @`.
+
+The result carries `already_current`, taken from Docker's own closing `Status:`
+line. "Pulled" and "already had it" are different answers to "did my update
+arrive", and reporting the first for both tells somebody their image is new when
+it is the one they have been running for a year. It also carries the digest the
+reference resolved to, which is the only thing that says *which* `nginx:latest`
+this now is.
+
+Fifteen minutes, sized on the operator's link rather than on Docker Hub: a few
+hundred megabytes over the uplink a cheap VPS actually has is minutes and is not
+a failure.
+
+### `docker.image.remove`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `image` |
+
+Deletes an image.
+
+**An image a container still needs is refused, and the container is named.**
+Docker's own answer here is `rmi -f`, which untags the image out from under a
+running service: the container keeps running on an image that no longer has a
+name, and the next restart — a reboot, a `restart: always` after an OOM kill —
+finds nothing to start from. That is a service dying hours later for a reason
+nobody will connect to a button pressed this morning, so this refuses with
+`dependents_exist` and says which container to deal with first. Stopped
+containers count: one is invisible in `docker ps`, is what an operator forgets,
+and is exactly what a removed image would strand.
+
+The result carries Docker's own `Untagged:` and `Deleted:` lines. An image with
+two tags is *untagged* rather than deleted and no space comes back until the last
+tag goes, and quoting the lines is how an operator who expected a gigabyte back
+finds out why they did not get it.
+
 ### `docker.logs`
 
 | | |
@@ -155,6 +256,37 @@ SIGTERM, then ten seconds, then Docker's own SIGKILL — the grace period is
 passed explicitly rather than left to Docker's default so the operation's
 timeout can be derived from it. Stopping an already-stopped container succeeds
 and changes nothing.
+
+### `docker.volume.remove`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `volume` *(a Docker volume name, not a path)* |
+
+Deletes a volume.
+
+Two refusals stand in front of it, because a volume is the only thing on the
+Docker page whose deletion cannot be undone by pulling something again.
+
+**A container still references it** — running or stopped — and the refusal names
+that container. Docker refuses this too, but its message names the volume and
+not the container, which leaves the operator to find the container themselves. A
+volume outliving its container is this panel's own design (`docker.remove` never
+passes `--volumes`), so a stopped container holding a volume is the normal case
+rather than an odd one.
+
+**It holds an engine this panel installed.** Deleting it deletes every database
+in that engine while the panel's engine registry goes on saying the engine is
+there — the panel reporting something that is not true, which is the one thing
+it must never do. The refusal points at `engine.remove` with `delete_data`,
+which is the operation that does this properly: it forgets the record at the
+same time.
+
+The volume name is parsed, not passed through. A `/` anywhere in it is a path,
+which is to say a bind mount, and `-f` in that position is an option rather than
+a volume; the same grammar validates the volume field on `docker.create`.
 
 ### `engine.remove`
 
@@ -572,13 +704,31 @@ operator saying "yes, put those in", once.
 Every container (running or stopped), image and volume Docker has on this
 server.
 
-Read-only, deliberately. The panel's security model is that a tenant reaches
-their own files and nothing else, held up by Linux users, directory modes and
-per-tenant FPM pools. Docker sits outside all of it — a container started with
-`-v /:/host`, or with the daemon socket mounted, is root on the machine — so an
-operation that starts an arbitrary container is one that hands somebody root
-through a panel whose whole job is to prevent that. Start, stop and run wait on
-a considered answer to the socket question; see `docs/roadmap-multi-stack.md`.
+The read half of the Docker page. What may be *asked for* is bounded by the
+shape of each operation's input rather than by this being read-only:
+`docker.create` takes an image, a name, ports, environment and named volumes and
+has no field for a raw flag, because `-v /:/host` or the daemon socket mounted
+into a container is root on a machine whose whole security model — Linux users,
+directory modes, per-tenant FPM pools — Docker sits outside of.
+
+Each volume carries three things a name and a driver cannot say, and each of
+them exists because a volume outliving its container is this panel's own design,
+which makes an orphan indistinguishable from a deliberate keepsake:
+
+- `size`, from `docker system df`. `null` rather than `0B` when that accounting
+  did not answer — it is the slow command on this page and its ten-second budget
+  can genuinely expire against a large volume, and inventing a zero would invite
+  somebody to delete a database on the strength of a number the panel made up.
+- `used_by`, the containers that mount it, running or stopped. `null` — not an
+  empty list — when the question could not be asked: "nothing uses this" reads
+  as permission to delete and "the panel could not tell" does not.
+- `engine`, the engine container this panel installed that keeps its data here,
+  read from the panel's own registry. Deleting that volume is deleting every
+  database in the engine, so the page says whose it is before offering a button.
+
+A registry that will not parse does not fail the inventory — the containers and
+images are still true — but it does set `note`, because going on to report every
+volume as belonging to no engine would be a lie.
 
 A machine without Docker reports `installed: false` and an empty list rather
 than an error, and one whose daemon is not answering says that instead — an
@@ -700,6 +850,74 @@ server down (spec §10.4).
 Removes the vhost first — stop serving before removing what was served — then
 the php-fpm pool, then the database row. Files are kept unless `purge_files` is
 set: a deleted vhost is re-renderable, a deleted home directory is not.
+
+### `site.reprovision`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — idempotent |
+| Input | `site_id` |
+
+Finishes setting up a site whose creation failed partway through.
+
+`site.create` builds an account, a directory, an FPM pool and a vhost in that
+order and unwinds in reverse on failure — but it deliberately leaves the
+tenant's *directory* alone, because it may already hold their code. So a site
+that failed halfway is a real row with some of its parts made and no way
+forward: the panel offered delete-and-start-again, which for a site whose files
+are already uploaded is not the same thing.
+
+This re-runs what creation does, idempotently, and reports what the row said
+before it ran so a repaired site can be told from a working one that was merely
+re-rendered. It leaves the directory alone for the same reason `site.create`
+does.
+
+### `site.alias.add`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — idempotent |
+| Input | `site_id`; `domain` |
+
+Attaches another domain to a site, so it answers to that name as well as its
+primary one.
+
+The alias goes through the **same** domain validation and the **same**
+cross-site collision check a new site's domain does. That is not politeness: an
+alias colliding with another customer's domain is the same outage as a duplicate
+site, and the check already existed — it simply had no caller here, because
+aliases were read-only after creation and the only way to attach one was to
+delete the site and make it again.
+
+The vhost is re-rendered through the active web server, so this works on Apache
+as well as nginx.
+
+Idempotent: an alias the site already holds converges on a re-render rather than
+colliding with itself, and the answer says `already_attached` so a retry is not
+read as an attachment that happened this time.
+
+**It does not touch the certificate.** A site with a live certificate that does
+not name the new alias will offer the primary name's certificate for it, and
+every browser will refuse the connection. The answer says so in
+`certificate_needs_reissue` rather than leaving it to be discovered by a
+customer; `cert.issue` is what fixes it.
+
+### `site.alias.remove`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — idempotent |
+| Input | `site_id`; `domain` |
+
+Detaches a domain from a site and re-renders the vhost. The site keeps its
+primary name, which cannot be removed this way — that is `site.delete`.
+
+Removing an alias that is not attached succeeds and changes nothing, for the
+same reason every other removal here does: the operator's intent is satisfied
+either way, and the answer says which happened.
 
 ### `site.drift`
 

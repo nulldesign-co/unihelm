@@ -291,6 +291,52 @@ pub enum DockerCommand {
         #[arg(long)]
         lines: Option<u32>,
     },
+    /// The images on this server: pull one, remove one, reclaim the rest.
+    #[command(subcommand)]
+    Image(DockerImageCommand),
+    /// The volumes on this server.
+    #[command(subcommand)]
+    Volume(DockerVolumeCommand),
+}
+
+/// Docker images.
+#[derive(Subcommand, Debug)]
+pub enum DockerImageCommand {
+    /// Fetch an image, or confirm the tag is already at this digest.
+    ///
+    /// Reports which of the two happened: "pulled" and "already had it" are
+    /// different answers to "did my update arrive".
+    Pull {
+        /// `nginx`, `redis:7`, `ghcr.io/owner/app:v1`.
+        image: String,
+    },
+    /// Delete an image.
+    ///
+    /// An image a container is built on is refused with that container named,
+    /// never force-removed: the container would keep running with no image to
+    /// restart from.
+    Remove { image: String },
+    /// Reclaim the disk that dangling layers eat.
+    ///
+    /// Dangling images only — the untagged leftovers of a rebuild or a re-pull.
+    /// Never every unused image: that would take the one pulled this morning
+    /// for a container not created yet.
+    Prune {
+        /// List what would go and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Docker volumes.
+#[derive(Subcommand, Debug)]
+pub enum DockerVolumeCommand {
+    /// Delete a volume nothing is using.
+    ///
+    /// Refused while a container still mounts it, and refused outright when it
+    /// holds an engine this panel installed — that is `engine remove
+    /// --delete-data`, which forgets the engine's record at the same time.
+    Remove { volume: String },
 }
 
 /// Language runtimes installed on this server.
@@ -403,6 +449,27 @@ pub enum SiteCommand {
         /// The site's id, as `unihelm site list` shows it.
         site_id: i64,
     },
+    /// Finish setting up a site whose creation failed partway through.
+    ///
+    /// Picks up where it stopped rather than starting again, and leaves the
+    /// tenant's files alone either way.
+    Reprovision {
+        /// The site's id, as `unihelm site list` shows it.
+        site_id: i64,
+    },
+    /// Attach another domain to a site, so it answers to that name too.
+    ///
+    /// The alias goes through the same validation and the same cross-site
+    /// collision check a new site's domain does. It does **not** get the site's
+    /// certificate: issue one that names it, or browsers refuse the connection.
+    AliasAdd {
+        /// The site's id, as `unihelm site list` shows it.
+        site_id: i64,
+        /// The domain to attach.
+        domain: String,
+    },
+    /// Detach a domain from a site. The site keeps its primary name.
+    AliasRemove { site_id: i64, domain: String },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

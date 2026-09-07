@@ -247,6 +247,26 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
                     .done();
                 call("docker.logs", input)
             }
+            DockerCommand::Image(cmd) => match cmd {
+                DockerImageCommand::Pull { image } => {
+                    call("docker.image.pull", json!({ "image": image }))
+                }
+                DockerImageCommand::Remove { image } => {
+                    call("docker.image.remove", json!({ "image": image }))
+                }
+                // Sent whichever way the flag went, rather than omitted when
+                // false: the operation's default is "delete", and a payload
+                // that leaves the field out relies on two places agreeing about
+                // which default that is.
+                DockerImageCommand::Prune { dry_run } => {
+                    call("docker.image.prune", json!({ "dry_run": dry_run }))
+                }
+            },
+            DockerCommand::Volume(cmd) => match cmd {
+                DockerVolumeCommand::Remove { volume } => {
+                    call("docker.volume.remove", json!({ "volume": volume }))
+                }
+            },
         },
         Command::Runtime(cmd) => match cmd {
             RuntimeCommand::List => call("runtime.list", json!({})),
@@ -370,6 +390,17 @@ fn site(cmd: &SiteCommand) -> Result<Action> {
             json!({ "site_id": site_id, "purge_files": purge_files }),
         ),
         SiteCommand::Drift { site_id } => call("site.drift", json!({ "site_id": site_id })),
+        SiteCommand::Reprovision { site_id } => {
+            call("site.reprovision", json!({ "site_id": site_id }))
+        }
+        SiteCommand::AliasAdd { site_id, domain } => call(
+            "site.alias.add",
+            json!({ "site_id": site_id, "domain": domain }),
+        ),
+        SiteCommand::AliasRemove { site_id, domain } => call(
+            "site.alias.remove",
+            json!({ "site_id": site_id, "domain": domain }),
+        ),
     })
 }
 

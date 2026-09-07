@@ -121,6 +121,90 @@ export function subscriptionChoice(list: readonly TerminalSubscription[]): Subsc
 }
 
 /**
+ * Whose `authorized_keys` the SSH keys card is looking at.
+ *
+ * The card used to call the keys endpoint with no account at all. That works
+ * for a customer — the agent resolves their own subscription — and cannot work
+ * for an administrator, whose scope is the whole server: the agent refuses,
+ * naming a `subscription_id` the card never offered. The whole card was a 400
+ * for the one role most likely to open it.
+ *
+ * So the account is decided here, before any request goes out, and the states
+ * are kept apart because they are different sentences on screen: a list still
+ * arriving is not an empty server, an empty server is not a failed request, and
+ * "there is one account" is not a list to choose from.
+ *
+ * `own` is the no-account call, and it is deliberately reachable only for
+ * callers the agent has a default for. An administrator never falls back to it:
+ * for them it is the exact request that fails.
+ */
+export type KeyAccount =
+  | { kind: "loading" }
+  /** Send no `subscription_id`; the agent resolves the caller's own. */
+  | { kind: "own" }
+  | { kind: "none" }
+  | { kind: "failed"; message: string }
+  /**
+   * The accounts this caller may manage, and which of them is being shown.
+   * `chosen: null` means nothing has been picked yet, which is a card that
+   * asks — never a card that guesses and then names the wrong login.
+   */
+  | { kind: "list"; options: TerminalSubscription[]; chosen: TerminalSubscription | null };
+
+export function sshKeyAccount(input: {
+  /** Global scope: the agent has no "my subscription" for this caller. */
+  isAdmin: boolean;
+  loading: boolean;
+  /** The server's own sentence about why the list did not arrive. */
+  error: string | null;
+  subscriptions: readonly TerminalSubscription[];
+  /** The row the operator picked, if the list needed picking from. */
+  picked: number | null;
+}): KeyAccount {
+  if (input.loading) return { kind: "loading" };
+  // A list that failed to load leaves a customer exactly where they were —
+  // sending no id still works for them — but an admin has nothing to fall back
+  // to, so they get the reason instead of a request that cannot succeed.
+  if (input.error !== null) {
+    return input.isAdmin ? { kind: "failed", message: input.error } : { kind: "own" };
+  }
+
+  const choice = subscriptionChoice(input.subscriptions);
+  if (choice.kind === "none") return { kind: "none" };
+  // One account is not a list to choose from: it is chosen, and named on
+  // screen. Making somebody pick the only option is a click that carries no
+  // decision.
+  if (choice.kind === "only") {
+    return { kind: "list", options: [choice.subscription], chosen: choice.subscription };
+  }
+  // Looked up rather than trusted: a picked id whose account has since gone
+  // would otherwise put a stale number on every call and a name on screen that
+  // no longer belongs to it.
+  const match = choice.options.find((option) => option.id === input.picked);
+  return { kind: "list", options: choice.options, chosen: match ?? null };
+}
+
+/**
+ * Whether the keys endpoint may be called yet, and for whom.
+ *
+ * The one rule this enforces is the bug it was written for: a request goes out
+ * only once the card knows whose keys it is asking about. Every other state —
+ * still loading, nothing to choose from, nothing chosen — sends nothing at all,
+ * because a list rendered from a refusal reads as "this account has no keys",
+ * which is a lie about somebody's login.
+ */
+export function keysRequest(account: KeyAccount): {
+  enabled: boolean;
+  subscriptionId?: number;
+} {
+  if (account.kind === "own") return { enabled: true };
+  if (account.kind === "list" && account.chosen !== null) {
+    return { enabled: true, subscriptionId: account.chosen.id };
+  }
+  return { enabled: false };
+}
+
+/**
  * How one subscription reads in the picker.
  *
  * Both halves are identifiers — a Linux account and a panel username — so there

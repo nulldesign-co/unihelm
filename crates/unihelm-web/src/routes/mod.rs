@@ -80,6 +80,12 @@ fn protected() -> Router<SharedState> {
             axum::routing::patch(sites::update).delete(sites::delete),
         )
         .route("/api/sites/{id}/drift", get(sites::drift))
+        .route("/api/sites/{id}/reprovision", post(sites::reprovision))
+        .route("/api/sites/{id}/aliases", post(sites::alias_add))
+        .route(
+            "/api/sites/{id}/aliases/{alias}",
+            axum::routing::delete(sites::alias_remove),
+        )
         .route("/api/sites/{id}/certificate", post(certs::issue))
         .route("/api/certificates", get(certs::list))
         .route("/api/tasks", get(tasks::list))
@@ -184,6 +190,26 @@ fn protected() -> Router<SharedState> {
         .route(
             "/api/server/docker/containers/{id}/logs",
             get(runtimes::docker_logs),
+        )
+        // Images are addressed in the body rather than in the path: a reference
+        // like `ghcr.io/owner/app:v1` carries slashes and colons, and a path
+        // parameter holding one is a percent-encoding problem at every client.
+        .route(
+            "/api/server/docker/images/pull",
+            post(runtimes::docker_image_pull),
+        )
+        .route(
+            "/api/server/docker/images/remove",
+            post(runtimes::docker_image_remove),
+        )
+        .route(
+            "/api/server/docker/images/prune",
+            post(runtimes::docker_image_prune),
+        )
+        // A volume name has no such trouble, so it stays in the path.
+        .route(
+            "/api/server/docker/volumes/{name}",
+            axum::routing::delete(runtimes::docker_volume_remove),
         )
         .route("/api/firewall/ports", post(firewall::port_open))
         .route("/api/firewall/ports/close", post(firewall::port_close))

@@ -34,10 +34,17 @@
 //!
 //! **uids must agree.** `uh_abc123` is uid 1007 on the host, and the pool inside
 //! the container must run as 1007 or every file PHP writes into that tenant's
-//! home belongs to somebody else. The container does not create accounts: the
-//! host's `/etc/passwd` and `/etc/group` come in read-only and the pools name
-//! the accounts they already name. That is also what makes `listen.group = nginx`
-//! resolve inside the container — see [`SocketVerdict`].
+//! home belongs to somebody else. The container does not create accounts: a
+//! `passwd` and a `group` come in read-only and the pools name the accounts they
+//! already name. That is also what makes `listen.group = nginx` resolve inside
+//! the container — see [`SocketVerdict`].
+//!
+//! Those two files are **the panel's own, not the host's**, and are filtered to
+//! the accounts this version's pools actually name — see
+//! [`accounts_this_master_needs`], which is candid about how much that removes
+//! and how much it does not. The host's `/etc/passwd` used to be mounted whole,
+//! which meant every tenant's PHP could read every other hosting customer's
+//! login name, uid and home path with one `file()` call.
 //!
 //! **The socket directory is the contract.** [`paths::fpm_socket_dir`] is
 //! bind-mounted in, so `fastcgi_pass unix:/run/unihelm/fpm/<site>-php83.sock` in
@@ -285,6 +292,10 @@ pub struct FpmContainer {
     /// start without it: FPM opens those files before it accepts a request, and
     /// a pool whose log directory is not there fails the whole master.
     log_root: PathBuf,
+    /// The panel's `passwd` for this container, mounted at `/etc/passwd`.
+    passwd_file: PathBuf,
+    /// The panel's `group` for this container, mounted at `/etc/group`.
+    group_file: PathBuf,
 }
 
 impl FpmContainer {
@@ -311,14 +322,19 @@ impl FpmContainer {
             .with_field("version"));
         }
 
+        let container = ContainerRef::parse(&container_name(version))?;
+        let account_dir = account_dir(&container);
+
         Ok(Self {
             version,
-            container: ContainerRef::parse(&container_name(version))?,
+            container,
             image: ImageRef::parse(&image_name(version))?,
             pool_dir: paths::fpm_pool_dir(family, version),
             socket_dir: paths::fpm_socket_dir(),
             home_root: paths::home_root(),
             log_root: paths::site_log_root(),
+            passwd_file: account_dir.join("passwd"),
+            group_file: account_dir.join("group"),
         })
     }
 
@@ -367,6 +383,10 @@ pub struct Pool {
     /// listens on TCP — which the panel never writes but an imported
     /// configuration may.
     pub socket: Option<PathBuf>,
+    /// Every account name this pool asks FPM to resolve. Read out of the file
+    /// rather than recomputed from the site row, for [`listen_socket`]'s reason:
+    /// the file is what the master obeys. See [`accounts_in`].
+    pub accounts: Vec<String>,
 }
 
 /// Everything FPM would run for one version.
@@ -400,6 +420,7 @@ impl PoolSet {
                 let body = std::fs::read_to_string(&path).ok()?;
                 pool_in(&body).then(|| Pool {
                     socket: listen_socket(&body),
+                    accounts: accounts_in(&body),
                     file: path,
                 })
             })
@@ -424,6 +445,85 @@ impl PoolSet {
             .iter()
             .filter_map(|p| p.socket.as_deref())
             .collect()
+    }
+
+    /// Every account name the pools of this version between them ask FPM to
+    /// resolve.
+    pub fn accounts(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .pools
+            .iter()
+            .flat_map(|p| p.accounts.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+/// The keys in a pool file whose value is a single account name.
+///
+/// This is the complete set FPM resolves through the name service for an
+/// ordinary pool: `user` and `group` are what the workers become, and
+/// `listen.owner` / `listen.group` are what the socket is chowned to. Anything
+/// missing from this list is an account the master would fail to resolve — and
+/// FPM fails the *whole master* when one pool will not start, so a name left out
+/// here takes down every site on the version, not just its own.
+const ACCOUNT_KEYS: &[&str] = &["user", "group", "listen.owner", "listen.group"];
+
+/// The keys whose value is a comma-separated list of account names.
+///
+/// Only meaningful in an FPM built with ACL support, and never written by this
+/// panel's own template — read anyway, because a pool an operator wrote by hand
+/// is still a pool this master has to start.
+const ACCOUNT_LIST_KEYS: &[&str] = &["listen.acl_users", "listen.acl_groups"];
+
+/// Every account name one pool file asks FPM to resolve.
+///
+/// Read out of the file for the reason [`listen_socket`] is: the file is what
+/// the master obeys. A pool somebody edited by hand, or one written by an older
+/// build, names whatever it names — and if this reader missed it, the container
+/// would be given a `passwd` without that account and the master would refuse to
+/// start at all.
+fn accounts_in(body: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        // An ini comment may follow the value, exactly as on a `listen` line.
+        let value = value.split(';').next().unwrap_or_default().trim();
+        if ACCOUNT_KEYS.contains(&key) {
+            push_name(&mut names, value);
+        } else if ACCOUNT_LIST_KEYS.contains(&key) {
+            for name in value.split(',') {
+                push_name(&mut names, name);
+            }
+        }
+    }
+    names
+}
+
+/// Keep a name that could be an account, and drop everything else.
+///
+/// `listen.owner` may legitimately be a numeric uid, which needs no passwd entry
+/// and must not become one. A value with a path separator or a NUL in it is not
+/// an account name either and has no business reaching a file the panel writes.
+fn push_name(names: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    let usable = !value.is_empty()
+        && value.len() <= 64
+        && !value.bytes().all(|b| b.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'));
+    if usable && !names.iter().any(|n| n == value) {
+        names.push(value.to_string());
     }
 }
 
@@ -534,6 +634,378 @@ fn a_pool_this_container_cannot_run(plan: &FpmContainer, pool: &Pool) -> Unihelm
 }
 
 // ---------------------------------------------------------------------------
+// The accounts this master is allowed to see
+// ---------------------------------------------------------------------------
+//
+// The master must resolve the names its pools use, and it used to do that by
+// having the host's whole `/etc/passwd` and `/etc/group` bind-mounted in. Those
+// files are the customer list of a shared hosting server — every tenant's login
+// name, uid and home path — and tenant PHP runs inside this container, so one
+// `file('/etc/passwd')` enumerated every other customer on the machine. Being
+// read-only stopped a tenant editing it and did nothing whatever about reading
+// it.
+//
+// So the panel writes a filtered pair instead. **How much that narrows things is
+// stated plainly in [`accounts_this_master_needs`] rather than overclaimed:**
+// one master serves every site on its PHP version, so its account files hold
+// every tenant with a pool on that version.
+
+/// The superuser. The master itself runs as root inside the container — see
+/// [`KEPT_CAPABILITIES`] — so uid 0 having a name is not optional here.
+const ROOT_ACCOUNT: &str = "root";
+
+/// The conventional unprivileged identity. Not needed by FPM itself; present
+/// because PHP code that calls `posix_getpwnam('nobody')` should get the same
+/// answer it would get on the host.
+const NOBODY_ACCOUNT: &str = "nobody";
+
+/// `0700 root:root`, for [`paths::engine_config_dir`]'s reason: unreachable by
+/// path to every unprivileged account on the host, while Docker — which resolves
+/// a bind mount as root — reaches it fine.
+const ACCOUNT_DIR_MODE: u32 = 0o700;
+
+/// The mode the two files are written with. World-readable *inode*, unreachable
+/// *path*: every account database on every Unix is 0644, and the workers inside
+/// the container have dropped to a tenant uid by the time they read it.
+const ACCOUNT_FILE_MODE: u32 = 0o644;
+
+/// Where one container's own account files live.
+///
+/// [`crate::appcontainer::account_dir`]'s layout and its reasoning, one
+/// directory per container: these are generated files the panel rewrites, not
+/// configuration an operator edits, so they live under the panel's state rather
+/// than in `/etc`.
+fn account_dir(container: &ContainerRef) -> PathBuf {
+    paths::state_dir()
+        .join("containers")
+        .join(container.as_str())
+}
+
+/// One account as the host's own name service knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdRecord {
+    name: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+    shell: String,
+}
+
+/// One group as the host's own name service knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupRecord {
+    name: String,
+    gid: u32,
+    /// Supplementary members, filtered before rendering — see
+    /// [`render_account_files`].
+    members: Vec<String>,
+}
+
+/// Every account name this version's master must be able to resolve.
+///
+/// **Say what this is, and what it is not.** One FPM master holds one pool per
+/// site and every site on this PHP version is in it, so the honest answer to
+/// "which accounts does it need?" is: *every tenant that has a pool on this
+/// version*, plus root, plus the web server's account for `listen.owner` and
+/// `listen.group`, plus `nobody`. This filter is not tighter than that and does
+/// not pretend to be — a version with forty 8.3 sites gets forty tenant names in
+/// its `passwd`, because the master genuinely resolves all forty.
+///
+/// What it does remove is everything with no pool here: every tenant on a
+/// *different* PHP version, every tenant with no PHP site at all, the panel's
+/// own service accounts, the mail and database system users, and every human
+/// login on the box. On a server running two or three PHP versions that is most
+/// of the list, and on a mixed server it is nearly all of it.
+///
+/// Narrowing it further means one container per site, which is the architecture
+/// `docs/design/containerised-runtimes.md` costed and rejected: a hundred sites
+/// would be a hundred masters and gigabytes of memory, to hide names from
+/// tenants who already share a filesystem boundary drawn by uid and
+/// `open_basedir`.
+fn accounts_this_master_needs(pools: &PoolSet, web_account: &str) -> Vec<String> {
+    let mut names = vec![
+        ROOT_ACCOUNT.to_string(),
+        NOBODY_ACCOUNT.to_string(),
+        // Named explicitly rather than relied on from `listen.group`: it is what
+        // [`check_socket`] measures the socket against, and a pool that somehow
+        // lacked the line would otherwise leave the master unable to resolve the
+        // group it is asked to chown to.
+        web_account.to_string(),
+    ];
+    for name in pools.accounts() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Resolve account names into the `passwd` and `group` text this container gets.
+///
+/// [`crate::appcontainer::render_account_files`]'s twin, duplicated for the
+/// reason the passwd helper below is. `getpwnam`/`getgrnam` rather than parsing
+/// `/etc/passwd`, so an operator's LDAP or sssd accounts resolve here exactly as
+/// they do everywhere else on the box — and so the design document's promise
+/// still holds: *the container does not create accounts, it names ones the host
+/// already has.*
+///
+/// A name that resolves to neither a user nor a group is left out rather than
+/// invented. That is the honest failure and the one FPM already reports well: a
+/// pool naming an account this server does not have refuses to start and says
+/// so, which is what should happen.
+fn render_account_files(names: &[String]) -> (String, String) {
+    let mut users: Vec<PasswdRecord> = Vec::new();
+    let mut groups: Vec<GroupRecord> = Vec::new();
+
+    for name in names {
+        if let Some(user) = passwd_record(name) {
+            if let Some(primary) = group_by_gid(user.gid) {
+                push_group(&mut groups, primary);
+            }
+            push_user(&mut users, user);
+        }
+        // Asked as a group as well as a user, because the two namespaces are
+        // separate: `listen.group = nginx` names a group without anything ever
+        // running as the `nginx` user.
+        if let Some(group) = group_record(name) {
+            push_group(&mut groups, group);
+        }
+    }
+
+    // Root is the one entry synthesised when the lookup comes back empty. The
+    // master runs as root inside the container, and a `passwd` with no uid 0 on
+    // a host whose name service is momentarily not answering is a master that
+    // fails for a reason nobody would guess from the message.
+    if !users.iter().any(|u| u.uid == 0) {
+        push_user(
+            &mut users,
+            PasswdRecord {
+                name: ROOT_ACCOUNT.to_string(),
+                uid: 0,
+                gid: 0,
+                home: "/root".to_string(),
+                shell: "/sbin/nologin".to_string(),
+            },
+        );
+    }
+    if !groups.iter().any(|g| g.gid == 0) {
+        push_group(
+            &mut groups,
+            GroupRecord {
+                name: ROOT_ACCOUNT.to_string(),
+                gid: 0,
+                members: Vec::new(),
+            },
+        );
+    }
+
+    // A group's member list is a second copy of the customer list: the `nginx`
+    // group on a host built the other way round — one where the web server is
+    // added to every tenant's group — would name every tenant on the machine.
+    // Only members this container already knows about survive, so `initgroups`
+    // still resolves every membership that can matter to a pool here.
+    let known: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
+    for group in &mut groups {
+        group.members.retain(|m| known.contains(&m.as_str()));
+    }
+
+    // Sorted so two runs produce byte-identical files. That matters more here
+    // than in [`crate::appcontainer`]: these are rewritten under a *running*
+    // master, and a file that churned on every site change would make a real
+    // change impossible to spot.
+    users.sort_by_key(|u| u.uid);
+    groups.sort_by_key(|g| g.gid);
+
+    (
+        users.iter().map(passwd_line).collect(),
+        groups.iter().map(group_line).collect(),
+    )
+}
+
+fn push_user(users: &mut Vec<PasswdRecord>, record: PasswdRecord) {
+    if !users.iter().any(|u| u.name == record.name) {
+        users.push(record);
+    }
+}
+
+fn push_group(groups: &mut Vec<GroupRecord>, record: GroupRecord) {
+    if !groups.iter().any(|g| g.name == record.name) {
+        groups.push(record);
+    }
+}
+
+/// One `passwd` line. The GECOS field is left empty: on a host where an operator
+/// filled it in it is somebody's real name and contact details, and nothing
+/// inside a container has ever read it.
+fn passwd_line(record: &PasswdRecord) -> String {
+    format!(
+        "{}:x:{}:{}::{}:{}\n",
+        record.name, record.uid, record.gid, record.home, record.shell
+    )
+}
+
+fn group_line(record: &GroupRecord) -> String {
+    format!(
+        "{}:x:{}:{}\n",
+        record.name,
+        record.gid,
+        record.members.join(",")
+    )
+}
+
+/// Write this version's own `passwd` and `group`, filtered to what its pools
+/// name.
+///
+/// Called before the master starts **and again before every reload**, because a
+/// new site's pool names an account the file written at install time has never
+/// heard of — and FPM fails the whole master when one pool cannot resolve its
+/// user, so a stale file here is every site on the version answering 502.
+fn refresh_account_files(ctx: &OpContext, plan: &FpmContainer, pools: &PoolSet) -> Result<()> {
+    let web_account = crate::provision::nginx_user(ctx.distro());
+    let names = accounts_this_master_needs(pools, web_account);
+    let (passwd, group) = render_account_files(&names);
+    write_account_files(&account_dir(&plan.container), &passwd, &group)?;
+    tracing::debug!(
+        version = plan.version.as_str(),
+        accounts = names.len(),
+        "wrote the filtered account files for the FPM container"
+    );
+    Ok(())
+}
+
+/// Write a container's own `passwd` and `group`.
+///
+/// **In place, never through a rename.** A bind-mounted *file* is the inode, not
+/// the path: a write-and-rename would leave the running master holding the old
+/// file forever while the host showed the new one — so the first site added
+/// after an install would get a pool the master cannot resolve, the master would
+/// refuse to reload, and every site on the version would go down for a reason
+/// invisible on both sides of the mount. Truncating and writing keeps the inode.
+fn write_account_files(dir: &Path, passwd: &str, group: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    std::fs::create_dir_all(dir)
+        .map_err(|e| UnihelmError::internal(format!("could not create {}: {e}", dir.display())))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(ACCOUNT_DIR_MODE)).map_err(
+        |e| {
+            UnihelmError::internal(format!(
+                "could not set {:04o} on {}: {e}",
+                ACCOUNT_DIR_MODE,
+                dir.display()
+            ))
+        },
+    )?;
+
+    for (name, body) in [("passwd", passwd), ("group", group)] {
+        let path = dir.join(name);
+        // Refused rather than followed, and refused rather than replaced:
+        // nothing in this module deletes a path.
+        if std::fs::symlink_metadata(&path).is_ok_and(|md| md.file_type().is_symlink()) {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidPath,
+                format!(
+                    "{} is a symlink; refusing to write this container's account file \
+                     through it",
+                    path.display()
+                ),
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(ACCOUNT_FILE_MODE)
+            .open(&path)
+            .map_err(|e| {
+                UnihelmError::internal(format!("could not open {}: {e}", path.display()))
+            })?;
+        file.write_all(body.as_bytes()).map_err(|e| {
+            UnihelmError::internal(format!("could not write {}: {e}", path.display()))
+        })?;
+    }
+    Ok(())
+}
+
+/// The passwd lookup [`crate::appcontainer`] keeps its own copy of.
+///
+/// Duplicated rather than hoisted for that module's stated reason: hoisting it
+/// means editing a shared module mid-wave, and copies of a few lines that call
+/// one libc function are a smaller problem than two agents rewriting one file.
+fn passwd_record(username: &str) -> Option<PasswdRecord> {
+    let c_name = std::ffi::CString::new(username).ok()?;
+    // SAFETY: `getpwnam` returns a pointer into a static buffer owned by libc;
+    // we read it immediately and copy every field out before anything else can
+    // call into the same buffer.
+    unsafe {
+        let pw = libc::getpwnam(c_name.as_ptr());
+        if pw.is_null() {
+            return None;
+        }
+        Some(PasswdRecord {
+            name: c_string((*pw).pw_name),
+            uid: (*pw).pw_uid,
+            gid: (*pw).pw_gid,
+            home: c_string((*pw).pw_dir),
+            shell: c_string((*pw).pw_shell),
+        })
+    }
+}
+
+fn group_record(name: &str) -> Option<GroupRecord> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: as above, for `getgrnam`.
+    unsafe {
+        let gr = libc::getgrnam(c_name.as_ptr());
+        read_group(gr)
+    }
+}
+
+fn group_by_gid(gid: u32) -> Option<GroupRecord> {
+    // SAFETY: as above, for `getgrgid`.
+    unsafe {
+        let gr = libc::getgrgid(gid);
+        read_group(gr)
+    }
+}
+
+/// # Safety
+///
+/// `gr` is null or a pointer libc owns and has just filled; everything is copied
+/// out before returning.
+unsafe fn read_group(gr: *mut libc::group) -> Option<GroupRecord> {
+    if gr.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut members = Vec::new();
+        let mut cursor = (*gr).gr_mem;
+        // `gr_mem` is a NULL-terminated array of C strings.
+        while !cursor.is_null() && !(*cursor).is_null() {
+            members.push(c_string(*cursor));
+            cursor = cursor.add(1);
+        }
+        Some(GroupRecord {
+            name: c_string((*gr).gr_name),
+            gid: (*gr).gr_gid,
+            members,
+        })
+    }
+}
+
+/// # Safety
+///
+/// `ptr` is null or a NUL-terminated C string libc owns.
+unsafe fn c_string(ptr: *const libc::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ---------------------------------------------------------------------------
 // The argv
 // ---------------------------------------------------------------------------
 
@@ -576,15 +1048,19 @@ fn run_argv(plan: &FpmContainer) -> Vec<String> {
         // sides so the vhost's `fastcgi_pass` needs no translating.
         "--volume".to_string(),
         format!("{0}:{0}", plan.socket_dir.display()),
-        // **The host's accounts**, read-only, which is what makes uid 1007
-        // inside mean `uh_abc123` outside — and what makes `listen.group = nginx`
-        // resolve to the gid nginx actually runs as. Read-only is not decoration:
-        // a writable bind of the host's passwd inside a container running
-        // tenant-authored code is the whole machine.
+        // **Accounts**, read-only, and **the panel's own pair rather than the
+        // host's**. They are what makes uid 1007 inside mean `uh_abc123`
+        // outside, and what makes `listen.group = nginx` resolve to the gid
+        // nginx actually runs as. They hold only the accounts this version's
+        // pools name — see [`accounts_this_master_needs`] — because tenant PHP
+        // runs in here, and the host's own `/etc/passwd` is a list of every
+        // hosting customer on the server. Read-only is not decoration either: a
+        // writable account database inside a container running tenant-authored
+        // code is every pool's identity for somebody else to choose.
         "--volume".to_string(),
-        "/etc/passwd:/etc/passwd:ro".to_string(),
+        format!("{}:/etc/passwd:ro", plan.passwd_file.display()),
         "--volume".to_string(),
-        "/etc/group:/etc/group:ro".to_string(),
+        format!("{}:/etc/group:ro", plan.group_file.display()),
         // **The sites.** One master serves every tenant on this version, so it
         // is the home root and not one home — a per-tenant mount would mean
         // recreating the container, and therefore an outage for every site on
@@ -1042,6 +1518,15 @@ pub async fn install(ctx: &OpContext, version: PhpVersion) -> Result<InstallOutp
         take_down(ctx, &docker, &plan.container).await?;
     }
 
+    // From a fresh read of the pool directory rather than from `found_now`: a
+    // site can be created while an image is arriving, and a master started with
+    // account files that predate its own pools cannot resolve the new pool's
+    // user — which fails the whole master, not just that pool. Written before
+    // the run for a second reason too: Docker creates a *directory* where a
+    // bind-mount source file is missing, and a directory at `/etc/passwd` is a
+    // container in which no name resolves at all.
+    refresh_account_files(ctx, &plan, &plan.pools())?;
+
     ctx.log(format!(
         "docker run {} as {} — pools from {}, sockets in {}",
         plan.image.as_str(),
@@ -1173,6 +1658,14 @@ pub async fn reload(ctx: &OpContext, version: PhpVersion) -> Result<ReloadPlan> 
             );
         }
         ReloadPlan::Signal => {
+            // **Before the signal, every time.** The pool that prompted this
+            // reload belongs to a site that may have been created a second ago,
+            // and its tenant is not in the account files the master was started
+            // with. Written in place, so the running master reads the new
+            // content off the inode it already holds; a master that could not
+            // resolve one pool's user would refuse the whole configuration and
+            // take every other site on this version down with it.
+            refresh_account_files(ctx, &plan, &pools)?;
             ctx.log(format!(
                 "docker kill --signal {RELOAD_SIGNAL} {} — {} pool(s), no restart and no \
                  dropped request",
@@ -1183,6 +1676,11 @@ pub async fn reload(ctx: &OpContext, version: PhpVersion) -> Result<ReloadPlan> 
             wait_until_serving(ctx, &docker, &plan, &pools).await?;
         }
         ReloadPlan::Start => {
+            // As above, and additionally because the container may have been
+            // created before its account files existed at all — a start whose
+            // bind-mount source is missing is a start Docker turns into a
+            // directory.
+            refresh_account_files(ctx, &plan, &pools)?;
             ctx.log(format!(
                 "starting {} — PHP {} now has {} pool(s) to run",
                 plan.container,
@@ -1890,17 +2388,200 @@ mod tests {
     }
 
     /// uid 1007 inside must be `uh_abc123` outside, and `listen.group = nginx`
-    /// must resolve. Both come from the host's own account files, read-only.
+    /// must resolve — so account files come in read-only, and they are **the
+    /// panel's own**.
+    ///
+    /// The host's `/etc/passwd` used to be mounted whole. Tenant PHP runs inside
+    /// this container, so every site on the version could read every hosting
+    /// customer's login name, uid and home path out of it; read-only stopped
+    /// them writing it and nothing stopped them reading it.
     #[test]
-    fn the_hosts_accounts_come_in_read_only() {
-        let mounts = values_of(&run_argv(&plan(PhpVersion::V83)), "--volume");
-        assert!(
-            mounts.contains(&"/etc/passwd:/etc/passwd:ro".to_string()),
-            "{mounts:?}"
+    fn the_accounts_that_come_in_are_the_panels_own_and_not_the_hosts() {
+        let resolved = plan(PhpVersion::V83);
+        let argv = run_argv(&resolved);
+        let mounts = values_of(&argv, "--volume");
+
+        for (source, target) in [
+            (&resolved.passwd_file, "/etc/passwd"),
+            (&resolved.group_file, "/etc/group"),
+        ] {
+            let mount = format!("{}:{target}:ro", source.display());
+            assert!(mounts.contains(&mount), "{mount} missing from {mounts:?}");
+            assert!(
+                source.starts_with(paths::state_dir()),
+                "{} is not the panel's own file",
+                source.display()
+            );
+        }
+
+        for leak in [
+            "/etc/passwd:/etc/passwd:ro",
+            "/etc/group:/etc/group:ro",
+            "/etc/passwd:/etc/passwd",
+            "/etc/group:/etc/group",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == leak),
+                "`{leak}` puts the whole host account list back inside every PHP site on \
+                 this version: {mounts:?}"
+            );
+        }
+
+        // Two versions are two masters and two files: an 8.3 container that read
+        // 7.4's would hold names it has no pool for.
+        assert_ne!(
+            resolved.passwd_file,
+            plan(PhpVersion::V74).passwd_file,
+            "two versions are two masters and must not share one account file"
         );
+    }
+
+    /// The master resolves exactly the names its pools give it, so those are the
+    /// names read out of the files rather than recomputed from a table.
+    #[test]
+    fn the_accounts_come_out_of_the_pool_file_itself() {
+        let body = "[example_com]\n\
+                    user  = uh_abc123\n\
+                    group = uh_abc123\n\
+                    listen = /run/unihelm/fpm/example_com-php83.sock\n\
+                    listen.owner = uh_abc123\n\
+                    listen.group = nginx\n\
+                    listen.mode  = 0660\n";
+        assert_eq!(accounts_in(body), vec!["uh_abc123", "nginx"]);
+
+        // A commented-out directive is not a directive, and an ini comment after
+        // the value is not part of the name.
+        assert_eq!(
+            accounts_in("[www]\n; user = ghost\nuser = uh_abc123 ; the tenant\n"),
+            vec!["uh_abc123"]
+        );
+        // `listen.owner` may be a bare uid, which needs no passwd entry and must
+        // not be invented into one.
+        assert!(accounts_in("[www]\nlisten.owner = 1007\n").is_empty());
+        // ACL lists are comma-separated, and an FPM built with ACL support does
+        // resolve every name in them.
+        assert_eq!(
+            accounts_in("[www]\nlisten.acl_users = nginx,uh_abc123\n"),
+            vec!["nginx", "uh_abc123"]
+        );
+        // A path is not an account name; nothing that could reach a file the
+        // panel writes gets through on a key we do not read.
+        assert!(accounts_in("[www]\nlisten = /run/unihelm/fpm/x.sock\n").is_empty());
+    }
+
+    /// **What the filter is, said out loud.** One master serves every site on
+    /// its version, so its `passwd` holds every tenant with a pool here — that
+    /// is not narrower and is not claimed to be. What it removes is everybody
+    /// with no pool on this version, which on a mixed server is nearly the whole
+    /// account list.
+    #[test]
+    fn a_masters_accounts_are_its_own_pools_tenants_and_nobody_else() {
+        let pools = PoolSet {
+            pools: vec![
+                Pool {
+                    file: PathBuf::from("/etc/php/8.3/fpm/pool.d/unihelm-a.conf"),
+                    socket: None,
+                    accounts: vec!["uh_aaa11111".to_string(), "nginx".to_string()],
+                },
+                Pool {
+                    file: PathBuf::from("/etc/php/8.3/fpm/pool.d/unihelm-b.conf"),
+                    socket: None,
+                    accounts: vec!["uh_bbb22222".to_string(), "nginx".to_string()],
+                },
+            ],
+        };
+        let names = accounts_this_master_needs(&pools, "nginx");
+
+        // Both tenants of this version, because both have a pool the master
+        // starts.
+        assert!(names.contains(&"uh_aaa11111".to_string()), "{names:?}");
+        assert!(names.contains(&"uh_bbb22222".to_string()), "{names:?}");
+        // The web server's account, root and nobody.
+        for expected in ["nginx", "root", "nobody"] {
+            assert!(names.contains(&expected.to_string()), "{names:?}");
+        }
+        // No duplicates: `nginx` is named by both pools and by the web server
+        // lookup, and a repeated passwd line is a file that reads as broken.
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "{names:?}");
+
+        // And a tenant with no pool on this version — one whose sites are all on
+        // 7.4, or who has no PHP site at all — never appears. That is the whole
+        // of the fix.
+        assert!(!names.contains(&"uh_ccc33333".to_string()), "{names:?}");
+        assert_eq!(names.len(), 5, "{names:?}");
+    }
+
+    /// A bind-mounted file is the inode, not the path. A write-and-rename would
+    /// leave the running master reading the old file forever while the host
+    /// showed the new one — so the first site created after an install would
+    /// name a tenant the master cannot resolve, and FPM fails the *whole* master
+    /// over one unresolvable pool.
+    #[test]
+    fn rewriting_the_account_files_keeps_the_inode_the_master_holds() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = pool_dir();
+        let dir = tmp.path().join("unihelm-php-8.3");
+        write_account_files(&dir, "root:x:0:0::/root:/sbin/nologin\n", "root:x:0:\n").unwrap();
+        let first = std::fs::metadata(dir.join("passwd")).unwrap().ino();
+
+        write_account_files(
+            &dir,
+            "root:x:0:0::/root:/sbin/nologin\nuh_abc123:x:1007:1007::/home/uh_abc123:/x\n",
+            "root:x:0:\nnginx:x:33:\n",
+        )
+        .unwrap();
+        let after = std::fs::metadata(dir.join("passwd")).unwrap();
+
+        assert_eq!(first, after.ino(), "the file was replaced, not rewritten");
+        assert_eq!(after.mode() & 0o777, ACCOUNT_FILE_MODE);
         assert!(
-            mounts.contains(&"/etc/group:/etc/group:ro".to_string()),
-            "{mounts:?}"
+            std::fs::read_to_string(dir.join("passwd"))
+                .unwrap()
+                .contains("uh_abc123"),
+            "the rewrite did not land where the master would read it"
+        );
+        // Root's alone on the host: a tenant who could write this file could map
+        // their own account name onto another tenant's uid, and the master would
+        // run their pool as that tenant.
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().mode() & 0o777,
+            ACCOUNT_DIR_MODE
+        );
+    }
+
+    /// Root always has a name inside the container: the master runs as root
+    /// there, and a `passwd` with no uid 0 fails in ways nothing in the log
+    /// explains. A name that resolves to nothing is still not invented.
+    #[test]
+    fn root_is_in_the_file_even_when_nothing_resolves() {
+        let (passwd, group) = render_account_files(&["uh_no_such_account_here".to_string()]);
+        assert!(passwd.starts_with("root:x:0:0:"), "{passwd}");
+        assert!(group.starts_with("root:x:0:"), "{group}");
+        assert!(!passwd.contains("uh_no_such_account_here"), "{passwd}");
+
+        // GECOS is empty on every line: on a host where an operator filled it in
+        // it is somebody's real name and phone number.
+        assert_eq!(
+            passwd_line(&PasswdRecord {
+                name: "uh_abc123".to_string(),
+                uid: 1007,
+                gid: 1007,
+                home: "/home/uh_abc123".to_string(),
+                shell: "/usr/sbin/nologin".to_string(),
+            }),
+            "uh_abc123:x:1007:1007::/home/uh_abc123:/usr/sbin/nologin\n"
+        );
+        assert_eq!(
+            group_line(&GroupRecord {
+                name: "nginx".to_string(),
+                gid: 33,
+                members: vec![],
+            }),
+            "nginx:x:33:\n"
         );
     }
 
@@ -2177,6 +2858,7 @@ mod tests {
             pools: vec![Pool {
                 file: dir.path().join("unihelm-example.com.conf"),
                 socket: Some(missing.clone()),
+                accounts: vec!["uh_abc123".to_string()],
             }],
         };
         let why = first_problem(&pools, "nginx").expect("a problem");
@@ -2289,14 +2971,17 @@ mod tests {
         let ours = Pool {
             file: plan.pool_dir().join("unihelm-example.com.conf"),
             socket: Some(paths::fpm_socket("example_com", PhpVersion::V83)),
+            accounts: vec!["uh_abc123".to_string()],
         };
         let stock = Pool {
             file: plan.pool_dir().join("www.conf"),
             socket: Some(PathBuf::from("/run/php/php8.3-fpm.sock")),
+            accounts: vec!["www-data".to_string()],
         };
         let tcp = Pool {
             file: plan.pool_dir().join("imported.conf"),
             socket: None,
+            accounts: Vec::new(),
         };
 
         let pools = PoolSet {

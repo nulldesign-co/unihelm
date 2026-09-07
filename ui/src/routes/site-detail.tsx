@@ -1,7 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, useNavigate } from "@tanstack/react-router";
-import { ExternalLink, FileDiff, Link2, Lock, LockOpen, RefreshCw, Wrench } from "lucide-react";
-import { forwardRef, useState, type ReactNode, type TextareaHTMLAttributes } from "react";
+import {
+  ExternalLink,
+  FileDiff,
+  Link2,
+  Lock,
+  LockOpen,
+  Plus,
+  RefreshCw,
+  Wrench,
+  X,
+} from "lucide-react";
+import {
+  forwardRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+  type TextareaHTMLAttributes,
+} from "react";
 import { useTranslation } from "react-i18next";
 
 import { TaskNotice } from "@/components/task-notice";
@@ -29,6 +45,7 @@ import {
   type UpdateSiteRequest,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
+import { aliasProblem, normalizeDomain, sitesApi } from "@/lib/sites-api";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -161,6 +178,7 @@ export function SiteDetailPage() {
           </>
         }
       />
+      {site.status === "failed" ? <UnfinishedBanner site={site} /> : null}
       <OverviewCard site={site} />
       <div className="grid gap-6 lg:grid-cols-2">
         <CertificateCard site={site} />
@@ -468,38 +486,223 @@ function CertificateCard({ site }: { site: SiteDetail }) {
 }
 
 // ---------------------------------------------------------------------------
-// Aliases (read-only: there is no alias endpoint in routes/sites.rs yet)
+// Re-provision
 // ---------------------------------------------------------------------------
 
+/**
+ * The way out of a `failed` row.
+ *
+ * A site whose provisioning stopped partway used to be a dead end: the state
+ * badge went red, the drift card said "No vhost exists on disk. Saving any
+ * setting writes it again" — and saving needs a setting to change — and the
+ * only real option left was Delete. The banner sits above the fold because a
+ * failed site is the one thing on this page worth reading first.
+ */
+function UnfinishedBanner({ site }: { site: SiteDetail }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const retry = useMutation({
+    mutationFn: () => sitesApi.reprovision(site.id),
+    onSuccess: (accepted: TaskAccepted) => {
+      setError(null);
+      setTaskId(accepted.task_id);
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Callout
+      tone="danger"
+      title={t("siteDetail.unfinishedTitle")}
+      action={
+        <Button variant="primary" onClick={() => retry.mutate()} loading={retry.isPending}>
+          <RefreshCw className="h-4 w-4" aria-hidden />
+          {t("siteDetail.reprovision")}
+        </Button>
+      }
+    >
+      <p>{t("siteDetail.unfinishedBody")}</p>
+      {error ? <p className="mt-2 font-mono text-xs break-words">{error}</p> : null}
+      {taskId ? (
+        <TaskNotice
+          key={taskId}
+          taskId={taskId}
+          onSettled={() => {
+            void queryClient.invalidateQueries({ queryKey: ["sites"] });
+            void queryClient.invalidateQueries({ queryKey: ["site-drift", site.id] });
+          }}
+        />
+      ) : null}
+    </Callout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Aliases
+// ---------------------------------------------------------------------------
+
+/**
+ * The other domains this site answers to, and the controls that change them.
+ *
+ * This card used to render a row of badges under the sentence "Aliases are set
+ * when the site is created; there is no API to change them yet" — which was
+ * true, and meant that attaching `www.` to a live site was a delete and a
+ * rebuild. There is an API now.
+ *
+ * Adding is refused while the site is not serving, because the operation
+ * refuses it too: a `failed` site has no vhost to add a name to, and a
+ * `provisioning` one is being rewritten by another task. The button says which,
+ * rather than posting and letting the task explain.
+ */
 function AliasesCard({ site }: { site: SiteDetail }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [draft, setDraft] = useState("");
+  const [touched, setTouched] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [task, setTask] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // The site is only re-rendered as a whole, so an alias change needs a vhost
+  // to change. `site.alias.add` refuses the other two states by name.
+  const ready = site.status === "active" || site.status === "suspended";
+  const problem = aliasProblem(draft, site);
+  // Only once the operator has moved on from the field: complaining that a
+  // half-typed `www.` needs a dot is complaining about typing.
+  const showProblem = touched && draft.trim() !== "" && problem !== null;
+
+  const started = (accepted: TaskAccepted) => {
+    setError(null);
+    setRunning(true);
+    setTask(accepted.task_id);
+  };
+  const failed = (e: unknown) => {
+    setRunning(false);
+    setError(e instanceof ApiError ? e.message : String(e));
+  };
+
+  const add = useMutation({
+    mutationFn: (domain: string) => sitesApi.addAlias(site.id, domain),
+    onSuccess: (accepted: TaskAccepted) => {
+      setDraft("");
+      setTouched(false);
+      started(accepted);
+    },
+    onError: failed,
+  });
+
+  const remove = useMutation({
+    mutationFn: (alias: string) => sitesApi.removeAlias(site.id, alias),
+    onSuccess: started,
+    onError: failed,
+  });
+
+  const busy = running || add.isPending || remove.isPending;
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    setTouched(true);
+    // Send the normalised name, because that is the spelling the agent stores
+    // and the one the remove button will have to match later.
+    if (problem !== null || busy || !ready) return;
+    add.mutate(normalizeDomain(draft));
+  };
+
   return (
     <Card>
       <CardHeader title={t("siteDetail.aliases")} description={t("siteDetail.aliasesHint")} />
       <CardBody>
         {site.aliases.length === 0 ? (
-          /* No action: aliases are fixed at creation, so the hint is the whole
-             teachable part. */
           <EmptyState
             className="py-8"
             icon={<Link2 />}
             title={t("siteDetail.noAliases")}
-            hint={t("siteDetail.aliasesReadOnly")}
+            hint={t("siteDetail.noAliasesHint")}
           />
         ) : (
-          <>
-            <ul className="flex flex-wrap gap-2">
-              {site.aliases.map((alias, index) => (
-                <li key={alias} className="animate-rise-in stagger" style={staggerStyle(index)}>
-                  <Badge tone="neutral">
-                    <span className="font-mono text-xs">{alias}</span>
-                  </Badge>
-                </li>
-              ))}
-            </ul>
-            <p className="mt-3 text-xs text-ink-subtle">{t("siteDetail.aliasesReadOnly")}</p>
-          </>
+          <ul className="flex flex-wrap gap-2">
+            {site.aliases.map((alias, index) => (
+              <li key={alias} className="animate-rise-in stagger" style={staggerStyle(index)}>
+                {/* The badge and its remove control are one chip: a separate
+                    button beside it would read as an action on the card. */}
+                <span className="inline-flex items-center gap-1 rounded-full border border-border bg-surface-muted ps-2.5 pe-1 py-0.5">
+                  <span className="font-mono text-xs text-ink">{alias}</span>
+                  <button
+                    type="button"
+                    aria-label={t("siteDetail.aliasRemoveLabel", { domain: alias })}
+                    disabled={busy || !ready}
+                    onClick={() => remove.mutate(alias)}
+                    className={cn(
+                      "rounded-full p-0.5 text-ink-subtle transition-colors",
+                      "hover:bg-danger-soft hover:text-danger",
+                      "focus-visible:outline-2 focus-visible:outline-accent",
+                      "disabled:pointer-events-none disabled:opacity-40",
+                    )}
+                  >
+                    <X className="h-3 w-3" aria-hidden />
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
+
+        <form onSubmit={submit} className="mt-4 border-t border-border pt-4">
+          <Field
+            label={t("siteDetail.aliasAddLabel")}
+            htmlFor="alias_domain"
+            error={showProblem ? t(`siteDetail.aliasProblem.${problem}`) : undefined}
+          >
+            <div className="flex flex-wrap items-start gap-2">
+              <Input
+                id="alias_domain"
+                className="min-w-48 flex-1 font-mono text-xs"
+                placeholder="www.example.com"
+                autoComplete="off"
+                spellCheck={false}
+                aria-invalid={showProblem}
+                disabled={busy || !ready}
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                onBlur={() => setTouched(true)}
+              />
+              <Button
+                type="submit"
+                variant="outline"
+                loading={add.isPending}
+                disabled={busy || !ready || draft.trim() === "" || problem !== null}
+              >
+                <Plus className="h-4 w-4" aria-hidden />
+                {t("siteDetail.aliasAdd")}
+              </Button>
+            </div>
+            <p className="text-xs text-ink-subtle">
+              {ready ? t("siteDetail.aliasAddHint") : t("siteDetail.aliasNotReady")}
+            </p>
+          </Field>
+        </form>
+
+        {error ? (
+          <Callout tone="danger" className="mt-3">
+            {error}
+          </Callout>
+        ) : null}
+        {task ? (
+          <TaskNotice
+            key={task}
+            taskId={task}
+            onSettled={() => {
+              setRunning(false);
+              // The alias list lives on the site row, and the vhost the drift
+              // card compares against has just been rewritten.
+              void queryClient.invalidateQueries({ queryKey: ["sites"] });
+              void queryClient.invalidateQueries({ queryKey: ["site-drift", site.id] });
+            }}
+          />
+        ) : null}
       </CardBody>
     </Card>
   );

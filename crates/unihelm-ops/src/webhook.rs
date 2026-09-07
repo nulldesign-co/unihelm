@@ -38,6 +38,13 @@
 //! policy the alert notifier uses, and literally the same function —
 //! [`crate::alerts::redirect_allowed`], because a webhook URL and an alert
 //! webhook URL are the same kind of secret in the same kind of path).
+//!
+//! It is also not a way to borrow the panel's network position. Every URL is
+//! resolved and refused if it lands off the public internet
+//! ([`crate::dns::ensure_outbound_destination`]) — at `webhook.set`, at
+//! `webhook.test`, and again before each delivery. Without that, a hook aimed at
+//! `169.254.169.254` made the panel read a cloud instance's credentials and POST
+//! them wherever it was told.
 
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
@@ -214,15 +221,23 @@ pub fn backoff(attempts_so_far: i64) -> Option<time::Duration> {
 
 const MAX_URL_LEN: usize = 2048;
 
-/// Reject a URL that is not one we would ever POST to.
+/// Reject a URL that is not one we would ever POST to, on its spelling alone.
 ///
-/// The same reasoning as the alert notifier's check, and deliberately the same
-/// permissiveness: private and loopback addresses are **not** blocked, because
-/// relaying through something local is the common legitimate case and only an
-/// account that already holds `server_manage` can register a hook. What is
-/// refused is the part somebody gets wrong by pasting — a non-HTTP scheme, an
-/// embedded newline (header injection into the request we are about to build),
-/// whitespace, or an absurd length.
+/// This is the syntactic half: a non-HTTP scheme, an embedded newline (header
+/// injection into the request we are about to build), whitespace, or an absurd
+/// length. It stays synchronous and pure, so it can run on a stored row without
+/// touching the network.
+///
+/// **Where the URL points is a separate question**, answered by
+/// [`crate::dns::ensure_outbound_destination`], which resolves the host and
+/// refuses anything that lands off the public internet. This function used to
+/// carry a comment saying loopback and private addresses were allowed on
+/// purpose, because only `server_manage` can register a hook. That reasoning
+/// was wrong in one specific way: the panel, not the caller, makes the request,
+/// so the caller was being handed the panel's network position — enough to read
+/// a cloud instance's metadata credentials and have them POSTed out, or to
+/// sweep the private network from inside it. Local relaying, the case that
+/// permissiveness was protecting, is the price of closing that.
 pub fn validate_url(url: &str) -> Result<String> {
     let url = url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -617,7 +632,22 @@ pub async fn deliver_due(ctx: &OpContext, transport: &dyn Deliverer) -> Result<S
             unix_seconds(),
         );
 
-        let outcome = transport.deliver(&request).await;
+        // Where the row points is re-checked here, not only at `webhook.set`.
+        // The stored URL is what an attacker with database access edits, and
+        // re-resolving per delivery also shortens the window in which a name
+        // that was public when it was stored has since been repointed inward.
+        //
+        // A refusal is recorded as an ordinary delivery failure rather than an
+        // instant disable, because "this name does not resolve right now" and
+        // "this name resolves into the private network" arrive here as the same
+        // error, and switching a working integration off because DNS blinked
+        // would be exactly the silent loss the failure counter exists to avoid.
+        // A destination that stays refused still reaches FAILURE_THRESHOLD and
+        // is disabled with its reason.
+        let outcome = match crate::dns::ensure_outbound_destination(&url, "url").await {
+            Ok(()) => transport.deliver(&request).await,
+            Err(e) => Err(e.detail),
+        };
         let (error, status) = match outcome {
             Ok(status) if is_success(status) => {
                 let _ = db
@@ -828,6 +858,11 @@ impl TypedOperation for Set {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let url = validate_url(&input.url)?;
+        // Refused at the door as well as on the way out: a hook stored pointing
+        // at the instance metadata service is a queued request to fetch it, and
+        // the operator who typed it deserves to be told now rather than through
+        // a delivery that quietly never happens.
+        crate::dns::ensure_outbound_destination(&url, "url").await?;
         let events = validate_events(&input.events)?;
         let repo = ctx.db().webhooks(ctx.scope());
 
@@ -986,6 +1021,10 @@ impl TypedOperation for Test {
             .ok_or_else(|| UnihelmError::not_found("webhook"))?;
 
         let url = validate_url(&hook.url)?;
+        // A test is a real POST to a real endpoint, so it gets the real guard.
+        // Without it `webhook.test` would be the shortest path to the confused
+        // deputy: store a hook, press Test, read the answer.
+        crate::dns::ensure_outbound_destination(&url, "url").await?;
         let secret = ctx
             .master_key()
             .open_str(&hook.secret_sealed)
@@ -1053,6 +1092,18 @@ mod tests {
     use crate::registry::testing::{auth_for, registry};
     use std::sync::Mutex;
     use unihelm_core::Role;
+
+    /// Hook URLs the destination guard accepts, and two of them because one
+    /// test updates a hook to a second address.
+    ///
+    /// IP literals, so no test here depends on the machine having a working
+    /// resolver — the guard short-circuits DNS for an address. They come from
+    /// 198.18.0.0/15 (RFC 2544 benchmarking) rather than the RFC 5737
+    /// documentation ranges, because `is_globally_routable` refuses
+    /// documentation space, which is the guard working rather than a problem to
+    /// route around.
+    const REACHABLE: &str = "https://198.18.0.7/hook";
+    const REACHABLE_2: &str = "https://198.18.0.8/other";
 
     // -- the signature scheme ------------------------------------------------
 
@@ -1303,7 +1354,7 @@ mod tests {
                 &ctx,
                 SetInput {
                     id: None,
-                    url: "https://example.com/hook".into(),
+                    url: REACHABLE.into(),
                     events: events.iter().map(|e| (*e).to_string()).collect(),
                     active: true,
                     owner_user_id: None,
@@ -1546,6 +1597,120 @@ mod tests {
         assert!(!hook.active);
     }
 
+    /// Issue 60: `webhook.set` checked the scheme and stopped there, so a hook
+    /// aimed at the cloud metadata service was stored, delivered to, and its
+    /// answer handed to whoever registered it — the panel acting as a deputy
+    /// for a request the caller could not make itself.
+    #[tokio::test]
+    async fn a_hook_pointed_inside_this_network_is_refused_with_the_address_named() {
+        let (reg, admin, _) = registry().await;
+        let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+
+        for inward in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://127.0.0.1:9000/hook",
+            "http://10.0.0.5/hook",
+            "http://192.168.1.1/hook",
+            "https://[::1]/hook",
+            // The v4-mapped spelling of loopback: the same destination, and
+            // the one a hand-written denylist misses.
+            "https://[::ffff:127.0.0.1]/hook",
+            // Userinfo in front of the host is where a naive split goes wrong.
+            "https://example.com@169.254.169.254/hook",
+        ] {
+            let err = Set
+                .run(
+                    &ctx,
+                    SetInput {
+                        id: None,
+                        url: inward.into(),
+                        events: vec!["site.created".into()],
+                        active: true,
+                        owner_user_id: None,
+                        rotate_secret: false,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "accepted {inward}");
+            assert_eq!(err.field.as_deref(), Some("url"));
+        }
+
+        // The refusal has to name the address it resolved to: "invalid URL"
+        // against a hostname that looks fine is a message nobody can act on.
+        let err = Set
+            .run(
+                &ctx,
+                SetInput {
+                    id: None,
+                    url: "http://169.254.169.254/latest/meta-data/".into(),
+                    events: vec!["site.created".into()],
+                    active: true,
+                    owner_user_id: None,
+                    rotate_secret: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.detail.contains("169.254.169.254"),
+            "the refusal must say where it resolved to: {}",
+            err.detail
+        );
+
+        // Nothing was stored on the way past.
+        let listed = List.run(&ctx, ListInput { id: None }).await.unwrap();
+        assert!(listed.webhooks.is_empty());
+    }
+
+    /// The row is what an attacker with database access edits, and what a
+    /// restore from a pre-guard backup brings back. Neither may become a POST.
+    #[tokio::test]
+    async fn a_stored_hook_that_points_inside_this_network_is_never_posted_to() {
+        let (reg, admin, _) = registry().await;
+        let (id, _) = hook_for(&reg, admin, &["site.created"]).await;
+        let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+        let db = reg.services().db.clone();
+        emit(&ctx, "site.created", serde_json::json!({})).await;
+
+        sqlx::query("UPDATE webhooks SET url = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind("http://169.254.169.254/latest/meta-data/")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let transport = ScriptedTransport::answering(Ok(200));
+        deliver_due(&ctx, &transport).await.unwrap();
+        assert_eq!(
+            transport.count(),
+            0,
+            "a stored internal destination must not be delivered to"
+        );
+
+        let history = db.recent_deliveries(id, 1).await.unwrap();
+        assert!(
+            history[0]
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("169.254.169.254"),
+            "the delivery record must say why: {:?}",
+            history[0].last_error
+        );
+        // A refused destination is an ordinary failure, not an instant
+        // disable — the same error covers "DNS is down right now", and
+        // switching a working integration off for that would be the silent
+        // loss the failure counter exists to prevent.
+        let hook = db
+            .webhooks(&unihelm_core::TenantScope::Global)
+            .by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hook.active, "one refusal must not disable the hook");
+    }
+
     #[tokio::test]
     async fn a_stored_url_that_would_be_refused_today_is_never_posted_to() {
         let (reg, admin, _) = registry().await;
@@ -1605,7 +1770,7 @@ mod tests {
                 &ctx,
                 SetInput {
                     id: Some(id),
-                    url: "https://example.com/hook".into(),
+                    url: REACHABLE.into(),
                     events: vec!["site.created".into()],
                     active: true,
                     owner_user_id: None,
@@ -1635,7 +1800,7 @@ mod tests {
                 &ctx,
                 SetInput {
                     id: Some(id),
-                    url: "https://example.com/other".into(),
+                    url: REACHABLE_2.into(),
                     events: vec!["*".into()],
                     active: true,
                     owner_user_id: None,
@@ -1645,6 +1810,6 @@ mod tests {
             .await
             .unwrap();
         assert!(out.secret.is_none());
-        assert_eq!(out.webhook.url, "https://example.com/other");
+        assert_eq!(out.webhook.url, REACHABLE_2);
     }
 }

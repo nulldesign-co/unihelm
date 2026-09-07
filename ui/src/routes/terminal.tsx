@@ -49,12 +49,29 @@ const XtermView = lazy(() => import("@/components/terminal/xterm-view"));
  * connection or a panel restart all leave it running, and the page reattaches
  * to the same one instead of starting a second.
  */
-type Phase =
+export type Phase =
   | { kind: "idle" }
   | { kind: "connecting" }
   | { kind: "open"; account: string }
   | { kind: "closed"; reason: string | null }
   | { kind: "denied"; reason: string };
+
+/**
+ * Is there a shell on the other end of the keyboard right now?
+ *
+ * Read off the phase rather than tracked beside it. Every way out of a live
+ * session already sets one — the operator ending it, the agent closing it, a
+ * refusal, a socket error, a failed handshake — so deriving it means a phase
+ * added later cannot forget to turn the terminal off, and there is no second
+ * flag to fall out of step with the first.
+ *
+ * Nothing joined the two before, so a session that had ended left a blinking
+ * cursor on screen. That is the only "type here" signal a terminal has, and the
+ * operator went on typing into a socket that was gone.
+ */
+export function isLive(phase: Phase): boolean {
+  return phase.kind === "open";
+}
 
 const SESSION_KEY = "unihelm.terminal.session";
 
@@ -171,7 +188,11 @@ export function TerminalPage() {
               sessionId.current = null;
               break;
             case "lagged":
-              term.current?.notice(t("terminal.lagged"));
+              // The server's own sentence when it has one, because it is the
+              // only thing that knows how much went missing. The key is the
+              // fallback for an older panel binary, which said only that
+              // *something* was dropped.
+              term.current?.notice(message.detail ?? t("terminal.lagged"));
               break;
           }
         };
@@ -312,6 +333,7 @@ export function TerminalPage() {
                 onData={onData}
                 onResize={onResize}
                 dark={document.documentElement.classList.contains("dark")}
+                live={isLive(phase)}
               />
             </Suspense>
           </div>

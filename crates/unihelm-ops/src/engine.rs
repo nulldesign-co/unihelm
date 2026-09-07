@@ -22,9 +22,9 @@
 //! below is derived from a catalogue lookup** — the image from [`RECIPES`], the
 //! tag from the version the operator picked off a fixed list, the ports and the
 //! mount from this file. A caller supplies a slug and a version and nothing
-//! else, so there is no flag to smuggle. `docker.create` publishes on every
-//! interface and has no field for a bind address, which is the one thing a
-//! database container must not do (see [`LOOPBACK`]).
+//! else, so there is no flag to smuggle. `docker.create` takes an image and a
+//! name from whoever is asking; an engine's identity, port and data directory
+//! are the panel's own and are not an operator's to type.
 //!
 //! ## The four things that had to be right
 //!
@@ -1247,8 +1247,7 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
     // After the pull, never before. Taking a serving engine down and then
     // spending a quarter of an hour on a download is an outage bought for
     // nothing, and bought again if the download fails.
-    let inventory = DockerList.run(ctx, ListInput::default()).await?;
-    if inventory.containers.iter().any(|c| c.name == name) {
+    if crate::docker::container_exists(&docker, &plan.container).await {
         ctx.log(format!(
             "{name} is already on this server; replacing it, and keeping its data"
         ));
@@ -1289,9 +1288,32 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
     }
     let started = start.run().await.map_err(UnihelmError::from)?;
     if !started.success() {
-        return Err(UnihelmError::new(
-            ErrorCode::CommandFailed,
-            started.failure_text(),
+        let text = started.failure_text();
+
+        // Two things this used to leave the operator holding, and both of them
+        // are what a port clash between Redis and Valkey actually looked like:
+        //
+        // 1. **A broken container.** `docker run` creates it and *then* starts
+        //    it, so a bind failure leaves `unihelm-redis-7` sitting in `created`
+        //    on the machine. The next attempt then failed on the name as well as
+        //    the port, and the message was about the name.
+        // 2. **Docker's own sentence**, which names an endpoint id and a driver
+        //    and mentions the port in the middle of it. `run_failure` pulls the
+        //    port out and names the holder — and the panel already knows the
+        //    holder, because every engine it published a port for is in the
+        //    registry above.
+        let swept = crate::docker::sweep_failed_run(ctx, &docker, &plan.container).await;
+        let holder = crate::docker::allocated_port(&text).and_then(|port| {
+            known
+                .values()
+                .find(|r| r.host_port == port)
+                .map(|r| r.container.clone())
+        });
+        return Err(crate::docker::run_failure(
+            &text,
+            plan.container.as_str(),
+            holder.as_deref(),
+            swept,
         ));
     }
 
@@ -1743,7 +1765,18 @@ impl TypedOperation for Status {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let registry = registry(ctx.db()).await?;
-        let inventory = DockerList.run(ctx, ListInput::default()).await?;
+        // The cheap inventory, not `docker.list`. This operation renders no
+        // volume size and no mount list, and `docker.list` now pays
+        // `docker system df` — which walks every volume's directory — to draw
+        // those on the Docker page. Reading the full list here would put those
+        // seconds behind the Databases page's first paint for two fields
+        // (a container's state, and whether a volume name still exists) that
+        // cost one command each.
+        let inventory = crate::docker::inventory().await;
+        let volumes = match inventory.docker.as_deref() {
+            Some(docker) => crate::docker::volume_names(docker).await,
+            None => Vec::new(),
+        };
 
         let mut engines: Vec<EngineStatus> = registry
             .values()
@@ -1765,7 +1798,7 @@ impl TypedOperation for Status {
                     data_volume_present: record
                         .volume
                         .as_deref()
-                        .is_some_and(|v| inventory.volumes.iter().any(|have| have.name == v)),
+                        .is_some_and(|v| volumes.iter().any(|have| have == v)),
                     volume: record.volume.clone(),
                     present: found.is_some(),
                     running: found.is_some_and(|c| c.running),
@@ -1781,7 +1814,7 @@ impl TypedOperation for Status {
         engines.sort_by(|a, b| a.container.cmp(&b.container));
 
         Ok(StatusOutput {
-            docker_available: inventory.installed && inventory.daemon_running,
+            docker_available: inventory.docker.is_some() && inventory.daemon_running,
             engines,
         })
     }

@@ -44,6 +44,18 @@ interface NavItem {
   to: string;
   label: string;
   icon: LucideIcon;
+  /**
+   * What an operator types when they are looking for this page and do not know
+   * what we called it — "ssl" for the site's certificate, "php" for the stack,
+   * "restore" for backups.
+   *
+   * Search aliases only: the palette matches on them and never shows them, so
+   * they are not user-visible copy and do not belong in the bundle. The list
+   * exists because sixteen nav labels matched as substrings meant "certificate"
+   * and "restore" found nothing at all, on a panel where both are things people
+   * come looking for in a hurry.
+   */
+  keywords?: string[];
 }
 
 interface NavGroup {
@@ -86,64 +98,233 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // operator is doing, not by when the feature shipped.
   const groups = useMemo<NavGroup[]>(
     () => [
-      { label: null, items: [{ to: "/", label: t("nav.dashboard"), icon: Gauge }] },
+      {
+        label: null,
+        items: [
+          {
+            to: "/",
+            label: t("nav.dashboard"),
+            icon: Gauge,
+            keywords: ["home", "overview", "status", "cpu", "memory", "disk", "load", "uptime"],
+          },
+        ],
+      },
       {
         label: t("nav.groupHosting"),
         items: [
-          { to: "/sites", label: t("nav.sites"), icon: Globe },
-          { to: "/discover", label: t("nav.discover"), icon: Compass },
-          { to: "/apps", label: t("nav.apps"), icon: Boxes },
-          { to: "/databases", label: t("nav.databases"), icon: Database },
-          { to: "/files", label: t("nav.files"), icon: FolderOpen },
-          { to: "/mail", label: t("nav.mail"), icon: Mail },
-          { to: "/dns", label: t("nav.dns"), icon: Network },
+          {
+            to: "/sites",
+            label: t("nav.sites"),
+            icon: Globe,
+            // TLS has no page of its own — it is a panel on the site — so
+            // "ssl" and "certificate" have to lead here or they lead nowhere.
+            keywords: [
+              "domain",
+              "vhost",
+              "website",
+              "ssl",
+              "tls",
+              "certificate",
+              "https",
+              "nginx",
+              "apache",
+              "php version",
+            ],
+          },
+          {
+            to: "/discover",
+            label: t("nav.discover"),
+            icon: Compass,
+            keywords: ["import", "adopt", "existing", "unmanaged", "migrate", "scan"],
+          },
+          {
+            to: "/apps",
+            label: t("nav.apps"),
+            icon: Boxes,
+            keywords: ["node", "nodejs", "python", "runtime", "service", "process", "port"],
+          },
+          {
+            to: "/databases",
+            label: t("nav.databases"),
+            icon: Database,
+            keywords: ["db", "mysql", "mariadb", "postgres", "postgresql", "sql", "adminer"],
+          },
+          {
+            to: "/files",
+            label: t("nav.files"),
+            icon: FolderOpen,
+            keywords: ["folder", "upload", "download", "editor", "permissions", "chmod", "archive"],
+          },
+          {
+            to: "/mail",
+            label: t("nav.mail"),
+            icon: Mail,
+            keywords: ["email", "smtp", "imap", "mailbox", "relay", "dkim", "spf", "dmarc"],
+          },
+          {
+            to: "/dns",
+            label: t("nav.dns"),
+            icon: Network,
+            keywords: ["zone", "records", "nameserver", "cname", "mx", "txt", "wildcard"],
+          },
         ],
       },
       {
         label: t("nav.groupOperations"),
         items: [
-          { to: "/cron", label: t("nav.cron"), icon: Clock },
-          { to: "/backups", label: t("nav.backups"), icon: Archive },
-          { to: "/tasks", label: t("nav.tasks"), icon: ListChecks },
-          { to: "/terminal", label: t("nav.terminal"), icon: TerminalSquare },
-          { to: "/stack", label: t("nav.stack"), icon: Layers },
-          { to: "/docker", label: t("nav.docker"), icon: Container },
+          {
+            to: "/cron",
+            label: t("nav.cron"),
+            icon: Clock,
+            keywords: ["schedule", "job", "crontab", "timer", "recurring"],
+          },
+          {
+            to: "/backups",
+            label: t("nav.backups"),
+            icon: Archive,
+            // "restore" is what somebody types at the worst moment of their
+            // week, and it appears nowhere in the word "Backups".
+            keywords: ["restore", "snapshot", "restic", "repository", "recover", "schedule"],
+          },
+          {
+            to: "/tasks",
+            label: t("nav.tasks"),
+            icon: ListChecks,
+            keywords: ["tasks", "history", "jobs", "log", "output", "running", "retry"],
+          },
+          {
+            to: "/terminal",
+            label: t("nav.terminal"),
+            icon: TerminalSquare,
+            keywords: ["shell", "ssh", "console", "bash", "command line", "keys"],
+          },
+          {
+            to: "/stack",
+            label: t("nav.stack"),
+            icon: Layers,
+            keywords: [
+              "php",
+              "nginx",
+              "apache",
+              "litespeed",
+              "mariadb",
+              "mysql",
+              "redis",
+              "node",
+              "install",
+              "versions",
+              "components",
+              "services",
+            ],
+          },
+          {
+            to: "/docker",
+            label: t("nav.docker"),
+            icon: Container,
+            keywords: ["container", "image", "volume", "registry", "pull"],
+          },
         ],
       },
       {
         label: t("nav.groupSecurity"),
         items: [
-          { to: "/firewall", label: t("nav.firewall"), icon: ShieldCheck },
-          { to: "/alerts", label: t("nav.alerts"), icon: BellRing },
+          {
+            to: "/firewall",
+            label: t("nav.firewall"),
+            icon: ShieldCheck,
+            keywords: ["ports", "ban", "block", "ip", "waf", "sentinel", "brute force"],
+          },
+          {
+            to: "/alerts",
+            label: t("nav.alerts"),
+            icon: BellRing,
+            keywords: ["notification", "rules", "channels", "webhook", "threshold", "email"],
+          },
         ],
       },
       {
         label: t("nav.groupAdmin"),
         items: [
-          { to: "/plans", label: t("nav.plans"), icon: Wallet },
-          { to: "/branding", label: t("nav.branding"), icon: Palette },
-          { to: "/settings", label: t("nav.settings"), icon: Settings },
+          {
+            to: "/plans",
+            label: t("nav.plans"),
+            icon: Wallet,
+            keywords: ["quota", "limits", "subscription", "package", "tenant", "suspend"],
+          },
+          {
+            to: "/branding",
+            label: t("nav.branding"),
+            icon: Palette,
+            keywords: ["logo", "favicon", "white label", "colour", "color", "panel name"],
+          },
+          {
+            to: "/settings",
+            label: t("nav.settings"),
+            icon: Settings,
+            keywords: ["preferences", "config", "users", "account", "2fa", "totp", "sessions"],
+          },
         ],
       },
     ],
     [t],
   );
 
+  // The palette's headings are the sidebar's own: a destination is filed where
+  // the operator already saw it, so the list they search reads like the list
+  // they browse. Nothing here invents a heading the bundle does not have.
   const commands = useMemo<Command[]>(
     () => [
-      { id: "tasks", label: t("tasks.title"), hint: "T", run: () => setTasksOpen(true) },
+      {
+        id: "tasks",
+        label: t("tasks.title"),
+        hint: "T",
+        icon: ListChecks,
+        keywords: ["tasks", "history", "jobs", "running", "output", "log", "progress"],
+        run: () => setTasksOpen(true),
+      },
       ...groups.flatMap((group) =>
         group.items.map((item) => ({
           id: `go-${item.to}`,
           label: item.label,
           icon: item.icon,
+          keywords: item.keywords,
+          // The dashboard sits in the sidebar's own headingless first group,
+          // and keeps that shape here.
+          group: group.label ?? undefined,
           run: () => void navigate({ to: item.to }),
         })),
       ),
-      { id: "theme-light", label: `${t("nav.theme")}: ${t("nav.themeLight")}`, icon: Sun, run: () => setTheme("light") },
-      { id: "theme-dark", label: `${t("nav.theme")}: ${t("nav.themeDark")}`, icon: Moon, run: () => setTheme("dark") },
-      { id: "theme-system", label: `${t("nav.theme")}: ${t("nav.themeSystem")}`, icon: Monitor, run: () => setTheme("system") },
-      { id: "sign-out", label: t("common.signOut"), icon: LogOut, run: () => void signOut() },
+      {
+        id: "theme-light",
+        label: `${t("nav.theme")}: ${t("nav.themeLight")}`,
+        icon: Sun,
+        group: t("nav.theme"),
+        keywords: ["appearance", "bright", "day"],
+        run: () => setTheme("light"),
+      },
+      {
+        id: "theme-dark",
+        label: `${t("nav.theme")}: ${t("nav.themeDark")}`,
+        icon: Moon,
+        group: t("nav.theme"),
+        keywords: ["appearance", "night", "black"],
+        run: () => setTheme("dark"),
+      },
+      {
+        id: "theme-system",
+        label: `${t("nav.theme")}: ${t("nav.themeSystem")}`,
+        icon: Monitor,
+        group: t("nav.theme"),
+        keywords: ["appearance", "auto", "os"],
+        run: () => setTheme("system"),
+      },
+      {
+        id: "sign-out",
+        label: t("common.signOut"),
+        icon: LogOut,
+        keywords: ["logout", "log out", "exit", "leave", "session"],
+        run: () => void signOut(),
+      },
     ],
     [t, groups, setTheme, signOut, navigate],
   );

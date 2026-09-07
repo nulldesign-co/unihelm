@@ -39,6 +39,18 @@
 //! (`~/.ssh` 0700, `authorized_keys` 0600, both owned by the account) come out
 //! right for free, because the account is what created them.
 //!
+//! # The server's own root account is not one of these
+//!
+//! Every account this module can reach comes from a subscription row, and the
+//! runner it reaches them with ([`crate::fsops::ops::runner_for`]) refuses uid
+//! or gid 0 outright — a "drop" to root is not a drop. So
+//! `/root/.ssh/authorized_keys` is not a file these operations can address at
+//! all, and no `subscription_id` names it. The keys card says so in as many
+//! words rather than offering a control that would fail: managing root's own
+//! keys would need a writer that runs *as* root, outside the tenant model
+//! everything above rests on, which is a separate decision and not a flag on
+//! these three operations.
+//!
 //! # Strict parsing, and no options
 //!
 //! An `authorized_keys` line may carry options before the key type —
@@ -753,6 +765,28 @@ impl Target {
 /// Resolve the subscription an operation names, check the plan, and build the
 /// privilege-dropping runner for it.
 async fn resolve(ctx: &OpContext, subscription_id: Option<i64>) -> Result<Target> {
+    // An admin's scope is the whole server, so there is no "my subscription"
+    // for `resolve_subscription` to hand back and it refuses — in the
+    // terminal's words, since the two share that helper. Opening a shell is not
+    // what this caller asked for, and the keys card offered no field to fill
+    // in, so every admin who opened it got the same 400 naming a field that was
+    // not on the screen: the card was dead for the one role most likely to use
+    // it. The card names an account now; this says which field carries it, in
+    // terms of what was asked, and answers the question a refusal here
+    // provokes — whether root's own keys are reachable this way. They are not
+    // (see the module header).
+    if subscription_id.is_none() && ctx.scope().is_global() {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            "name the subscription whose SSH keys to manage: an administrator's \
+             scope is the whole server, so there is no single account to fall back \
+             to. The server's own root account is not one of the choices — the \
+             panel writes a tenant's `~/.ssh/authorized_keys` as that tenant, and \
+             never writes `/root/.ssh/authorized_keys`",
+        )
+        .with_field("subscription_id"));
+    }
+
     // Resolved through the caller's scope and never created: see
     // `terminal::resolve_subscription` for why the "default subscription"
     // helper is the wrong one here.
@@ -1180,6 +1214,119 @@ mod tests {
         };
         let err = target.read().await.unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    /// An admin's context over an in-memory database — enough to reach
+    /// [`resolve`], which is as far as these tests need to get.
+    async fn admin_context() -> OpContext {
+        let (reg, admin, _) = crate::registry::testing::registry().await;
+        OpContext::new(
+            reg.services().clone(),
+            crate::registry::testing::auth_for(admin, Role::Admin),
+        )
+    }
+
+    async fn customer_context() -> OpContext {
+        let (reg, _, customer) = crate::registry::testing::registry().await;
+        OpContext::new(
+            reg.services().clone(),
+            crate::registry::testing::auth_for(customer, Role::Customer),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_admin_who_names_no_account_is_refused_in_terms_of_keys_not_shells() {
+        // The keys card sent no `subscription_id` and an admin's scope has no
+        // account to default to, so this refusal was the whole experience of
+        // the card for an admin — and it arrived in the terminal's words,
+        // about opening a shell, naming a field the card did not offer. The
+        // card offers one now; the sentence has to match what was asked, and
+        // has to answer the question it provokes about root.
+        let ctx = admin_context().await;
+
+        let mut refusals = vec![
+            List.run(
+                &ctx,
+                ListInput {
+                    subscription_id: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+            Remove
+                .run(
+                    &ctx,
+                    RemoveInput {
+                        subscription_id: None,
+                        fingerprint: "SHA256:whatever".into(),
+                    },
+                )
+                .await
+                .unwrap_err(),
+        ];
+        // `add` parses the key before it resolves, so this one has to be a real
+        // key or it would be refused for the wrong reason.
+        refusals.push(
+            Add.run(
+                &ctx,
+                AddInput {
+                    subscription_id: None,
+                    key: ed25519_line(1, "laptop"),
+                },
+            )
+            .await
+            .unwrap_err(),
+        );
+
+        for err in refusals {
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.detail);
+            // The card highlights the field it now has, so the name has to be
+            // the one it binds its account picker to.
+            assert_eq!(err.field.as_deref(), Some("subscription_id"));
+            assert!(err.detail.contains("SSH keys"), "{}", err.detail);
+            assert!(
+                !err.detail.contains("shell"),
+                "the terminal's wording leaked back in: {}",
+                err.detail
+            );
+            // Root is the first thing an admin reaches for here, and the answer
+            // is no — said once, where they are already reading.
+            assert!(
+                err.detail.contains("/root/.ssh/authorized_keys"),
+                "{}",
+                err.detail
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_customer_still_has_their_own_account_resolved_for_them() {
+        // The refusal above is for callers whose scope holds every account. A
+        // customer's scope holds theirs, so naming nothing must still go to
+        // `resolve_subscription` — a seeded customer with no subscription is a
+        // `not_found`, not a demand that they fill in a field their card does
+        // not show.
+        let ctx = customer_context().await;
+        let err = List
+            .run(
+                &ctx,
+                ListInput {
+                    subscription_id: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound, "{}", err.detail);
+    }
+
+    #[test]
+    fn root_is_not_an_account_these_operations_could_ever_name() {
+        // What the card's "root is not managed here" line rests on: every
+        // target is built from a subscription's `linux_user`, and `root` is not
+        // a name that survives being parsed as one. The UI states this as a
+        // fact about the panel, so it is pinned here rather than left to the
+        // reader of two modules.
+        assert!(LinuxUser::parse("root").is_err());
     }
 
     #[test]

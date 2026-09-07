@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
   Container,
+  Download,
+  Eraser,
   HardDrive,
   Layers,
   Play,
@@ -35,16 +37,20 @@ import { cn } from "@/lib/utils";
 /**
  * Docker's inventory (`docker.list`), and the lifecycle of what is in it.
  *
- * Five things here are decisions rather than layout:
+ * Six things here are decisions rather than layout:
  *
- * 1. **The controls act on containers; nothing here makes one.** Start, stop,
- *    restart, remove and a log tail, because those are what an operator needs
- *    at 3am and the alternative is an SSH session. No "run", though, and the
- *    callout at the top says why rather than leaving a gap somebody reads as an
- *    oversight: a container can be handed the host's filesystem or the daemon
- *    socket by a single flag, so a form that took run arguments would be a root
- *    shell with a nicer font. The flags on what is listed below were chosen by
- *    whoever created it.
+ * 1. **All three tables act, and none of them takes a raw flag.** Containers
+ *    start, stop, restart and go; images are pulled, removed and pruned;
+ *    volumes are removed. The callout at the top says what the create form will
+ *    not take rather than leaving a gap somebody reads as an oversight: a
+ *    container can be handed the host's filesystem or the daemon socket by a
+ *    single flag, so a form that accepted run arguments would be a root shell
+ *    with a nicer font. Everything below is a field, not an argument.
+ *
+ *    The image and volume tables were a list and nothing else until 0.7.3, and
+ *    that was the defect: on a small VPS the layers of three image upgrades are
+ *    the difference between a working server and a full one, and the panel
+ *    could show the disk filling with no way to empty it.
  * 2. **Stopping asks first; starting does not.** The panel did not create most
  *    of what is on this page — a container here may be an nginx serving
  *    somebody's production site, and it looks exactly like one an operator is
@@ -73,6 +79,12 @@ import { cn } from "@/lib/utils";
  *    on exactly the machines least able to notice — and now it would also
  *    offer the wrong button, which is how a live container gets a Start it
  *    does not need and a dead one never gets the one it does.
+ * 6. **An unknown is never drawn as a zero or as an empty list.** A volume
+ *    whose size `docker system df` could not measure shows "Unknown", not
+ *    `0B`; one whose containers could not be read shows "Unknown", not
+ *    "Nothing". Those two pairs look identical on a page and mean opposite
+ *    things next to a delete button, and the second of each pair is the one
+ *    that ends with somebody's database gone.
  */
 export function DockerPage() {
   const [creating, setCreating] = useState(false);
@@ -161,6 +173,21 @@ interface DockerImage {
 interface DockerVolume {
   name: string;
   driver: string;
+  /**
+   * What it occupies, in Docker's own words. `null` when `docker system df`
+   * did not answer — which is not `0B`, and must not be drawn as one.
+   */
+  size: string | null;
+  /**
+   * The containers that mount it, running or stopped.
+   *
+   * `null` is "the panel could not tell" and `[]` is "nothing uses this". Those
+   * are the two answers a Remove button hangs off, and drawing them the same
+   * way is how somebody deletes a database.
+   */
+  used_by: string[] | null;
+  /** The engine container this panel installed that keeps its data here. */
+  engine: string | null;
 }
 
 interface DockerInventory {
@@ -484,6 +511,17 @@ function Inventory({ inventory }: { inventory: DockerInventory }) {
 
   return (
     <>
+      {/* The daemon is up and something else is not — today, an engine registry
+          that would not parse, which means the volumes below cannot say which
+          of them hold a database. A warning rather than silence: the tables are
+          still true, but one column of them has stopped being able to answer,
+          and an operator about to delete a volume needs to know that before
+          they press the button and not after. */}
+      {inventory.note ? (
+        <Callout tone="warning" className="mb-6">
+          {inventory.note}
+        </Callout>
+      ) : null}
       <ContainerSection containers={inventory.containers} />
       <ImageSection images={inventory.images} />
       <VolumeSection volumes={inventory.volumes} />
@@ -558,7 +596,10 @@ function InventorySkeleton() {
       <section className="space-y-3">
         <SectionHeader title={t("docker.imagesTitle")} description={t("docker.imagesHint")} />
         <Table className="min-w-[560px]">
-          <ImageHead />
+          {/* The same gate the real header uses. A ghost that draws an Actions
+              column the arriving table will not have — or omits one it will —
+              moves every cell sideways under the pointer when the rows land. */}
+          <ImageHead canManage={canManage} />
           <tbody>
             {Array.from({ length: 2 }, (_, i) => (
               <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
@@ -572,6 +613,11 @@ function InventorySkeleton() {
                 <Td>
                   <Skeleton className="ms-auto h-3.5 w-14" />
                 </Td>
+                {canManage ? (
+                  <Td>
+                    <Skeleton className="ms-auto h-8 w-8 rounded-lg" />
+                  </Td>
+                ) : null}
               </tr>
             ))}
           </tbody>
@@ -580,8 +626,8 @@ function InventorySkeleton() {
 
       <section className="space-y-3">
         <SectionHeader title={t("docker.volumesTitle")} description={t("docker.volumesHint")} />
-        <Table>
-          <VolumeHead />
+        <Table className="min-w-[880px]">
+          <VolumeHead canManage={canManage} />
           <tbody>
             {Array.from({ length: 2 }, (_, i) => (
               <tr key={i} className="animate-rise-in stagger" style={staggerStyle(i)}>
@@ -589,8 +635,19 @@ function InventorySkeleton() {
                   <Skeleton className={cn("h-3.5", i % 2 === 0 ? "w-56" : "w-36")} />
                 </Td>
                 <Td>
+                  <Skeleton className="ms-auto h-3.5 w-12" />
+                </Td>
+                <Td>
+                  <Skeleton className="h-3.5 w-32" />
+                </Td>
+                <Td>
                   <Skeleton className="h-3.5 w-16" />
                 </Td>
+                {canManage ? (
+                  <Td>
+                    <Skeleton className="ms-auto h-8 w-8 rounded-lg" />
+                  </Td>
+                ) : null}
               </tr>
             ))}
           </tbody>
@@ -668,13 +725,20 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
           className="py-10"
         />
       ) : (
-        {/* Wider than the five column widths above add up to (1072px), so they
-            can all be honoured; below this the card scrolls sideways, which is
-            the whole point of `Table`'s `overflow-x-auto`. The old 780px was
-            narrower than the columns needed, so rather than scrolling, the
-            table squeezed them — and a `min-w` under that sum brings the same
-            failure back quietly, because auto layout answers a shortfall by
-            shrinking columns, not by scrolling. Raise this if a column grows. */}
+        // Wider than the five column widths above add up to (1072px), so they
+        // can all be honoured; below this the card scrolls sideways, which is
+        // the whole point of `Table`'s `overflow-x-auto`. The old 780px was
+        // narrower than the columns needed, so rather than scrolling, the table
+        // squeezed them — and a `min-w` under that sum brings the same failure
+        // back quietly, because auto layout answers a shortfall by shrinking
+        // columns, not by scrolling. Raise this if a column grows.
+        //
+        // Written as a line comment rather than a `{/* … */}` block: a JSX
+        // comment expression is only legal among *children*, and this position
+        // is a ternary branch, so the block form made the whole file a syntax
+        // error — the Docker page did not build at all, and `npm run typecheck`
+        // is what says so (`tsc --noEmit` alone checks nothing here, because the
+        // root tsconfig has `files: []` and only project references).
         <Table className="min-w-[1080px]">
           <ContainerHead />
           <tbody>
@@ -1023,7 +1087,7 @@ function LogsDialog({
 // Images
 // ---------------------------------------------------------------------------
 
-function ImageHead() {
+function ImageHead({ canManage }: { canManage: boolean }) {
   const { t } = useTranslation();
   return (
     <thead>
@@ -1031,17 +1095,89 @@ function ImageHead() {
         <Th>{t("docker.repository")}</Th>
         <Th className="w-40">{t("docker.tag")}</Th>
         <Th className="w-28 text-end">{t("docker.size")}</Th>
+        {canManage ? <Th className="w-32 text-end">{t("docker.actions")}</Th> : null}
       </tr>
     </thead>
   );
 }
 
+/**
+ * Docker prints `<none>` in both columns for a dangling image: the untagged
+ * leftover of a rebuild or a re-pull, which nothing can ever refer to again.
+ *
+ * This is the same set `docker.image.prune` deletes, derived here from the list
+ * the page already has so the confirmation can name what is about to go rather
+ * than asking the operator to trust a number that arrives afterwards.
+ */
+function isDangling(image: DockerImage): boolean {
+  return image.repository === "<none>" || image.tag === "<none>";
+}
+
+/**
+ * The images on this server, and the three things an operator can do to them.
+ *
+ * Until this existed the table was a list and nothing else: an operator could
+ * watch a small VPS fill with the layers of three image upgrades and had no way
+ * to empty it from the panel — the disk filled and the only remedy was an SSH
+ * session, which is strictly more privilege than the buttons here.
+ *
+ * Pull is a task, because a pull is minutes. Remove and Prune each ask first,
+ * for different reasons: a removal is refused by the agent if a container needs
+ * the image, and the operator should see that refusal rather than a silent
+ * no-op; a prune is not refused by anything, so the dialog is where the
+ * operator finds out what it will take.
+ */
 function ImageSection({ images }: { images: DockerImage[] }) {
   const { t } = useTranslation();
+  const { user } = useSession();
+  const canManage = user?.permissions.includes("server_manage") ?? false;
+
+  const [pulling, setPulling] = useState(false);
+  const [pruning, setPruning] = useState(false);
+  // One error sink for the table, like the container section's: Docker's
+  // failures are sentences, and a sentence folded into a table cell is one
+  // nobody reads.
+  const [error, setError] = useState<string | null>(null);
+
+  const dangling = images.filter(isDangling);
 
   return (
     <section className="space-y-3">
-      <SectionHeader title={t("docker.imagesTitle")} description={t("docker.imagesHint")} />
+      <SectionHeader
+        title={t("docker.imagesTitle")}
+        description={t("docker.imagesHint")}
+        actions={
+          canManage ? (
+            <>
+              <Button variant="outline" size="sm" onClick={() => setPulling(true)}>
+                <Download className="h-3.5 w-3.5" aria-hidden />
+                {t("docker.pullImage")}
+              </Button>
+              {/* Offered only when there is something to reclaim. A Prune button
+                  above an inventory with no dangling images is a button whose
+                  honest answer is "0B", and one that answers 0B is one people
+                  learn to press without reading. */}
+              {dangling.length > 0 ? (
+                <Button variant="outline" size="sm" onClick={() => setPruning(true)}>
+                  <Eraser className="h-3.5 w-3.5" aria-hidden />
+                  {t("docker.pruneImages")}
+                </Button>
+              ) : null}
+            </>
+          ) : null
+        }
+      />
+
+      {error ? <Callout tone="danger">{error}</Callout> : null}
+
+      <PullImageDialog open={pulling} onClose={() => setPulling(false)} />
+      <PruneImagesDialog
+        open={pruning}
+        dangling={dangling}
+        onClose={() => setPruning(false)}
+        onError={setError}
+      />
+
       {images.length === 0 ? (
         <EmptyState
           icon={<Layers aria-hidden />}
@@ -1051,7 +1187,7 @@ function ImageSection({ images }: { images: DockerImage[] }) {
         />
       ) : (
         <Table className="min-w-[560px]">
-          <ImageHead />
+          <ImageHead canManage={canManage} />
           <tbody>
             {images.map((row, index) => (
               <Tr
@@ -1069,10 +1205,21 @@ function ImageSection({ images }: { images: DockerImage[] }) {
                 </Td>
                 <Td className="whitespace-nowrap">
                   {/* Neutral, not accent: `latest` is not a better tag than a
-                      pinned one, and a colour would say it was. */}
-                  <Badge tone="neutral">{row.tag}</Badge>
+                      pinned one, and a colour would say it was. Dangling is the
+                      one tag state that is a fact about the image rather than a
+                      preference, so it is the one that gets a word. */}
+                  {isDangling(row) ? (
+                    <Badge tone="warning">{t("docker.dangling")}</Badge>
+                  ) : (
+                    <Badge tone="neutral">{row.tag}</Badge>
+                  )}
                 </Td>
                 <Td className="tnum text-end whitespace-nowrap text-ink-muted">{row.size}</Td>
+                {canManage ? (
+                  <Td>
+                    <ImageActions image={row} onError={setError} />
+                  </Td>
+                ) : null}
               </Tr>
             ))}
           </tbody>
@@ -1082,28 +1229,270 @@ function ImageSection({ images }: { images: DockerImage[] }) {
   );
 }
 
+/**
+ * The reference to remove an image by.
+ *
+ * `repository:tag` where there is one, and the id where there is not: a
+ * dangling image has no name to refer to, and `<none>:<none>` is Docker's way
+ * of printing that rather than something it would accept back.
+ */
+function imageRef(image: DockerImage): string {
+  return isDangling(image) ? image.id : `${image.repository}:${image.tag}`;
+}
+
+/** One image's controls: a removal, behind a confirmation. */
+function ImageActions({
+  image,
+  onError,
+}: {
+  image: DockerImage;
+  onError: (message: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const name = imageRef(image);
+
+  const remove = useMutation({
+    mutationFn: () => endpoints.removeImage({ image: name }),
+    onSuccess: () => {
+      setConfirming(false);
+      onError(null);
+      void queryClient.invalidateQueries({ queryKey: ["docker"] });
+    },
+    onError: (e) => {
+      setConfirming(false);
+      onError(
+        t("docker.actionFailed", {
+          name,
+          message: e instanceof ApiError ? e.message : String(e),
+        }),
+      );
+    },
+  });
+
+  return (
+    <div className="flex items-center justify-end gap-1">
+      <Menu label={t("docker.imageActionsFor", { name })}>
+        <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
+          {t("docker.remove")}
+        </MenuItem>
+      </Menu>
+
+      {confirming ? (
+        <Dialog
+          open
+          onClose={() => setConfirming(false)}
+          title={t("docker.imageRemoveTitle", { name })}
+          description={t("docker.imageRemoveHint")}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setConfirming(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant="danger"
+                loading={remove.isPending}
+                onClick={() => remove.mutate()}
+              >
+                {t("docker.imageRemoveConfirm")}
+              </Button>
+            </>
+          }
+        >
+          {/* The agent refuses an image a container is built on and names that
+              container, so this says what the panel will do rather than
+              promising the removal will happen. */}
+          <p className="text-sm text-ink-muted">{t("docker.imageRemoveBody")}</p>
+          <p className="mt-3 font-mono text-xs break-all text-ink-subtle">{image.id}</p>
+        </Dialog>
+      ) : null}
+    </div>
+  );
+}
+
+/** Fetch an image the operator names. */
+function PullImageDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [image, setImage] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const pull = useMutation({
+    mutationFn: () => endpoints.pullImage({ image: image.trim() }),
+    onSuccess: () => {
+      // A task, so the image arrives some minutes after this returns. The
+      // refetch is what shows it; the Tasks page is where the pull itself is
+      // watched, and this dialog does not pretend to be that.
+      void queryClient.invalidateQueries({ queryKey: ["docker"] });
+      onClose();
+      setImage("");
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("docker.pullTitle")}
+      description={t("docker.pullHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            loading={pull.isPending}
+            disabled={image.trim() === ""}
+            onClick={() => {
+              setError(null);
+              pull.mutate();
+            }}
+          >
+            {t("docker.pullConfirm")}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {error}
+        </Callout>
+      ) : null}
+      <Field label={t("docker.imageField")} htmlFor="dk-pull-image">
+        <Input
+          id="dk-pull-image"
+          value={image}
+          onChange={(e) => setImage(e.target.value)}
+          placeholder="nginx:alpine"
+        />
+      </Field>
+      <p className="-mt-1 text-xs text-ink-muted">{t("docker.imageHint")}</p>
+    </Dialog>
+  );
+}
+
+/**
+ * The pause in front of a prune, and the list of what it will take.
+ *
+ * The list is the point. A prune reports what it reclaimed *afterwards*, in a
+ * task log, and "it deleted something, somewhere" is not a thing to agree to in
+ * advance — so the images about to go are named here, by id and size, from the
+ * inventory the page already has.
+ */
+function PruneImagesDialog({
+  open,
+  dangling,
+  onClose,
+  onError,
+}: {
+  open: boolean;
+  dangling: DockerImage[];
+  onClose: () => void;
+  onError: (message: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+
+  const prune = useMutation({
+    mutationFn: () => endpoints.pruneImages(),
+    onSuccess: () => {
+      onError(null);
+      void queryClient.invalidateQueries({ queryKey: ["docker"] });
+      onClose();
+    },
+    onError: (e) => {
+      onClose();
+      onError(
+        t("docker.actionFailed", {
+          name: t("docker.imagesTitle"),
+          message: e instanceof ApiError ? e.message : String(e),
+        }),
+      );
+    },
+  });
+
+  if (!open) return null;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={t("docker.pruneTitle")}
+      description={t("docker.pruneHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button variant="danger" loading={prune.isPending} onClick={() => prune.mutate()}>
+            {t("docker.pruneConfirm")}
+          </Button>
+        </>
+      }
+    >
+      <p className="text-sm text-ink-muted">{t("docker.pruneBody")}</p>
+      <ul className="mt-3 max-h-56 overflow-y-auto rounded-lg border border-border bg-canvas p-3">
+        {dangling.map((row) => (
+          <li key={row.id} className="flex items-baseline justify-between gap-3 py-0.5">
+            <span className="font-mono text-xs break-all text-ink-muted">{row.id}</span>
+            <span className="tnum font-mono text-xs whitespace-nowrap text-ink-subtle">
+              {row.size}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Dialog>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Volumes
 // ---------------------------------------------------------------------------
 
-function VolumeHead() {
+function VolumeHead({ canManage }: { canManage: boolean }) {
   const { t } = useTranslation();
   return (
     <thead>
       <tr>
-        <Th>{t("docker.volume")}</Th>
-        <Th className="w-40">{t("docker.driver")}</Th>
+        <Th className="w-64">{t("docker.volume")}</Th>
+        <Th className="w-28 text-end">{t("docker.size")}</Th>
+        <Th className="w-64">{t("docker.usedBy")}</Th>
+        <Th className="w-28">{t("docker.driver")}</Th>
+        {canManage ? <Th className="w-32 text-end">{t("docker.actions")}</Th> : null}
       </tr>
     </thead>
   );
 }
 
+/**
+ * The volumes on this server, and what is actually in them.
+ *
+ * A name and a driver were all this table had, which made it unreadable in
+ * exactly the case it exists for. A volume outliving its container is this
+ * panel's own design — removing a container never takes its volumes — so the
+ * disk fills with volumes that are either somebody's database or the residue of
+ * a container deleted a year ago, and nothing on the page could tell those
+ * apart. Size, what mounts it, and whether it belongs to an engine the panel
+ * installed are the three answers that make the Remove button safe to offer.
+ *
+ * "Nothing mounts this" and "the panel could not tell" are drawn differently on
+ * purpose. The first is a licence to delete; the second is not, and rendering
+ * an unknown as an empty list is how somebody deletes a database.
+ */
 function VolumeSection({ volumes }: { volumes: DockerVolume[] }) {
   const { t } = useTranslation();
+  const { user } = useSession();
+  const canManage = user?.permissions.includes("server_manage") ?? false;
+  const [error, setError] = useState<string | null>(null);
 
   return (
     <section className="space-y-3">
       <SectionHeader title={t("docker.volumesTitle")} description={t("docker.volumesHint")} />
+
+      {error ? <Callout tone="danger">{error}</Callout> : null}
+
       {volumes.length === 0 ? (
         <EmptyState
           icon={<HardDrive aria-hidden />}
@@ -1112,18 +1501,140 @@ function VolumeSection({ volumes }: { volumes: DockerVolume[] }) {
           className="py-10"
         />
       ) : (
-        <Table>
-          <VolumeHead />
+        <Table className="min-w-[880px]">
+          <VolumeHead canManage={canManage} />
           <tbody>
             {volumes.map((row, index) => (
               <Tr key={row.name} className="animate-rise-in stagger" style={staggerStyle(index)}>
-                <Td className="w-full font-mono text-xs break-all">{row.name}</Td>
+                <Td>
+                  <p className="font-mono text-xs break-all text-ink">{row.name}</p>
+                  {/* The engine that owns it, said under the name rather than in
+                      a column of its own: it is the fact that changes what the
+                      Remove button means, and it applies to a handful of the
+                      rows rather than to all of them. */}
+                  {row.engine ? (
+                    <span className="mt-1 inline-flex">
+                      <Badge tone="warning">
+                        {t("docker.volumeEngine", { container: row.engine })}
+                      </Badge>
+                    </span>
+                  ) : null}
+                </Td>
+                <Td className="tnum text-end whitespace-nowrap text-ink-muted">
+                  {/* `null` is not zero. `docker system df` walks each volume's
+                      directory and can time out on a large one, and printing 0B
+                      for a volume nobody measured would invite somebody to
+                      delete a database on the strength of a made-up number. */}
+                  {row.size ?? <span className="text-ink-subtle">{t("docker.sizeUnknown")}</span>}
+                </Td>
+                <Td className="text-xs text-ink-muted">
+                  {row.used_by === null ? (
+                    <span className="text-ink-subtle">{t("docker.usedByUnknown")}</span>
+                  ) : row.used_by.length === 0 ? (
+                    <span className="text-ink-subtle">{t("docker.usedByNothing")}</span>
+                  ) : (
+                    <span className="font-mono break-all">{row.used_by.join(", ")}</span>
+                  )}
+                </Td>
                 <Td className="whitespace-nowrap text-ink-muted">{row.driver}</Td>
+                {canManage ? (
+                  <Td>
+                    <VolumeActions volume={row} onError={setError} />
+                  </Td>
+                ) : null}
               </Tr>
             ))}
           </tbody>
         </Table>
       )}
     </section>
+  );
+}
+
+/**
+ * One volume's controls: a removal, behind a confirmation that says what is
+ * known about the volume rather than a generic warning.
+ *
+ * The item is offered on every row, including one an engine owns and one a
+ * container still mounts. The agent refuses both, by name — and a menu item
+ * that quietly vanished for those rows would hide the rule instead of teaching
+ * it, leaving an operator to conclude the panel is broken. The dialog carries
+ * the specific warning; the agent's refusal is the backstop.
+ */
+function VolumeActions({
+  volume,
+  onError,
+}: {
+  volume: DockerVolume;
+  onError: (message: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+
+  const remove = useMutation({
+    mutationFn: () => endpoints.removeVolume(volume.name),
+    onSuccess: () => {
+      setConfirming(false);
+      onError(null);
+      void queryClient.invalidateQueries({ queryKey: ["docker"] });
+    },
+    onError: (e) => {
+      setConfirming(false);
+      onError(
+        t("docker.actionFailed", {
+          name: volume.name,
+          message: e instanceof ApiError ? e.message : String(e),
+        }),
+      );
+    },
+  });
+
+  return (
+    <div className="flex items-center justify-end gap-1">
+      <Menu label={t("docker.volumeActionsFor", { name: volume.name })}>
+        <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
+          {t("docker.remove")}
+        </MenuItem>
+      </Menu>
+
+      {confirming ? (
+        <Dialog
+          open
+          onClose={() => setConfirming(false)}
+          title={t("docker.volumeRemoveTitle", { name: volume.name })}
+          description={t("docker.volumeRemoveHint")}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setConfirming(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button variant="danger" loading={remove.isPending} onClick={() => remove.mutate()}>
+                {t("docker.volumeRemoveConfirm")}
+              </Button>
+            </>
+          }
+        >
+          {/* Three different sentences, because these are three different
+              decisions. Deleting a database is not the same act as deleting an
+              orphan, and one wording covering both would have to be so hedged
+              that neither operator could act on it. */}
+          {volume.engine ? (
+            <Callout tone="danger">
+              {t("docker.volumeRemoveEngine", { container: volume.engine })}
+            </Callout>
+          ) : volume.used_by === null ? (
+            <Callout tone="warning">{t("docker.volumeRemoveUnknown")}</Callout>
+          ) : volume.used_by.length > 0 ? (
+            <Callout tone="warning">
+              {t("docker.volumeRemoveInUse", { containers: volume.used_by.join(", ") })}
+            </Callout>
+          ) : (
+            <p className="text-sm text-ink-muted">{t("docker.volumeRemoveBody")}</p>
+          )}
+          <p className="mt-3 text-sm text-ink-muted">{t("docker.volumeRemoveFinal")}</p>
+        </Dialog>
+      ) : null}
+    </div>
   );
 }
