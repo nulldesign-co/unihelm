@@ -61,6 +61,17 @@ pub struct ComponentRequest {
     /// Which version. Omitted means the catalogue's recommended one.
     #[serde(default)]
     pub version: Option<String>,
+    /// `host` or `container`, for an entry that offers both.
+    ///
+    /// The Stack page has posted this since containers landed and this struct
+    /// had nowhere to put it, so serde dropped it and every install followed the
+    /// catalogue's default — a container for every database and cache. An
+    /// operator who picked "on the server" got one anyway and was told nothing.
+    /// Left a `String` for the same reason `component` is one: the agent looks
+    /// it up in the catalogue and refuses what that entry does not offer, and a
+    /// second copy of the rule here is a second copy that can drift.
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 impl ComponentRequest {
@@ -70,6 +81,13 @@ impl ComponentRequest {
         if let Some(v) = &self.version {
             m.insert("version".into(), json!(v));
         }
+        // Only when it was asked for. Absent has to stay absent across this
+        // boundary: the agent answers "the operator said nothing" with the
+        // catalogue's default, and filling one in here would take that decision
+        // away from the one place that is allowed to make it.
+        if let Some(r) = &self.runtime {
+            m.insert("runtime".into(), json!(r));
+        }
         serde_json::Value::Object(m)
     }
 
@@ -78,6 +96,20 @@ impl ComponentRequest {
         match &self.version {
             Some(v) => format!("{} {v}", self.component),
             None => self.component.clone(),
+        }
+    }
+
+    /// The rest of the decision, beside the target.
+    ///
+    /// "Installed MariaDB" and "installed MariaDB on the host" are different
+    /// decisions with different consequences for the machine, and only one of
+    /// them is answerable afterwards from the slug alone.
+    fn audit_detail(&self) -> serde_json::Value {
+        match &self.runtime {
+            Some(r) => json!({ "runtime": r }),
+            // Not `"runtime": null`: the row would then claim the operator was
+            // asked and declined to answer, when the field simply was not sent.
+            None => json!({}),
         }
     }
 }
@@ -122,6 +154,7 @@ pub async fn install(
         Some(&peer),
         "stack.install",
         &body.component.describe(),
+        body.component.audit_detail(),
     )
     .await?;
     ops::invoke(
@@ -168,6 +201,7 @@ pub async fn remove(
         Some(&peer),
         "stack.remove",
         &body.component.describe(),
+        body.component.audit_detail(),
     )
     .await?;
     ops::invoke(
@@ -177,6 +211,136 @@ pub async fn remove(
         body.component.as_input(),
     )
     .await
+}
+
+/// Which installed component's service to act on.
+///
+/// No `runtime`: `stack.start` and `stack.stop` act on a systemd unit, and a
+/// container has none. `version` still matters, because `php8.3-fpm` and
+/// `php8.4-fpm` are two services on one machine.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ServiceRequest {
+    /// A catalogue slug whose service the panel is allowed to name: `nginx`,
+    /// `apache`, `php`, `mariadb`, `redis`, `docker`. Anything else is refused
+    /// by the agent, which holds the list.
+    pub component: String,
+    /// Which version, for the entries that run several services at once.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+impl ServiceRequest {
+    fn as_input(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("component".into(), json!(self.component));
+        if let Some(v) = &self.version {
+            m.insert("version".into(), json!(v));
+        }
+        serde_json::Value::Object(m)
+    }
+
+    fn describe(&self) -> String {
+        match &self.version {
+            Some(v) => format!("{} {v}", self.component),
+            None => self.component.clone(),
+        }
+    }
+}
+
+/// Start the service an installed component ships.
+#[utoipa::path(
+    post,
+    path = "/api/stack/start",
+    tag = "stack",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = ServiceRequest,
+    responses(
+        (status = 200, description = "The unit's state afterwards", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`: needs `server.manage`", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: the panel does not name this component's unit", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn start(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<ServiceRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service_action(&state, peer, &headers, &current, "stack.start", &body).await
+}
+
+/// Stop the service an installed component ships.
+#[utoipa::path(
+    post,
+    path = "/api/stack/stop",
+    tag = "stack",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = ServiceRequest,
+    responses(
+        (status = 200, description = "The unit's state afterwards", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`: needs `server.manage`", body = ApiErrorBody),
+        // The refusal that matters: stopping the web server this machine serves
+        // with while sites are still up. It arrives here rather than in a task
+        // log, because the operation is immediate — the operator reads the
+        // sentence in the same click that asked the question.
+        (status = 409, description = "`dependents_exist`: it serves this machine's sites", body = ApiErrorBody),
+        (status = 501, description = "`not_implemented`: the panel does not name this component's unit", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn stop(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<ServiceRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    service_action(&state, peer, &headers, &current, "stack.stop", &body).await
+}
+
+/// The half both share: authorise, record the intent, then ask the agent.
+///
+/// `invoke_now` rather than `invoke`, because both operations are immediate and
+/// a task id arriving here would be a bug rather than an outcome — the whole
+/// point of the fast lane is that a package install running for four minutes is
+/// not why a stop button does nothing.
+async fn service_action(
+    state: &SharedState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    current: &CurrentUser,
+    op: &str,
+    body: &ServiceRequest,
+) -> ApiResult<Json<serde_json::Value>> {
+    // `server.manage` is the permission that covers service state, and it is
+    // what `svc.action` already requires for the identical act. Reaching it
+    // through the Stack page must not make it cheaper to do.
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+
+    // Before the work, like every other stack change. Stopping the web server
+    // takes every site on the machine offline, and "who did that" is the first
+    // question anybody asks afterwards — including when the agent was down and
+    // the stop never happened at all.
+    audit(
+        state,
+        current,
+        headers,
+        Some(&peer),
+        op,
+        &body.describe(),
+        json!({}),
+    )
+    .await?;
+
+    let data = ops::invoke_now(state, &current.auth, op, body.as_input()).await?;
+    Ok(Json(data))
 }
 
 /// Which web server to move this machine to.
@@ -239,6 +403,7 @@ pub async fn switch_webserver(
         } else {
             body.target.clone()
         },
+        json!({ "accept_gaps": body.accept_gaps }),
     )
     .await?;
     ops::invoke(
@@ -262,6 +427,7 @@ async fn audit(
     peer: Option<&SocketAddr>,
     action: &str,
     target: &str,
+    detail: serde_json::Value,
 ) -> ApiResult<()> {
     state
         .db
@@ -272,7 +438,7 @@ async fn audit(
             ip: Some(client_ip(peer, headers)),
             action: action.to_string(),
             target: Some(target.to_string()),
-            detail: json!({}),
+            detail,
             request_id: Some(current.auth.request_id.clone()),
             subscription_id: None,
         })

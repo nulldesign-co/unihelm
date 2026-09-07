@@ -491,14 +491,55 @@ fn journal_time(record: &serde_json::Value) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(micros.checked_mul(1_000)?).ok()
 }
 
+/// The openings of the sshd lines that mean "an authentication attempt failed".
+///
+/// The list used to be `Failed password for` and `Invalid user` alone, and the
+/// gap that left was not a rounding error: a key-based brute force never writes
+/// either of them. `sshd` logs a rejected key as `Failed publickey for …`, the
+/// end of a hammered connection as `maximum authentication attempts exceeded`,
+/// and a client that walks away mid-handshake as `Connection closed by
+/// authenticating user …`. A scanner blind to all three watched an attack run
+/// at full speed and reported nothing to do, which is the worst way for a
+/// defence to fail — it looks exactly like peace.
+///
+/// `Failed ` is deliberately the whole method-agnostic prefix rather than a
+/// list of method names: sshd's format is `Failed <method> for …`, and
+/// enumerating the methods would mean a new blind spot for every authentication
+/// method OpenSSH grows. Nothing is claimed on the prefix alone — a line still
+/// has to carry an `<address> port <number>` pair to yield anything at all, so
+/// an unrelated `Failed to …` produces `None`.
+///
+/// `reset` sits beside `closed` because they are one event with two transport
+/// endings (FIN and RST); recognising one and not the other would be an
+/// arbitrary hole in the same shape.
+const SSH_FAILURE_OPENINGS: &[&str] = &[
+    "Failed ",
+    "Invalid user",
+    "maximum authentication attempts exceeded",
+    "Connection closed by authenticating user",
+    "Connection reset by authenticating user",
+];
+
+/// sshd writes its severity into the message text, so `MESSAGE` for the
+/// maximum-attempts line begins `error: `. Matching the opening without
+/// stripping this first would have recognised that shape only on the
+/// distributions that do not use it.
+fn strip_sshd_severity(message: &str) -> &str {
+    for prefix in ["error: ", "fatal: ", "warning: "] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    message
+}
+
 /// The offending address in an sshd failure line, if this line is one.
 ///
-/// Only `Failed password …` and `Invalid user …` count (spec §11.9). The
-/// address is taken from the **last** `from <ip> port <n>` triple in the line,
-/// not the first, and that is a security property rather than a stylistic
-/// choice: the username is attacker-controlled and lands in the middle of the
-/// message, so an attacker connecting as the user
-/// `from 203.0.113.1 port 22` produces
+/// The recognised shapes are [`SSH_FAILURE_OPENINGS`] (spec §11.9). The address
+/// is taken from the **last** `<ip> port <n>` pair in the line, not the first,
+/// and that is a security property rather than a stylistic choice: the username
+/// is attacker-controlled and lands in the middle of the message, so an
+/// attacker connecting as the user `from 203.0.113.1 port 22` produces
 ///
 /// ```text
 /// Invalid user from 203.0.113.1 port 22 from 198.51.100.9 port 55555
@@ -507,31 +548,33 @@ fn journal_time(record: &serde_json::Value) -> Option<OffsetDateTime> {
 /// and a first-match parser would ban whichever address the attacker named.
 /// That turns a brute-force defence into a remote "ban anyone" primitive —
 /// including, on a panel whose operator is behind a known address, a way to
-/// lock the operator out.
+/// lock the operator out. sshd puts the real address last in every shape here,
+/// because the part it interpolates comes first.
+///
+/// The pair is `<ip> port <n>` rather than `from <ip> port <n>` because two of
+/// those shapes write no `from` at all: `Connection closed by authenticating
+/// user root 203.0.113.9 port 55555 [preauth]`. The `port <number>` half is
+/// what still has to be there, and it is what keeps a username that merely
+/// looks like an address from becoming one.
 pub fn parse_ssh_failure(message: &str) -> Option<IpAddr> {
-    let message = message.trim();
-    if !(message.starts_with("Failed password for") || message.starts_with("Invalid user")) {
+    let message = strip_sshd_severity(message.trim());
+    if !SSH_FAILURE_OPENINGS
+        .iter()
+        .any(|opening| message.starts_with(opening))
+    {
         return None;
     }
 
     let tokens: Vec<&str> = message.split_whitespace().collect();
     let mut found = None;
     for i in 0..tokens.len() {
-        if tokens[i] != "from" {
-            continue;
-        }
-        // The full shape sshd writes: `from <addr> port <number>`. Requiring
-        // all four parts is what keeps a username containing the bare word
-        // "from" out of the result.
-        let (Some(addr), Some(port_kw), Some(port)) =
-            (tokens.get(i + 1), tokens.get(i + 2), tokens.get(i + 3))
-        else {
+        let (Some(port_kw), Some(port)) = (tokens.get(i + 1), tokens.get(i + 2)) else {
             continue;
         };
         if *port_kw != "port" || port.trim_end_matches(':').parse::<u16>().is_err() {
             continue;
         }
-        if let Ok(ip) = addr.parse::<IpAddr>() {
+        if let Ok(ip) = tokens[i].parse::<IpAddr>() {
             found = Some(canonical(ip));
         }
     }
@@ -2531,12 +2574,87 @@ not json at all
         assert_eq!(parse_ssh_failure(line), Some(ip("198.51.100.9")));
     }
 
+    /// One real journal line per shape the parser used to walk past.
+    ///
+    /// Between them these are most of what a modern attack writes: password
+    /// guessing is the loud minority, and a key-based brute force produces not
+    /// one line the old two-shape parser recognised — so it ran unlimited and
+    /// unseen while Sentinel reported nothing to do.
+    #[test]
+    fn every_shape_a_real_attack_writes_is_recognised() {
+        for (line, expected) in [
+            // Password guessing, the two shapes that always worked.
+            (
+                "Failed password for root from 203.0.113.9 port 55234 ssh2",
+                "203.0.113.9",
+            ),
+            (
+                "Invalid user oracle from 198.51.100.7 port 51000",
+                "198.51.100.7",
+            ),
+            // A rejected key. `Failed <method> for …`, so this is every method
+            // OpenSSH has and every one it grows.
+            (
+                "Failed publickey for root from 203.0.113.9 port 40222 ssh2: RSA \
+                 SHA256:0Yx5rP0h8Nn2bJmQ1cW7uF3vK9sT4dL6eR8aZ2iX1oU",
+                "203.0.113.9",
+            ),
+            (
+                "Failed none for invalid user admin from 203.0.113.9 port 40224 ssh2",
+                "203.0.113.9",
+            ),
+            // The end of a connection that tried every key it had. sshd writes
+            // its own severity into the message, so this one arrives prefixed.
+            (
+                "error: maximum authentication attempts exceeded for root from \
+                 203.0.113.9 port 40222 ssh2 [preauth]",
+                "203.0.113.9",
+            ),
+            // A scanner that walks away mid-handshake. No `from` anywhere in
+            // the line — the address simply follows the username.
+            (
+                "Connection closed by authenticating user root 203.0.113.9 port 55555 [preauth]",
+                "203.0.113.9",
+            ),
+            (
+                "Connection reset by authenticating user root 2001:db8::5 port 55556 [preauth]",
+                "2001:db8::5",
+            ),
+        ] {
+            assert_eq!(parse_ssh_failure(line), Some(ip(expected)), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_shapes_are_no_easier_to_aim_than_the_old_ones() {
+        // The username is still attacker-controlled, and in the two shapes with
+        // no `from` it sits immediately before the address — the most
+        // convenient possible place to forge one. Last-pair-wins is what keeps
+        // the real address the one that counts.
+        let line = "Connection closed by authenticating user 203.0.113.1 port 22 \
+                    198.51.100.9 port 55555 [preauth]";
+        assert_eq!(parse_ssh_failure(line), Some(ip("198.51.100.9")));
+
+        let line = "error: maximum authentication attempts exceeded for \
+                    from 203.0.113.1 port 22 from 198.51.100.9 port 40222 ssh2 [preauth]";
+        assert_eq!(parse_ssh_failure(line), Some(ip("198.51.100.9")));
+    }
+
     #[test]
     fn lines_that_are_not_authentication_failures_yield_nothing() {
         for line in [
             "Accepted password for root from 203.0.113.9 port 22 ssh2",
+            // A key login that worked. `Failed ` opens a shape; `Accepted `
+            // never does, however many `<addr> port <n>` pairs follow it.
+            "Accepted publickey for deploy from 192.0.2.5 port 40000 ssh2: RSA SHA256:abc",
+            // A connection that ended without anyone authenticating: an
+            // ordinary disconnect, and not the `authenticating user` shape.
             "Connection closed by 203.0.113.9 port 22",
             "Received disconnect from 203.0.113.9 port 22:11: Bye Bye",
+            // `Failed ` opens plenty of lines that are not about a credential.
+            // None of them carries an address and a port, which is why the
+            // prefix can afford to be broad.
+            "error: Failed to set uid to 0",
             "Failed password for root from 203.0.113.9",
             "Failed password for root",
             "Invalid user",

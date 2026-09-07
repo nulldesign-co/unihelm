@@ -430,7 +430,7 @@ be verified, which the UI surfaces rather than hides.
 |---|---|
 | Permission | `stack_manage` |
 | Execution | task — not cancellable, idempotent |
-| Input | `component` *(flattened)* — `nginx`, `php` (with `version`), `mariadb` or `postgres`; `extensions` *(optional list of `PhpExt`)* |
+| Input | `component` *(flattened)* — `nginx`, `php` (with `version`), `mariadb` or `postgres`; `extensions` *(optional list of `PhpExt`)*; `runtime` *(optional)* — `host` or `container` |
 
 Adds the component's repository, verifies its signing key against a full 40-hex
 fingerprint pin (`crates/unihelm-distro/src/repos.rs`), installs the packages
@@ -438,17 +438,91 @@ and starts the service. `component` is a typed enum precisely so an API caller
 cannot ask the panel to `apt install` something of their choosing. For PHP, an
 empty `extensions` list means the default set mainstream applications assume.
 
+`runtime` is where it runs, and it is optional in the strong sense: an absent
+field means "no preference" and is answered with the catalogue's own default —
+a container for every database and cache, the host for everything else. A
+present field is the operator's decision and is followed. The distinction is
+the whole point of the `Option`: the Stack page has offered "Run it: on the
+server / in a container" since containers landed, and until this field existed
+the answer never left the browser, so picking the host got a container and the
+panel said nothing about it. A runtime the entry does not offer is refused as
+`UNI-1201 invalid_input` naming what it does offer, rather than corrected to
+the default — a silent correction is the same defect wearing a different hat.
+
 ### `stack.remove`
 
 | | |
 |---|---|
 | Permission | `stack_manage` |
 | Execution | task — not cancellable, idempotent |
-| Input | `component` *(flattened)*, as for `stack.install` |
+| Input | `component` *(flattened)*, as for `stack.install`; `runtime` *(optional)* |
 
 Removes a component, refusing while anything still depends on it — a PHP
 version with sites on it, or a database engine with managed databases, comes
 back as `UNI-1404 dependents_exist` instead of breaking those sites.
+
+`runtime: "container"` is **refused**, not performed. Everything this operation
+does below its guards is the package manager, and a container has no packages:
+the removal would run to completion, touch nothing, mark the row removed and
+report success while the container carried on serving. `engine.remove` is the
+operation that takes a container off, and the refusal says so.
+
+### `stack.start`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `component` *(flattened)* — a catalogue slug, with `version` where several run at once |
+
+Starts the systemd unit an installed component ships, and then reads the unit's
+state back. The second half is not decoration: `systemctl start` exiting zero
+means systemd accepted the request, not that the service is running, and a
+start reported over a unit that died during start-up is exactly the kind of
+false success this panel is judged on. A unit that is not active afterwards
+comes back as `UNI-1602 service_action_failed` naming the `systemctl status`
+and `journalctl` lines that say why.
+
+The permission is `server_manage` rather than `stack_manage` even though the
+operation lives in the stack namespace: it changes service state, which is what
+`server_manage` describes, and it is what `svc.action` already requires for the
+identical act. Reaching it from the Stack page must not make it cheaper to do.
+
+The slug is resolved to a `ManagedUnit` — the same enum whitelist `svc.action`
+uses — so operator text can never name an arbitrary unit (spec §5.2). Six
+entries resolve: `nginx`, `apache`, `php`, `mariadb`, `redis`, `docker`.
+Anything else is `UNI-1503 not_implemented` listing those six. PostgreSQL is
+deliberately absent although a `ManagedUnit` exists for it: that variant
+resolves the major from a compile-time constant, so on the RHEL family it can
+name `postgresql-17.service` on a machine running 16 — and an action reported
+against a unit that is not the one installed is worse than no button at all.
+
+### `stack.stop`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `component` *(flattened)*, as for `stack.start` |
+
+Stops the unit, with the same whitelist, the same permission and the same
+read-back afterwards — a unit still active after a stop is a failure, not a
+success.
+
+One refusal is its own: stopping the web server that actually serves this
+machine while any site is still up comes back as `UNI-1404 dependents_exist`
+listing the sites. Until this operation existed there was no way to stop a web
+server from the panel at all, which is how a server that came up serving with
+Apache had nothing anywhere in the UI that could take it off port 80; the
+control is the fix and this sentence is what has to come with it, because one
+click here is every site on the machine going dark.
+
+Which server is serving is read from `webserver::active`, never from the slug:
+on a machine switched to Apache, a guard keyed on `nginx` refuses to stop the
+one serving nothing and permits the stop of the one holding every site up. A
+site that is suspended or failed is already not being served and is not counted
+— "every site is already down" has to stay a reachable state, or the incumbent
+could never be stopped at all.
 
 ## Sites
 
@@ -1094,7 +1168,7 @@ fails on the existing archive rather than silently rebuilding it.
 |---|---|
 | Permission | `file_manage` |
 | Execution | task — not cancellable, idempotent |
-| Input | `subscription_id` *(optional)*; `archive`; `dest` *(optional, home root when absent; must exist)* |
+| Input | `subscription_id` *(optional)*; `archive`; `dest` *(optional, home root when absent; created if missing, its parents must exist)* |
 
 Extracts an archive with path-traversal and zip-bomb guards: entries with
 absolute or `..` paths — and symlink entries, which would plant a

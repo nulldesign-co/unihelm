@@ -30,13 +30,16 @@ import type {
 import { en } from "../i18n/en";
 
 import {
+  contestedPort,
   defaultCommandFor,
   defaultRuntimeFor,
   defaultVersionFor,
   groupByCategory,
   hostHoldsEntry,
   planFor,
+  portIncumbentFor,
   runtimeOf,
+  serviceControlFor,
   servingState,
   sideBySideIn,
   supportFor,
@@ -102,6 +105,48 @@ const nginx: CatalogueEntry = {
   // renews and serves files out of tenant homes.
   install: { runtimes: ["host"], default_runtime: "host" },
   versions: [version({ version: "stable", recommended: true })],
+};
+
+/** The other server that wants port 80, and the reason issue 23 exists. */
+const apache: CatalogueEntry = {
+  slug: "apache",
+  display_name: "Apache",
+  category: "web_server",
+  summary: "For applications that need .htaccess.",
+  side_by_side: false,
+  install: { runtimes: ["host"], default_runtime: "host" },
+  versions: [version({ version: "distro", recommended: true })],
+};
+
+/** Two caches that collide on 6379, and one that does not. */
+const redis: CatalogueEntry = {
+  slug: "redis",
+  display_name: "Redis",
+  category: "cache",
+  summary: "In-memory store.",
+  side_by_side: false,
+  install: { runtimes: ["host", "container"], default_runtime: "container" },
+  versions: [version({ version: "distro", recommended: true })],
+};
+
+const valkey: CatalogueEntry = { ...redis, slug: "valkey", display_name: "Valkey" };
+
+const memcached: CatalogueEntry = {
+  ...redis,
+  slug: "memcached",
+  display_name: "Memcached",
+  summary: "A simpler cache than Redis.",
+};
+
+/** An engine whose unit the agent will not name, so its chip gets no control. */
+const postgres: CatalogueEntry = {
+  slug: "postgres",
+  display_name: "PostgreSQL",
+  category: "database",
+  summary: "For applications that want its types.",
+  side_by_side: false,
+  install: { runtimes: ["host", "container"], default_runtime: "container" },
+  versions: [version({ version: "17", recommended: true })],
 };
 
 /** The row every container-backed install depends on. */
@@ -478,6 +523,136 @@ describe("where an install goes", () => {
     expect(plan.runtime).toBe("host");
     expect(plan.support).toBe("host");
     expect(plan.dockerMissing).toBe(false);
+  });
+});
+
+describe("what is already holding the port", () => {
+  /** Something up on this machine, as `stack.status` reports it. */
+  const up = (
+    over: Partial<StackComponentView> & { component: string; version: string },
+  ): StackComponentView =>
+    row({ display_name: over.component, unit_active: true, ...over });
+
+  it("knows which entries contend for a port and which have one to themselves", () => {
+    expect(contestedPort(nginx)).toBe(80);
+    expect(contestedPort(apache)).toBe(80);
+    expect(contestedPort(redis)).toBe(6379);
+    expect(contestedPort(valkey)).toBe(6379);
+    // The asymmetry the agent has: Memcached is in the cache category and is on
+    // 11211, so keying the caches on the category would invent a collision.
+    expect(contestedPort(memcached)).toBeNull();
+    expect(contestedPort(mariadb)).toBeNull();
+  });
+
+  it("disables install on a rival and names what is in the way", () => {
+    // Issue 23 exactly: a machine serving with Apache had Install armed on
+    // nginx and OpenLiteSpeed, so the click reached the agent and came back as
+    // a failed task.
+    const serving = [
+      up({ component: "apache", version: "distro", display_name: "Apache", category: "web_server", status: "unmanaged" }),
+    ];
+    const plan = planFor(nginx, serving, "stable");
+    expect(plan.portIncumbent?.display_name).toBe("Apache");
+    expect(plan.action).toBe("install");
+  });
+
+  it("says nothing while the rival is installed but stopped", () => {
+    // The agent judges the incumbent by its unit being active, and an
+    // installed-but-stopped Apache holds nothing: blocking here would be
+    // blocking an install that would have worked.
+    const stopped = [
+      up({
+        component: "apache",
+        version: "distro",
+        display_name: "Apache",
+        category: "web_server",
+        unit_active: false,
+      }),
+    ];
+    expect(planFor(nginx, stopped, "stable").portIncumbent).toBeNull();
+  });
+
+  it("is not a collision with itself", () => {
+    // Reinstalling the server that is already serving is idempotent.
+    const serving = [
+      up({ component: "nginx", version: "stable", display_name: "Nginx", category: "web_server" }),
+    ];
+    expect(planFor(nginx, serving, "stable").portIncumbent).toBeNull();
+  });
+
+  it("keeps Memcached out of the caches' collision", () => {
+    const redisUp = [
+      up({ component: "redis", version: "distro", display_name: "Redis", category: "cache" }),
+    ];
+    expect(portIncumbentFor(valkey, redisUp)?.display_name).toBe("Redis");
+    // And a cache is no reason to refuse anything outside 6379.
+    expect(portIncumbentFor(memcached, redisUp)).toBeNull();
+    expect(portIncumbentFor(mariadb, redisUp)).toBeNull();
+  });
+
+  it("says nothing on a row that offers no button at all", () => {
+    // An unmanaged row carries neither chooser nor Install, so a warning about
+    // a click it does not offer is a warning about nothing.
+    const machine = [
+      up({ component: "apache", version: "distro", display_name: "Apache", category: "web_server" }),
+      up({ component: "nginx", version: "stable", category: "web_server", status: "unmanaged" }),
+    ];
+    expect(planFor(nginx, machine, "stable").portIncumbent).toBeNull();
+  });
+});
+
+describe("the start and stop control on an installed version's chip", () => {
+  const nginxRow = (over: Partial<StackComponentView> = {}) =>
+    row({ component: "nginx", version: "stable", category: "web_server", ...over });
+
+  it("offers stop while the unit is up and start while it is not", () => {
+    expect(serviceControlFor(nginx, nginxRow({ unit_active: true }))).toBe("stop");
+    expect(serviceControlFor(nginx, nginxRow({ unit_active: false }))).toBe("start");
+  });
+
+  it("offers the control for a server the panel did not install", () => {
+    // The case issue 23 is about: an Apache somebody installed by hand is the
+    // Apache holding port 80, and the panel had nowhere to stop it. Install and
+    // Remove stay hidden on an unmanaged row for reasons that do not apply to a
+    // stop — which the button beside it undoes.
+    const byHand = row({
+      component: "apache",
+      version: "distro",
+      category: "web_server",
+      status: "unmanaged",
+      unit_active: true,
+    });
+    expect(serviceControlFor(apache, byHand)).toBe("stop");
+  });
+
+  it("offers nothing for a container, which has no unit", () => {
+    const container = row({
+      component: "mariadb",
+      version: "11.8",
+      category: "database",
+      runtime: "container",
+    });
+    expect(serviceControlFor(mariadb, container)).toBeNull();
+  });
+
+  it("offers nothing where the agent will not name the unit", () => {
+    // PostgreSQL's `ManagedUnit` resolves its major from a compile-time
+    // constant, so on the RHEL family it can name a unit that is not the one
+    // installed. A button that acts on the wrong service is worse than none,
+    // and this list has to stay in step with the agent's own.
+    const here = row({ component: "postgres", version: "17", category: "database" });
+    expect(serviceControlFor(postgres, here)).toBeNull();
+  });
+
+  it("offers nothing for a row that is not on the machine", () => {
+    const failed = row({
+      component: "nginx",
+      version: "stable",
+      category: "web_server",
+      status: "failed",
+      unit_active: false,
+    });
+    expect(serviceControlFor(nginx, failed)).toBeNull();
   });
 });
 

@@ -72,6 +72,8 @@ fn protected() -> Router<SharedState> {
         .route("/api/stack", get(stack::status))
         .route("/api/stack/install", post(stack::install))
         .route("/api/stack/remove", post(stack::remove))
+        .route("/api/stack/start", post(stack::start))
+        .route("/api/stack/stop", post(stack::stop))
         .route("/api/sites", get(sites::list).post(sites::create))
         .route(
             "/api/sites/{id}",

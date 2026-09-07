@@ -245,7 +245,7 @@ fn dispatch(call: &FsCall, payload: &mut impl BufRead, out: &mut impl Write) -> 
 
         FsRequest::Extract { archive: src, dest } => {
             let source = safepath::resolve(home, src)?;
-            let target = safepath::resolve(home, dest)?;
+            let target = extract_dest(home, dest)?;
             let (files, bytes) = archive::extract(&source, &target)?;
             reply_data(FsData::Extracted { files, bytes }, out)
         }
@@ -506,6 +506,44 @@ fn strip_home(home: &Path, path: &Path) -> SafeResult<String> {
     Ok(out.join("/"))
 }
 
+/// Resolve the directory an extraction lands in, creating it when it is not
+/// there yet.
+///
+/// This used to be a plain [`safepath::resolve`], which walks every component
+/// with `symlink_metadata` and so answered ENOENT for anything that did not
+/// already exist. That made *"extract into a folder named after the archive"* —
+/// the destination people actually type, and the one the file manager offers —
+/// fail every single time, on a name nothing else in the panel would create for
+/// them.
+///
+/// [`safepath::resolve_new`] plus [`safepath::child`] is the pair Copy, Rename
+/// and Mkdir already use for a target that is not there yet, so nothing here is
+/// relaxed: every parent is still walked one component at a time and still
+/// refuses a symlink, a missing parent is still a `NotFound` rather than a
+/// silent `mkdir -p`, and a link sitting at the destination name is still an
+/// escape. Only the final `mkdir` is new — and it runs as the tenant, so the
+/// directory it creates is owned by the account whose home it is in.
+fn extract_dest(home: &Path, dest: &Path) -> SafeResult<SafePath> {
+    // The home itself is the default destination, and it has no last component
+    // for `resolve_new` to hand back — it also always exists, so there is
+    // nothing to create.
+    if dest.as_os_str().is_empty() {
+        return safepath::home_root(home);
+    }
+
+    let (parent, name) = safepath::resolve_new(home, dest)?;
+    let target = safepath::child(&parent, &name)?;
+    match std::fs::create_dir(target.as_path()) {
+        Ok(()) => Ok(target),
+        // Extracting into a directory that is already there is the common case
+        // — re-extracting over a previous run is the second most common thing
+        // this operation does. A plain file at that name is refused by
+        // `archive::extract`, which says which of the two it found.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(target),
+        Err(e) => Err(SafeError::io(target.as_path(), &e)),
+    }
+}
+
 fn copy_tree(from: &SafePath, to: &SafePath) -> SafeResult<u64> {
     let meta =
         std::fs::symlink_metadata(from.as_path()).map_err(|e| SafeError::io(from.as_path(), &e))?;
@@ -724,6 +762,141 @@ fn write_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn temp_home() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        // The temp dir may itself be a symlink (/var -> /private/var on macOS);
+        // the agent always hands over the canonical home.
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, path)
+    }
+
+    /// Run one request the way `run_local` does and parse the reply line.
+    fn call(home: &Path, request: FsRequest) -> FsReply {
+        let mut out = Vec::new();
+        serve_one(
+            &FsCall {
+                home: home.to_path_buf(),
+                request,
+                payload_len: 0,
+            },
+            &mut io::empty(),
+            &mut out,
+        )
+        .expect("writing a reply into a Vec cannot fail");
+        let line: Vec<u8> = out.into_iter().take_while(|b| *b != b'\n').collect();
+        serde_json::from_slice(&line).expect("the helper answers with exactly one reply line")
+    }
+
+    /// A one-file `site.tar.gz` at the top of the home.
+    fn archive_of_one_file(home: &Path) {
+        std::fs::create_dir(home.join("src")).unwrap();
+        std::fs::write(home.join("src/index.php"), b"<?php echo 1;").unwrap();
+        let reply = call(
+            home,
+            FsRequest::Compress {
+                root: PathBuf::new(),
+                entries: vec!["src".into()],
+                archive: "site.tar.gz".into(),
+                format: ArchiveFormat::TarGz,
+            },
+        );
+        assert!(matches!(reply, FsReply::Ok { .. }), "{reply:?}");
+    }
+
+    fn extract_into(home: &Path, dest: &str) -> FsReply {
+        call(
+            home,
+            FsRequest::Extract {
+                archive: "site.tar.gz".into(),
+                dest: PathBuf::from(dest),
+            },
+        )
+    }
+
+    #[test]
+    fn extracting_into_a_folder_that_does_not_exist_yet_creates_it() {
+        // The destination was resolved with `safepath::resolve`, which walks
+        // each component with `symlink_metadata` — so a folder named after the
+        // archive, the obvious thing to extract into, was ENOENT every time.
+        let (_guard, home) = temp_home();
+        archive_of_one_file(&home);
+
+        let reply = extract_into(&home, "site");
+        let FsReply::Ok {
+            data: FsData::Extracted { files, .. },
+            ..
+        } = reply
+        else {
+            panic!("expected an extraction, got {reply:?}");
+        };
+        assert_eq!(files, 1);
+        assert_eq!(
+            std::fs::read(home.join("site/src/index.php")).unwrap(),
+            b"<?php echo 1;"
+        );
+    }
+
+    #[test]
+    fn extracting_into_a_folder_that_is_already_there_still_works() {
+        // Creating the destination must not turn "already extracted once" into
+        // an AlreadyExists refusal: re-extracting over a previous run is the
+        // second most common thing this operation does.
+        let (_guard, home) = temp_home();
+        archive_of_one_file(&home);
+        std::fs::create_dir(home.join("site")).unwrap();
+
+        let reply = extract_into(&home, "site");
+        assert!(matches!(reply, FsReply::Ok { .. }), "{reply:?}");
+        assert!(home.join("site/src/index.php").exists());
+    }
+
+    #[test]
+    fn extracting_under_a_parent_that_does_not_exist_is_refused_not_created() {
+        // Copy and Rename resolve a not-yet-existing target the same way and
+        // refuse the same shape: one new name, not a whole missing chain.
+        let (_guard, home) = temp_home();
+        archive_of_one_file(&home);
+
+        let reply = extract_into(&home, "nope/site");
+        let FsReply::Err { kind, .. } = reply else {
+            panic!("expected a refusal, got {reply:?}");
+        };
+        assert_eq!(kind, FsErrorKind::NotFound);
+        assert!(!home.join("nope").exists());
+    }
+
+    #[test]
+    fn a_destination_that_climbs_out_of_the_home_is_still_refused() {
+        let (_guard, home) = temp_home();
+        archive_of_one_file(&home);
+
+        let reply = extract_into(&home, "../escaped");
+        let FsReply::Err { kind, .. } = reply else {
+            panic!("expected a refusal, got {reply:?}");
+        };
+        assert_eq!(kind, FsErrorKind::Escape);
+        assert!(!home.parent().unwrap().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_standing_where_the_destination_goes_is_still_refused() {
+        // The widening must not become a way through a link: creating the
+        // destination happens *after* the same refuse-every-symlink walk.
+        let (_guard, home) = temp_home();
+        archive_of_one_file(&home);
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.join("out")).unwrap();
+
+        let reply = extract_into(&home, "out");
+        let FsReply::Err { kind, .. } = reply else {
+            panic!("expected a refusal, got {reply:?}");
+        };
+        assert_eq!(kind, FsErrorKind::Escape);
+        assert!(!outside.path().join("src").exists());
+    }
 
     #[test]
     fn setuid_and_friends_are_refused() {

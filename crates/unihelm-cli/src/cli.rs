@@ -469,6 +469,11 @@ pub enum StackCommand {
         /// Extensions to add to the default set. Repeat or comma-separate.
         #[arg(long = "ext", value_delimiter = ',')]
         extensions: Vec<String>,
+        /// Where to run it. Omitted means whatever the catalogue recommends
+        /// for this component, which for the databases and caches is a
+        /// container.
+        #[arg(long, value_enum)]
+        runtime: Option<RuntimeArg>,
     },
     /// Remove a component.
     Remove {
@@ -476,6 +481,31 @@ pub enum StackCommand {
         /// What to install: any slug the Stack page lists.
         component: String,
         /// Which version, e.g. `8.3` or `11.4`. Defaults to the recommended one.
+        #[arg(long)]
+        version: Option<String>,
+        /// Which of the two installs to take off. Removing a container is
+        /// `unihelm engine remove`; this path removes host packages.
+        #[arg(long, value_enum)]
+        runtime: Option<RuntimeArg>,
+    },
+    /// Start the service an installed component ships.
+    Start {
+        /// `nginx`, `apache`, `php`, `mariadb`, `redis` or `docker` — the
+        /// components whose unit the panel is allowed to name.
+        component: String,
+        /// Which version, for the components that run several services at once.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Stop it.
+    ///
+    /// Refused while it is the web server serving this machine and any site is
+    /// still up: one stop there is every site on the server going dark, and the
+    /// refusal names them. Switch web servers, or suspend the sites, first.
+    Stop {
+        /// As for `start`.
+        component: String,
+        /// Which version, for the components that run several services at once.
         #[arg(long)]
         version: Option<String>,
     },
@@ -502,6 +532,19 @@ pub enum StackCommand {
         /// `nginx` or `apache`.
         target: String,
     },
+}
+
+/// Host packages or a container, as the Stack page's "Run it" menu asks it.
+///
+/// Optional wherever it appears, and that is load-bearing rather than tidy: the
+/// agent answers "no preference" with the catalogue's own default, and a flag
+/// with a `default_value` here would turn every scripted install into a claim
+/// the operator never made.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum RuntimeArg {
+    Host,
+    Container,
 }
 
 // ---------------------------------------------------------------------------

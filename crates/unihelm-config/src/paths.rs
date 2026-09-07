@@ -437,6 +437,55 @@ pub fn mail_site_config(domain: &str) -> PathBuf {
     mail_dir().join(format!("{domain}.msmtprc"))
 }
 
+// ---------------------------------------------------------------------------
+// Engine containers (spec §11.5; `unihelm_ops::engine`)
+// ---------------------------------------------------------------------------
+
+/// Where the panel keeps the configuration files it mounts into engine
+/// containers — today the one file a Redis or Valkey container reads its
+/// password out of.
+///
+/// **This directory is the boundary, and the file mode inside it is not.**
+/// That is the opposite of every other secret the panel writes, so it is worth
+/// being exact about why. A cache image drops privileges before it reads its
+/// configuration (the official Redis and Valkey entrypoints `gosu` to their own
+/// unprivileged account), so a bind-mounted file the container can actually
+/// read has to grant read to *other* — [`ENGINE_CONFIG_FILE_MODE`], not 0600.
+/// A 0600 file is one the server cannot open, and an engine that will not start
+/// is not a safer engine, it is a broken one.
+///
+/// What keeps every local account on the host away from the password is this
+/// directory: `0700 root:root` means no unprivileged user can traverse it, so
+/// the file inside cannot be opened by path however permissive its own mode is
+/// — while Docker, which resolves the mount as root, reaches it fine. Loosening
+/// this mode publishes every cache password on the machine to every tenant, and
+/// nothing else would notice.
+pub fn engine_config_dir() -> PathBuf {
+    config_dir().join("engines")
+}
+
+/// The mode [`engine_config_dir`] must be created with and kept at. See its
+/// documentation: this number is the access control, not the file's.
+pub const ENGINE_CONFIG_DIR_MODE: u32 = 0o700;
+
+/// The mode one engine's configuration file is written with.
+///
+/// World-readable *inode*, unreachable *path* — see [`engine_config_dir`]. The
+/// container's server runs as its own unprivileged uid, which is not root and
+/// not in root's group, so nothing narrower can be opened through the mount.
+pub const ENGINE_CONFIG_FILE_MODE: u32 = 0o644;
+
+/// One engine container's configuration file.
+///
+/// Named for the container rather than for the catalogue slug, because the
+/// container name *is* the identity of an installed engine: Redis 7 and Redis 8
+/// on one machine are two servers with two passwords, and one file for both
+/// would hand whichever started second a password its data was never
+/// initialised with.
+pub fn engine_config_file(container: &str) -> PathBuf {
+    engine_config_dir().join(format!("{container}.conf"))
+}
+
 /// The http-context nginx include that turns ModSecurity on.
 ///
 /// `03-` so it sorts after the catch-all, panel and Adminer server blocks and
@@ -524,6 +573,33 @@ mod tests {
         assert!(waf_main_conf().starts_with(config_dir()));
         assert!(waf_crs_release_dir("4.29.0").starts_with(data_dir()));
         assert!(waf_data_dir().starts_with(data_dir()));
+    }
+
+    /// A cache container's password lives in this file, and the file has to be
+    /// readable by the unprivileged account the image drops to — so the mode on
+    /// the file cannot be what keeps tenants out. The directory is. Every
+    /// engine's file must therefore be *directly* inside it, and the directory
+    /// must be 0700: a config file that ended up one level out, or a directory
+    /// relaxed to 0755, would publish every cache password on the machine while
+    /// the file still looked deliberately permissioned.
+    #[test]
+    fn an_engine_config_is_kept_secret_by_its_directory_and_not_by_its_mode() {
+        let dir = engine_config_dir();
+        assert!(dir.starts_with(config_dir()), "{dir:?}");
+        assert_eq!(ENGINE_CONFIG_DIR_MODE, 0o700);
+
+        let file = engine_config_file("unihelm-redis-7");
+        assert_eq!(file.parent(), Some(dir.as_path()));
+        assert_eq!(
+            file.to_str().unwrap(),
+            "/etc/unihelm/engines/unihelm-redis-7.conf"
+        );
+        // Two versions of one cache are two servers with two passwords.
+        assert_ne!(file, engine_config_file("unihelm-redis-8"));
+
+        // The file mode is what the container needs to read it through the
+        // mount, and nothing more is claimed for it.
+        assert_eq!(ENGINE_CONFIG_FILE_MODE & 0o004, 0o004);
     }
 
     #[test]

@@ -523,6 +523,21 @@ export function CompressDialog({
 
 // ---------------------------------------------------------------------------
 
+/**
+ * The archive's name with its extension taken off — `site.tar.gz` → `site`.
+ *
+ * Only the extensions the server recognises are stripped, and only from the
+ * end: a file called `2024.backup.zip` keeps the dot in the middle, because the
+ * folder is meant to be recognisable, not tidy.
+ */
+function archiveStem(name: string): string {
+  const lower = name.toLowerCase();
+  for (const ext of [".tar.gz", ".tar.zst", ".tgz", ".tzst", ".zip"]) {
+    if (lower.endsWith(ext)) return name.slice(0, name.length - ext.length);
+  }
+  return name;
+}
+
 export function ExtractDialog({
   entry,
   dir,
@@ -536,10 +551,24 @@ export function ExtractDialog({
 }) {
   const { t } = useTranslation();
   const [dest, setDest] = useState(dir);
+  // On by default, and now possible: extracting into a folder named after the
+  // archive used to fail with "not found", because the helper resolved the
+  // destination as a path that had to exist already. So the choice was between
+  // making the folder by hand first and letting an archive with no top-level
+  // directory scatter itself across the current one.
+  const [intoOwnFolder, setIntoOwnFolder] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const stem = archiveStem(entry.name).trim();
+  // An archive whose whole name is its extension leaves nothing to name a
+  // folder after; the switch has nothing to offer there.
+  const canUseOwnFolder = isValidName(stem);
+  const target = cleanPath(
+    intoOwnFolder && canUseOwnFolder ? joinPath(cleanPath(dest), stem) : dest,
+  );
+
   const extract = useMutation({
-    mutationFn: () => filesApi.extract(entry.path, cleanPath(dest)),
+    mutationFn: () => filesApi.extract(entry.path, target),
     onSuccess: (result) => {
       onDone(result.task_id);
       onClose();
@@ -577,6 +606,19 @@ export function ExtractDialog({
           onChange={(event) => setDest(event.target.value)}
         />
       </Field>
+      {canUseOwnFolder ? (
+        <Switch
+          checked={intoOwnFolder}
+          onChange={setIntoOwnFolder}
+          label={t("files.extractOwnFolder", { name: stem })}
+          description={t("files.extractOwnFolderHint")}
+        />
+      ) : null}
+      {/* Where the files actually land, spelled out — the switch changes it, so
+          the switch must not be the only thing that says where. */}
+      <p className="mt-3 truncate rounded-lg bg-surface-muted px-3 py-2 font-mono text-xs text-ink-subtle">
+        {target === "" ? t("files.home") : target}
+      </p>
       <ErrorNote error={error} />
     </Dialog>
   );

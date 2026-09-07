@@ -113,6 +113,17 @@ const TEMPLATES: &[(&str, &str)] = &[
         "modsecurity/main.conf",
         include_str!("../templates/modsecurity/main.conf.j2"),
     ),
+    // The file a containerised Redis or Valkey reads its password out of
+    // (`unihelm_ops::engine`). One template for both: Valkey is a fork of Redis
+    // down to the configuration grammar. Rendered here rather than assembled in
+    // `engine.rs` for the reason the strict-undefined note above gives — a
+    // context missing `password` has to be a render failure, because the
+    // alternative is a cache that comes up with no authentication at all while
+    // the panel reports it installed.
+    (
+        "engine/redis.conf",
+        include_str!("../templates/engine/redis.conf.j2"),
+    ),
 ];
 
 pub struct TemplateSet {
@@ -356,6 +367,47 @@ mod tests {
         assert!(
             block.contains("proxy_read_timeout 24h;"),
             "an idle PTY must outlive nginx's 60s default:\n{block}"
+        );
+    }
+
+    /// A cache with no `requirepass` is one every account on a shared host can
+    /// read every other customer's sessions out of and `FLUSHALL` at will —
+    /// which is what Redis, Valkey and Memcached containers were all doing. The
+    /// rendered file has to carry the password, and a context that forgot it
+    /// has to *fail* rather than render a server with authentication switched
+    /// off: an empty `requirepass` line is not a syntax error to Redis, it is a
+    /// server with no password.
+    #[test]
+    fn a_cache_config_carries_a_password_or_fails_to_render() {
+        let set = TemplateSet::load().unwrap();
+        let rendered = set
+            .render(
+                "engine/redis.conf",
+                &json!({ "engine": {
+                    "container": "unihelm-redis-7",
+                    "password": "s3cr3tPassw0rd",
+                    "data_dir": "/data",
+                }}),
+            )
+            .unwrap();
+
+        assert!(
+            rendered.contains("requirepass s3cr3tPassw0rd"),
+            "the cache would answer anybody:\n{rendered}"
+        );
+        // The persistence that used to be an argument to the server has to
+        // survive the move into this file, or the data volume stays empty while
+        // the panel reports the data safe.
+        assert!(rendered.contains("appendonly yes"), "{rendered}");
+        assert!(rendered.contains("dir /data"), "{rendered}");
+
+        let no_password = set.render(
+            "engine/redis.conf",
+            &json!({ "engine": { "container": "unihelm-redis-7", "data_dir": "/data" }}),
+        );
+        assert!(
+            no_password.is_err(),
+            "a missing password rendered a cache with no authentication: {no_password:?}"
         );
     }
 

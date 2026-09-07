@@ -982,7 +982,8 @@ pub struct ExtractInput {
     #[serde(default)]
     pub subscription_id: Option<i64>,
     pub archive: TenantPath,
-    /// Directory to extract into; the home root when absent. Must exist.
+    /// Directory to extract into; the home root when absent. Created if it is
+    /// not there yet, the way Copy already treats a destination it has to make.
     #[serde(default)]
     pub dest: Option<TenantPath>,
 }

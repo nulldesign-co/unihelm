@@ -286,6 +286,28 @@ export interface StackComponentRequest {
   runtime?: StackRuntime;
 }
 
+/**
+ * What /api/stack/{start,stop} take.
+ *
+ * No `runtime`: these act on a systemd unit and a container has none. `version`
+ * still matters, because `php8.3-fpm` and `php8.4-fpm` are two services on one
+ * machine.
+ */
+export interface StackServiceRequest {
+  component: string;
+  version?: string;
+}
+
+/** The unit's state after a start or a stop, read back rather than assumed. */
+export interface StackServiceResult {
+  slug: string;
+  /** The unit systemd was told about, not the slug that was typed. */
+  unit: string;
+  action: string;
+  unit_state: string;
+  unit_active: boolean;
+}
+
 /** Where an entry belongs on the Stack page. Mirrors `catalogue::Category`. */
 export type StackCategory = "web_server" | "language" | "database" | "cache" | "container";
 
@@ -1007,6 +1029,17 @@ export const endpoints = {
     api.post<TaskAccepted>("/api/stack/install", component),
   removeComponent: (component: StackComponentRequest) =>
     api.post<TaskAccepted>("/api/stack/remove", component),
+  /**
+   * Start or stop the service an installed component ships.
+   *
+   * Not tasks: both answer in the same round trip with the unit's state
+   * afterwards, which is why the refusal for stopping the web server that
+   * serves this machine reaches the caller here rather than in a task log.
+   */
+  startComponent: (component: StackServiceRequest) =>
+    api.post<StackServiceResult>("/api/stack/start", component),
+  stopComponent: (component: StackServiceRequest) =>
+    api.post<StackServiceResult>("/api/stack/stop", component),
 
   sites: () => api.get<SitesResponse>("/api/sites"),
   createSite: (body: CreateSiteRequest) => api.post<TaskAccepted>("/api/sites", body),

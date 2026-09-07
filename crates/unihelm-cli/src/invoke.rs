@@ -157,6 +157,14 @@ fn parse_volume_mounts(specs: &[String]) -> anyhow::Result<Vec<serde_json::Value
 }
 
 /// rather than three that have to agree.
+/// The wire spelling of a runtime, which is the catalogue's own.
+fn runtime_str(runtime: RuntimeArg) -> &'static str {
+    match runtime {
+        RuntimeArg::Host => "host",
+        RuntimeArg::Container => "container",
+    }
+}
+
 fn component_value(component: &str, version: Option<&str>) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     m.insert("component".into(), json!(component));
@@ -392,17 +400,40 @@ fn stack(cmd: &StackCommand) -> Result<Action> {
             component,
             version,
             extensions,
+            runtime,
         } => {
             let mut input = component_value(component, version.as_deref());
             if let Some(map) = input.as_object_mut() {
                 map.insert("extensions".into(), json!(extensions));
+                // Only when the operator said so. An absent key is how the
+                // agent is told "no preference", and sending `null` would be
+                // the CLI answering a question it was not asked.
+                if let Some(runtime) = runtime {
+                    map.insert("runtime".into(), json!(runtime_str(*runtime)));
+                }
             }
             call("stack.install", input)
         }
-        StackCommand::Remove { component, version } => call(
-            "stack.remove",
+        StackCommand::Remove {
+            component,
+            version,
+            runtime,
+        } => {
+            let mut input = component_value(component, version.as_deref());
+            if let Some(map) = input.as_object_mut()
+                && let Some(runtime) = runtime
+            {
+                map.insert("runtime".into(), json!(runtime_str(*runtime)));
+            }
+            call("stack.remove", input)
+        }
+        StackCommand::Start { component, version } => call(
+            "stack.start",
             component_value(component, version.as_deref()),
         ),
+        StackCommand::Stop { component, version } => {
+            call("stack.stop", component_value(component, version.as_deref()))
+        }
         StackCommand::Webserver {
             target,
             accept_gaps,

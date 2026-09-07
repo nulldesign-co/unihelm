@@ -45,9 +45,38 @@ export interface SshKeyListResponse {
   has_unmanaged_keys: boolean;
 }
 
+/**
+ * One subscription, as the terminal needs to name it.
+ *
+ * A slice of what `subscription.list` returns — an admin picking whose shell to
+ * open recognises the Linux account and the customer behind it; the plan and
+ * quota columns on that row are the plans page's business.
+ */
+export interface TerminalSubscription {
+  id: number;
+  linux_user: string;
+  status: "active" | "suspended" | "pending_delete";
+  /** Null when the owning user row has gone; the Linux account still names it. */
+  customer_username: string | null;
+}
+
+export interface SubscriptionListResponse {
+  subscriptions: TerminalSubscription[];
+}
+
 export const terminalApi = {
   openSession: (body: OpenSessionRequest) =>
     api.post<OpenSessionResponse>("/api/terminal/sessions", body),
+  /**
+   * The subscriptions this caller may see.
+   *
+   * The terminal needs it because `subscription_id` is not optional for an
+   * administrator: their scope is the whole server, so the agent has no "my
+   * subscription" to resolve and refuses a tenant shell that does not name one.
+   * The page had no way to name one, so every admin "My account" terminal was a
+   * 400 quoting a field the screen did not offer.
+   */
+  subscriptions: () => api.get<SubscriptionListResponse>("/api/subscriptions"),
   sshKeys: (subscriptionId?: number) =>
     api.get<SshKeyListResponse>(
       `/api/ssh-keys${subscriptionId === undefined ? "" : `?subscription_id=${subscriptionId}`}`,
@@ -64,6 +93,47 @@ export const terminalApi = {
       }`,
     ),
 };
+
+/**
+ * What the start panel should show for the accounts it found.
+ *
+ * Three outcomes, kept apart on purpose. One subscription is not a list to
+ * choose from — making somebody pick the only option is a click that carries no
+ * decision. None is not an empty picker with a 400 waiting behind it: it is a
+ * statement that this server has no tenant accounts yet, and a pointer at where
+ * they are made. A failed request is neither, and the caller must not fold it
+ * into "none" — an empty list would be a claim about the server that this page
+ * has not established.
+ */
+export type SubscriptionChoice =
+  | { kind: "none" }
+  | { kind: "only"; id: number; subscription: TerminalSubscription }
+  | { kind: "pick"; options: TerminalSubscription[] };
+
+export function subscriptionChoice(list: readonly TerminalSubscription[]): SubscriptionChoice {
+  // By id, so the same server produces the same order on every load and the
+  // option an operator reached for last time is where they left it.
+  const options = [...list].sort((a, b) => a.id - b.id);
+  const only = options[0];
+  if (only === undefined) return { kind: "none" };
+  if (options.length === 1) return { kind: "only", id: only.id, subscription: only };
+  return { kind: "pick", options };
+}
+
+/**
+ * How one subscription reads in the picker.
+ *
+ * Both halves are identifiers — a Linux account and a panel username — so there
+ * is nothing here to translate; the id is appended because two customers can
+ * share a name in the operator's head but never in the database.
+ */
+export function subscriptionLabel(s: TerminalSubscription): string {
+  // Truthiness, not a null check: a row whose owning user has gone can arrive
+  // with the name null or missing, and neither should print "null" at an
+  // operator choosing a root-capable shell.
+  const who = s.customer_username ? `${s.linux_user} · ${s.customer_username}` : s.linux_user;
+  return `${who} (#${s.id})`;
+}
 
 /** What the socket sends us. */
 export type ServerMessage =

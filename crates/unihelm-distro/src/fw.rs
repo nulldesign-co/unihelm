@@ -618,19 +618,36 @@ impl FwBackend for UfwBackend {
     }
 
     async fn unban_ip(&self, ip: IpAddr) -> Result<()> {
-        let out = self
+        // By number against `status numbered`, and only for lines carrying our
+        // own mark.
+        //
+        // `ufw delete deny from <ip>` matches on the rule's *shape* and carries
+        // no comment predicate, so it deleted whichever deny for that address
+        // ufw found first — including one the operator had written by hand
+        // before Unihelm existed. Unbanning an address the operator had also
+        // blocked themselves silently threw their block away, and nothing in
+        // the panel said a rule had gone.
+        let listing = self
             .cmd()
-            .args(["--force", "delete", "deny", "from", &ip.to_string()])
-            .run()
+            .args(["status", "numbered"])
+            .run_checked()
             .await?;
-        if out.success() || out.failure_text().contains("non-existent") {
-            return Ok(());
+        for index in ufw_ban_indices(&listing.stdout, ip) {
+            let index = index.to_string();
+            let cmd = self.cmd().args(["--force", "delete", &index]);
+            let out = cmd.run().await?;
+            if !out.success() {
+                return Err(DistroError::CommandFailed {
+                    cmd: cmd.display(),
+                    status: out.status,
+                    output: out.failure_text(),
+                });
+            }
         }
-        Err(DistroError::CommandFailed {
-            cmd: format!("ufw delete deny from {ip}"),
-            status: out.status,
-            output: out.failure_text(),
-        })
+        // No marked rule is the state the caller asked for, not a failure: the
+        // ban may have been lifted from a shell, or never applied because the
+        // firewall was down when Sentinel placed it.
+        Ok(())
     }
 
     async fn list_bans(&self) -> Result<Vec<IpAddr>> {
@@ -701,6 +718,53 @@ fn parse_ufw_status(text: &str) -> Vec<PortRule> {
         });
     }
     rules
+}
+
+/// The `ufw status numbered` line numbers of the ban rules **we** wrote for `ip`.
+///
+/// Highest first, and that ordering is the reason this returns numbers rather
+/// than deleting as it goes: ufw renumbers every rule below the one it deletes,
+/// so taking them in ascending order removes rule 4 and then removes whatever
+/// slid up into 5's place — some other rule entirely.
+///
+/// A line qualifies only when all three hold: it denies, it carries our own
+/// `unihelm: ban` comment, and the address appears in the rule body as an
+/// address rather than as a substring. The middle condition is the one that
+/// matters here — ufw's own `delete deny from <ip>` has no way to express it,
+/// which is how unbanning used to delete an operator's hand-written block of
+/// the same address. The third keeps `203.0.113.9` off a rule for
+/// `203.0.113.90`, and lets `2001:db8::1` match however ufw chose to print it.
+fn ufw_ban_indices(text: &str, ip: IpAddr) -> Vec<u32> {
+    let marker = format!("{MARK}: ban");
+    let mut indices: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        let Some((number, rest)) = line
+            .trim_start()
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+        else {
+            continue;
+        };
+        let Ok(number) = number.trim().parse::<u32>() else {
+            continue;
+        };
+        let (body, comment) = match rest.split_once('#') {
+            Some((body, comment)) => (body, comment.trim()),
+            None => (rest, ""),
+        };
+        if !body.contains("DENY") || comment != marker {
+            continue;
+        }
+        if !body
+            .split_whitespace()
+            .any(|token| token.parse::<IpAddr>().is_ok_and(|parsed| parsed == ip))
+        {
+            continue;
+        }
+        indices.push(number);
+    }
+    indices.sort_unstable_by(|a, b| b.cmp(a));
+    indices
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +1530,68 @@ To                         Action      From
 
         assert_eq!(rules.iter().find(|r| r.port == 22).unwrap().comment, "ssh");
         assert_eq!(rules.iter().find(|r| r.port == 8088).unwrap().comment, "");
+    }
+
+    /// `ufw status numbered` on a host where the operator blocked an address by
+    /// hand and Sentinel later banned the same one.
+    const NUMBERED_STATUS: &str = "\
+Status: active
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] Anywhere                   DENY IN     203.0.113.9
+[ 2] Anywhere                   DENY IN     203.0.113.9                # unihelm: ban
+[ 3] 22/tcp                     ALLOW IN    Anywhere                   # ssh
+[ 4] Anywhere                   DENY IN     203.0.113.90               # unihelm: ban
+[ 5] Anywhere                   DENY IN     198.51.100.4               # unihelm: ban
+[ 6] Anywhere (v6)              DENY IN     2001:0db8:0000::1          # unihelm: ban
+";
+
+    #[test]
+    fn unbanning_finds_our_own_ban_and_leaves_the_operators_block_alone() {
+        // `ufw delete deny from 203.0.113.9` matched on shape alone and took
+        // rule 1 — a block the operator wrote before Unihelm was installed —
+        // while the panel reported the unban as done.
+        assert_eq!(
+            ufw_ban_indices(NUMBERED_STATUS, "203.0.113.9".parse().unwrap()),
+            vec![2],
+            "only the marked rule is ours to delete"
+        );
+    }
+
+    #[test]
+    fn an_address_is_matched_as_an_address_and_not_as_a_substring() {
+        // Rule 4 is a different host whose text begins with rule 2's address.
+        assert_eq!(
+            ufw_ban_indices(NUMBERED_STATUS, "203.0.113.90".parse().unwrap()),
+            vec![4]
+        );
+        // And a v6 address matches however ufw chose to print it.
+        assert_eq!(
+            ufw_ban_indices(NUMBERED_STATUS, "2001:db8::1".parse().unwrap()),
+            vec![6]
+        );
+    }
+
+    #[test]
+    fn nothing_of_ours_to_delete_is_an_empty_list_not_a_guess() {
+        // The caller treats this as success: the ban may have been lifted from
+        // a shell, or never applied because the firewall was down.
+        assert!(ufw_ban_indices(NUMBERED_STATUS, "192.0.2.1".parse().unwrap()).is_empty());
+        assert!(ufw_ban_indices("Status: inactive\n", "203.0.113.9".parse().unwrap()).is_empty());
+        assert!(ufw_ban_indices("", "203.0.113.9".parse().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn several_marked_rules_come_back_highest_first() {
+        // Deleting renumbers everything below, so ascending order would delete
+        // one of ours and then whichever rule slid up into the next slot.
+        let doubled =
+            format!("{NUMBERED_STATUS}[ 7] Anywhere DENY IN 203.0.113.9 # unihelm: ban\n");
+        assert_eq!(
+            ufw_ban_indices(&doubled, "203.0.113.9".parse().unwrap()),
+            vec![7, 2]
+        );
     }
 
     /// A DENY line is not a hole in the firewall and must not be listed as one.

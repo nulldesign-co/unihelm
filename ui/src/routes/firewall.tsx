@@ -98,7 +98,9 @@ export function FirewallPage() {
           <BackendCard data={firewall.data!} />
           <RulesCard data={firewall.data!} />
           <BansCard backend={firewall.data!.backend} yourIp={firewall.data!.your_ip ?? null} />
-          <SentinelCard backend={firewall.data!.backend} />
+          {/* Sentinel needs the backend's *state*, not only its name: a ban it
+              records while the firewall is stopped is enforced by nobody. */}
+          <SentinelCard backend={firewall.data!.backend} active={firewall.data!.active} />
         </>
       )}
     </div>
@@ -1256,7 +1258,30 @@ export function sentinelProblems(settings: SentinelSettings): SentinelField[] {
   return problems;
 }
 
-function SentinelCard({ backend }: { backend: FirewallBackend }) {
+/**
+ * Why an enabled Sentinel would not actually be enforcing anything.
+ *
+ * Two different holes with two different fixes, and neither is visible from
+ * this card on its own — which is how the switch came to be flippable on a
+ * server whose firewall was stopped. Sentinel would have gone on reading logs,
+ * deciding, recording bans and reporting them, while every address it banned
+ * kept reaching the server: the panel's own ban list saying "blocking" about
+ * nothing at all.
+ */
+export type SentinelGap = "no_backend" | "backend_inactive" | null;
+
+export function sentinelGap(
+  enabled: boolean,
+  backend: FirewallBackend,
+  active: boolean,
+): SentinelGap {
+  // An off Sentinel enforces nothing by design; saying so would be noise.
+  if (!enabled) return null;
+  if (backend === "none") return "no_backend";
+  return active ? null : "backend_inactive";
+}
+
+function SentinelCard({ backend, active }: { backend: FirewallBackend; active: boolean }) {
   const { t } = useTranslation();
 
   const sentinel = useQuery({ queryKey: ["sentinel"], queryFn: endpoints.sentinel });
@@ -1276,7 +1301,7 @@ function SentinelCard({ backend }: { backend: FirewallBackend }) {
                 : String(sentinel.error)}
           </Callout>
         ) : (
-          <SentinelForm settings={sentinel.data!} backend={backend} />
+          <SentinelForm settings={sentinel.data!} backend={backend} active={active} />
         )}
       </CardBody>
     </Card>
@@ -1302,9 +1327,11 @@ function SentinelFormSkeleton() {
 function SentinelForm({
   settings,
   backend,
+  active,
 }: {
   settings: SentinelSettings;
   backend: FirewallBackend;
+  active: boolean;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -1319,6 +1346,8 @@ function SentinelForm({
   const problems = sentinelProblems(draft);
   const has = (field: SentinelField) => problems.includes(field);
   const invalidEntries = draft.allowlist.filter((item) => !isCidr(item));
+  const gap = sentinelGap(draft.enabled, backend, active);
+  const backendName = t(`firewall.backendName.${backend}`, { defaultValue: backend });
 
   const save = useMutation({
     mutationFn: () => endpoints.setSentinel(draft),
@@ -1358,8 +1387,34 @@ function SentinelForm({
         description={t("firewall.sentinel.enableHint")}
       />
 
-      {draft.enabled && backend === "none" ? (
+      {/* Read from the draft, not from the saved settings: the moment to say
+          "this would enforce nothing" is while the operator's hand is still on
+          the switch, not after they have pressed Save and been told it worked.
+          The banner at the top of the page says the same thing about the
+          firewall, but an operator who came here to turn Sentinel on is looking
+          at this card — and the start button is repeated rather than pointed
+          at, because "scroll up" is a step at which people give up. */}
+      {gap === "no_backend" ? (
         <Callout tone="warning">{t("firewall.sentinel.noBackend")}</Callout>
+      ) : gap === "backend_inactive" ? (
+        <Callout tone="warning" title={t("firewall.inactiveTitle", { backend: backendName })}>
+          <p>
+            {t("firewall.sentinel.inactiveBackend", {
+              backend: backendName,
+              defaultValue:
+                "Sentinel is on, but {{backend}} is installed and not running. It would go on " +
+                "reading logs and recording bans, and nothing would enforce them — every " +
+                "address it banned would still reach this server.",
+            })}
+          </p>
+          {isSwitchable(backend) ? (
+            <div className="mt-3">
+              <StartControl backend={backendName} />
+            </div>
+          ) : (
+            <p className="mt-1">{t("firewall.lifecycle.notSwitchable")}</p>
+          )}
+        </Callout>
       ) : null}
 
       <div className="grid gap-4 sm:grid-cols-3">

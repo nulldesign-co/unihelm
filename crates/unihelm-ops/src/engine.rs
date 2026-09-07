@@ -42,6 +42,22 @@
 //!    with the panel's master key exactly like the SMTP relay password, reaches
 //!    the image through the child process's *environment* rather than an argv,
 //!    and is never written to a log line.
+//! 5. **A cache is a database too.** Redis, Valkey and Memcached shipped with
+//!    no authentication at all on the strength of being published on loopback
+//!    — but "localhost only" is not a boundary on a shared host, where every
+//!    tenant's PHP process and every tenant shell is on that same host. Any
+//!    customer could run `KEYS *` over every other customer's sessions and
+//!    `FLUSHALL` the lot. Redis and Valkey now get a generated password like
+//!    the SQL engines, handed over the one way that does not cross the boundary
+//!    being drawn — see [`Credential`]. Memcached still has none, honestly and
+//!    on the record: see its recipe.
+//!
+//! **None of that reaches a container that is already running.** A cache
+//! installed before this was written has no password and no configuration file,
+//! and nothing here can retrofit one: the server reads its configuration at
+//! start. It keeps answering every local account until it is installed again,
+//! which replaces the container. `engine.status` says so per container rather
+//! than leaving the operator to assume the fix was retroactive.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -110,12 +126,72 @@ enum Probe {
         /// enough. `redis-cli` exits 0 having printed an error.
         expect: Option<&'static str>,
     },
+    /// A client that has to log in first, told to do so on its **stdin**.
+    ///
+    /// A probe that cannot authenticate against a server that now requires a
+    /// password is worse than no probe: `redis-cli ping` answers `NOAUTH` and
+    /// exits 0, so the install would either hang for the full budget or — if
+    /// the refusal were accepted as an answer — report a healthy cache the
+    /// panel cannot actually talk to. Authenticating also proves the sealed
+    /// password is the one the server was started with, which is the only thing
+    /// that makes the record worth keeping.
+    ///
+    /// Stdin rather than `-a <password>` or `REDISCLI_AUTH`, for the same
+    /// reason the credential does not reach the server that way either: the
+    /// `docker exec` runs on the host, so its argv and its environment are in
+    /// `/proc` for every local account to read — the very boundary the password
+    /// exists to draw. `redis-cli` runs whatever lines it reads from a pipe,
+    /// which is exactly how `db.rs` gets SQL to `mariadb`.
+    ExecAuthenticated {
+        argv: &'static [&'static str],
+        expect: &'static str,
+    },
     /// A line spoken to the published port, for an image that ships no client.
     Wire {
         send: &'static str,
         expect: &'static str,
     },
 }
+
+/// How the administrative credential reaches a server when its container starts.
+///
+/// An enum rather than the optional variable name this used to be, because that
+/// `None` meant two different things at once — "this image has no notion of a
+/// password" and "nobody has wired one up here yet" — and Redis, Valkey and
+/// Memcached were all running with no authentication at all on the strength of
+/// the ambiguity. Every engine now has to say which of the three it is, and a
+/// new one cannot be added without answering the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Credential {
+    /// The image reads it **once**, from this variable, while it initialises an
+    /// empty data directory, and never looks at it again. `--env NAME` with no
+    /// value keeps it off the argv; see [`run_argv`].
+    Env { variable: &'static str },
+    /// The server reads it out of a configuration file at every start. The
+    /// panel renders that file, keeps it in a directory no unprivileged account
+    /// can traverse ([`unihelm_config::paths::engine_config_dir`]), and
+    /// bind-mounts it read-only at `mount`.
+    ///
+    /// Not an environment variable and not an argv, both of which are readable
+    /// from `/proc` by any local account — which is the boundary in question,
+    /// since on a shared host every tenant *is* a local account.
+    ConfigFile { mount: &'static str },
+    /// This image has no authentication the panel can configure, and saying so
+    /// out loud is the only honest option. Only Memcached: see its recipe.
+    Unauthenticated,
+}
+
+/// Where a cache container reads its configuration.
+///
+/// Its own name under `/etc`, so it cannot collide with a file the base image
+/// ships now or grows later — and one level deep, so Docker creates no
+/// directory in the container to place it.
+const CACHE_CONFIG_MOUNT: &str = "/etc/unihelm-cache.conf";
+
+/// The template rendered into [`CACHE_CONFIG_MOUNT`]'s host-side file. One for
+/// Redis and Valkey both: Valkey is a fork of Redis down to its configuration
+/// grammar.
+const CACHE_CONFIG_TEMPLATE: &str = "engine/redis.conf";
 
 /// Everything this panel knows about running one catalogue entry as a container.
 #[derive(Debug, Clone, Copy)]
@@ -144,9 +220,8 @@ struct Recipe {
     /// disk, so promising it a volume would be promising durability it does not
     /// have.
     data_dir: Option<&'static str>,
-    /// The variable the image reads its administrative password from at first
-    /// start. `None` where the image has no such notion.
-    root_password_env: Option<&'static str>,
+    /// How this server is told its password, and whether it has one at all.
+    credential: Credential,
     /// The account that password belongs to, as `db.create` must connect as.
     root_user: Option<&'static str>,
     /// Environment every container of this kind needs, none of it secret.
@@ -170,7 +245,9 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 3306,
             default_host_port: 3306,
             data_dir: Some("/var/lib/mysql"),
-            root_password_env: Some("MARIADB_ROOT_PASSWORD"),
+            credential: Credential::Env {
+                variable: "MARIADB_ROOT_PASSWORD",
+            },
             root_user: Some("root"),
             env: &[],
             command: &[],
@@ -203,7 +280,9 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 3306,
             default_host_port: 3306,
             data_dir: Some("/var/lib/mysql"),
-            root_password_env: Some("MYSQL_ROOT_PASSWORD"),
+            credential: Credential::Env {
+                variable: "MYSQL_ROOT_PASSWORD",
+            },
             root_user: Some("root"),
             env: &[],
             command: &[],
@@ -228,7 +307,9 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 5432,
             default_host_port: 5432,
             data_dir: Some("/var/lib/postgresql/data"),
-            root_password_env: Some("POSTGRES_PASSWORD"),
+            credential: Credential::Env {
+                variable: "POSTGRES_PASSWORD",
+            },
             root_user: Some("postgres"),
             env: &[],
             command: &[],
@@ -246,7 +327,9 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 27017,
             default_host_port: 27017,
             data_dir: Some("/data/db"),
-            root_password_env: Some("MONGO_INITDB_ROOT_PASSWORD"),
+            credential: Credential::Env {
+                variable: "MONGO_INITDB_ROOT_PASSWORD",
+            },
             root_user: Some("root"),
             // The image creates the administrative user only when *both* halves
             // are present; a password with no username is silently ignored and
@@ -267,21 +350,31 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 6379,
             default_host_port: 6379,
             data_dir: Some("/data"),
-            // Redis has no root account. It is published on loopback only, which
-            // is the posture the host package ships with too. When step 2 puts
-            // applications on a Docker network beside it, that network is where
-            // the credential question has to be answered.
-            root_password_env: None,
+            // This used to be `None`, on the reasoning that Redis has no root
+            // account and is published on loopback only. Loopback is not a
+            // boundary on a shared host: every tenant's PHP process and every
+            // tenant shell runs on it, so "no password" meant any customer
+            // could read every other customer's sessions with `KEYS *` and
+            // delete the lot with `FLUSHALL`. Redis has no user, but it does
+            // have `requirepass`, and that is what this generates.
+            credential: Credential::ConfigFile {
+                mount: CACHE_CONFIG_MOUNT,
+            },
+            // Still none: `requirepass` authenticates a connection, it does not
+            // create an account. Nothing here is a login `db.create` could use,
+            // which is why this stays `None` while the password is real.
             root_user: None,
             env: &[],
             // The image's own command persists nothing, so a volume at /data
             // would stay empty and "your data survives a restart" would be a
             // lie. Passing a command replaces the image's CMD entirely, which is
-            // why the server is named again here.
-            command: &["redis-server", "--appendonly", "yes"],
-            probe: Probe::Exec {
-                argv: &["redis-cli", "ping"],
-                expect: Some("PONG"),
+            // why the server is named again here. `--appendonly yes` used to
+            // ride along; it moved into the configuration file the password
+            // needs, whose path [`run_argv`] appends after this.
+            command: &["redis-server"],
+            probe: Probe::ExecAuthenticated {
+                argv: &["redis-cli"],
+                expect: "PONG",
             },
         },
     ),
@@ -293,13 +386,18 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 6379,
             default_host_port: 6379,
             data_dir: Some("/data"),
-            root_password_env: None,
+            // A fork of Redis down to `requirepass` and the configuration file
+            // grammar, so it is protected the same way and out of the same
+            // template.
+            credential: Credential::ConfigFile {
+                mount: CACHE_CONFIG_MOUNT,
+            },
             root_user: None,
             env: &[],
-            command: &["valkey-server", "--appendonly", "yes"],
-            probe: Probe::Exec {
-                argv: &["valkey-cli", "ping"],
-                expect: Some("PONG"),
+            command: &["valkey-server"],
+            probe: Probe::ExecAuthenticated {
+                argv: &["valkey-cli"],
+                expect: "PONG",
             },
         },
     ),
@@ -311,7 +409,22 @@ const RECIPES: &[(&str, Recipe)] = &[
             container_port: 11211,
             default_host_port: 11211,
             data_dir: None,
-            root_password_env: None,
+            // **This one really has no authentication, and the panel will not
+            // pretend otherwise.** Memcached has no password: its only
+            // authentication is SASL, which needs a binary built with
+            // `--enable-sasl` and a `sasldb` of accounts to go with it, and the
+            // official image is not built that way. There is nothing to
+            // generate and nothing to seal, so nothing is — rather than
+            // inventing a credential the server would ignore, which would leave
+            // the panel holding a secret that protects nothing and an operator
+            // believing their cache is closed.
+            //
+            // What that costs, said plainly: anything that can reach
+            // 127.0.0.1:11211 — every tenant shell and every tenant's PHP — can
+            // read and delete every key in this cache. It is only safe on a
+            // machine whose local accounts are all trusted, which a shared host
+            // is not.
+            credential: Credential::Unauthenticated,
             root_user: None,
             env: &[],
             command: &[],
@@ -425,6 +538,15 @@ impl EnginePlan {
         self.volume.as_deref()
     }
 
+    /// The host-side file this engine's configuration is written to, named for
+    /// the container so two versions of one cache cannot share a password.
+    ///
+    /// Derived rather than stored, exactly like the container name: install and
+    /// remove have to agree on it without consulting anything.
+    fn config_file(&self) -> std::path::PathBuf {
+        unihelm_config::paths::engine_config_file(self.container.as_str())
+    }
+
     pub fn display_name(&self) -> String {
         self.component.display_name()
     }
@@ -482,11 +604,25 @@ pub struct EngineRecord {
     /// engine's default one — see [`choose_host_port`].
     pub host_port: u16,
     pub container_port: u16,
-    /// The administrative account, absent for the caches.
+    /// The administrative account, absent for the caches — `requirepass`
+    /// authenticates a connection without naming anybody, so there is no login
+    /// for `db.create` to use even where the password is real.
     #[serde(default)]
     pub root_user: Option<String>,
     /// Sealed with the panel's master key, exactly as the SMTP relay password
     /// is. Opened with [`EngineRecord::open_root_password`] and never logged.
+    ///
+    /// `None` on two kinds of record, and telling them apart matters to an
+    /// operator: an engine the panel cannot authenticate at all (Memcached),
+    /// and a cache installed before it gave caches passwords, which keeps
+    /// running unauthenticated until the container is replaced. See
+    /// [`authentication_note`], which is what `engine.status` says about each.
+    ///
+    /// **Nothing shows this to an operator yet**, and for a SQL engine nothing
+    /// needs to: `db.create` uses it on their behalf and hands out per-tenant
+    /// credentials. A cache has no such flow — the password *is* what an
+    /// application connects with — so until the panel grows a place to reveal
+    /// it, the install logs the root-only file it can be read out of.
     #[serde(default)]
     pub root_password_sealed: Option<String>,
 }
@@ -734,6 +870,12 @@ fn pull_argv(image: &ImageRef) -> Vec<String> {
 /// readable by every local user, which is precisely the leak `db.rs` puts its
 /// SQL on stdin to avoid. The function does not take the password at all, so
 /// there is no way to get this wrong later.
+///
+/// A [`Credential::ConfigFile`] engine keeps that property differently: what
+/// goes on the argv is the *path* of a file only root can reach, mounted
+/// read-only. Read-only because the panel writes that file and the server only
+/// reads it — a cache that could rewrite its own configuration could rewrite
+/// away its own password.
 fn run_argv(plan: &EnginePlan, host_port: u16) -> Vec<String> {
     let mut argv = vec![
         "run".to_string(),
@@ -760,13 +902,24 @@ fn run_argv(plan: &EnginePlan, host_port: u16) -> Vec<String> {
         argv.push(format!("{key}={value}"));
     }
 
-    if let Some(key) = plan.recipe.root_password_env {
+    if let Credential::ConfigFile { mount } = plan.recipe.credential {
+        argv.push("--volume".to_string());
+        argv.push(format!("{}:{mount}:ro", plan.config_file().display()));
+    }
+    if let Credential::Env { variable } = plan.recipe.credential {
         argv.push("--env".to_string());
-        argv.push(key.to_string());
+        argv.push(variable.to_string());
     }
 
     argv.push(plan.image.as_str().to_string());
     argv.extend(plan.recipe.command.iter().map(|c| c.to_string()));
+    // After the command, because that is where the server expects it:
+    // `redis-server /path/to/redis.conf`. A configuration file named anywhere
+    // else on that line is one the server ignores, and an ignored
+    // configuration file here is a cache with no password.
+    if let Credential::ConfigFile { mount } = plan.recipe.credential {
+        argv.push(mount.to_string());
+    }
     argv
 }
 
@@ -794,8 +947,20 @@ fn volume_remove_argv(volume: &str) -> Vec<String> {
     vec!["volume".to_string(), "rm".to_string(), volume.to_string()]
 }
 
-fn exec_argv(container: &ContainerRef, probe: &'static [&'static str]) -> Vec<String> {
-    let mut argv = vec!["exec".to_string(), container.as_str().to_string()];
+/// `docker exec` for a probe. `interactive` adds `-i`, which is what keeps the
+/// child's stdin attached to the pipe: without it Docker hands the process
+/// `/dev/null`, `redis-cli` reads EOF before it has authenticated, and the
+/// probe would fail against a perfectly healthy server.
+fn exec_argv(
+    container: &ContainerRef,
+    probe: &'static [&'static str],
+    interactive: bool,
+) -> Vec<String> {
+    let mut argv = vec!["exec".to_string()];
+    if interactive {
+        argv.push("-i".to_string());
+    }
+    argv.push(container.as_str().to_string());
     argv.extend(probe.iter().map(|a| a.to_string()));
     argv
 }
@@ -832,13 +997,22 @@ const READY_BUDGET: Duration = Duration::from_secs(180);
 ///    work is caught here rather than by the first tenant.
 /// 2. **The server speaks its own protocol.** A TCP accept is not a handshake:
 ///    both database images bind the port before they finish coming up.
-async fn wait_until_ready(ctx: &OpContext, plan: &EnginePlan, host_port: u16) -> Result<()> {
+/// 3. **The server accepts the credential the panel holds.** For an engine
+///    whose password is in a mounted file, a probe that did not log in would
+///    pass against a server the panel cannot use — and against one started
+///    under a different password entirely.
+async fn wait_until_ready(
+    ctx: &OpContext,
+    plan: &EnginePlan,
+    host_port: u16,
+    password: Option<&str>,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + READY_BUDGET;
     let mut delay = Duration::from_millis(500);
     let mut last = String::from("nothing answered on the published port");
 
     for attempt in 1.. {
-        match probe_once(plan, host_port).await {
+        match probe_once(plan, host_port, password).await {
             Ok(()) => {
                 ctx.log(format!(
                     "{} is accepting connections on {LOOPBACK}:{host_port} (attempt {attempt})",
@@ -869,36 +1043,112 @@ async fn wait_until_ready(ctx: &OpContext, plan: &EnginePlan, host_port: u16) ->
 }
 
 /// One readiness attempt. `Err` carries why, in words worth showing.
-async fn probe_once(plan: &EnginePlan, host_port: u16) -> std::result::Result<(), String> {
+async fn probe_once(
+    plan: &EnginePlan,
+    host_port: u16,
+    password: Option<&str>,
+) -> std::result::Result<(), String> {
     match plan.recipe.probe {
         Probe::Wire { send, expect } => wire_probe(host_port, send, expect).await,
         Probe::Exec { argv, expect } => {
-            // The port first: a client inside the container can be perfectly
-            // happy while nothing outside can reach it.
-            let _ = tokio::net::TcpStream::connect((LOOPBACK, host_port))
-                .await
-                .map_err(|e| format!("{LOOPBACK}:{host_port} is not answering ({e})"))?;
-
-            let docker = docker_program().map_err(|e| e.detail)?;
-            let out = unihelm_distro::Cmd::new(&docker)
-                .args(exec_argv(&plan.container, argv))
-                .timeout(Duration::from_secs(10))
-                .run()
-                .await
-                .map_err(|e| e.to_string())?;
-
-            if !out.success() {
-                return Err(out.failure_text());
-            }
+            let out = exec_probe(plan, host_port, argv, false, None).await?;
             match expect {
-                Some(text) if !out.stdout.contains(text) => Err(format!(
+                Some(text) if !out.contains(text) => Err(format!(
                     "the readiness check answered `{}` rather than `{text}`",
-                    out.trimmed_stdout()
+                    out.trim()
                 )),
                 _ => Ok(()),
             }
         }
+        Probe::ExecAuthenticated { argv, expect } => {
+            // No password, no probe — and no pretending. This is reachable only
+            // if a `ConfigFile` engine ever reached the wait without one, which
+            // would mean the server was started with a configuration file the
+            // panel cannot log in with; calling that ready is exactly the lie
+            // this probe exists to prevent.
+            let Some(password) = password else {
+                return Err(format!(
+                    "the panel holds no password for {}, so it cannot check whether the \
+                     server is answering; the container was started from a configuration \
+                     file it cannot log in with",
+                    plan.container.as_str()
+                ));
+            };
+            // Two lines on stdin, which `redis-cli` and `valkey-cli` run in
+            // order. The password is alphanumeric by construction
+            // ([`generate_password`]), so nothing in it can be read as a
+            // separator or a quote and change what this line means.
+            let script = format!("AUTH {password}\nPING\n");
+            let out = exec_probe(plan, host_port, argv, true, Some(script)).await?;
+            read_authenticated_probe(&out, expect)
+        }
     }
+}
+
+/// What two lines from `redis-cli` mean: the reply to `AUTH`, then the reply to
+/// `PING`.
+///
+/// **Both, and in that order, because the ping alone is not the question.** A
+/// server that came up with no password at all answers `AUTH` with "ERR Client
+/// sent AUTH, but no password is set" and then answers `PING` with `PONG` quite
+/// happily — so a probe that only looked for `PONG` would pass the very
+/// condition this whole change exists to remove, and the install would report a
+/// protected cache that any account on the machine can read. The first line has
+/// to be the server accepting the credential.
+fn read_authenticated_probe(out: &str, expect: &str) -> std::result::Result<(), String> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    // The client's own words are worth passing on rather than paraphrasing:
+    // `WRONGPASS` means the panel's sealed copy is not what the server was
+    // started under, which is a different problem with a different fix. `AUTH`
+    // is never echoed back, so nothing secret is in them.
+    match lines.next() {
+        Some("OK") => {}
+        Some(refused) => {
+            return Err(format!(
+                "the server refused the password the panel holds for it: {refused}"
+            ));
+        }
+        None => return Err("the client said nothing at all".to_string()),
+    }
+    if lines.any(|l| l.contains(expect)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the server accepted the password but did not answer `{expect}`: {}",
+            out.trim()
+        ))
+    }
+}
+
+/// Run a client that ships inside the image and hand back what it printed.
+///
+/// The published port is checked first in every case: a client inside the
+/// container can be perfectly happy while nothing outside can reach it, and
+/// outside is where `db.create` and every tenant application connect from.
+async fn exec_probe(
+    plan: &EnginePlan,
+    host_port: u16,
+    argv: &'static [&'static str],
+    interactive: bool,
+    stdin: Option<String>,
+) -> std::result::Result<String, String> {
+    let _ = tokio::net::TcpStream::connect((LOOPBACK, host_port))
+        .await
+        .map_err(|e| format!("{LOOPBACK}:{host_port} is not answering ({e})"))?;
+
+    let docker = docker_program().map_err(|e| e.detail)?;
+    let mut cmd = unihelm_distro::Cmd::new(&docker)
+        .args(exec_argv(&plan.container, argv, interactive))
+        .timeout(Duration::from_secs(10));
+    if let Some(script) = stdin {
+        cmd = cmd.stdin_data(script.into_bytes());
+    }
+    let out = cmd.run().await.map_err(|e| e.to_string())?;
+
+    if !out.success() {
+        return Err(out.failure_text());
+    }
+    Ok(out.stdout)
 }
 
 /// Speak to the published port and check the reply, for an image with no client.
@@ -970,6 +1220,21 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
     let root_password =
         root_password_to_start_under(plan.recipe, known.get(&name), ctx.master_key())?;
 
+    // Before the pull, and before anything is taken down. The file has to exist
+    // when `docker run` resolves the mount — Docker creates an empty *directory*
+    // where a bind source is missing, and a server handed a directory for its
+    // configuration does not start. Doing it first also means a render or a
+    // permission failure costs nothing: no image fetched, no serving container
+    // stopped.
+    if let Credential::ConfigFile { .. } = plan.recipe.credential {
+        let Some(password) = root_password.as_deref() else {
+            return Err(UnihelmError::internal(format!(
+                "{name} needs a password in a configuration file and none was generated"
+            )));
+        };
+        write_engine_config(ctx, plan, password)?;
+    }
+
     ctx.log(format!("docker pull {}", plan.image.as_str()));
     run_checked(&docker, &pull_argv(&plan.image), PULL_BUDGET).await?;
 
@@ -987,6 +1252,26 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
         ctx.log(format!(
             "{name} is already on this server; replacing it, and keeping its data"
         ));
+        // What replacing a cache the panel holds no password for actually
+        // means, said while the operator is watching the task rather than
+        // discovered afterwards. Nothing could give a *running* server a
+        // password — it reads its configuration once, at start — so a cache
+        // installed before this existed has been accepting every connection on
+        // the machine, and recreating the container is the only thing that
+        // changes that. It is also what breaks the clients using it.
+        if let (Credential::ConfigFile { .. }, None) = (
+            plan.recipe.credential,
+            known
+                .get(&name)
+                .and_then(|r| r.root_password_sealed.as_ref()),
+        ) {
+            ctx.log(format!(
+                "the panel holds no password for the {name} it is replacing, so that \
+                 container has been accepting any connection from this server — every tenant \
+                 shell and every site's PHP. The replacement requires one: anything already \
+                 using this cache will be refused with NOAUTH until it is given that password."
+            ));
+        }
         remove_container(ctx, &docker, plan, false).await?;
     }
 
@@ -997,8 +1282,8 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
     let mut start = unihelm_distro::Cmd::new(&docker)
         .args(run_argv(plan, host_port))
         .timeout(Duration::from_secs(60));
-    if let (Some(variable), Some(password)) =
-        (plan.recipe.root_password_env, root_password.as_deref())
+    if let (Credential::Env { variable }, Some(password)) =
+        (plan.recipe.credential, root_password.as_deref())
     {
         start = start.env(variable, password);
     }
@@ -1033,7 +1318,7 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
     // holding somebody's data directory, that nothing can ever log in to again.
     record_engine(&db, record.clone()).await?;
 
-    wait_until_ready(ctx, plan, host_port).await?;
+    wait_until_ready(ctx, plan, host_port, root_password.as_deref()).await?;
 
     // Reported out of the record, so what the operator is told is what the panel
     // will still say tomorrow — `db.create` reads that port from the same row.
@@ -1050,12 +1335,19 @@ pub async fn install_container(ctx: &OpContext, plan: &EnginePlan) -> Result<Ins
 
 /// The root password this container has to be started under.
 ///
-/// Every one of these images reads that variable **once**, while it initialises
-/// an empty data directory, and never looks at it again. So an engine going back
-/// beside a volume it left behind has to be started under the credential already
-/// baked into that data: generating a fresh one would leave the panel holding a
-/// password the server has never heard of, and `db.create` locked out of a
-/// database that is in perfect health.
+/// A [`Credential::Env`] image reads that variable **once**, while it
+/// initialises an empty data directory, and never looks at it again. So an
+/// engine going back beside a volume it left behind has to be started under the
+/// credential already baked into that data: generating a fresh one would leave
+/// the panel holding a password the server has never heard of, and `db.create`
+/// locked out of a database that is in perfect health.
+///
+/// A [`Credential::ConfigFile`] server rereads its file at every start, so it
+/// *could* be given a fresh password here — and must not be. That password is
+/// in the connection string of every application using the cache, and rotating
+/// it silently on a reinstall would take those applications down while the
+/// panel reported the engine healthy. Rotation is a thing an operator asks for,
+/// not a side effect of putting a container back.
 fn root_password_to_start_under(
     recipe: &Recipe,
     kept: Option<&EngineRecord>,
@@ -1066,7 +1358,110 @@ fn root_password_to_start_under(
     {
         return Ok(Some(already));
     }
-    Ok(recipe.root_password_env.map(|_| generate_password()))
+    match recipe.credential {
+        Credential::Env { .. } | Credential::ConfigFile { .. } => Ok(Some(generate_password())),
+        // Nothing to generate: Memcached would ignore it, and a secret that
+        // protects nothing is worse than no secret — it reads, in the record
+        // and on the page, exactly like one that does.
+        Credential::Unauthenticated => Ok(None),
+    }
+}
+
+/// Render this engine's configuration file and put it where only root can read
+/// it and only the container can use it.
+///
+/// The mode on the *file* is deliberately not the protection here, and
+/// [`unihelm_config::paths::engine_config_dir`] explains why at length: the
+/// cache images drop to their own unprivileged account before reading their
+/// configuration, so a 0600 file is one the server cannot open. The directory
+/// is the boundary — 0700, so no local account can traverse to the file however
+/// its own mode reads — and it is created before the file exists, so there is
+/// never a moment when the password is sitting in a directory somebody could
+/// walk into.
+///
+/// Rendered through the panel's own template environment rather than assembled
+/// here, because that environment treats an undefined variable as an error: a
+/// context that lost its `password` fails the install instead of writing a
+/// cache with authentication switched off.
+fn write_engine_config(ctx: &OpContext, plan: &EnginePlan, password: &str) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let dir = unihelm_config::paths::engine_config_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(unihelm_config::paths::ENGINE_CONFIG_DIR_MODE)
+        .create(&dir)
+        .map_err(|e| {
+            UnihelmError::internal(format!(
+                "could not create {} to hold the engine's password: {e}",
+                dir.display()
+            ))
+        })?;
+    // `DirBuilder`'s mode applies only to directories it creates, so a
+    // directory an older panel left behind at 0755 would keep it — and that
+    // mode is the entire access control on the file inside.
+    std::fs::set_permissions(
+        &dir,
+        std::fs::Permissions::from_mode(unihelm_config::paths::ENGINE_CONFIG_DIR_MODE),
+    )
+    .map_err(|e| {
+        UnihelmError::internal(format!(
+            "could not restrict {} to root; refusing to write an engine password into a \
+             directory other accounts can read: {e}",
+            dir.display()
+        ))
+    })?;
+
+    let body = ctx.config().preview(
+        CACHE_CONFIG_TEMPLATE,
+        &serde_json::json!({ "engine": {
+            "container": plan.container.as_str(),
+            "password": password,
+            // The mount point of the data volume, which is where the
+            // append-only file has to land for the volume to hold anything.
+            "data_dir": plan.recipe.data_dir.unwrap_or("/data"),
+        }}),
+    )?;
+
+    let path = plan.config_file();
+    unihelm_config::managed::write_atomic(
+        &path,
+        &body,
+        unihelm_config::paths::ENGINE_CONFIG_FILE_MODE,
+    )?;
+    // The path, never the contents — but the path *is* the answer to the
+    // question this install leaves an operator with. A cache that now demands a
+    // password is no use to anybody who cannot find out what it is, and the
+    // panel has nowhere yet to show them (see the note on
+    // [`EngineRecord::root_password_sealed`]); root can read the file, and
+    // nobody else on the machine can.
+    ctx.log(format!(
+        "wrote {} — {} will require the password in it. Applications need that password: \
+         read it as root with `grep requirepass {}`. No unprivileged account on this server \
+         can open that file.",
+        path.display(),
+        plan.container.as_str(),
+        path.display()
+    ));
+    Ok(())
+}
+
+/// Take an engine's configuration file off the machine.
+///
+/// Called exactly where the record is forgotten, because the two are one thing:
+/// the record holds the sealed password and the file holds the copy the server
+/// reads, and a file left behind for an engine the panel no longer remembers is
+/// a password nothing can ever use again sitting on disk.
+fn remove_engine_config(plan: &EnginePlan) -> Result<()> {
+    let path = plan.config_file();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(UnihelmError::internal(format!(
+            "could not remove {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 /// Refuse to run an engine in a container when this server already has it as
@@ -1257,6 +1652,7 @@ pub async fn remove_container(
         // that no longer exists would only mean a later install of the same
         // version silently reusing a password for data that is not there.
         forget_engine(&db, &name).await?;
+        remove_engine_config(plan)?;
     } else {
         // The record **stays**, and that is deliberate: the volume it names is
         // still on the machine, and the sealed credential is the only thing that
@@ -1269,6 +1665,7 @@ pub async fn remove_container(
             ));
         } else {
             forget_engine(&db, &name).await?;
+            remove_engine_config(plan)?;
         }
     }
 
@@ -1308,6 +1705,20 @@ pub struct EngineStatus {
     pub status: String,
     /// Whether the data is still on the machine.
     pub data_volume_present: bool,
+    /// **Whether anything at all has to log in to this server.**
+    ///
+    /// Read off the record rather than off the recipe, because those are
+    /// different questions: the recipe says what the panel installs *today*, the
+    /// record says what this container was actually started with. A Redis
+    /// installed before caches had passwords has no sealed credential, and it
+    /// keeps answering every account on this machine until it is installed
+    /// again — the panel says so instead of showing a page that implies the fix
+    /// was retroactive.
+    pub authenticated: bool,
+    /// Said in words when it is not, because `false` on a status page is a fact
+    /// and not an instruction. `None` when the container does require a
+    /// password.
+    pub authentication_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1362,6 +1773,8 @@ impl TypedOperation for Status {
                         "not on this server — the container was removed outside the panel"
                             .to_string()
                     }),
+                    authenticated: record.root_password_sealed.is_some(),
+                    authentication_note: authentication_note(record),
                 }
             })
             .collect();
@@ -1372,6 +1785,43 @@ impl TypedOperation for Status {
             engines,
         })
     }
+}
+
+/// What to tell an operator about a container nothing has to log in to.
+///
+/// Two different situations, and they need different sentences because they
+/// have different fixes. One is a container the panel could protect and has
+/// not yet — installing it again does it. The other is Memcached, which the
+/// panel cannot protect at all, and the only fix is not putting untrusted
+/// accounts on the machine. Collapsing them into one "unauthenticated" badge
+/// would leave an operator either doing nothing about the first or waiting
+/// forever for a fix to the second.
+fn authentication_note(record: &EngineRecord) -> Option<String> {
+    if record.root_password_sealed.is_some() {
+        return None;
+    }
+    let unfixable = matches!(
+        recipe(&record.slug).map(|r| r.credential),
+        Some(Credential::Unauthenticated)
+    );
+    Some(if unfixable {
+        format!(
+            "{} has no password: its only authentication is SASL, which needs a build the \
+             official image does not ship. Anything that can reach {LOOPBACK}:{} — every \
+             shell and every site's PHP on this server — can read and delete every key in \
+             it. Run it only on a machine whose local accounts you all trust.",
+            record.container, record.host_port
+        )
+    } else {
+        format!(
+            "{} was installed before the panel gave this engine a password, so it accepts \
+             any connection from this machine — including every tenant shell and every \
+             site's PHP. A running server cannot be given one; install {} again from the \
+             Stack Manager to replace the container with an authenticated one, and expect \
+             to hand the new password to whatever already connects to it.",
+            record.container, record.slug
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,6 +1876,12 @@ fn generate_password() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The panel's real template environment, so what these tests assert about a
+    // cache's configuration is what an install actually writes — a fixture
+    // string here could agree with itself while the shipped template had lost
+    // its `requirepass` line.
+    use unihelm_config::TemplateSet;
 
     fn plan(slug: &str, version: Option<&str>) -> EnginePlan {
         EnginePlan::resolve(slug, version).expect("a catalogued engine")
@@ -1751,26 +2207,144 @@ mod tests {
 
     /// The Redis image's own command keeps nothing on disk, so a volume at
     /// /data would stay empty while the panel reported the data was safe.
+    ///
+    /// `--appendonly yes` used to be an argument; it moved into the
+    /// configuration file the password needs, so this now asks the file. The
+    /// property is the same one and losing it would be just as quiet.
     #[test]
     fn a_cache_given_a_volume_is_told_to_persist_to_it() {
+        let templates = TemplateSet::load().expect("the panel's own templates");
         for slug in ["redis", "valkey"] {
-            let argv = run_argv(&plan(slug, None), 6379);
+            let resolved = plan(slug, None);
+            let rendered = templates
+                .render(
+                    CACHE_CONFIG_TEMPLATE,
+                    &serde_json::json!({ "engine": {
+                        "container": resolved.container().as_str(),
+                        "password": "irrelevant-here",
+                        "data_dir": resolved.recipe.data_dir.unwrap(),
+                    }}),
+                )
+                .unwrap();
             assert!(
-                argv.windows(2)
-                    .any(|w| w[0] == "--appendonly" && w[1] == "yes"),
-                "{slug} would persist nothing: {argv:?}"
+                rendered.contains("appendonly yes"),
+                "{slug} would persist nothing:\n{rendered}"
             );
+            assert!(rendered.contains("dir /data"), "{slug}:\n{rendered}");
+
             // The command comes after the image, or Docker reads it as a flag.
             // The image by its exact name: `--name unihelm-redis-7` also
             // contains the slug and comes first, so a substring match here
             // would pass whatever the order was.
-            let resolved = plan(slug, None);
+            let argv = run_argv(&resolved, 6379);
             let image = argv
                 .iter()
                 .position(|a| a == resolved.image().as_str())
                 .unwrap_or_else(|| panic!("{slug} names no image: {argv:?}"));
-            let command = argv.iter().position(|a| a == "--appendonly").unwrap();
+            let command = argv
+                .iter()
+                .position(|a| a.ends_with("-server"))
+                .unwrap_or_else(|| panic!("{slug} names no server: {argv:?}"));
             assert!(image < command, "{argv:?}");
+        }
+    }
+
+    /// **The defect this wave exists for.** Every containerised cache ran with
+    /// no authentication at all, published on loopback — which is not a
+    /// boundary on a shared host, where every tenant's PHP and every tenant
+    /// shell is a local account. Any customer could `KEYS *` over everybody
+    /// else's sessions and `FLUSHALL` the lot.
+    #[test]
+    fn a_cache_requires_a_password_and_reads_it_from_a_file_only_root_can_reach() {
+        for slug in ["redis", "valkey"] {
+            let resolved = plan(slug, None);
+            let Credential::ConfigFile { mount } = resolved.recipe.credential else {
+                panic!("{slug} would answer anybody on this server");
+            };
+            let argv = run_argv(&resolved, 6379);
+
+            // The file is bind-mounted read-only: the panel writes it, the
+            // server only reads it, and a cache that could rewrite its own
+            // configuration could rewrite away its own password.
+            let expected = format!(
+                "{}:{mount}:ro",
+                unihelm_config::paths::engine_config_file(resolved.container().as_str()).display()
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--volume" && w[1] == expected),
+                "{slug} does not mount its configuration: {argv:?}"
+            );
+
+            // And the server is actually told to read it. A configuration file
+            // mounted but not named is a cache with no password, which is
+            // exactly the state this replaces.
+            let named = argv
+                .iter()
+                .position(|a| a == mount)
+                .unwrap_or_else(|| panic!("{slug} never reads its config: {argv:?}"));
+            let server = argv
+                .iter()
+                .position(|a| a.ends_with("-server"))
+                .unwrap_or_else(|| panic!("{slug} names no server: {argv:?}"));
+            assert!(
+                server < named,
+                "the path is the server's argument: {argv:?}"
+            );
+        }
+    }
+
+    /// Every engine's password reaches it **by reference and never by value**,
+    /// and each one has exactly one channel — the variable Docker is told to
+    /// copy from this process's environment, or the file only root can reach.
+    ///
+    /// Held over every recipe rather than over the two caches, because the way
+    /// this broke was an engine being added with no channel at all: `None` read
+    /// as "this image has no password" and nobody noticed it also meant "and so
+    /// it has none".
+    #[test]
+    fn every_engine_carries_its_password_by_reference_and_by_exactly_one_route() {
+        for (slug, recipe) in RECIPES {
+            let resolved = plan(slug, None);
+            let argv = run_argv(&resolved, recipe.default_host_port);
+            let mounts: Vec<&String> = argv
+                .windows(2)
+                .filter(|w| w[0] == "--volume")
+                .map(|w| &w[1])
+                .collect();
+            let config_mounts = mounts.iter().filter(|m| m.contains("/engines/")).count();
+
+            match recipe.credential {
+                Credential::Env { variable } => {
+                    // The name alone. `--env NAME=secret` would put it in
+                    // `/proc/<pid>/cmdline` for the length of the run.
+                    assert!(
+                        argv.windows(2).any(|w| w[0] == "--env" && w[1] == variable),
+                        "{slug} does not tell Docker where to read {variable}: {argv:?}"
+                    );
+                    assert_eq!(config_mounts, 0, "{slug} has two routes: {argv:?}");
+                }
+                Credential::ConfigFile { mount } => {
+                    assert_eq!(
+                        config_mounts, 1,
+                        "{slug} does not mount the file its password is in: {argv:?}"
+                    );
+                    assert!(
+                        argv.contains(&mount.to_string()),
+                        "{slug} never reads the file it mounts: {argv:?}"
+                    );
+                    // No environment variable beside it. Two routes would mean
+                    // the leaky one still leaks.
+                    assert!(
+                        !argv.iter().any(|a| a == "--env"),
+                        "{slug} also passes the password by environment: {argv:?}"
+                    );
+                }
+                Credential::Unauthenticated => {
+                    assert_eq!(config_mounts, 0, "{slug}: {argv:?}");
+                    assert!(!argv.iter().any(|a| a == "--env"), "{slug}: {argv:?}");
+                }
+            }
         }
     }
 
@@ -1847,13 +2421,17 @@ mod tests {
     fn every_engine_knows_how_to_be_asked_whether_it_is_ready() {
         for (slug, recipe) in RECIPES {
             match recipe.probe {
-                Probe::Exec { argv, .. } => {
+                Probe::Exec { argv, .. } | Probe::ExecAuthenticated { argv, .. } => {
                     assert!(!argv.is_empty(), "{slug} has an empty probe");
                     // No credential in a probe: `docker exec` argv are as
-                    // readable as any other, and ping answers without one.
+                    // readable as any other — this one runs on the *host*, so
+                    // its command line is in `/proc` for every local account —
+                    // and ping either answers without one or authenticates over
+                    // stdin.
                     assert!(
                         !argv.iter().any(|a| a.contains("password")
                             || a.contains("PASSWORD")
+                            || a.starts_with("-a")
                             || a.starts_with("-p")),
                         "{slug}'s probe carries a credential: {argv:?}"
                     );
@@ -1863,6 +2441,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A probe that cannot log in is worse than no probe once the server
+    /// requires a password: `redis-cli ping` answers `NOAUTH` and exits 0, so
+    /// the install would either burn the whole readiness budget or — if that
+    /// refusal were taken for an answer — report a healthy cache the panel
+    /// cannot actually talk to. Authenticating is also the only thing that
+    /// proves the sealed password is the one the server was started with.
+    #[test]
+    fn a_cache_that_requires_a_password_is_probed_with_it() {
+        for slug in ["redis", "valkey"] {
+            let recipe = recipe(slug).unwrap();
+            assert!(
+                matches!(recipe.credential, Credential::ConfigFile { .. }),
+                "{slug} has no password, so this test is asserting nothing"
+            );
+            let Probe::ExecAuthenticated { argv, expect } = recipe.probe else {
+                panic!("{slug} would report a server it cannot log in to as ready");
+            };
+            assert_eq!(expect, "PONG");
+            // `-i`, or Docker hands the client `/dev/null` and it reads EOF
+            // before it has authenticated — a failing probe against a perfectly
+            // healthy server.
+            let exec = exec_argv(plan(slug, None).container(), argv, true);
+            assert_eq!(exec[0..2], ["exec".to_string(), "-i".to_string()]);
+        }
+    }
+
+    /// The trap inside the fix: a Redis that came up with **no** password
+    /// answers `AUTH` with an error and then answers `PING` with `PONG`. A
+    /// probe that only looked for the pong would pass the exact condition this
+    /// change exists to remove and report a protected cache that every account
+    /// on the machine can read.
+    #[test]
+    fn a_ping_alone_does_not_prove_a_cache_is_protected() {
+        assert_eq!(read_authenticated_probe("OK\nPONG\n", "PONG"), Ok(()));
+
+        let unprotected = read_authenticated_probe(
+            "(error) ERR Client sent AUTH, but no password is set\nPONG\n",
+            "PONG",
+        )
+        .expect_err("a server with no password must not read as ready");
+        assert!(unprotected.contains("no password is set"), "{unprotected}");
+
+        // A password the server does not know is a different fault with a
+        // different fix, and the server's own word for it is the useful one.
+        let wrong = read_authenticated_probe("(error) WRONGPASS invalid password\n", "PONG")
+            .expect_err("a refused credential is not readiness");
+        assert!(wrong.contains("WRONGPASS"), "{wrong}");
+
+        // Authenticated but not answering, and nothing at all, are both refusals
+        // rather than a shrug.
+        assert!(read_authenticated_probe("OK\n", "PONG").is_err());
+        assert!(read_authenticated_probe("", "PONG").is_err());
     }
 
     /// A socket probe would pass against the temporary server both MySQL-family
@@ -1883,8 +2515,20 @@ mod tests {
     /// argument to Docker itself.
     #[test]
     fn the_probe_runs_inside_the_container_it_names() {
-        let argv = exec_argv(plan("redis", None).container(), &["redis-cli", "ping"]);
+        let argv = exec_argv(
+            plan("redis", None).container(),
+            &["redis-cli", "ping"],
+            false,
+        );
         assert_eq!(argv, vec!["exec", "unihelm-redis-7", "redis-cli", "ping"]);
+
+        // `-i` is a flag to Docker, so it belongs before the container name;
+        // after it, Docker would hand it to the client as an argument.
+        let interactive = exec_argv(plan("redis", None).container(), &["redis-cli"], true);
+        assert_eq!(
+            interactive,
+            vec!["exec", "-i", "unihelm-redis-7", "redis-cli"]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1957,6 +2601,79 @@ mod tests {
             root_password_to_start_under(recipe("memcached").unwrap(), None, &key).unwrap(),
             None
         );
+
+        // A cache whose password lives in a file gets one generated on a first
+        // install, and keeps the one it has on a reinstall. It *could* be
+        // rotated — the file is reread at every start — and must not be:
+        // rotating it silently would break every application holding the old
+        // one while the panel reported the engine healthy.
+        let redis = recipe("redis").unwrap();
+        let first = root_password_to_start_under(redis, None, &key)
+            .unwrap()
+            .expect("a cache on a shared host needs a password");
+        assert_eq!(first.len(), 32);
+
+        let mut cached = record("unihelm-redis-7", "redis", 6379);
+        cached.root_password_sealed = Some(key.seal_str(&secret).unwrap());
+        assert_eq!(
+            root_password_to_start_under(redis, Some(&cached), &key).unwrap(),
+            Some(secret)
+        );
+    }
+
+    /// Memcached is the one engine here with no authentication, and the panel
+    /// says so rather than implying otherwise: its only mechanism is SASL,
+    /// which needs a build the official image does not ship. This test is what
+    /// stops a *second* engine quietly joining it — every other recipe has to
+    /// give its password a way in.
+    #[test]
+    fn only_memcached_runs_without_authentication_and_it_says_so() {
+        for (slug, recipe) in RECIPES {
+            match recipe.credential {
+                Credential::Unauthenticated => assert_eq!(
+                    *slug, "memcached",
+                    "{slug} would run with no authentication on a shared host"
+                ),
+                Credential::Env { variable } => assert!(!variable.is_empty(), "{slug}"),
+                Credential::ConfigFile { mount } => assert!(
+                    mount.starts_with('/'),
+                    "{slug} names no configuration file: {mount}"
+                ),
+            }
+        }
+    }
+
+    /// A container the panel cannot log in to is a fact the operator has to be
+    /// told, with the fix that applies to *their* case. A cache installed
+    /// before this existed keeps running unauthenticated until it is installed
+    /// again — nothing here is retroactive — and Memcached cannot be fixed at
+    /// all. One badge for both would leave an operator either doing nothing
+    /// about the first or waiting for a fix to the second.
+    #[test]
+    fn a_container_with_no_password_says_so_and_says_what_to_do() {
+        // What an upgrade finds on disk: a Redis recorded before caches had
+        // passwords.
+        let mut legacy = record("unihelm-redis-7", "redis", 6379);
+        legacy.root_password_sealed = None;
+        let note = authentication_note(&legacy).expect("an unauthenticated cache must say so");
+        assert!(note.contains("install"), "{note}");
+        assert!(note.contains("redis"), "{note}");
+
+        // Memcached's note may not tell anybody to reinstall: that fixes
+        // nothing, and sending an operator round that loop is its own lie.
+        let mut memcached = record("unihelm-memcached-1.6", "memcached", 11211);
+        memcached.root_password_sealed = None;
+        let note = authentication_note(&memcached).expect("memcached has no password");
+        assert!(note.contains("SASL"), "{note}");
+        assert!(
+            !note.contains("install"),
+            "reinstalling memcached changes nothing: {note}"
+        );
+
+        // And an engine that does require one is not warned about.
+        let mut protected = record("unihelm-mariadb-11.8", "mariadb", 3306);
+        protected.root_password_sealed = Some("sealed".into());
+        assert_eq!(authentication_note(&protected), None);
     }
 
     /// `db.create` connects to a port, and the record is where that port lives.

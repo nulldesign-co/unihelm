@@ -8,8 +8,11 @@
 //! - state-changing requests must also present the session's CSRF token in a
 //!   header, which `SameSite=Strict` already makes hard to forge and this makes
 //!   pointless to try;
-//! - failed logins are counted per address *and* per account, so neither a
-//!   spray across accounts nor a focus on one gets an unlimited budget;
+//! - failed logins are counted per address and per (account, address) pair, so
+//!   neither a spray across accounts nor a focus on one gets an unlimited
+//!   budget — and every budget an attacker can spend is their own address's,
+//!   because a budget belonging to an *account* is a lockout anyone can impose
+//!   on anyone. What the account's own count still buys is a delay;
 //! - an unknown username still costs a full argon2 verification, so response
 //!   time does not tell an attacker which accounts exist;
 //! - and because that verification is expensive on purpose, only a few may run
@@ -35,9 +38,23 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// How many failures from one address before it is refused, and over what window.
 const IP_FAILURE_LIMIT: i64 = 10;
-/// Per-account limit, lower because a targeted attack is the more dangerous one.
+/// Per (account, address) limit, lower because a targeted attack is the more
+/// dangerous one. Both budgets belong to the caller's own address; see
+/// [`check_rate_limits`] for why no budget may belong to an account.
 const ACCOUNT_FAILURE_LIMIT: i64 = 5;
 const FAILURE_WINDOW: Duration = Duration::minutes(15);
+
+/// Failures against one account, from anywhere, before answers start slowing.
+const ACCOUNT_SLOWDOWN_AFTER: i64 = ACCOUNT_FAILURE_LIMIT;
+/// What each failure past that is worth, and the ceiling it stops at.
+///
+/// 500 ms is invisible to somebody typing a password and ruinous to somebody
+/// spraying one account from a botnet, which is the whole trade. The cap is
+/// what keeps it a delay rather than a refusal in disguise: five seconds is a
+/// long pause on a login form and it is still a login, which "locked out" is
+/// not.
+const ACCOUNT_SLOWDOWN_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+const ACCOUNT_SLOWDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many argon2 verifications the panel will run at the same time.
 ///
@@ -232,29 +249,59 @@ pub fn clearing_cookie(secure: bool) -> Cookie<'static> {
     cookie
 }
 
-/// Refuse a login attempt that is part of a burst.
+/// How long to make this caller wait for an account that is under attack.
 ///
-/// Returns the error to send, or `None` to proceed. The message is deliberately
-/// the same for both limits: telling an attacker *which* limit they hit is
-/// telling them whether the account exists.
+/// A pure function of the count, so the curve can be asserted without a clock.
+pub fn account_slowdown(failures: i64) -> std::time::Duration {
+    let over = failures.saturating_sub(ACCOUNT_SLOWDOWN_AFTER).max(0);
+    ACCOUNT_SLOWDOWN_STEP
+        .saturating_mul(u32::try_from(over).unwrap_or(u32::MAX))
+        .min(ACCOUNT_SLOWDOWN_CAP)
+}
+
+/// Refuse — or merely slow down — a login attempt that is part of a burst.
+///
+/// **Every hard refusal is keyed on the caller's own address.** It used to be
+/// possible to refuse on an account's failures alone, counted from everywhere,
+/// and that is a lockout anybody could impose on anybody: five wrong passwords
+/// for `admin` every fifteen minutes — no account, no session, no session
+/// cookie needed — and the real admin could not sign in from any address on
+/// earth with the correct password, for as long as the attacker cared to keep
+/// it up. The budgets an attacker can spend are now their own: the (account,
+/// address) pair, and the address across all accounts.
+///
+/// **The account signal survives as a delay.** Ignoring it entirely would hand
+/// a botnet with a thousand addresses a thousand free budgets against one
+/// account. [`account_slowdown`] makes each failure past the threshold cost
+/// every later attempt a little more time, to a cap — so the spray gets slower
+/// and slower while a correct password from an address that is not itself over
+/// budget still gets in, which is the line between a defence and an outage.
+///
+/// The refusal message is the same whichever budget ran out: both are about the
+/// caller's address, so saying which one would only tell an attacker how far
+/// along they are.
 pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<()> {
     let by_ip = db
         .recent_failures_for_ip(ip, FAILURE_WINDOW)
         .await
         .map_err(ApiError::from)?;
-    let by_account = db
-        .recent_failures_for_username(username, FAILURE_WINDOW)
+    let by_pair = db
+        .recent_failures_for_ip_and_username(ip, username, FAILURE_WINDOW)
         .await
         .map_err(ApiError::from)?;
 
-    if by_ip >= IP_FAILURE_LIMIT || by_account >= ACCOUNT_FAILURE_LIMIT {
-        tracing::warn!(
-            ip,
-            username,
-            by_ip,
-            by_account,
-            "login refused by rate limit"
-        );
+    if by_ip >= IP_FAILURE_LIMIT || by_pair >= ACCOUNT_FAILURE_LIMIT {
+        tracing::warn!(ip, username, by_ip, by_pair, "login refused by rate limit");
+        // Recorded here rather than left to the caller, so that no future call
+        // site can refuse silently. A refusal the panel never wrote down is a
+        // refusal Sentinel cannot see, and Sentinel bans on what is written
+        // down — so the throttle engaging used to be the moment the attacker
+        // became invisible. The row is filed as throttled and so cannot feed
+        // the budgets above; a write that fails is logged and the refusal
+        // stands, because failing to record an attack is no reason to allow it.
+        if let Err(e) = db.record_throttled_login_attempt(ip, username).await {
+            tracing::warn!(ip, error = %e, "could not record a throttled login attempt");
+        }
         // Name the actual number. "A few minutes" against a fifteen-minute
         // window means somebody waits two, fails again, and concludes their
         // password is wrong — which is what happened to the first person to
@@ -262,12 +309,32 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
         return Err(ApiError::code(
             ErrorCode::RateLimited,
             format!(
-                "too many failed attempts; this account is locked for {} minutes. \
-                 A correct password will not work until then. \
-                 `unihelm user unlock <name>` clears it from the server.",
+                "too many failed sign-ins from your address ({ip}), so this one was refused \
+                 without the password being checked. The block is on this address alone — the \
+                 account still works from anywhere else — and it lifts by itself {} minutes \
+                 after the last failed attempt. `unihelm user unlock <name>` on the server \
+                 clears an account's failed attempts and the addresses they came from.",
                 FAILURE_WINDOW.whole_minutes()
             ),
         ));
+    }
+
+    let by_account = db
+        .recent_failures_for_username(username, FAILURE_WINDOW)
+        .await
+        .map_err(ApiError::from)?;
+    let slowdown = account_slowdown(by_account);
+    if !slowdown.is_zero() {
+        tracing::info!(
+            ip,
+            username,
+            by_account,
+            delay_ms = slowdown.as_millis() as u64,
+            "slowing a login for an account under attack"
+        );
+        // A sleep, not a blocked thread: the runtime keeps serving everything
+        // else, including the operator's attempt to look at what is happening.
+        tokio::time::sleep(slowdown).await;
     }
     Ok(())
 }
@@ -558,8 +625,8 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limits_trip_on_either_axis() {
+        // Spraying accounts from one address spends that address's budget...
         let db = Db::open_memory().await.unwrap();
-
         for _ in 0..IP_FAILURE_LIMIT {
             db.record_login_attempt("10.0.0.5", "someone", false)
                 .await
@@ -570,18 +637,138 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.inner.code, ErrorCode::RateLimited);
 
-        // A different address, but the same account under attack.
+        // ...and hammering one account from one address spends the smaller,
+        // per-pair budget before that.
         let db = Db::open_memory().await.unwrap();
-        for i in 0..ACCOUNT_FAILURE_LIMIT {
-            db.record_login_attempt(&format!("10.0.0.{i}"), "admin", false)
+        for _ in 0..ACCOUNT_FAILURE_LIMIT {
+            db.record_login_attempt("10.0.0.6", "admin", false)
                 .await
                 .unwrap();
         }
-        assert!(check_rate_limits(&db, "10.0.0.99", "admin").await.is_err());
+        assert!(check_rate_limits(&db, "10.0.0.6", "admin").await.is_err());
+        // Another account from the same address still has room, and the same
+        // account from another address is untouched.
         assert!(
-            check_rate_limits(&db, "10.0.0.99", "someone-else")
+            check_rate_limits(&db, "10.0.0.6", "someone-else")
                 .await
                 .is_ok()
+        );
+        assert!(check_rate_limits(&db, "10.0.0.99", "admin").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_attacker_locks_out_their_own_address_and_nobody_elses() {
+        // The lockout anyone could impose on anyone: five wrong passwords for
+        // `admin` every fifteen minutes, needing no account and no session, and
+        // the real admin could not sign in from anywhere on earth with the
+        // correct password for as long as it kept up.
+        let db = Db::open_memory().await.unwrap();
+        for _ in 0..(ACCOUNT_FAILURE_LIMIT * 3) {
+            db.record_login_attempt("203.0.113.9", "admin", false)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            check_rate_limits(&db, "203.0.113.9", "admin")
+                .await
+                .is_err(),
+            "the address doing it must be refused"
+        );
+        assert!(
+            check_rate_limits(&db, "198.51.100.4", "admin")
+                .await
+                .is_ok(),
+            "and no other address may pay for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_sprayed_from_everywhere_is_slowed_and_never_refused() {
+        // A botnet with a thousand addresses gets a thousand fresh per-pair
+        // budgets, so the account's own count still has to be worth something.
+        // What it is worth is time, not a refusal.
+        // One failure past the threshold, so the assertion below costs the
+        // suite one step and not the whole cap.
+        let db = Db::open_memory().await.unwrap();
+        for i in 0..(ACCOUNT_SLOWDOWN_AFTER + 1) {
+            db.record_login_attempt(&format!("203.0.113.{i}"), "admin", false)
+                .await
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        assert!(
+            check_rate_limits(&db, "198.51.100.4", "admin")
+                .await
+                .is_ok(),
+            "the admin's own address is not over budget, so it must still get in"
+        );
+        assert!(
+            started.elapsed() >= ACCOUNT_SLOWDOWN_STEP,
+            "and it must have been made to wait on the way"
+        );
+    }
+
+    #[test]
+    fn the_account_slowdown_is_free_until_it_bites_and_then_stops_growing() {
+        assert!(account_slowdown(0).is_zero());
+        assert!(
+            account_slowdown(ACCOUNT_SLOWDOWN_AFTER).is_zero(),
+            "the threshold itself is not yet a delay"
+        );
+        assert_eq!(
+            account_slowdown(ACCOUNT_SLOWDOWN_AFTER + 1),
+            ACCOUNT_SLOWDOWN_STEP
+        );
+        assert_eq!(
+            account_slowdown(ACCOUNT_SLOWDOWN_AFTER + 2),
+            ACCOUNT_SLOWDOWN_STEP * 2
+        );
+        // A cap, not a curve that eventually becomes a refusal in disguise.
+        assert_eq!(account_slowdown(i64::MAX), ACCOUNT_SLOWDOWN_CAP);
+        assert_eq!(account_slowdown(-1), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attempt_is_evidence_for_sentinel_and_does_not_extend_its_own_lock() {
+        // Both directions. Counted by the throttle, every retry would renew the
+        // lock that refused it and the fifteen minutes would never end;
+        // uncounted by Sentinel, the attacker becomes invisible at exactly the
+        // moment the panel decided they were an attacker.
+        let db = Db::open_memory().await.unwrap();
+        for _ in 0..ACCOUNT_FAILURE_LIMIT {
+            db.record_login_attempt("203.0.113.9", "admin", false)
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..4 {
+            assert!(
+                check_rate_limits(&db, "203.0.113.9", "admin")
+                    .await
+                    .is_err()
+            );
+        }
+
+        assert_eq!(
+            db.recent_failures_for_ip("203.0.113.9", FAILURE_WINDOW)
+                .await
+                .unwrap(),
+            ACCOUNT_FAILURE_LIMIT,
+            "the refusals must not have spent the budget that produced them"
+        );
+        let evidence = db
+            .failed_logins_since(unihelm_db::now() - FAILURE_WINDOW)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(ip, _)| ip == "203.0.113.9")
+            .map(|(_, n)| n);
+        assert_eq!(
+            evidence,
+            Some(ACCOUNT_FAILURE_LIMIT + 4),
+            "and Sentinel must see every one of them"
         );
     }
 

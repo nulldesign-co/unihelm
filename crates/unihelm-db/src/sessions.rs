@@ -14,6 +14,42 @@ use crate::{Db, DbError, Result, from_sql_time, now, password, to_sql_time};
 /// forgotten laptop is not a standing invitation.
 pub const DEFAULT_TTL: Duration = Duration::hours(12);
 
+/// What a refused attempt is filed under in `login_attempts.username`.
+///
+/// `login_attempts` has four columns and the one query that must keep seeing
+/// these rows — [`Db::failed_logins_since`], which is Sentinel's evidence —
+/// reads `ip` and `success` only. So `username` is where the distinction goes:
+/// the row still names the account the attempt was aimed at, prefixed, and the
+/// throttle counters filter on that prefix. A `throttled` column would say the
+/// same thing more plainly, and is the shape to move to the next time this
+/// table is migrated; migrations here are forward-only and their numbers are
+/// allocated in `docs/wave1-contracts.md`, so it is not a change to make in
+/// passing.
+///
+/// The prefix is not a secret and does not need to be: [`account_label`] strips
+/// it off everything a caller supplies, so no client can file its own attempt
+/// under it however it spells its username.
+const THROTTLED_LABEL_PREFIX: &str = "throttled:";
+
+/// The account label a caller-supplied username is filed under.
+///
+/// Stripping repeatedly rather than once, because a single strip would leave
+/// `throttled:throttled:admin` still wearing the marker.
+fn account_label(username: &str) -> &str {
+    let mut label = username;
+    while let Some(rest) = label.strip_prefix(THROTTLED_LABEL_PREFIX) {
+        label = rest;
+    }
+    label
+}
+
+/// The `LIKE` pattern that matches every throttled row and nothing else.
+///
+/// The prefix carries no `%` or `_` of its own, so it needs no `ESCAPE` clause.
+fn throttled_like_pattern() -> String {
+    format!("{THROTTLED_LABEL_PREFIX}%")
+}
+
 /// A freshly minted session. `token` is the cookie value and is never stored.
 #[derive(Debug, Clone)]
 pub struct IssuedSession {
@@ -173,27 +209,89 @@ impl Db {
         )
         .bind(to_sql_time(now()))
         .bind(ip)
-        .bind(username)
+        // Never the raw string. The login route records whatever the client
+        // typed, so without this a caller could file its own attempt under the
+        // throttled label and buy itself an unlimited budget.
+        .bind(account_label(username))
         .bind(i64::from(success))
         .execute(self.pool())
         .await?;
         Ok(())
     }
 
-    /// Failed attempts from one address inside `window`.
+    /// Record an attempt the panel refused *without checking the password*.
+    ///
+    /// It is a failure to Sentinel and not a failure to the throttle, and both
+    /// halves are load-bearing. Until this existed the login route returned on
+    /// the throttle's error before recording anything, so the moment the
+    /// throttle engaged the attacker's address stopped accumulating evidence
+    /// and Sentinel — which bans on recorded failures — went blind exactly when
+    /// there was most to see.
+    ///
+    /// The row therefore carries the real address and `success = 0`, which is
+    /// all [`Db::failed_logins_since`] asks for, and is filed under
+    /// [`THROTTLED_LABEL_PREFIX`] rather than the account it named, which is
+    /// what keeps [`Db::recent_failures_for_ip`] and its siblings from counting
+    /// it. Counting it there would make the refusal renew the lock that caused
+    /// it, on every retry, for as long as the attempts kept coming.
+    pub async fn record_throttled_login_attempt(&self, ip: &str, username: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO login_attempts (at, ip, username, success) VALUES (?1, ?2, ?3, 0)",
+        )
+        .bind(to_sql_time(now()))
+        .bind(ip)
+        .bind(format!(
+            "{THROTTLED_LABEL_PREFIX}{}",
+            account_label(username)
+        ))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Failed attempts from one address inside `window`, throttled ones aside.
     pub async fn recent_failures_for_ip(&self, ip: &str, window: Duration) -> Result<i64> {
         let since = to_sql_time(now() - window);
         let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM login_attempts WHERE ip = ?1 AND success = 0 AND at >= ?2",
+            "SELECT COUNT(*) FROM login_attempts
+             WHERE ip = ?1 AND success = 0 AND at >= ?2 AND username NOT LIKE ?3",
         )
         .bind(ip)
+        .bind(since)
+        .bind(throttled_like_pattern())
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Failed attempts against one account *from one address* inside `window`.
+    ///
+    /// This pair, rather than the account alone, is what may earn a refusal.
+    /// Counting an account's failures from everywhere and refusing on the total
+    /// meant five wrong passwords for `admin` every fifteen minutes — which
+    /// needs no account and no session — held the real admin out from every
+    /// address on earth, indefinitely, with the correct password.
+    pub async fn recent_failures_for_ip_and_username(
+        &self,
+        ip: &str,
+        username: &str,
+        window: Duration,
+    ) -> Result<i64> {
+        let since = to_sql_time(now() - window);
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM login_attempts
+             WHERE ip = ?1 AND username = ?2 AND success = 0 AND at >= ?3",
+        )
+        .bind(ip)
+        // Throttled rows are filed under a label no `account_label` can return,
+        // so this equality excludes them without a second predicate.
+        .bind(account_label(username))
         .bind(since)
         .fetch_one(self.pool())
         .await?;
         Ok(row.0)
     }
 
-    /// Failed attempts against one account inside `window`.
     /// Forget an account's failed logins, and the failures from the addresses
     /// they came from.
     ///
@@ -205,17 +303,20 @@ impl Db {
     ///
     /// The IP rows go too: whoever is locked out has usually spent some of that
     /// budget as well, and clearing only half leaves them still refused for a
-    /// reason the command said it had fixed.
+    /// reason the command said it had fixed. That second pass is also what
+    /// takes the throttled rows those addresses left behind, which the first
+    /// pass cannot see because they are filed under a different label.
     pub async fn clear_login_failures(&self, username: &str) -> Result<u64> {
+        let account = account_label(username);
         let ips = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT ip FROM login_attempts WHERE username = ?1 AND success = 0",
         )
-        .bind(username)
+        .bind(account)
         .fetch_all(self.pool())
         .await?;
 
         let mut cleared = sqlx::query("DELETE FROM login_attempts WHERE username = ?1")
-            .bind(username)
+            .bind(account)
             .execute(self.pool())
             .await?
             .rows_affected();
@@ -230,6 +331,11 @@ impl Db {
         Ok(cleared)
     }
 
+    /// Failed attempts against one account, from anywhere, inside `window`.
+    ///
+    /// A signal about the account rather than about a caller: anyone on the
+    /// internet can raise it for any account, so what the panel does with it
+    /// must never be a refusal (see `unihelm_web::auth::check_rate_limits`).
     pub async fn recent_failures_for_username(
         &self,
         username: &str,
@@ -239,7 +345,7 @@ impl Db {
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM login_attempts WHERE username = ?1 AND success = 0 AND at >= ?2",
         )
-        .bind(username)
+        .bind(account_label(username))
         .bind(since)
         .fetch_one(self.pool())
         .await?;
@@ -503,6 +609,151 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_are_counted_per_account_and_address_pair() {
+        // The pair is what may earn a refusal, so it must not pick up the
+        // failures the same account collected from somewhere else.
+        let (db, _) = seed().await;
+        for _ in 0..4 {
+            db.record_login_attempt("10.0.0.9", "admin", false)
+                .await
+                .unwrap();
+        }
+        db.record_login_attempt("10.0.0.10", "admin", false)
+            .await
+            .unwrap();
+
+        let window = Duration::minutes(15);
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "admin", window)
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.10", "admin", window)
+                .await
+                .unwrap(),
+            1,
+            "an address must only answer for what it did itself"
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.11", "admin", window)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_attempt_is_evidence_for_sentinel_and_not_for_the_throttle() {
+        // Both directions, because getting either one backwards is a bug with
+        // teeth: counted by the throttle, every refusal renews the lock that
+        // caused it; invisible to Sentinel, the defence goes blind the moment
+        // the throttle engages, which is when there is most to see.
+        let (db, _) = seed().await;
+        for _ in 0..2 {
+            db.record_login_attempt("10.0.0.9", "admin", false)
+                .await
+                .unwrap();
+        }
+        db.record_throttled_login_attempt("10.0.0.9", "admin")
+            .await
+            .unwrap();
+        db.record_throttled_login_attempt("10.0.0.9", "admin")
+            .await
+            .unwrap();
+
+        let window = Duration::minutes(15);
+        assert_eq!(
+            db.recent_failures_for_ip("10.0.0.9", window).await.unwrap(),
+            2,
+            "a refusal must not spend the budget that produced it"
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "admin", window)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.recent_failures_for_username("admin", window)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let evidence = db
+            .failed_logins_since(now() - window)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(ip, _)| ip == "10.0.0.9")
+            .map(|(_, n)| n);
+        assert_eq!(
+            evidence,
+            Some(4),
+            "Sentinel counts what the attacker actually did, refusals included"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_cannot_file_its_own_attempt_as_throttled() {
+        // The login route records whatever the client typed. If that string
+        // could wear the throttled label, an attacker would spell their
+        // username `throttled:admin` and buy an unlimited budget.
+        let (db, _) = seed().await;
+        for _ in 0..3 {
+            db.record_login_attempt("10.0.0.9", "throttled:admin", false)
+                .await
+                .unwrap();
+        }
+
+        let window = Duration::minutes(15);
+        assert_eq!(
+            db.recent_failures_for_ip("10.0.0.9", window).await.unwrap(),
+            3
+        );
+        assert_eq!(
+            db.recent_failures_for_username("admin", window)
+                .await
+                .unwrap(),
+            3,
+            "the marker is stripped, so the attempts land on the account they named"
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "throttled:admin", window)
+                .await
+                .unwrap(),
+            3,
+            "and the same stripping makes the query find them again"
+        );
+    }
+
+    #[tokio::test]
+    async fn unlocking_an_account_also_clears_the_refusals_it_collected() {
+        // The refusals hold no lock of their own, but leaving them behind
+        // leaves Sentinel holding evidence against an operator the command just
+        // said it had unlocked.
+        let (db, _) = seed().await;
+        for _ in 0..5 {
+            db.record_login_attempt("10.0.0.9", "admin", false)
+                .await
+                .unwrap();
+        }
+        db.record_throttled_login_attempt("10.0.0.9", "admin")
+            .await
+            .unwrap();
+
+        assert_eq!(db.clear_login_failures("admin").await.unwrap(), 6);
+        assert!(
+            db.failed_logins_since(now() - Duration::minutes(15))
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

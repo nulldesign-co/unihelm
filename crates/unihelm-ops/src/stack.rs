@@ -30,7 +30,7 @@ use unihelm_config::paths;
 use unihelm_core::{ErrorCode, Permission, PhpVersion, Result, UnihelmError};
 use unihelm_db::ComponentStatus;
 use unihelm_distro::fw::{PortRule, Proto};
-use unihelm_distro::svc::{ManagedUnit, UnitName};
+use unihelm_distro::svc::{ManagedUnit, SvcAction, UnitName};
 use unihelm_distro::{Cmd, Distro, Family, PackageName, ResolvedRepo};
 
 use crate::catalogue;
@@ -434,6 +434,107 @@ impl StackComponent {
         };
         Ok(Some(unit))
     }
+
+    /// The entry as one of the units the panel is allowed to name.
+    ///
+    /// Deliberately narrower than [`Self::unit`], which builds a `UnitName` from
+    /// a string literal wherever no `ManagedUnit` covers the entry. That is safe
+    /// there because the literal is written in this file; it would not be safe
+    /// for `stack.start` and `stack.stop`, whose input is a slug an operator
+    /// typed. Routing that through the same enum `svc.action` uses is what keeps
+    /// the pair from ever becoming a way to name an arbitrary systemd unit
+    /// (spec §5.2) — the property the enum exists to buy.
+    ///
+    /// PostgreSQL is absent even though a `ManagedUnit` exists for it: that
+    /// variant resolves the major from a compile-time constant, so on EL it can
+    /// name `postgresql-17.service` on a machine running 16 — and a stop that
+    /// reports success against a unit that is not the one installed is exactly
+    /// the lie this file is written against. Everything else missing here has
+    /// only a literal unit name, which is the same problem one step earlier.
+    fn managed_unit(self) -> Result<ManagedUnit> {
+        match self.entry.slug {
+            "nginx" => Ok(ManagedUnit::Nginx),
+            "apache" => Ok(ManagedUnit::Apache),
+            "php" => Ok(ManagedUnit::PhpFpm {
+                version: self.php_version()?,
+            }),
+            "mariadb" => Ok(ManagedUnit::MariaDb),
+            "redis" => Ok(ManagedUnit::KvStore),
+            "docker" => Ok(ManagedUnit::Docker),
+            _ => Err(UnihelmError::new(
+                ErrorCode::NotImplemented,
+                format!(
+                    "the panel cannot start or stop {}: its service is not one of the units \
+                     the panel is allowed to name. It can start and stop: {}.",
+                    self.display_name(),
+                    CONTROLLABLE_SLUGS.join(", ")
+                ),
+            )
+            .with_field("component")),
+        }
+    }
+}
+
+/// The catalogue slugs [`StackComponent::managed_unit`] answers for.
+///
+/// Beside the match rather than derived from it, for two readers: the refusal
+/// above lists them, and the Stack page mirrors them to decide whether a chip
+/// draws a start/stop control at all. A slug in one and not the other is a
+/// button that always comes back refused, which is the shape of defect this
+/// list exists to prevent — so a test below pins the two together.
+pub const CONTROLLABLE_SLUGS: &[&str] = &["nginx", "apache", "php", "mariadb", "redis", "docker"];
+
+/// A runtime as a sentence, for a refusal an operator has to act on.
+///
+/// `host`/`container` are the wire's words; "on the host, as packages" is what
+/// the Stack page's own menu says, and an error that answers a menu should use
+/// the menu's language.
+fn as_words(runtime: catalogue::Runtime) -> &'static str {
+    match runtime {
+        catalogue::Runtime::Host => "on the host, as packages",
+        catalogue::Runtime::Container => "in a container",
+    }
+}
+
+/// Where this install or removal happens: what the caller asked for, or the
+/// catalogue's default when they expressed no preference.
+///
+/// The Stack page has offered "Run it: on the server / in a container" since
+/// containers landed, and the answer never left the browser — the web layer's
+/// `ComponentRequest` had no field to carry it. An operator who picked the host
+/// got whatever the catalogue preferred, which for every database and cache is
+/// a container, and the panel said nothing. It showed a choice it did not have.
+///
+/// A runtime the entry does not offer is refused by name rather than quietly
+/// corrected to the default, because a silent correction is the same defect in
+/// a different hat: the operator asked for one thing and got another without
+/// being told.
+fn runtime_for(
+    component: StackComponent,
+    asked: Option<catalogue::Runtime>,
+) -> Result<catalogue::Runtime> {
+    let install = component.entry.install;
+    let Some(runtime) = asked else {
+        return Ok(install.default_runtime());
+    };
+    if !install.allows(runtime) {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "{} does not run {}. It runs: {}.",
+                component.display_name(),
+                as_words(runtime),
+                install
+                    .runtimes()
+                    .iter()
+                    .map(|r| as_words(*r))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .with_field("runtime"));
+    }
+    Ok(runtime)
 }
 
 fn parse_packages(names: &[&str]) -> Result<Vec<PackageName>> {
@@ -807,6 +908,14 @@ pub struct InstallInput {
     /// set that mainstream applications assume.
     #[serde(default)]
     pub extensions: Vec<PhpExt>,
+    /// Where to run it: `host` or `container`.
+    ///
+    /// A third state rather than a defaulted value, and that is the point:
+    /// "the operator chose the host" and "the operator said nothing" are
+    /// different requests, and only the second one may be answered with the
+    /// catalogue's container. See [`runtime_for`].
+    #[serde(default)]
+    pub runtime: Option<catalogue::Runtime>,
 }
 
 #[derive(Debug, Serialize)]
@@ -851,6 +960,11 @@ impl TypedOperation for Install {
         let slug = component.slug();
         let db = ctx.db().clone();
 
+        // Before the claim for the same reason the two collision checks are:
+        // an unsupported runtime is a refusal, and a refusal must not leave a
+        // `failed` row behind for an install that never began.
+        let runtime = runtime_for(component, input.runtime)?;
+
         // Before the claim, not after: a refusal here means nothing was
         // touched, and marking the component `failed` for an install that never
         // started would put a red row on the page for a machine that is fine.
@@ -872,7 +986,7 @@ impl TypedOperation for Install {
             ));
         }
 
-        let outcome = install_component(ctx, component, &input.extensions).await;
+        let outcome = install_component(ctx, component, runtime, &input.extensions).await;
 
         match &outcome {
             Ok(out) => {
@@ -1077,18 +1191,27 @@ async fn decide_about_the_contested_port(ctx: &OpContext, component: StackCompon
 async fn install_component(
     ctx: &OpContext,
     component: StackComponent,
+    runtime: catalogue::Runtime,
     extensions: &[PhpExt],
 ) -> Result<InstallOutput> {
     // One install surface, two ways of running the thing.
     //
-    // The catalogue says whether an entry belongs on the host or in a container,
-    // and this is where that is acted on — rather than a second `engine.install`
-    // beside this one. The owner's complaint about the old stack was that the
-    // panel had several places to install software and they disagreed; adding
-    // another would be repeating it in a new shape.
-    if crate::catalogue::default_runtime(component.catalogue_slug())
-        == Some(crate::catalogue::Runtime::Container)
-    {
+    // Which way is [`runtime_for`]'s answer, not the catalogue's: this used to
+    // read `default_runtime` directly, so the "Run it" menu on the Stack page
+    // decided nothing at all and an operator asking for host packages got a
+    // container. The catalogue is still what answers when nobody chose — that
+    // decision has just moved to where the caller's own preference is visible.
+    //
+    // Both branches live here rather than in a second `engine.install` beside
+    // this one. The owner's complaint about the old stack was that the panel had
+    // several places to install software and they disagreed; adding another
+    // would be repeating it in a new shape.
+    ctx.log(format!(
+        "installing {} {}",
+        component.display_name(),
+        as_words(runtime)
+    ));
+    if runtime == catalogue::Runtime::Container {
         let plan = crate::engine::EnginePlan::for_component(component)?;
         crate::engine::refuse_when_the_host_already_runs_this_engine(ctx, &plan).await?;
         let out = crate::engine::install_container(ctx, &plan).await?;
@@ -1098,7 +1221,9 @@ async fn install_component(
             // No packages were installed on this server, and saying so with an
             // empty list is more honest than inventing the image's contents.
             packages: Vec::new(),
-            runtime: "container".into(),
+            // The resolved runtime rather than a literal, so the field cannot
+            // disagree with the branch that produced it.
+            runtime: runtime.as_str().into(),
             container: Some(out.container),
             volume: out.volume,
             host_port: Some(out.host_port),
@@ -1253,7 +1378,7 @@ async fn install_component(
         installed_version,
         packages: packages.iter().map(|p| p.as_str().to_string()).collect(),
         // The host path: packages on this server, nothing containerised.
-        runtime: "host".into(),
+        runtime: runtime.as_str().into(),
         container: None,
         volume: None,
         host_port: None,
@@ -1603,6 +1728,21 @@ pub struct Remove;
 pub struct RemoveInput {
     #[serde(flatten)]
     pub component: StackComponent,
+    /// Which of the two installs to take off, when the entry offers both.
+    ///
+    /// Carried for the same reason [`InstallInput::runtime`] is: the page sends
+    /// it, and a field the panel accepts and ignores is how "remove the
+    /// container" became "run the package manager over packages that were never
+    /// installed, and report success". See [`Remove::run`], which refuses that
+    /// rather than performing it.
+    ///
+    /// Absent means the **host**, and not the catalogue's default the way it
+    /// does on the install side. The catalogue's preference is an answer about
+    /// a fresh install, and this operation removes packages — reading it here
+    /// would make a bare `stack.remove mariadb` refuse to touch the host
+    /// MariaDB that is actually on the machine.
+    #[serde(default)]
+    pub runtime: Option<catalogue::Runtime>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1626,6 +1766,33 @@ impl TypedOperation for Remove {
         let component = input.component;
         let slug = component.slug();
         let db = ctx.db().clone();
+
+        // What is being removed, before anything is removed. Only when the
+        // caller said something: silence here is the host, per
+        // [`RemoveInput::runtime`], and putting it through `runtime_for` would
+        // read the catalogue's *install* preference as a removal target.
+        //
+        // A container is refused rather than attempted. Everything below this
+        // point is the package manager; a container has no packages, so the
+        // removal would run to completion, touch nothing, mark the row removed
+        // and report success while the container carried on serving.
+        // `engine.remove` is the operation that takes a container off, and the
+        // refusal says so rather than leaving the operator to find out.
+        if let Some(asked) = input.runtime
+            && runtime_for(component, Some(asked))? == catalogue::Runtime::Container
+        {
+            return Err(UnihelmError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "`stack.remove` removes {}'s packages from this server, and a container \
+                     has none — running it here would report a removal that did not happen. \
+                     Remove the container with `engine.remove` (`unihelm engine remove {}`).",
+                    component.display_name(),
+                    component.entry.slug,
+                ),
+            )
+            .with_field("runtime"));
+        }
 
         // Removing PHP 8.3 while sites are running on it takes those sites down
         // (spec §11.1). Refuse and say which ones.
@@ -1776,6 +1943,168 @@ async fn refuse_to_remove_a_version_that_is_not_the_one_here(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// stack.start / stack.stop
+// ---------------------------------------------------------------------------
+
+/// What `stack.start` and `stack.stop` take: one catalogue entry, and for the
+/// side-by-side ones the version, because `php8.3-fpm` and `php8.4-fpm` are two
+/// services.
+///
+/// No `runtime`: these act on a systemd unit, and a container has none. Stopping
+/// a containerised engine is `docker.stop`.
+#[derive(Debug, Deserialize)]
+pub struct ServiceInput {
+    #[serde(flatten)]
+    pub component: StackComponent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServiceOutput {
+    pub slug: String,
+    /// The unit systemd was actually told about, so a task log names it rather
+    /// than the slug the operator typed.
+    pub unit: String,
+    pub action: &'static str,
+    pub unit_state: String,
+    pub unit_active: bool,
+}
+
+/// `stack.start` — start the service a catalogue entry installed.
+pub struct Start;
+
+/// `stack.stop` — stop it, unless stopping it takes this machine's sites off
+/// the internet.
+pub struct Stop;
+
+#[async_trait]
+impl TypedOperation for Start {
+    type Input = ServiceInput;
+    type Output = ServiceOutput;
+
+    const NAME: &'static str = "stack.start";
+    // `server_manage` and not `stack_manage`: this changes service state, which
+    // is the permission's own description, and it is what `svc.action` already
+    // requires for the identical act. Filing it under the stack namespace it is
+    // reached from must not quietly widen who may do it.
+    const PERMISSION: Permission = Permission::ServerManage;
+    // The fast lane, for `svc.action`'s reason: a package install that has been
+    // running for four minutes must never be why a start button does nothing.
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        act_on_the_service(ctx, input.component, SvcAction::Start).await
+    }
+}
+
+#[async_trait]
+impl TypedOperation for Stop {
+    type Input = ServiceInput;
+    type Output = ServiceOutput;
+
+    const NAME: &'static str = "stack.stop";
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        refuse_to_stop_what_is_serving(ctx, input.component).await?;
+        act_on_the_service(ctx, input.component, SvcAction::Stop).await
+    }
+}
+
+/// Tell systemd, then check it happened.
+///
+/// The second half is the part worth writing down. `systemctl start` exiting
+/// zero means systemd accepted the request, not that the service is running —
+/// the install path learned that when a PHP-FPM with no pool exited immediately
+/// after `enable --now` and the install reported `ok` over a machine answering
+/// 502 on every PHP site. A start that reports success over a unit that died on
+/// start-up is the same lie, so the state afterwards is read and disagreed with.
+async fn act_on_the_service(
+    ctx: &OpContext,
+    component: StackComponent,
+    action: SvcAction,
+) -> Result<ServiceOutput> {
+    let unit = component.managed_unit()?;
+    let name = unit.unit_name(ctx.distro().info.family);
+
+    ctx.log(format!("{} {name}", action.as_str()));
+    ctx.distro().svc.action(&name, action).await?;
+
+    let status = ctx.distro().svc.status(&name).await?;
+    let wanted_active = matches!(action, SvcAction::Start);
+    if status.is_active() != wanted_active {
+        return Err(UnihelmError::new(
+            ErrorCode::ServiceActionFailed,
+            format!(
+                "{name} was told to {} and systemd accepted it, but the unit is {}. \
+                 `systemctl status {name}` and `journalctl -xeu {name}` say why.",
+                action.as_str(),
+                format!("{:?}", status.state).to_lowercase(),
+            ),
+        ));
+    }
+
+    Ok(ServiceOutput {
+        slug: component.slug(),
+        unit: name.as_str().to_string(),
+        action: action.as_str(),
+        unit_state: format!("{:?}", status.state).to_lowercase(),
+        unit_active: status.is_active(),
+    })
+}
+
+/// Refuse to stop the web server this machine serves with while sites are up.
+///
+/// There was no way to stop a web server from the panel at all until this pair
+/// existed, which is how a machine that came up serving with Apache had nothing
+/// anywhere in the UI that could take it off port 80. The control is the fix;
+/// this is the sentence that has to come with it. One click here is every site
+/// on the server going dark, and "taking a machine offline" is not a thing a
+/// panel should do without saying so first.
+///
+/// Judged on the same two facts `stack.remove` uses — which server actually
+/// serves (never nginx by name; a machine switched to Apache had that guard
+/// pointing at the wrong one for a release) and how many sites are still up. A
+/// site that is suspended or failed is already not being served, so it is not a
+/// reason to refuse: "every site is already down" is the state in which stopping
+/// costs nothing, and it has to stay reachable or the incumbent could never be
+/// stopped at all.
+async fn refuse_to_stop_what_is_serving(ctx: &OpContext, component: StackComponent) -> Result<()> {
+    let Some(server) = crate::webserver::WebServer::from_slug(component.entry.slug) else {
+        return Ok(());
+    };
+    if crate::webserver::active(ctx).await? != server {
+        return Ok(());
+    }
+
+    let live: Vec<String> = ctx
+        .db()
+        .all_sites()
+        .await
+        .map_err(UnihelmError::from)?
+        .into_iter()
+        .filter(|s| s.status == unihelm_db::SiteStatus::Active)
+        .map(|s| s.domain)
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+
+    Err(UnihelmError::new(
+        ErrorCode::DependentsExist,
+        format!(
+            "{} is what serves this machine, and {} sites are still up on it: {}. \
+             Stopping it now takes every one of them offline. Switch to another web \
+             server first, or suspend those sites, and this becomes a stop with \
+             nothing behind it.",
+            server.display_name(),
+            live.len(),
+            live.join(", ")
+        ),
+    ))
+}
+
 /// Add the execute bit for "other" so a service running as another account can
 /// traverse into a subdirectory, without being able to list what is there.
 fn make_traversable(dirs: &[std::path::PathBuf]) -> Result<()> {
@@ -1915,9 +2244,9 @@ mod tests {
     use unihelm_core::{AuthContext, Role, TenantScope, UserId};
     use unihelm_db::Db;
     use unihelm_distro::mock::{SharedRecorder, mock_distro_with_recorder};
-    use unihelm_distro::svc::SvcAction;
 
     use super::*;
+    use crate::registry::testing::{auth_for, registry};
 
     fn c(slug: &str) -> StackComponent {
         StackComponent::resolve(slug, None).unwrap()
@@ -2687,6 +3016,7 @@ mod tests {
                 &ctx,
                 RemoveInput {
                     component: c("mysql"),
+                    runtime: None,
                 },
             )
             .await
@@ -2716,6 +3046,7 @@ mod tests {
                 &ctx,
                 RemoveInput {
                     component: c("mariadb"),
+                    runtime: None,
                 },
             )
             .await
@@ -2875,6 +3206,7 @@ mod tests {
                 &ctx,
                 RemoveInput {
                     component: cv("node", "20"),
+                    runtime: None,
                 },
             )
             .await
@@ -2899,6 +3231,7 @@ mod tests {
                 &ctx,
                 RemoveInput {
                     component: cv("node", "20"),
+                    runtime: None,
                 },
             )
             .await
@@ -2925,6 +3258,7 @@ mod tests {
                 InstallInput {
                     component: c("mysql"),
                     extensions: Vec::new(),
+                    runtime: None,
                 },
             )
             .await
@@ -3021,5 +3355,250 @@ mod tests {
         // bootstrapping trust.
         let err = fetch_key("http://example.com/key.gpg").await.unwrap_err();
         assert!(err.detail.contains("refusing to fetch"));
+    }
+
+    // -- where the operator asked it to run ---------------------------------
+
+    #[test]
+    fn the_runtime_the_operator_chose_is_the_one_that_is_used() {
+        // The defect: the Stack page's "Run it" menu posted `runtime` and every
+        // layer between it and here dropped the field, so picking "on the
+        // server" for MariaDB installed a container and the panel said nothing.
+        assert_eq!(
+            runtime_for(c("mariadb"), Some(catalogue::Runtime::Host)).unwrap(),
+            catalogue::Runtime::Host
+        );
+        assert_eq!(
+            runtime_for(c("mariadb"), Some(catalogue::Runtime::Container)).unwrap(),
+            catalogue::Runtime::Container
+        );
+        // And saying nothing still means the catalogue's own answer, which for
+        // an engine is the container the design settled on.
+        assert_eq!(
+            runtime_for(c("mariadb"), None).unwrap(),
+            catalogue::Runtime::Container
+        );
+        assert_eq!(
+            runtime_for(c("nginx"), None).unwrap(),
+            catalogue::Runtime::Host
+        );
+    }
+
+    #[test]
+    fn a_runtime_the_entry_does_not_offer_is_refused_by_name() {
+        // Not corrected to the default: a silent correction is the same defect
+        // as a silently dropped field — the operator asked for one thing and
+        // got another without being told.
+        let err = runtime_for(c("nginx"), Some(catalogue::Runtime::Container)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.detail.contains("Nginx"), "{}", err.detail);
+        assert!(err.detail.contains("container"), "{}", err.detail);
+        assert!(
+            err.detail.contains("host"),
+            "the refusal has to say what it does run: {}",
+            err.detail
+        );
+    }
+
+    #[test]
+    fn the_wire_carries_the_runtime_the_page_sends() {
+        let chosen: InstallInput =
+            serde_json::from_str(r#"{"component":"mariadb","runtime":"host"}"#).unwrap();
+        assert_eq!(chosen.runtime, Some(catalogue::Runtime::Host));
+
+        // Absent stays absent rather than becoming a value: "the operator chose
+        // the host" and "the operator said nothing" are different requests.
+        let silent: InstallInput = serde_json::from_str(r#"{"component":"mariadb"}"#).unwrap();
+        assert_eq!(silent.runtime, None);
+
+        let removal: RemoveInput =
+            serde_json::from_str(r#"{"component":"redis","runtime":"container"}"#).unwrap();
+        assert_eq!(removal.runtime, Some(catalogue::Runtime::Container));
+    }
+
+    #[tokio::test]
+    async fn an_install_onto_a_runtime_the_entry_refuses_leaves_no_row_behind() {
+        // The refusal has to happen before the row is claimed, like the two
+        // port collisions: a `failed` row for an install that never began puts
+        // a red row on the page for a machine that is perfectly fine.
+        let (ctx, _, _) = op_ctx(Family::Debian).await;
+        let err = Install
+            .run(
+                &ctx,
+                InstallInput {
+                    component: c("nginx"),
+                    extensions: Vec::new(),
+                    runtime: Some(catalogue::Runtime::Container),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(ctx.db().components().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_container_through_the_package_path_is_refused_not_reported_done() {
+        // Everything below that refusal is the package manager. A container has
+        // no packages, so the removal would run to completion, touch nothing,
+        // and mark the row removed while the container carried on serving.
+        let (ctx, _, _) = op_ctx(Family::Debian).await;
+        let err = Remove
+            .run(
+                &ctx,
+                RemoveInput {
+                    component: c("mariadb"),
+                    runtime: Some(catalogue::Runtime::Container),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.detail.contains("engine.remove"), "{}", err.detail);
+        assert!(ctx.db().components().await.unwrap().is_empty());
+
+        // And saying nothing still means the packages, even though MariaDB's
+        // catalogue *install* default is a container: reading that preference
+        // here would make a bare removal refuse to touch the host install that
+        // is the only thing on the machine.
+        Remove
+            .run(
+                &ctx,
+                RemoveInput {
+                    component: c("mariadb"),
+                    runtime: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // -- stack.start / stack.stop -------------------------------------------
+
+    #[test]
+    fn only_the_entries_the_panel_whitelists_can_be_started_or_stopped() {
+        // The property `svc.action` buys with an enum, kept here: a slug an
+        // operator typed can only ever reach a unit this file already manages.
+        for entry in catalogue::CATALOGUE {
+            assert_eq!(
+                CONTROLLABLE_SLUGS.contains(&entry.slug),
+                c(entry.slug).managed_unit().is_ok(),
+                "`{}` disagrees with CONTROLLABLE_SLUGS, which the Stack page mirrors",
+                entry.slug
+            );
+        }
+
+        // And what it will not name, it refuses about — listing what it can, so
+        // the answer is actionable rather than a flat no.
+        let err = c("postgres").managed_unit().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert!(err.detail.contains("PostgreSQL"), "{}", err.detail);
+        assert!(err.detail.contains("nginx"), "{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn a_start_names_the_unit_it_told_systemd_about_and_checks_it_came_up() {
+        let (reg, admin, _) = registry().await;
+        let out = reg
+            .dispatch(
+                "stack.start",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "php", "version": "8.3" }),
+                None,
+            )
+            .await
+            .unwrap();
+        // The mock distro is Debian-family.
+        assert_eq!(out["unit"], "php8.3-fpm.service");
+        assert_eq!(out["slug"], "php8.3");
+        assert_eq!(out["unit_active"], true);
+    }
+
+    #[tokio::test]
+    async fn stopping_the_web_server_that_is_serving_is_refused_while_sites_are_up() {
+        // Issue 23's other half. The control exists so a machine serving with
+        // Apache is not stuck on port 80 with nothing in the panel to stop it —
+        // and it comes with this sentence, because one click here is every site
+        // on the server going dark.
+        let (reg, admin, customer) = registry().await;
+        seed_active_site(reg.services().db.clone(), customer, "shop.example.com").await;
+
+        let err = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "nginx" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+        assert!(err.detail.contains("shop.example.com"), "{}", err.detail);
+        assert!(err.detail.contains("Nginx"), "{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_web_server_nothing_is_riding_on_goes_ahead() {
+        // The escape hatch has to stay open, or the incumbent could never be
+        // stopped at all: a suspended site is already not being served, so it is
+        // not a reason to refuse.
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let site = seed_active_site(db.clone(), customer, "gone.example.com").await;
+        db.set_site_status(site, unihelm_db::SiteStatus::Suspended)
+            .await
+            .unwrap();
+
+        let out = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "nginx" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["unit"], "nginx.service");
+        assert_eq!(out["unit_active"], false);
+    }
+
+    #[tokio::test]
+    async fn a_web_server_that_is_not_the_one_serving_can_be_stopped_with_sites_up() {
+        // Which server is serving, never a slug: on a machine switched to
+        // Apache this guard keyed on `nginx` would refuse to stop the one that
+        // serves nothing and allow the stop of the one holding every site up.
+        let (reg, admin, customer) = registry().await;
+        seed_active_site(reg.services().db.clone(), customer, "live.example.com").await;
+
+        // Nothing has switched this machine, so nginx serves and Apache does not.
+        reg.dispatch(
+            "stack.stop",
+            &auth_for(admin, Role::Admin),
+            serde_json::json!({ "component": "apache" }),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// One active site under a fresh subscription, for the stop guard.
+    async fn seed_active_site(db: Db, owner: UserId, domain: &str) -> unihelm_core::SiteId {
+        let sub = db.create_subscription(owner).await.unwrap();
+        let site = db
+            .create_site(unihelm_db::NewSite {
+                subscription_id: sub.id,
+                domain: unihelm_core::Domain::parse(domain).unwrap(),
+                site_type: unihelm_db::SiteType::Static,
+                php_version: None,
+                root_dir: format!("/home/{}/sites/{domain}/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+        db.set_site_status(site.id, unihelm_db::SiteStatus::Active)
+            .await
+            .unwrap();
+        site.id
     }
 }

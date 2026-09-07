@@ -82,7 +82,7 @@ impl UserView {
         (status = 200, description = "Signed in; the session cookie rides on this response", body = LoginResponse),
         (status = 401, description = "`invalid_credentials`", body = ApiErrorBody),
         (status = 403, description = "`account_suspended`", body = ApiErrorBody),
-        (status = 429, description = "`rate_limited`: too many attempts from this IP or for this account, or too many password checks already running", body = ApiErrorBody),
+        (status = 429, description = "`rate_limited`: too many failed attempts from this address, or too many password checks already running", body = ApiErrorBody),
         (status = 501, description = "`not_implemented`: the account requires TOTP, which this build cannot verify", body = ApiErrorBody),
     ),
 )]
@@ -97,6 +97,9 @@ pub async fn login(
     let ip = client_ip(Some(&peer), &headers);
     let username = body.username.trim().to_ascii_lowercase();
 
+    // Refuses only on budgets belonging to this caller's address, records the
+    // refusal itself so Sentinel keeps seeing the attack, and may hold this
+    // request for a moment when the account is under attack from elsewhere.
     check_rate_limits(&state.db, &ip, &username).await?;
 
     let user = state

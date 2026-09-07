@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
 import { Check, KeyRound, Plug, PowerOff, ShieldAlert, TerminalSquare, Trash2 } from "lucide-react";
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -11,6 +12,7 @@ import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field, Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
+import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { ApiError } from "@/lib/api";
@@ -20,10 +22,13 @@ import { cn } from "@/lib/utils";
 import {
   decodeBytes,
   encodeText,
+  subscriptionChoice,
+  subscriptionLabel,
   terminalApi,
   websocketUrl,
   type ServerMessage,
   type SshKey,
+  type SubscriptionChoice,
   type TerminalTargetKind,
 } from "@/lib/terminal-api";
 
@@ -81,6 +86,25 @@ export function TerminalPage() {
   const [target, setTarget] = useState<TerminalTargetKind>(isAdmin ? "root" : "tenant");
   const [confirmedRoot, setConfirmedRoot] = useState(false);
 
+  // An administrator opening a tenant shell has to say whose. Their scope is
+  // the whole server, so the agent has no "my subscription" to resolve and
+  // refuses the request naming `subscription_id` — a field this page never
+  // offered, so "My account" was a 400 every time for the one person who can
+  // reach every account. A customer sends nothing and the agent resolves their
+  // own, which is why the query only runs for the admin case.
+  const needsSubscription = isAdmin && target === "tenant";
+  const subscriptions = useQuery({
+    queryKey: ["subscriptions"],
+    queryFn: () => terminalApi.subscriptions(),
+    enabled: needsSubscription,
+    retry: false,
+  });
+  const choice = subscriptionChoice(subscriptions.data?.subscriptions ?? []);
+  const [picked, setPicked] = useState<number | null>(null);
+  // One account is not a list to choose from, so it is chosen here rather than
+  // asked about; anything else waits for the operator.
+  const chosen = choice.kind === "only" ? choice.id : picked;
+
   const socket = useRef<WebSocket | null>(null);
   const term = useRef<XtermHandle>(null);
   const sessionId = useRef<string | null>(rememberedSession());
@@ -103,7 +127,15 @@ export function TerminalPage() {
         const opened = await terminalApi.openSession(
           options.reattach && sessionId.current
             ? { session_id: sessionId.current }
-            : { target, cols: size.cols, rows: size.rows },
+            : {
+                target,
+                cols: size.cols,
+                rows: size.rows,
+                // Only when this page actually knows one. A customer has no id
+                // to send and the agent resolves their own subscription; an
+                // admin has no "own", which is the refusal this carries.
+                ...(needsSubscription && chosen !== null ? { subscription_id: chosen } : {}),
+              },
         );
         sessionId.current = opened.session_id;
         rememberSession(opened.session_id);
@@ -161,7 +193,7 @@ export function TerminalPage() {
         setPhase({ kind: "denied", reason });
       }
     },
-    [target, t],
+    [target, needsSubscription, chosen, t],
   );
 
   // Leaving the page drops the socket and nothing else — the shell keeps
@@ -183,6 +215,20 @@ export function TerminalPage() {
   }, [send, t]);
 
   const rootBlocked = target === "root" && !confirmedRoot;
+  // Nothing to open a shell *as* yet: still loading, the list failed, there are
+  // no accounts, or nobody has picked one. Refusing the click is the honest
+  // answer — the alternative is the 400 this fixes.
+  const tenantBlocked = needsSubscription && chosen === null;
+
+  // An empty list and a failed request are different facts, and only one of
+  // them is a statement about this server. Keeping them apart is what stops the
+  // page telling an operator there are no accounts when it simply could not
+  // ask.
+  const listError = !subscriptions.error
+    ? null
+    : subscriptions.error instanceof ApiError
+      ? subscriptions.error.message
+      : t("terminal.subscriptionsFailed");
 
   return (
     <div className="space-y-6">
@@ -209,7 +255,18 @@ export function TerminalPage() {
           }}
           confirmedRoot={confirmedRoot}
           onConfirmRoot={setConfirmedRoot}
-          blocked={rootBlocked}
+          blocked={rootBlocked || tenantBlocked}
+          tenant={
+            needsSubscription
+              ? {
+                  loading: subscriptions.isPending,
+                  error: listError,
+                  choice,
+                  chosen,
+                  onPick: setPicked,
+                }
+              : null
+          }
           phase={phase}
           canReattach={sessionId.current !== null}
           onConnect={connect}
@@ -289,6 +346,20 @@ function TerminalSkeleton() {
   );
 }
 
+/**
+ * Which tenant an admin's shell opens as, and how far the page has got towards
+ * knowing it. `null` on this prop means the question does not apply — a
+ * customer, or an admin on the root target.
+ */
+interface TenantChoice {
+  loading: boolean;
+  /** The list could not be fetched. Never the same thing as "there are none". */
+  error: string | null;
+  choice: SubscriptionChoice;
+  chosen: number | null;
+  onPick: (id: number | null) => void;
+}
+
 function StartPanel({
   isAdmin,
   target,
@@ -296,6 +367,7 @@ function StartPanel({
   confirmedRoot,
   onConfirmRoot,
   blocked,
+  tenant,
   phase,
   canReattach,
   onConnect,
@@ -306,6 +378,7 @@ function StartPanel({
   confirmedRoot: boolean;
   onConfirmRoot: (value: boolean) => void;
   blocked: boolean;
+  tenant: TenantChoice | null;
   phase: Phase;
   canReattach: boolean;
   onConnect: (options: { reattach: boolean }) => void;
@@ -352,6 +425,8 @@ function StartPanel({
           <p className="text-sm text-ink-muted">{t("terminal.tenantOnly")}</p>
         )}
 
+        {tenant ? <TenantChooser {...tenant} /> : null}
+
         {target === "root" ? (
           // The panel's highest-stakes consent, on the panel's own toggle
           // rather than on a raw checkbox that appears nowhere else.
@@ -384,6 +459,83 @@ function StartPanel({
         <p className="text-xs text-ink-subtle">{t("terminal.idleNote")}</p>
       </CardBody>
     </Card>
+  );
+}
+
+/**
+ * Whose shell an administrator is opening.
+ *
+ * Four states, and the difference between the last two is the whole point: a
+ * list that failed to load is *not* a server with no tenants on it. Saying so
+ * would be the panel claiming something it has not established, and it would
+ * point the operator at the sites page to fix a problem that is not there.
+ */
+function TenantChooser({ loading, error, choice, chosen, onPick }: TenantChoice) {
+  const { t } = useTranslation();
+
+  if (loading) {
+    return (
+      <div role="status" aria-live="polite" className="space-y-1.5">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-9 w-full rounded-lg" />
+      </div>
+    );
+  }
+
+  if (error !== null) {
+    // The server's own sentence, not a rewrite of it: whatever stopped the list
+    // arriving is what the operator has to act on.
+    return <Callout tone="danger">{error}</Callout>;
+  }
+
+  if (choice.kind === "none") {
+    return (
+      <Callout
+        tone="info"
+        title={t("terminal.noSubscriptions")}
+        action={
+          <Link to="/sites" className="font-medium text-accent transition-colors hover:underline">
+            {t("terminal.noSubscriptionsLink")}
+          </Link>
+        }
+      >
+        {t("terminal.noSubscriptionsHint")}
+      </Callout>
+    );
+  }
+
+  if (choice.kind === "only") {
+    // Chosen, and said out loud. Making somebody pick from a list of one is a
+    // click that carries no decision — but opening a shell as an account the
+    // page never named would be worse.
+    return (
+      <p className="text-sm text-ink-muted">
+        {t("terminal.subscriptionOnly", { account: subscriptionLabel(choice.subscription) })}
+      </p>
+    );
+  }
+
+  return (
+    <Field label={t("terminal.whichSubscription")} htmlFor="terminal-subscription">
+      <Select
+        id="terminal-subscription"
+        value={chosen === null ? "" : String(chosen)}
+        onChange={(event) =>
+          onPick(event.target.value === "" ? null : Number(event.target.value))
+        }
+      >
+        {/* No pre-selected first row: which tenant a root-capable operator drops
+            into is not a thing to decide for them by list order. */}
+        <option value="">{t("terminal.chooseSubscription")}</option>
+        {choice.options.map((option) => (
+          <option key={option.id} value={option.id}>
+            {option.status === "active"
+              ? subscriptionLabel(option)
+              : t("terminal.subscriptionSuspended", { account: subscriptionLabel(option) })}
+          </option>
+        ))}
+      </Select>
+    </Field>
   );
 }
 

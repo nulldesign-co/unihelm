@@ -298,14 +298,35 @@ pub(crate) fn extract_with_limits(
         )
     })?;
 
-    if !std::fs::metadata(dest.as_path())
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
-        return Err(SafeError::new(
-            FsErrorKind::NotADirectory,
-            format!("`{}` is not a directory", dest.relative()),
-        ));
+    // Creating the destination is the caller's job (`helper::extract_dest`);
+    // this is the guard on what it hands over, and it now says which of the
+    // three failures happened. It used to answer "is not a directory" for a
+    // destination that was simply absent — which is what an operator saw for
+    // every "extract into a folder named after the archive", and it sent them
+    // looking for a file that was not there. `symlink_metadata`, not
+    // `metadata`: a link at the destination is refused rather than followed,
+    // the same rule the rest of this module applies to every entry it writes.
+    match std::fs::symlink_metadata(dest.as_path()) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(SafeError::escape(dest.as_path()));
+        }
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(SafeError::new(
+                FsErrorKind::NotADirectory,
+                format!("`{}` is not a directory", dest.relative()),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SafeError::new(
+                FsErrorKind::NotFound,
+                format!(
+                    "`{}` does not exist, so there is nowhere to extract into",
+                    dest.relative()
+                ),
+            ));
+        }
+        Err(e) => return Err(SafeError::io(dest.as_path(), &e)),
     }
 
     match format {
@@ -800,6 +821,63 @@ mod tests {
         let (files, _) = extract(&home.safe("a.tar.gz"), &dest).unwrap();
         assert_eq!(files, 1, "only the real file");
         assert!(!home.path.join("out/src/leak").exists());
+    }
+
+    // -- the destination ----------------------------------------------------
+
+    /// A one-file `site.tar.gz` at the top of `home`, for the destination
+    /// cases below.
+    fn archive_of_one_file(home: &Home) -> SafePath {
+        home.write("src/index.php", b"<?php echo 1;");
+        compress(
+            &home.root(),
+            &["src".into()],
+            &home.safe_new("site.tar.gz"),
+            ArchiveFormat::TarGz,
+        )
+        .unwrap();
+        home.safe("site.tar.gz")
+    }
+
+    #[test]
+    fn a_destination_that_is_not_there_is_reported_as_missing_not_as_a_non_directory() {
+        // This answered `NotADirectory` for an absent path, which is what an
+        // operator saw for the most ordinary extract there is — "into a folder
+        // named after the archive" — and it named the wrong problem.
+        let home = Home::new();
+        let archive = archive_of_one_file(&home);
+        let dest = safepath::child(&home.root(), "missing").unwrap();
+
+        let err = extract(&archive, &dest).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::NotFound, "{}", err.message);
+        assert!(err.message.contains("missing"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_plain_file_where_the_destination_goes_is_still_a_non_directory() {
+        let home = Home::new();
+        let archive = archive_of_one_file(&home);
+        home.write("taken", b"i am a file");
+
+        let err = extract(&archive, &home.safe("taken")).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::NotADirectory, "{}", err.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_destination_is_refused_rather_than_followed() {
+        // The check used to be `metadata`, which follows: a link pointing at a
+        // directory outside the home passed as "a directory" and the whole
+        // archive landed there.
+        let home = Home::new();
+        let archive = archive_of_one_file(&home);
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path.join("out")).unwrap();
+
+        let dest = safepath::child(&home.root(), "out").unwrap();
+        let err = extract(&archive, &dest).unwrap_err();
+        assert_eq!(err.kind, FsErrorKind::Escape, "{}", err.message);
+        assert!(!outside.path().join("src").exists());
     }
 
     // -- hostile entry names ------------------------------------------------

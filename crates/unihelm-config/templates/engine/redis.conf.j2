@@ -1,0 +1,35 @@
+# Configuration for {{ engine.container }}, written by Unihelm.
+#
+# Redis and Valkey both read this file — Valkey is a fork of Redis and its
+# configuration grammar is the same one, so there is one template rather than
+# two that would drift apart.
+#
+# WHY THE PASSWORD IS IN A FILE AND NOT ANYWHERE ELSE. `--requirepass <secret>`
+# on the server's command line, and a `REDIS_PASSWORD` in its environment, are
+# both readable out of `/proc` by any account on this machine — and every
+# tenant's PHP process and every tenant shell is an account on this machine.
+# That is the exact boundary the password exists to draw, so the credential
+# travels the one way that does not cross it: a file the host keeps in a
+# `0700 root:root` directory (see `paths::engine_config_dir`) and mounts into
+# the container read-only.
+#
+# Edits to this file are overwritten the next time the engine is installed, and
+# a running container will not see them at all: the mount follows the inode
+# this file had when the container started, and the panel replaces the file
+# rather than rewriting it in place.
+
+# The whole point. Without it every account on this server can run `KEYS *`
+# against every other customer's sessions, and `FLUSHALL` the lot.
+requirepass {{ engine.password }}
+
+# Persistence. This was an argument to the server before the password needed a
+# file, and it has to stay somewhere: the container is given a data volume, and
+# an append-only file is what makes that volume hold anything. Without it the
+# volume stays empty and "your data survives a restart" would be a lie.
+appendonly yes
+
+# Where that append-only file goes: the volume's mount point, said explicitly
+# rather than inherited from the image's working directory, so a base image
+# that changes its `WORKDIR` cannot quietly move a customer's data onto the
+# container's own writable layer — where a restart discards it.
+dir {{ engine.data_dir }}

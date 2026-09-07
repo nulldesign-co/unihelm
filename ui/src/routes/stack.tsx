@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Boxes, Download, Trash2 } from "lucide-react";
+import { Boxes, Download, Play, Square, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -306,6 +306,74 @@ export function hostHoldsEntry(rows: readonly StackComponentView[], version?: st
 }
 
 /**
+ * The cache slugs that bind 6379. Mirrors the agent's `contested_port`.
+ */
+const KV_PORT_HOLDERS = new Set(["redis", "valkey"]);
+
+/**
+ * The port this entry binds where something else in the catalogue binds the
+ * same one, or `null` when nothing contends for it.
+ *
+ * Mirrors the agent's `contested_port`, asymmetry included, and the asymmetry
+ * is the part worth keeping: web servers are keyed on the category, so a fourth
+ * one added to the catalogue tomorrow is covered without anybody remembering
+ * this function — while the caches are keyed on the slug, because Memcached is
+ * on 11211 and only Valkey is a fork of Redis down to its `bind` line. Keying
+ * the caches on the category too would put "Memcached is holding port 6379"
+ * under a disabled Install: a sentence the operator would believe, about a
+ * collision that does not exist, blocking an install the agent would accept.
+ */
+function contestedPortOf(slug: string, category: StackCategory): number | null {
+  if (category === WEB_SERVER_CATEGORY) return 80;
+  if (category === "cache") return KV_PORT_HOLDERS.has(slug) ? 6379 : null;
+  return null;
+}
+
+export function contestedPort(entry: CatalogueEntry): number | null {
+  return contestedPortOf(entry.slug, entry.category);
+}
+
+/**
+ * The sibling whose service is up and holding this entry's port.
+ *
+ * The agent refuses an install while another catalogue entry that binds the
+ * same port has an *active* unit: Apache on 80 while nginx wants it, Redis on
+ * 6379 while Valkey wants it. The page has to know, because it draws the
+ * button — left to the agent, the operator presses a live Install on a machine
+ * Apache is serving and gets a red task explaining a rule this row could have
+ * stated before the click. That refusal machinery already exists here for two
+ * other cases (`dockerMissing`, `hostIncumbent`); this collision was simply
+ * never wired into it.
+ *
+ * Judged on `unit_active` exactly as the agent judges it, and never on being
+ * installed: an installed-but-stopped Apache holds nothing, and blocking there
+ * would be blocking an install that would have worked. It is also what makes
+ * the Stop control on the incumbent's own chip the answer this points at.
+ *
+ * The row itself rather than a boolean, which is where this departs from
+ * `hostIncumbent`: there the incumbent is this same entry at a version the row
+ * already has in hand, and here it is a different entry entirely — so carrying
+ * it back is the only way the callout can name what is in the way.
+ */
+export function portIncumbentFor(
+  entry: CatalogueEntry,
+  components: readonly StackComponentView[],
+): StackComponentView | null {
+  const port = contestedPort(entry);
+  if (port === null) return null;
+  return (
+    components.find(
+      (c) =>
+        // Reinstalling the server that is already serving is idempotent, not a
+        // collision with itself — the agent skips its own entry here too.
+        c.component !== entry.slug &&
+        c.unit_active &&
+        contestedPortOf(c.component, c.category) === port,
+    ) ?? null
+  );
+}
+
+/**
  * The panel's own host install of one version, when there is one.
  *
  * The row [`hostHoldsEntry`] answered "yes" about, handed back so the warning
@@ -437,6 +505,18 @@ export interface RowPlan {
    */
   hostIncumbent: boolean;
   /**
+   * Another entry's service is up and holding the port this one wants, so the
+   * agent will refuse the install. The row it names, because the callout has to
+   * say what is in the way and offer somewhere to go about it.
+   *
+   * Same shape as `dockerMissing` and `hostIncumbent`: a blocked click the row
+   * explains, rather than one that reaches the agent and comes back as a failed
+   * task. Until this existed, Install stayed armed on nginx and OpenLiteSpeed
+   * while Apache held port 80 — and there was nowhere in the panel to stop
+   * Apache either, so the failed task was the whole of the operator's answer.
+   */
+  portIncumbent: StackComponentView | null;
+  /**
    * Where this runs is a decision about the version, taken for everything on
    * it. Drives the sentence that has to be read before the click, not after.
    */
@@ -470,6 +550,10 @@ export function planFor(
   const hostIncumbent =
     runtime === "container" &&
     hostHoldsEntry(rows, entry.side_by_side ? selectedVersion : undefined);
+  // Not scoped to a mode: the agent decides the port collision before it looks
+  // at host or container at all, so a container install is refused over a
+  // running Apache exactly as a host one is.
+  const portIncumbent = portIncumbentFor(entry, components);
   const shape = {
     rows,
     unmanaged,
@@ -480,6 +564,7 @@ export function planFor(
     support,
     dockerMissing,
     hostIncumbent,
+    portIncumbent,
     perVersion,
   };
 
@@ -488,7 +573,14 @@ export function planFor(
   if (unmanaged) {
     // No chooser on this row, so nothing here is blocked: a warning about a
     // click the row does not offer is a warning about nothing.
-    return { action: "none", replaces: null, ...shape, dockerMissing: false, hostIncumbent: false };
+    return {
+      action: "none",
+      replaces: null,
+      ...shape,
+      dockerMissing: false,
+      hostIncumbent: false,
+      portIncumbent: null,
+    };
   }
 
   const held = entry.versions.find((v) => present.has(v.version))?.version ?? null;
@@ -597,6 +689,22 @@ export function StackPage() {
 
   const install = useMutation({ mutationFn: endpoints.installComponent, ...settle });
   const remove = useMutation({ mutationFn: endpoints.removeComponent, ...settle });
+
+  // Start and stop are not tasks: they answer with the unit's state in the same
+  // round trip, so there is nothing to poll for and `justActed` would only make
+  // the page hammer the agent for fifteen seconds after a click that has
+  // already finished. The refusal for stopping the web server that serves this
+  // machine arrives on `onError`, which is the whole reason those operations
+  // are immediate — the sentence is read in the click that asked for it.
+  const settleService = {
+    onSuccess: () => {
+      setError(null);
+      void queryClient.invalidateQueries({ queryKey: ["stack"] });
+    },
+    onError: (e: unknown) => setError(e instanceof ApiError ? e.message : String(e)),
+  };
+  const startService = useMutation({ mutationFn: endpoints.startComponent, ...settleService });
+  const stopService = useMutation({ mutationFn: endpoints.stopComponent, ...settleService });
 
   // The machine's own survey of what is on `$PATH`, which the catalogue cannot
   // answer: it says what the panel can install, not what is there. Read rather
@@ -724,6 +832,16 @@ export function StackPage() {
       ? keyOf(remove.variables)
       : null;
 
+  // Tracked apart from `busy`: a start or a stop is in the agent's fast lane
+  // precisely so a package install running for four minutes is not why a stop
+  // button does nothing (spec §10.1). Disabling every control on the page while
+  // an install runs would put that rule back.
+  const controlling = startService.isPending
+    ? `${startService.variables.component}@${startService.variables.version ?? ""}`
+    : stopService.isPending
+      ? `${stopService.variables.component}@${stopService.variables.version ?? ""}`
+      : null;
+
   return (
     <div className="space-y-6">
       <PageHeader title={t("stack.title")} description={t("stack.subtitle")} />
@@ -800,8 +918,10 @@ export function StackPage() {
                       index={index}
                       busy={busy}
                       acting={acting}
+                      controlling={controlling}
                       dockerAnchor={dockerAnchor}
                       installed={installed}
+                      activeWebServer={stack.data?.web_server ?? ""}
                       serving={servingState(entry, stack.data?.web_server ?? "", components)}
                       switching={
                         switchServer.isPending
@@ -839,6 +959,12 @@ export function StackPage() {
                       }
                       onRemove={(version, rowRuntime) =>
                         remove.mutate({ component: entry.slug, version, runtime: rowRuntime })
+                      }
+                      onControl={(action, version) =>
+                        (action === "start" ? startService : stopService).mutate({
+                          component: entry.slug,
+                          version,
+                        })
                       }
                     />
                   );
@@ -990,6 +1116,57 @@ export function defaultCommandFor(
   return { command, owns: mine.is_default, movable: !mine.is_default };
 }
 
+/**
+ * The catalogue slugs `stack.start` and `stack.stop` can name a unit for.
+ *
+ * Mirrors `CONTROLLABLE_SLUGS` in the agent, which resolves each of these to a
+ * `ManagedUnit` — the same enum `svc.action` uses, so a slug an operator typed
+ * can never reach an arbitrary systemd unit. It is duplicated here rather than
+ * sent, for `RENDERABLE_SERVERS`'s reason: the only thing it changes is whether
+ * a button is drawn, and the agent refuses on its own if this list is ever
+ * ahead of it. PostgreSQL and the rest are absent on the agent's side because
+ * their unit name cannot be resolved reliably on both families, and a control
+ * that acts on the wrong unit is worse than no control.
+ */
+const CONTROLLABLE = new Set(["nginx", "apache", "php", "mariadb", "redis", "docker"]);
+
+/** What a chip's service control would do, or `null` when it draws none. */
+export type ServiceControl = "start" | "stop";
+
+/**
+ * Whether one installed version's chip carries a start/stop control.
+ *
+ * This is the half of issue 23 the page owns. A machine that came up serving
+ * with Apache had nothing anywhere in the panel that could take it off port 80:
+ * no control on any page, and no operation behind one. The row already knew the
+ * unit was active — it draws "not running" off the same field — and there was
+ * simply nothing to press.
+ *
+ * `unmanaged` counts, deliberately, and it is the case that matters most: an
+ * Apache somebody installed by hand is the Apache holding the port. The panel
+ * has never needed to have installed a unit to be allowed to stop it — that is
+ * what `svc.action` has always done — and the reasons the row hides Install and
+ * Remove from an unmanaged component (a vendor repository written over somebody
+ * else's configuration; a removal whose dependents the panel cannot know) do
+ * not apply to a stop, which is reversible by the button next to it.
+ *
+ * A container has no unit; `docker.stop` is what stops one.
+ *
+ * The version an unmanaged row reports is the agent's guess, which is why the
+ * chip prints it as unknown — but it is not load-bearing here: the entries with
+ * a per-version unit (`php8.3-fpm`) are the side-by-side ones, whose rows are
+ * matched to a version by the package manager rather than guessed.
+ */
+export function serviceControlFor(
+  entry: CatalogueEntry,
+  row: StackComponentView,
+): ServiceControl | null {
+  if (!CONTROLLABLE.has(entry.slug)) return null;
+  if (runtimeOf(row) !== "host") return null;
+  if (row.status !== "installed" && row.status !== "unmanaged") return null;
+  return row.unit_active ? "stop" : "start";
+}
+
 /** Catalogue slugs whose category is the web server. */
 export const WEB_SERVER_CATEGORY: StackCategory = "web_server";
 
@@ -1067,8 +1244,10 @@ function EntryRow({
   index,
   busy,
   acting,
+  controlling,
   dockerAnchor,
   installed,
+  activeWebServer,
   serving,
   switching,
   awaitingConfirm,
@@ -1078,6 +1257,7 @@ function EntryRow({
   onSelectRuntime,
   onInstall,
   onRemove,
+  onControl,
   onMakeDefault,
 }: {
   entry: CatalogueEntry;
@@ -1087,10 +1267,20 @@ function EntryRow({
   busy: boolean;
   /** `slug@version@mode` of the mutation in flight, if any. */
   acting: string | null;
+  /** `slug@version` of the start or stop in flight, if any. */
+  controlling: string | null;
   /** Anchor of the row that installs Docker, when this catalogue has one. */
   dockerAnchor: string | null;
   /** The machine's survey of `$PATH`, for the bare-command badge. */
   installed: readonly InstalledRuntime[];
+  /**
+   * The slug of the web server serving this machine's sites.
+   *
+   * Needed beyond `serving`, which answers about *this* row: when another row's
+   * server is holding the port, whether stopping it costs every site on the
+   * machine depends on whether that one is the one serving.
+   */
+  activeWebServer: string;
   /** Whether this web server serves, could serve, or neither. */
   serving: ServingState;
   /** The slug of the switch in flight, if any. */
@@ -1103,6 +1293,7 @@ function EntryRow({
   onSelectRuntime: (runtime: StackRuntime) => void;
   onInstall: () => void;
   onRemove: (version: string, runtime: StackRuntime) => void;
+  onControl: (action: ServiceControl, version: string) => void;
   onMakeDefault: (runtime: string, version: string) => void;
   onSwitch: () => void;
 }) {
@@ -1137,6 +1328,10 @@ function EntryRow({
   // engine replaces itself and in a container it does not, which is the whole
   // reason the mode is on the page.
   const gainsSideBySide = container && !entry.side_by_side;
+  // The port the row below is about. Non-null whenever `portIncumbent` is —
+  // it is what found it — and read once so the sentence and its title cannot
+  // be built from two different answers.
+  const held = contestedPort(entry);
 
   return (
     <li
@@ -1190,6 +1385,9 @@ function EntryRow({
                   support={plan.support}
                   busy={busy}
                   pending={acting === rowKey(entry.slug, row.version, runtimeOf(row))}
+                  control={serviceControlFor(entry, row)}
+                  controlPending={controlling === `${entry.slug}@${row.version}`}
+                  onControl={(action) => onControl(action, row.version)}
                   command={defaultCommandFor(entry, row, installed)}
                   movingDefault={
                     settingDefault !== null &&
@@ -1284,7 +1482,8 @@ function EntryRow({
                   plan.action === "held" ||
                   plan.action === "none" ||
                   plan.dockerMissing ||
-                  plan.hostIncumbent
+                  plan.hostIncumbent ||
+                  plan.portIncumbent !== null
                 }
                 onClick={onInstall}
                 aria-label={t(
@@ -1372,6 +1571,46 @@ function EntryRow({
             : t(`stack.source.${plan.selected.source}`)}
           {gainsSideBySide ? ` ${t("stack.runtimeNote.containerSideBySide")}` : null}
         </p>
+      ) : null}
+
+      {/* First of the three that say the click cannot happen at all, because it
+          is the only one about something running on the machine right now — and
+          the only one with a control to point at. It names the incumbent rather
+          than the port, since "Apache" is what the operator has to go and do
+          something about, and links to that row the way the Docker callout
+          links to Docker's. */}
+      {plan.portIncumbent && held !== null ? (
+        <Callout
+          tone="warning"
+          className="mt-3"
+          title={t("stack.portIncumbentTitle", {
+            name: plan.portIncumbent.display_name,
+            port: held,
+          })}
+          action={
+            <a
+              href={`#${entryAnchor(plan.portIncumbent.component)}`}
+              className="font-medium text-accent transition-colors hover:underline"
+            >
+              {t("stack.portIncumbentLink", { name: plan.portIncumbent.display_name })}
+            </a>
+          }
+        >
+          {t("stack.portIncumbent", {
+            name: plan.portIncumbent.display_name,
+            port: held,
+            wanted: entry.display_name,
+          })}
+          {/* Only when the one in the way is the server actually serving. On a
+              machine where it is, Stop is not "free the port" — it is every
+              site going dark until something else is installed and serving, and
+              that is the fact the operator needs before pressing it rather than
+              after. Said here and not on the Stop button itself, because this
+              is the row that sent them there. */}
+          {plan.portIncumbent.component === activeWebServer ? (
+            <> {t("stack.portIncumbentServing", { name: plan.portIncumbent.display_name })}</>
+          ) : null}
+        </Callout>
       ) : null}
 
       {/* Before the Replace and end-of-life warnings, because it is the one that
@@ -1477,9 +1716,12 @@ function InstalledChip({
   support,
   busy,
   pending,
+  control,
+  controlPending,
   command,
   movingDefault,
   onRemove,
+  onControl,
   onMakeDefault,
 }: {
   entry: CatalogueEntry;
@@ -1488,11 +1730,16 @@ function InstalledChip({
   support: RuntimeSupport;
   busy: boolean;
   pending: boolean;
+  /** Start or stop, or `null` where the panel cannot name this one's unit. */
+  control: ServiceControl | null;
+  /** This version's service is being started or stopped right now. */
+  controlPending: boolean;
   /** The bare command this version owns or could own, or `null`. */
   command: DefaultCommand | null;
   /** This version's default is being moved right now. */
   movingDefault: boolean;
   onRemove: () => void;
+  onControl: (action: ServiceControl) => void;
   onMakeDefault: () => void;
 }) {
   const { t } = useTranslation();
@@ -1565,6 +1812,36 @@ function InstalledChip({
             })}
           >
             {t("stack.makeDefault", { command: command.command })}
+          </Button>
+        ) : null}
+        {control ? (
+          // Not disabled by `busy`: a start or a stop is in the agent's fast
+          // lane exactly so a package install running for four minutes is not
+          // why this button does nothing.
+          //
+          // A stop carries danger weight rather than a confirmation step. What
+          // it costs depends on the machine, not on this chip, and the agent is
+          // the only thing that knows — it refuses a stop of the web server
+          // that is serving while any site is up, and the sentence it refuses
+          // with names them. That sentence arrives in this same click, because
+          // the operation is immediate.
+          <Button
+            variant={control === "stop" ? "danger" : "ghost"}
+            size="sm"
+            loading={controlPending}
+            disabled={controlPending}
+            onClick={() => onControl(control)}
+            aria-label={t(control === "stop" ? "stack.stopAria" : "stack.startAria", {
+              name: entry.display_name,
+              version: versionLabel(row.version, t),
+            })}
+          >
+            {control === "stop" ? (
+              <Square className="h-3.5 w-3.5" aria-hidden />
+            ) : (
+              <Play className="h-3.5 w-3.5" aria-hidden />
+            )}
+            {t(control === "stop" ? "stack.stop" : "stack.start")}
           </Button>
         ) : null}
         {removable ? (

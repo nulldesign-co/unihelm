@@ -164,6 +164,14 @@ export const en = {
     showing: "Tasks {{from}}–{{to}}",
   },
   terminal: {
+    whichSubscription: "Whose account",
+    chooseSubscription: "Choose an account…",
+    subscriptionOnly: "Opens as {{account}} — the only tenant account on this server.",
+    subscriptionSuspended: "{{account}} — suspended",
+    subscriptionsFailed: "The tenant accounts could not be loaded, so there is nothing to choose from yet.",
+    noSubscriptions: "This server has no tenant accounts yet",
+    noSubscriptionsHint: "A tenant account and its Linux user are created with the first site. Add one and its shell appears here.",
+    noSubscriptionsLink: "Add a site",
     title: "Terminal",
     subtitle:
       "A real shell on this server, in the browser. It runs as a Linux account and can do everything that account can.",
@@ -224,6 +232,16 @@ export const en = {
     dockerNeeded:
       "These run in containers, so Docker has to be on this server first. It is in the Containers section below.",
     dockerNeededLink: "Install Docker",
+    portIncumbentTitle: "{{name}} is holding port {{port}}",
+    portIncumbent:
+      "{{name}} is running and has port {{port}}. {{wanted}} wants the same port, and installing it now would leave one of the two unable to start — so the panel will not pick which. Stop {{name}} first if {{wanted}} is meant to replace it.",
+    portIncumbentServing:
+      "{{name}} is what serves this machine's sites: stopping it takes every one of them offline until something else is installed and serving in its place.",
+    portIncumbentLink: "Go to {{name}}",
+    start: "Start",
+    stop: "Stop",
+    startAria: "Start the {{name}} {{version}} service",
+    stopAria: "Stop the {{name}} {{version}} service",
     hostIncumbentTitle: "This engine is already installed on the host",
     hostIncumbent:
       "{{name}} is installed as packages on this server and holds its port. A container cannot start beside it — remove the host install first, or keep using it.",
@@ -830,6 +848,9 @@ export const en = {
     extractHint:
       "Files land in the folder below; the server refuses archives that try to write outside it.",
     extractDest: "Extract into",
+    extractOwnFolder: "Into a new folder called {{name}}",
+    extractOwnFolderHint:
+      "Keeps an archive with no top-level folder of its own from scattering its files across this one.",
     taskStarted: "Started in the background — follow it in Tasks.",
     editorLoading: "Opening…",
     editorBinary: "This is a binary file, and the editor only opens text. Download it instead.",
@@ -1445,6 +1466,8 @@ export const en = {
         "Off on a fresh install, on purpose: a server behind an office NAT looks like one address, and an automatic ban could lock its own operator out. Put the addresses you administer from on the allowlist before turning this on.",
       noBackend:
         "There is no firewall on this host, so Sentinel would record bans it cannot enforce. Install a firewall backend first.",
+      inactiveBackend:
+        "Sentinel is on, but {{backend}} is installed and not running. It would go on reading logs and recording bans, and nothing would enforce them — every address it banned would still reach this server.",
       threshold: "Failures before a ban",
       thresholdHint:
         "That many failed SSH logins from one address inside the window earns a ban of the length below.",

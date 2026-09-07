@@ -84,6 +84,8 @@ pub const API_VERSION: &str = "1.0.0";
         super::stack::status,
         super::stack::install,
         super::stack::remove,
+        super::stack::start,
+        super::stack::stop,
         super::sites::list,
         super::sites::create,
         super::sites::update,
