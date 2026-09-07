@@ -64,6 +64,24 @@ pub fn panel_upstream() -> Upstream {
     upstream_from(Path::new(unihelm_core::config::paths::CONFIG))
 }
 
+/// The TCP port `unihelm-web` listens on, as its own configuration says.
+///
+/// Read from the config file rather than assumed, because an operator who moved
+/// the panel off 8088 is exactly the one a hard-coded 8088 would lock out. The
+/// default is used when the file cannot be read, which is the same port the
+/// panel would itself have bound to in that case.
+pub fn panel_listen_port() -> u16 {
+    let text = std::fs::read_to_string(unihelm_core::config::paths::CONFIG).ok();
+    let listen = text
+        .and_then(|t| UnihelmConfig::from_toml(&t).ok())
+        .map(|c| c.panel.listen)
+        .unwrap_or_else(|| UnihelmConfig::default().panel.listen);
+    listen
+        .parse::<std::net::SocketAddr>()
+        .map(|a| a.port())
+        .unwrap_or(8088)
+}
+
 fn upstream_from(path: &Path) -> Upstream {
     // Absent or unreadable, assume the defaults the panel itself would use.
     let default = UnihelmConfig::default();

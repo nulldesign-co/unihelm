@@ -398,7 +398,27 @@ async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result
     let leaving = from.unit()?.unit_name(family);
     let arriving = target.unit()?.unit_name(family);
 
-    svc.disable(&leaving, true).await?;
+    // An incumbent that is not installed is not an error.
+    //
+    // On a machine that never had nginx — Apache installed from the Stack page
+    // on a fresh server — the incumbent this operation is nominally moving away
+    // from does not exist, and `systemctl disable` on an unknown unit fails. It
+    // used to fail here, which meant the one operation that could correct the
+    // panel's idea of what serves the machine could not be run on the machine
+    // that needed it most.
+    let leaving_present = svc
+        .status(&leaving)
+        .await
+        .map(|s| s.enabled.is_some() || s.is_active())
+        .unwrap_or(false);
+    if leaving_present {
+        svc.disable(&leaving, true).await?;
+    } else {
+        ctx.log(format!(
+            "{} is not installed on this machine, so there is nothing to stop",
+            from.display_name()
+        ));
+    }
     if let Err(e) = svc.enable(&arriving, true).await {
         // The target would not start. Put the incumbent back — enabled as well
         // as running, which is what `enable(_, true)` does — because the
@@ -415,12 +435,15 @@ async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result
         // the result away with `.ok()`. If nginx also fails to come back, the
         // machine is serving nothing and the panel was telling the operator it
         // was fine, in the one moment they most needed the truth.
-        let restored = svc.enable(&leaving, true).await.is_ok()
-            && svc
-                .status(&leaving)
-                .await
-                .map(|s| s.is_active())
-                .unwrap_or(false);
+        // Nothing was taken down if the incumbent was never there, so there is
+        // nothing to put back and the machine is in the state it started in.
+        let restored = !leaving_present
+            || (svc.enable(&leaving, true).await.is_ok()
+                && svc
+                    .status(&leaving)
+                    .await
+                    .map(|s| s.is_active())
+                    .unwrap_or(false));
 
         if restored {
             return Err(UnihelmError::new(
@@ -455,6 +478,50 @@ async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result
     Ok(())
 }
 
+/// Which catalogued web server is actually running on this machine.
+///
+/// `None` when none of them is — a fresh server, or one whose web server is
+/// stopped. The caller treats that as nginx, which is what the installer puts
+/// there and what every machine this panel has ever provisioned runs.
+///
+/// Order is the catalogue's, and it decides ties. Two web servers cannot both
+/// hold port 80, so a machine with two *active* units is one where somebody
+/// started a second by hand and it failed to bind; the first is the one serving.
+/// That case is logged rather than guessed at silently.
+async fn probe_active(ctx: &OpContext) -> Option<WebServer> {
+    let svc = &ctx.distro().svc;
+    let mut running = Vec::new();
+    for server in [WebServer::Nginx, WebServer::Apache, WebServer::Litespeed] {
+        let Ok(unit) = server.unit() else { continue };
+        // A unit systemd has never heard of answers successfully with
+        // `not-found`, so this asks whether it is *active*, not whether the
+        // call succeeded — the distinction that made the first version of
+        // `refuse_when_the_target_is_not_installed` wrong.
+        if svc
+            .status(&unit.unit_name(ctx.distro().info.family))
+            .await
+            .map(|s| s.is_active())
+            .unwrap_or(false)
+        {
+            running.push(server);
+        }
+    }
+
+    if running.len() > 1 {
+        ctx.log(format!(
+            "more than one web server is running ({}); treating {} as the one serving, \
+             because they cannot both hold port 80",
+            running
+                .iter()
+                .map(|s| s.display_name())
+                .collect::<Vec<_>>()
+                .join(", "),
+            running[0].display_name()
+        ));
+    }
+    running.first().copied()
+}
+
 /// Which web server this machine serves sites with.
 ///
 /// Absent means nginx. Not a default anybody chose — it is the only one the
@@ -464,7 +531,31 @@ async fn exchange(ctx: &OpContext, from: WebServer, target: WebServer) -> Result
 pub async fn active(ctx: &OpContext) -> Result<WebServer> {
     match ctx.db().get_setting::<WebServer>(WEB_SERVER_SETTING).await {
         Ok(Some(server)) => Ok(server),
-        Ok(None) => Ok(WebServer::Nginx),
+        // No row. Ask the machine instead of assuming.
+        //
+        // This used to answer nginx flatly, and the row is written in exactly
+        // one place — the end of a successful switch. So a server where somebody
+        // installed Apache from the Stack page and never switched (there was
+        // nothing to switch *from*) had the panel convinced nginx was serving:
+        // the Stack page drew a Serving badge on an nginx that was not installed,
+        // offered to "switch to Apache" from the Apache already running, and
+        // `site.create` wrote nginx vhosts into a directory httpd never reads and
+        // reported success. On a machine that never had nginx the switch could
+        // not even be used to correct it, because it begins by disabling the
+        // incumbent — which was not there.
+        Ok(None) => {
+            let found = probe_active(ctx).await;
+            let answer = found.unwrap_or(WebServer::Nginx);
+            // Cached so the probe costs one systemctl call per machine rather
+            // than one per vhost render. A failure to write is not a failure to
+            // answer: the probe already told us the truth, and refusing to
+            // render a vhost because a cache write failed would be worse than
+            // paying for the probe again.
+            if let Err(e) = ctx.db().set_setting(WEB_SERVER_SETTING, &answer).await {
+                tracing::warn!(error = %e, "could not record the web server this machine runs");
+            }
+            Ok(answer)
+        }
         // Deliberately an error and not a fall back to nginx. A row that exists
         // and cannot be read is a machine that may be serving with Apache, and
         // guessing nginx there would write vhosts into a directory nothing is

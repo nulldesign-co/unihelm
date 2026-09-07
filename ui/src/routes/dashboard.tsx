@@ -234,7 +234,17 @@ export function DashboardPage() {
 interface Problem {
   id: string;
   label: string;
-  to: "/" | "/alerts" | "/firewall" | "/stack";
+  /**
+   * The page that can fix this, or `null` when no page can.
+   *
+   * `null` rather than `"/"`. The banner above this list says outright that
+   * "each one links to the page that can fix it", and every entry was drawn as
+   * a link with a chevron — so a problem pointing at `"/"` was a promise of
+   * navigation to somebody already standing on `/`, and clicking it did
+   * nothing at all. Two of the three did that: a full disk and the panel's own
+   * memory, neither of which has a page.
+   */
+  to: "/alerts" | "/firewall" | "/stack" | null;
 }
 
 /**
@@ -291,7 +301,9 @@ function collectProblems({
           mount: disk.mount,
           pct: formatPercent(pct, locale),
         }),
-        to: "/",
+        // Nowhere to send them: the panel has no disk page, and the fix is on
+        // the server rather than in here.
+        to: null,
       });
     }
   }
@@ -302,7 +314,7 @@ function collectProblems({
 
   const rss = overview.metrics?.panel.total_rss_bytes ?? null;
   if (rss !== null && rss > RSS_BUDGET_BYTES) {
-    problems.push({ id: "budget", label: t("dashboard.health.panelOverBudget"), to: "/" });
+    problems.push({ id: "budget", label: t("dashboard.health.panelOverBudget"), to: null });
   }
 
   return problems;
@@ -359,16 +371,25 @@ function HealthBanner({ problems }: { problems: Problem[] }) {
             <ul className="mt-3 flex flex-wrap gap-2">
               {problems.map((problem, index) => (
                 <li key={problem.id} className="animate-rise-in stagger" style={staggerStyle(index)}>
-                  <Link
-                    to={problem.to}
-                    className="group inline-flex items-center gap-1.5 rounded-full border border-warning/30 bg-surface/80 px-3 py-1 text-sm text-ink transition-[transform,box-shadow,border-color] duration-150 hover:-translate-y-px hover:border-warning hover:shadow-card-hover motion-reduce:hover:translate-y-0"
-                  >
-                    {problem.label}
-                    <ChevronRight
-                      className="h-3.5 w-3.5 text-ink-subtle transition-transform duration-150 group-hover:translate-x-0.5 motion-reduce:group-hover:translate-x-0"
-                      aria-hidden
-                    />
-                  </Link>
+                  {problem.to === null ? (
+                    // A statement, not a control. No chevron and no hover lift:
+                    // both of those say "this goes somewhere", and this does
+                    // not — which is the whole defect being fixed.
+                    <span className="inline-flex items-center rounded-full border border-warning/30 bg-surface/80 px-3 py-1 text-sm text-ink">
+                      {problem.label}
+                    </span>
+                  ) : (
+                    <Link
+                      to={problem.to}
+                      className="group inline-flex items-center gap-1.5 rounded-full border border-warning/30 bg-surface/80 px-3 py-1 text-sm text-ink transition-[transform,box-shadow,border-color] duration-150 hover:-translate-y-px hover:border-warning hover:shadow-card-hover motion-reduce:hover:translate-y-0"
+                    >
+                      {problem.label}
+                      <ChevronRight
+                        className="h-3.5 w-3.5 text-ink-subtle transition-transform duration-150 group-hover:translate-x-0.5 motion-reduce:group-hover:translate-x-0"
+                        aria-hidden
+                      />
+                    </Link>
+                  )}
                 </li>
               ))}
             </ul>

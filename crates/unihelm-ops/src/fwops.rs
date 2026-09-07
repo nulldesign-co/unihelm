@@ -862,6 +862,29 @@ impl TypedOperation for PortClose {
         let rule = port_rule(input.port, &input.proto, input.source.as_deref(), &comment)?;
         let fw = &ctx.distro().fw;
 
+        // The panel's own port is not closeable from the panel.
+        //
+        // Not a warning, because there is no version of this the operator wants:
+        // the request would succeed, the firewall would start dropping SYNs to
+        // the port, and the browser tab that sent it would keep working off its
+        // established connection until it was reloaded — so the mistake would
+        // not surface until the operator had already gone. The port is opened
+        // unconditionally when the firewall starts, and it stays open.
+        let panel_port = crate::panel::panel_listen_port();
+        if rule.port == panel_port && rule.proto == Proto::Tcp {
+            return Err(UnihelmError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "{panel_port}/tcp is the port this panel is served on. Closing it would \
+                     lock you out of the panel — and not visibly, because the browser tab \
+                     you sent this from would keep working off its existing connection \
+                     until you reloaded it. To move the panel elsewhere, change \
+                     `panel.listen` in the configuration first; this port follows it."
+                ),
+            )
+            .with_field("port"));
+        }
+
         fw.close_port(&rule).await.map_err(UnihelmError::from)?;
 
         ctx.db()
@@ -1623,6 +1646,56 @@ async fn ensure_ssh_reachable(
     Ok(unprotected)
 }
 
+/// Keep the panel's own port open across the start of a default-deny firewall.
+///
+/// The companion to [`ensure_ssh_reachable`], and it exists because that
+/// function on its own was not enough: `fw.enable` opened SSH, started ufw, and
+/// left the panel's own listener behind a deny-by-default policy. The browser
+/// tab that pressed the button went on working — netfilter keeps ESTABLISHED
+/// connections — so the operation looked like it had succeeded, and the lockout
+/// only appeared on the next page load, from another device, or after the
+/// browser was closed. On a real server this showed up as
+/// `[UFW BLOCK] ... DPT=8088 SYN` in `dmesg`.
+///
+/// It is **not** gated behind `allow_ssh` or any other flag. Turning a firewall
+/// on is a deliberate act; locking yourself out of the thing you turned it on
+/// from is not something to offer as a choice. SSH is a separate question
+/// because a host may legitimately have no sshd, and because closing SSH is
+/// something an operator may actually want.
+async fn ensure_panel_reachable(
+    ctx: &OpContext,
+    lifecycle: &Lifecycle,
+    view: &AdmittingView,
+) -> Result<Option<u16>> {
+    let port = crate::panel::panel_listen_port();
+
+    // Already reachable — by an explicit rule, or because something in this
+    // ruleset already admits it. Nothing to do, and nothing to say.
+    if !unprotected_ssh_ports(&view.rules, &[port], None).contains(&port) {
+        return Ok(None);
+    }
+
+    let rule = PortRule::anywhere(port, Proto::Tcp, PANEL_RULE_COMMENT);
+    // Backend first, record second — the ordering `fw.port.open` uses, so a
+    // record cannot outlive a failed apply and show as drift forever.
+    open_before_start(ctx, lifecycle, &rule).await?;
+    ctx.db()
+        .record_fw_rule(rule.port, rule.proto.as_str(), None, &rule.comment)
+        .await
+        .map_err(UnihelmError::from)?;
+    ctx.log(format!(
+        "opened {port}/tcp for this panel before starting the firewall — without it the \
+         firewall would have shut the door it was switched on through"
+    ));
+    Ok(Some(port))
+}
+
+/// The comment that marks the panel's own port rule.
+///
+/// Its own string so `fw.port.close` can recognise it and refuse: a rule an
+/// operator can delete is a lockout with an extra step.
+pub const PANEL_RULE_COMMENT: &str = "unihelm panel";
+
 /// ufw's own switch.
 ///
 /// `--force` on the way in because a bare `ufw enable` asks "Command may
@@ -1744,8 +1817,12 @@ impl TypedOperation for Enable {
         // firewalld to look at it replaces whatever is in netfilter, and
         // stopping it again does not put a hand-written ruleset back.
         let view = admitting_view(&lifecycle).await?;
-        let opened =
+        let mut opened =
             ensure_ssh_reachable(ctx, &lifecycle, &view, &ssh, client_ip, input.allow_ssh).await?;
+        // And the panel's own port, unconditionally. See the function.
+        if let Some(port) = ensure_panel_reachable(ctx, &lifecycle, &view).await? {
+            opened.push(port);
+        }
         match lifecycle {
             Lifecycle::Ufw => ufw_switch(true).await?,
             _ => firewalld_switch(ctx, true).await?,
@@ -3268,6 +3345,49 @@ ufw allow 53\n";
         let rules = parse_ufw_added("ufw allow 22/tcp\n");
         assert_eq!(unprotected_ssh_ports(&rules, &[22, 2222], None), vec![2222]);
         assert!(unprotected_ssh_ports(&rules, &[22], None).is_empty());
+    }
+
+    #[test]
+    fn the_panels_own_port_is_treated_as_unprotected_until_a_rule_admits_it() {
+        // The bug this pins locked an operator out of their own panel on a live
+        // server: `fw.enable` opened SSH, started ufw, and left the panel's
+        // listener behind a deny-by-default policy. It looked like it had
+        // worked, because netfilter keeps ESTABLISHED connections and the tab
+        // that pressed the button went on running. `dmesg` on that server:
+        // `[UFW BLOCK] ... DPT=8088 SYN`.
+        let port = crate::panel::panel_listen_port();
+        assert_eq!(port, 8088, "the default the installer ships");
+
+        let none = parse_ufw_added("ufw allow 22/tcp\n");
+        assert_eq!(unprotected_ssh_ports(&none, &[port], None), vec![port]);
+
+        // And a rule that admits it means there is nothing to do.
+        let opened = parse_ufw_added("ufw allow 22/tcp\nufw allow 8088/tcp\n");
+        assert!(unprotected_ssh_ports(&opened, &[port], None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_the_panels_own_port_is_refused() {
+        // Succeeding here would drop every new connection to the panel while
+        // the tab that sent the request kept working off its established one —
+        // so the operator would not find out until after they had gone.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let err = PortClose
+            .run(
+                &ctx,
+                PortInput {
+                    port: crate::panel::panel_listen_port(),
+                    proto: "tcp".into(),
+                    source: None,
+                    comment: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("lock you out"), "{}", err.detail);
+        assert!(err.detail.contains("panel.listen"), "{}", err.detail);
     }
 
     #[test]

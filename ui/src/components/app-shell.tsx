@@ -377,20 +377,30 @@ function SidebarContent({
 
       <nav
         ref={navRef}
-        className="relative min-h-0 flex-1 space-y-4 overflow-y-auto px-3 pt-1 pb-3"
+        className="relative min-h-0 flex-1 overflow-y-auto px-3 pt-1 pb-3"
         aria-label={t("nav.menu")}
       >
         {pill ? (
           <span
             aria-hidden
             className={cn(
-              "pointer-events-none absolute inset-x-3 z-0 rounded-lg bg-accent-soft",
+              // `top-0` is load-bearing. Without it the pill keeps `top: auto`,
+              // which resolves to its *static* position — after this nav's
+              // `pt-1` — while `pill.top` is an `offsetTop` measured from the
+              // padding box. The two origins differ by exactly those 4px, so
+              // the highlight sat 4px below the icon and label it belongs to.
+              "pointer-events-none absolute inset-x-3 top-0 z-0 rounded-lg bg-accent-soft",
               settled && "transition-transform duration-300 ease-out-quint motion-reduce:transition-none",
             )}
             style={{ height: pill.height, transform: `translateY(${pill.top}px)` }}
           />
         ) : null}
 
+        {/* The groups get their own wrapper so `space-y-4` applies between
+            *them*. On the nav it also counted the pill as a sibling, which put
+            a 16px margin above the first group whenever the pill was rendered
+            and took it away again when it was not. */}
+        <div className="space-y-4">
         {groups.map((group, index) => (
           <div key={group.label ?? index}>
             {group.label ? (
@@ -430,6 +440,7 @@ function SidebarContent({
             </ul>
           </div>
         ))}
+        </div>
       </nav>
 
       {/* Who you are and the three things you do without leaving the page, on
