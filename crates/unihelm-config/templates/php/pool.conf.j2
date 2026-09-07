@@ -121,5 +121,17 @@ env[{{ entry.key }}] = {{ entry.value }}
 
 {% if pool.extra_ini %}
 ; --- per-site overrides, from the panel ------------------------------------
+; Only the settings `check_php_overrides` (unihelm-ops, site.rs) allows reach
+; this line: sizes, times and error display. It has to be an allowlist because
+; this is the end of the pool and FPM lets the last assignment win, so anything
+; rendered here outranks the isolation section above.
 {{ pool.extra_ini }}
+
+; And the boundary is restated afterwards so that ordering is never what decides
+; it. A row stored before that allowlist existed still renders verbatim above,
+; and `php_admin_value[disable_functions] =` in such a row would otherwise leave
+; the site with no basedir and every exec function back — two lines is a cheap
+; price for that not being possible.
+php_admin_value[open_basedir] = {{ pool.open_basedir }}
+php_admin_value[disable_functions] = {{ pool.disable_functions }}
 {% endif %}

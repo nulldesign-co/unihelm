@@ -552,7 +552,7 @@ function SearchResults({
 
   return (
     <Card>
-      <CardBody className="pt-3">
+      <CardBody className="first:pt-3">
         <p className="tnum mb-2 text-xs text-ink-muted">
           {t("files.searchResults", { count: entries.length })}
           {results.data?.truncated ? ` ${t("files.searchTruncated")}` : ""}

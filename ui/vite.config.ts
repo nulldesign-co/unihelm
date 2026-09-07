@@ -25,7 +25,11 @@ export default defineConfig({
       // this context and the terminal's WebSocket is dropped — the page works
       // in a build and only fails under `npm run dev`, which is the worst
       // shape a bug can have.
-      "/api": { target: "http://127.0.0.1:8088", changeOrigin: true, ws: true },
+      // No `changeOrigin`: it rewrites Host to 127.0.0.1:8088 while the browser's
+      // Origin stays localhost:5173, and the terminal's websocket upgrade refuses
+      // a handshake whose Origin and Host disagree. Forwarding the browser's own
+      // Host keeps the two in step.
+      "/api": { target: "http://127.0.0.1:8088", ws: true },
       "/healthz": { target: "http://127.0.0.1:8088", changeOrigin: true },
     },
   },

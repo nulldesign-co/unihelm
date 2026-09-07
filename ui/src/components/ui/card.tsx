@@ -52,6 +52,24 @@ export function CardHeader({
   );
 }
 
+/**
+ * The card's content well.
+ *
+ * The top inset is positional — `first:pt-5`, not a bare `pt-5` — because the
+ * two shapes a body appears in want opposite things. After a `CardHeader` the
+ * header's own `pb-3` is the gap, and a second inset on top of it opens a
+ * gutter. As a card's *first* child there is nothing above it at all, and for
+ * a long time this had no top padding for that case: the seven headerless
+ * cards in the panel each pressed their first element against the card border,
+ * most visibly the terminal's start panel, where a Callout sat wedged into the
+ * corner. `first:` gets both cases from one rule instead of asking every call
+ * site to remember which shape it is.
+ *
+ * A call site that wants a different first-child inset must say so with the
+ * same variant (`first:pt-3`). A bare `pt-3` will not win: it is one class
+ * against a class-plus-pseudo-class, and tailwind-merge leaves both in place
+ * because they carry different modifiers.
+ */
 export function CardBody({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={cn("px-5 pb-5", className)} {...props} />;
+  return <div className={cn("px-5 pb-5 first:pt-5", className)} {...props} />;
 }

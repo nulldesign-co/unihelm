@@ -942,6 +942,11 @@ impl TypedOperation for Update {
         if let Some(snippet) = input.custom_nginx_snippet.as_ref().and_then(|s| s.as_ref()) {
             check_snippet(snippet)?;
         }
+        // The role gate above says who may write this box; it never said what
+        // may be in it, and the pool renders it after the isolation lines.
+        if let Some(overrides) = input.php_ini_overrides.as_ref().and_then(|s| s.as_ref()) {
+            check_php_overrides(overrides)?;
+        }
         if let Some(size) = input.client_max_body_size.as_ref() {
             check_body_size(size)?;
         }
@@ -1138,6 +1143,162 @@ fn check_snippet(snippet: &str) -> Result<()> {
             UnihelmError::new(ErrorCode::InvalidInput, "the snippet leaves a block open")
                 .with_field("custom_nginx_snippet"),
         );
+    }
+    Ok(())
+}
+
+/// Settings a site may reasonably need to differ from the pool default: sizes,
+/// times, and how errors are shown. Everything absent from this list is refused
+/// by name — including every `php_admin_value` line `pool.conf` writes for a
+/// security reason, which is the point of having a list at all.
+const ALLOWED_PHP_SETTINGS: &[&str] = &[
+    "date.timezone",
+    "default_charset",
+    "default_socket_timeout",
+    "display_errors",
+    "error_reporting",
+    "max_execution_time",
+    "max_file_uploads",
+    "max_input_nesting_level",
+    "max_input_time",
+    "max_input_vars",
+    "memory_limit",
+    "output_buffering",
+    "post_max_size",
+    "session.cookie_httponly",
+    "session.cookie_samesite",
+    "session.cookie_secure",
+    "session.gc_maxlifetime",
+    "upload_max_filesize",
+    "zlib.output_compression",
+];
+
+/// The per-site PHP overrides, restricted to settings that are per-site.
+///
+/// There was a guard here, but it was a guard on *who*: `site.update` refuses
+/// this field from anyone who is not an admin, so the tenant escape the field
+/// invites was already closed. Nothing looked at the text itself, and the text
+/// is dropped at the end of the FPM pool where the last assignment of a setting
+/// wins — so `php_admin_value[disable_functions] =` typed by an admin into a
+/// box labelled "php.ini overrides" unset `open_basedir` and `disable_functions`
+/// for that site, and the panel reported the pool as ready. A pasted php.ini
+/// from a forum thread does that as easily as an attack does; the operator was
+/// never told which line cost them the isolation.
+///
+/// Hence an allowlist and a refusal that names the offending line. Values are
+/// not parsed beyond being non-empty: a value cannot contain a newline (see the
+/// carriage-return check below), so it cannot become a second directive, and
+/// what `memory_limit = wrong` means is FPM's question to answer at validation
+/// time, not ours to guess.
+fn check_php_overrides(overrides: &str) -> Result<()> {
+    const MAX: usize = 4 * 1024;
+    const MAX_VALUE: usize = 256;
+
+    let refuse = |detail: String| {
+        Err(UnihelmError::new(ErrorCode::InvalidInput, detail).with_field("php_ini_overrides"))
+    };
+    let syntax = |line_no: usize, line: &str| {
+        format!(
+            "line {line_no} of the PHP overrides is not a pool directive: `{line}`. This is an \
+             FPM pool, not a php.ini, so each line must be `php_value[name] = value`, \
+             `php_admin_value[name] = value` or `php_admin_flag[name] = on|off` — \
+             `php_value[memory_limit] = 256M`, not `memory_limit = 256M`."
+        )
+    };
+
+    if overrides.len() > MAX {
+        return refuse(format!(
+            "the PHP overrides are {} bytes and the limit is {MAX}: this box is for a few \
+             per-site settings, not a whole php.ini",
+            overrides.len()
+        ));
+    }
+    if overrides.contains('\0') {
+        return refuse("the PHP overrides contain a NUL byte".into());
+    }
+    // A lone CR ends a line for PHP's ini scanner but not for `str::lines()`,
+    // so a carriage return in the middle of a line would be a directive
+    // separator this function cannot see. Refuse it rather than guess where the
+    // lines are.
+    if overrides.contains('\r') {
+        return refuse(
+            "the PHP overrides contain a carriage return; save them with plain newlines".into(),
+        );
+    }
+    if let Some(c) = overrides
+        .chars()
+        .find(|c| c.is_control() && *c != '\n' && *c != '\t')
+    {
+        return refuse(format!(
+            "the PHP overrides contain a control character (U+{:04X})",
+            c as u32
+        ));
+    }
+
+    for (n, raw) in overrides.lines().enumerate() {
+        let line_no = n + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+
+        let Some((head, value)) = line.split_once('=') else {
+            return refuse(syntax(line_no, line));
+        };
+        let Some((directive, key)) = head.trim().split_once('[') else {
+            return refuse(syntax(line_no, line));
+        };
+        let Some(key) = key.trim_end().strip_suffix(']') else {
+            return refuse(syntax(line_no, line));
+        };
+        let key = key.trim();
+
+        // `php_flag` is missing on purpose: `php_admin_flag` says the same
+        // thing and cannot be undone by ini_set() from inside the site's own
+        // code, which is what an operator setting a flag from the panel means.
+        if !matches!(
+            directive,
+            "php_value" | "php_admin_value" | "php_admin_flag"
+        ) {
+            return refuse(format!(
+                "line {line_no} of the PHP overrides uses `{directive}[…]`, which the panel does \
+                 not accept. Use `php_value[name]`, `php_admin_value[name]` or \
+                 `php_admin_flag[name]`."
+            ));
+        }
+
+        let named = key.to_ascii_lowercase();
+        if matches!(named.as_str(), "open_basedir" | "disable_functions") {
+            return refuse(format!(
+                "line {line_no} of the PHP overrides sets `{key}`, which cannot be set from here. \
+                 open_basedir and disable_functions are what separates one customer from another \
+                 on this server: the first confines a site to its own directory, the second keeps \
+                 it from running programs, and the panel sets both per pool from the site's own \
+                 paths."
+            ));
+        }
+        if !ALLOWED_PHP_SETTINGS.contains(&named.as_str()) {
+            return refuse(format!(
+                "line {line_no} of the PHP overrides sets `{key}`, which is not a per-site \
+                 setting. The panel accepts: {}.",
+                ALLOWED_PHP_SETTINGS.join(", ")
+            ));
+        }
+
+        let value = value.trim();
+        if value.is_empty() {
+            return refuse(format!(
+                "line {line_no} of the PHP overrides sets `{key}` to nothing. Give it a value, or \
+                 delete the line to keep the pool's default."
+            ));
+        }
+        if value.len() > MAX_VALUE {
+            return refuse(format!(
+                "line {line_no} of the PHP overrides gives `{key}` a value of {} bytes; the limit \
+                 is {MAX_VALUE}",
+                value.len()
+            ));
+        }
     }
     Ok(())
 }
@@ -1448,6 +1609,156 @@ mod tests {
         assert!(check_snippet("ok\0bad").is_err());
     }
 
+    /// The settings sites are actually given this box for must keep working, or
+    /// the allowlist is a regression dressed as a fix.
+    #[test]
+    fn php_overrides_accept_the_settings_that_are_a_sites_own_business() {
+        assert!(check_php_overrides("").is_ok());
+        assert!(check_php_overrides("php_value[memory_limit] = 512M").is_ok());
+        assert!(
+            check_php_overrides(
+                "; the media library needs a bigger upload\n\
+                 php_value[upload_max_filesize] = 256M\n\
+                 php_value[post_max_size] = 256M\n\
+                 \n\
+                 php_admin_value[max_execution_time] = 300\n\
+                 php_admin_flag[display_errors] = off\n\
+                 php_value[date.timezone] = Europe/Berlin\n\
+                 php_value[error_reporting] = E_ALL & ~E_DEPRECATED\n"
+            )
+            .is_ok()
+        );
+    }
+
+    /// This is the whole reason the box is checked at all: the overrides render
+    /// at the end of the FPM pool, where the last assignment wins, so a line
+    /// like these used to unset the isolation for that site and report success.
+    #[test]
+    fn a_php_override_that_unsets_the_isolation_is_refused_by_name() {
+        for (overrides, named) in [
+            ("php_admin_value[disable_functions] =", "disable_functions"),
+            ("php_admin_value[open_basedir] = /", "open_basedir"),
+            (
+                "php_value[memory_limit] = 512M\nphp_admin_value[DISABLE_FUNCTIONS] = ",
+                "DISABLE_FUNCTIONS",
+            ),
+        ] {
+            let err = check_php_overrides(overrides).expect_err("accepted an escape");
+            assert_eq!(err.code, ErrorCode::InvalidInput);
+            assert_eq!(err.field.as_deref(), Some("php_ini_overrides"));
+            assert!(
+                err.detail.contains(named),
+                "the message must name the line's setting: {}",
+                err.detail
+            );
+            assert!(
+                err.detail.contains("separates one customer from another"),
+                "the message must say what the setting is for: {}",
+                err.detail
+            );
+        }
+    }
+
+    /// Everything the pool sets as a boundary, and everything nobody asked for,
+    /// is refused by name rather than rewritten or dropped.
+    #[test]
+    fn a_php_override_outside_the_allowlist_is_refused_and_says_what_is_allowed() {
+        for setting in [
+            "session.save_path",
+            "sendmail_path",
+            "opcache.file_cache",
+            "allow_url_include",
+            "extension",
+            "auto_prepend_file",
+        ] {
+            let err = check_php_overrides(&format!("php_admin_value[{setting}] = x"))
+                .expect_err("accepted a setting that is not per-site");
+            assert!(err.detail.contains(setting), "{}", err.detail);
+            assert!(err.detail.contains("memory_limit"), "{}", err.detail);
+        }
+        // `php_flag` and a bare word are not pool directives either.
+        assert!(check_php_overrides("php_flag[display_errors] = on").is_err());
+        assert!(check_php_overrides("open_basedir[x] = /").is_err());
+    }
+
+    /// Operators paste php.ini, because the field is called "php.ini
+    /// overrides". Say which line, and what the pool syntax is.
+    #[test]
+    fn a_php_override_written_as_php_ini_is_refused_with_the_pool_syntax() {
+        for overrides in [
+            "memory_limit = 256M",
+            "php_value[memory_limit] = 512M\nmemory_limit = 256M",
+            "php_value[memory_limit 512M",
+            "php_value[memory_limit] 512M",
+        ] {
+            let err = check_php_overrides(overrides).expect_err("accepted a non-directive");
+            assert_eq!(err.field.as_deref(), Some("php_ini_overrides"));
+            assert!(
+                err.detail.contains("php_value[memory_limit] = 256M"),
+                "the message must show the shape it wants: {}",
+                err.detail
+            );
+        }
+    }
+
+    /// A carriage return is the interesting one: PHP's ini scanner ends a line
+    /// on a lone CR and `str::lines()` does not, so a CR in the middle of an
+    /// accepted line would smuggle a second directive past the line loop.
+    #[test]
+    fn php_overrides_are_bounded_and_free_of_nul_and_carriage_returns() {
+        assert!(check_php_overrides(&"a".repeat(5_000)).is_err());
+        assert!(check_php_overrides("php_value[memory_limit] = 256M\0").is_err());
+        assert!(
+            check_php_overrides(
+                "php_value[memory_limit] = 256M\rphp_admin_value[open_basedir] = /"
+            )
+            .is_err()
+        );
+        assert!(check_php_overrides("php_value[memory_limit] = 256M\x1b[2J").is_err());
+        assert!(check_php_overrides("php_value[memory_limit] =").is_err());
+    }
+
+    /// Defence in depth for rows written before the allowlist existed: they
+    /// still render verbatim, so the pool assigns the boundary again below them
+    /// and ordering stops being what decides it.
+    #[test]
+    fn the_pool_restates_the_isolation_after_the_per_site_overrides() {
+        use unihelm_config::TemplateSet;
+
+        let mut pool = PoolContext::new("example.com", "uh_abc123", PhpVersion::V83, 1024, "nginx");
+        pool.extra_ini =
+            Some("php_admin_value[disable_functions] =\nphp_admin_value[open_basedir] = /".into());
+
+        let rendered = TemplateSet::load()
+            .expect("the templates load")
+            .render("php/pool.conf", &serde_json::json!({ "pool": &pool }))
+            .expect("the pool renders");
+
+        let last_assignment = |setting: &str| {
+            let prefix = format!("php_admin_value[{setting}]");
+            rendered
+                .lines()
+                .map(str::trim)
+                .rfind(|line| line.starts_with(&prefix))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        assert_eq!(
+            last_assignment("open_basedir"),
+            format!("php_admin_value[open_basedir] = {}", pool.open_basedir),
+            "the overrides won the pool: {rendered}"
+        );
+        assert_eq!(
+            last_assignment("disable_functions"),
+            format!(
+                "php_admin_value[disable_functions] = {}",
+                pool.disable_functions
+            ),
+            "the overrides won the pool: {rendered}"
+        );
+    }
+
     #[test]
     fn the_api_site_type_maps_onto_storage() {
         for (input, expected) in [
@@ -1632,6 +1943,55 @@ mod update_tests {
                 .www_policy,
             WwwPolicy::None,
             "a setting the panel cannot honour must not be stored either"
+        );
+    }
+
+    /// Being an admin is permission to tune a site, not permission to take the
+    /// isolation off one. The row must not be written either: it is rendered
+    /// verbatim by every later pool render, long after whoever typed it has
+    /// forgotten they did.
+    #[tokio::test]
+    async fn php_overrides_that_disable_the_isolation_are_refused_even_for_an_admin() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let sub = db.create_subscription(customer).await.unwrap();
+        let site = db
+            .create_site(NewSite {
+                subscription_id: sub.id,
+                domain: Domain::parse("example.com").unwrap(),
+                site_type: SiteType::Static,
+                php_version: None,
+                root_dir: format!("/home/{}/sites/example.com/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+
+        let err = reg
+            .dispatch(
+                "site.update",
+                &auth_for(admin, Role::Admin),
+                json!({
+                    "site_id": site.id.get(),
+                    "php_ini_overrides": "php_admin_value[disable_functions] =",
+                }),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("php_ini_overrides"));
+        assert!(err.detail.contains("disable_functions"), "{}", err.detail);
+        assert_eq!(
+            db.sites(&TenantScope::Global)
+                .by_id(site.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .php_ini_overrides,
+            None
         );
     }
 }

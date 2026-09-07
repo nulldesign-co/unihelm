@@ -205,6 +205,24 @@ server {
         add_header Cache-Control "public, immutable";
         access_log off;
         try_files $uri =404;
+
+        # Repeated on purpose. This is not duplication to tidy away: nginx's
+        # `add_header` list does not merge, so a location carrying even one
+        # header of its own inherits *none* from the server block. The
+        # Cache-Control line above is that one header, and it cost this location
+        # every security header — every css, js, image, font and video went out
+        # with no X-Content-Type-Options, no X-Frame-Options, no Referrer-Policy
+        # and no HSTS. That is most of the bytes on most sites, and it is
+        # invisible from the outside: the HTML is served by another location and
+        # still carried them all, so a spot check of the page passed.
+{% for header in site.security_headers %}
+        add_header {{ header }} always;
+{% endfor %}
+{% if site.http3 and site.tls_enabled %}
+        # Same inheritance rule, same consequence: without this line a client
+        # that fetched an asset first would never learn HTTP/3 is available.
+        add_header Alt-Svc 'h3=":443"; ma=86400' always;
+{% endif %}
     }
 {% endif %}
 

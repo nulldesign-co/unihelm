@@ -516,7 +516,7 @@ function InventorySkeleton() {
         {/* The same `min-w` as the real table. Without it the ghost lays its
             columns out at one width and the rows arrive at another, which is
             the horizontal version of the jump this component exists to stop. */}
-        <Table className="min-w-[780px]">
+        <Table className="min-w-[1080px]">
           <ContainerHead />
           <tbody>
             {Array.from({ length: 3 }, (_, i) => (
@@ -604,14 +604,24 @@ function InventorySkeleton() {
 // Containers
 // ---------------------------------------------------------------------------
 
-/** Named once so the ghost above can borrow the real header rather than guess. */
+/**
+ * Named once so the ghost above can borrow the real header rather than guess.
+ *
+ * Every column is given a width, including the two that carry the longest
+ * strings. Until 0.7.2 Container and Image were the only unsized columns while
+ * the first body cell asked for `w-full`, so the name column took everything
+ * left over and Image was squeezed to whatever remained — with `break-all` on
+ * the cell, that was a repository name broken mid-token down a column a few
+ * characters wide. Sizing both, and letting the card scroll rather than the
+ * columns collapse, is what keeps `ghcr.io/owner/app:v1` readable as a name.
+ */
 function ContainerHead() {
   const { t } = useTranslation();
   return (
     <thead>
       <tr>
-        <Th>{t("docker.container")}</Th>
-        <Th>{t("docker.image")}</Th>
+        <Th className="w-56">{t("docker.container")}</Th>
+        <Th className="w-64">{t("docker.image")}</Th>
         <Th className="w-48">{t("docker.status")}</Th>
         <Th className="w-56">{t("docker.ports")}</Th>
         <Th className="w-44 text-end">{t("docker.actions")}</Th>
@@ -658,19 +668,33 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
           className="py-10"
         />
       ) : (
-        <Table className="min-w-[780px]">
+        {/* Wider than the five column widths above add up to (1072px), so they
+            can all be honoured; below this the card scrolls sideways, which is
+            the whole point of `Table`'s `overflow-x-auto`. The old 780px was
+            narrower than the columns needed, so rather than scrolling, the
+            table squeezed them — and a `min-w` under that sum brings the same
+            failure back quietly, because auto layout answers a shortfall by
+            shrinking columns, not by scrolling. Raise this if a column grows. */}
+        <Table className="min-w-[1080px]">
           <ContainerHead />
           <tbody>
             {containers.map((row, index) => (
               <Tr key={row.id} className="animate-rise-in stagger" style={staggerStyle(index)}>
-                <Td className="w-full">
+                <Td>
                   <p className="font-mono text-xs break-all text-ink">{row.name}</p>
                   {/* The id, because it is what an operator types into
                       `docker logs` — and the only thing that stays put when
                       two containers share a name across a recreate. */}
                   <p className="tnum mt-0.5 font-mono text-xs text-ink-subtle">{row.id}</p>
                 </Td>
-                <Td className="font-mono text-xs break-all text-ink-muted">{row.image}</Td>
+                {/* `break-words`, not `break-all`: an image name is one token
+                    with meaning at every boundary — registry, owner, repo,
+                    tag — and cutting it mid-token to fit is how a reader loses
+                    which of two `app:v1` tags they are looking at. Under
+                    `break-words` the name sets its own minimum width and the
+                    card scrolls to it; under `break-all` it silently shrank to
+                    whatever was left over. */}
+                <Td className="font-mono text-xs break-words text-ink-muted">{row.image}</Td>
                 <Td>
                   <div className="flex flex-col items-start gap-1">
                     <Badge tone={row.running ? "success" : "neutral"} dot>
@@ -682,7 +706,13 @@ function ContainerSection({ containers }: { containers: DockerContainer[] }) {
                     <span className="text-xs text-ink-muted">{row.status}</span>
                   </div>
                 </Td>
-                <Td className="font-mono text-xs break-all text-ink-muted">
+                {/* One line, whatever it costs the card's width. A mapping is
+                    read as a unit — `0.0.0.0:8080->80/tcp` says host, port,
+                    direction, target and protocol in one breath — and wrapping
+                    it puts the arrow on one line and its target on the next,
+                    which is how "published on every interface" gets misread as
+                    "published on localhost". */}
+                <Td className="font-mono text-xs whitespace-nowrap text-ink-muted">
                   {row.ports.trim() === "" ? (
                     <span className="text-ink-subtle">{t("docker.noPorts")}</span>
                   ) : (

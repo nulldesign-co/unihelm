@@ -403,8 +403,31 @@ export const en = {
     createConfirm: "Create and start",
     createFailed: "The container was not created",
     actions: "Actions",
+    // Until 0.7.2 the page asked for these eight and the block carried none of
+    // them, so i18next fell back to the key: a stopped container's only button
+    // read `docker.start`, the ⋯ listed `docker.logs` and `docker.remove`, and
+    // a failed action reported the string `docker.actionFailed` instead of what
+    // Docker had said. Every key the page names is resolved here by
+    // `coverage.test.ts`, which now scans this page too.
     stop: "Stop",
+    start: "Start",
+    restart: "Restart",
+    remove: "Remove",
+    logs: "Logs",
     actionsFor: "Actions for {{name}}",
+    // The container is named because one error line sits above a whole table,
+    // and the message is quoted rather than rewritten: "You cannot remove a
+    // running container" carries its own remedy, and a paraphrase would be a
+    // second source of truth about a machine this page cannot see. Attributed
+    // to the server, not to Docker — a 403 or an unreachable agent lands here
+    // too, and neither of those is Docker speaking.
+    actionFailed: "That did not work on {{name}}. The server said: {{message}}",
+    logsTitle: "{{name}} logs",
+    logsHint: "The last {{lines}} lines this container wrote. Both output streams, merged into the order they were written.",
+    // Not "this container has written nothing": its output may be going to a
+    // logging driver Docker does not keep a tail for, which is what the hint
+    // below covers. Empty is a fact about the log, not about the container.
+    logsEmpty: "Nothing in this container's log",
     logsEmptyHint: "A container started moments ago, or one whose logging driver sends its output somewhere else, both look like this.",
     noRun: "Unihelm creates, starts, stops, restarts and removes containers here. What it will not take is a raw flag list: `--privileged`, `-v /:/host` or the Docker socket each make a container root on this machine, so the form below asks for an image, a name, ports, environment and named volumes instead. Anything past that is still `docker run` over SSH, on purpose.",
     noRunTitle: "What this page will and will not do",

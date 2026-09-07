@@ -918,6 +918,110 @@ mod tests {
         );
     }
 
+    /// Every `location` block in a rendered vhost, as (its opening line, its
+    /// body).
+    ///
+    /// No location in this template contains a nested block, so a `}` alone on
+    /// its own line closes the one that was opened.
+    fn location_blocks(rendered: &str) -> Vec<(String, String)> {
+        let mut blocks = Vec::new();
+        let mut lines = rendered.lines();
+        while let Some(line) = lines.next() {
+            if !line.trim_start().starts_with("location ") {
+                continue;
+            }
+            let mut body = String::new();
+            for inner in lines.by_ref() {
+                if inner.trim() == "}" {
+                    break;
+                }
+                body.push_str(inner);
+                body.push('\n');
+            }
+            blocks.push((line.trim().to_string(), body));
+        }
+        blocks
+    }
+
+    /// nginx's `add_header` list does not merge: a location carrying one header
+    /// of its own inherits none from the server block.
+    ///
+    /// The asset location carries `Cache-Control`, so every css, js, image,
+    /// font and video went out with no X-Content-Type-Options, no
+    /// X-Frame-Options, no Referrer-Policy and no HSTS — most of the bytes on
+    /// most sites. Nothing showed it: the HTML comes from a different location
+    /// and still carried all four, so a spot check of the page passed.
+    #[test]
+    fn the_asset_location_repeats_the_security_headers_it_would_otherwise_lose() {
+        let mut ctx = php_site().with_tls(&paths::cert_dir("example.com"), true);
+        ctx.http3 = true;
+        let rendered = render_site(&ctx);
+
+        let (_, asset) = location_blocks(&rendered)
+            .into_iter()
+            .find(|(head, _)| head.contains("jpg|jpeg"))
+            .unwrap_or_else(|| panic!("no static asset location:\n{rendered}"));
+        let asset = directives_only(&asset);
+
+        assert!(
+            ctx.security_headers
+                .iter()
+                .any(|h| h.starts_with("Strict-Transport-Security")),
+            "a TLS site is meant to carry HSTS, so this test would prove nothing without it"
+        );
+        for header in &ctx.security_headers {
+            assert!(
+                asset.contains(&format!("add_header {header} always;")),
+                "assets are served with no `{header}`:\n{asset}"
+            );
+        }
+        assert!(
+            asset.contains(r#"add_header Alt-Svc 'h3=":443"; ma=86400' always;"#),
+            "a client whose first request is an asset never learns HTTP/3 exists:\n{asset}"
+        );
+        // And the header this location was already setting is still set.
+        assert!(
+            asset.contains(r#"add_header Cache-Control "public, immutable";"#),
+            "{asset}"
+        );
+    }
+
+    /// The same trap, across every shape of site, so the next location to grow
+    /// an `add_header` of its own cannot drop the security headers in silence.
+    #[test]
+    fn no_location_sets_a_header_of_its_own_and_loses_the_security_headers() {
+        for site_type in [
+            SiteType::Php,
+            SiteType::Static,
+            SiteType::Proxy,
+            SiteType::Redirect,
+        ] {
+            for maintenance in [false, true] {
+                let mut ctx = php_site().with_tls(&paths::cert_dir("example.com"), true);
+                ctx.site_type = site_type.as_str();
+                ctx.redirect_target = "https://new.example.com".into();
+                ctx.maintenance_mode = maintenance;
+                ctx.http3 = true;
+                let rendered = render_site(&ctx);
+
+                for (head, body) in location_blocks(&rendered) {
+                    let body = directives_only(&body);
+                    if !body.contains("add_header") {
+                        continue;
+                    }
+                    for header in &ctx.security_headers {
+                        assert!(
+                            body.contains(&format!("add_header {header} always;")),
+                            "`{head}` on a {} site sets a header of its own, so nginx hands it \
+                             none of the server's — `{header}` is gone here:\n{body}",
+                            site_type.as_str()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_php_vhost_renders_with_the_path_info_guard() {
         let out = render_site(&php_site());

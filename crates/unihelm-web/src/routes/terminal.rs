@@ -30,6 +30,18 @@
 //! because that is the only channel the browser gives us; it is a capability
 //! with a one-minute life, not an identity, and it is never logged.
 //!
+//! Step 2 also refuses a handshake whose `Origin` names a host other than the
+//! one the request was addressed to. Be clear about what that is worth: it is
+//! **not** what holds the door today. `SameSite=Strict` is — a cross-site
+//! handshake carries no session cookie, so `CurrentUser` turns it away and no
+//! ticket is ever consulted. The `Origin` check is the second lock, and it is
+//! written down here so nobody removes the first one believing this replaced
+//! it: loosen the cookie for some future sign-in flow and this becomes the
+//! only thing between a page on the internet and a root shell. A handshake
+//! with *no* `Origin` is allowed through, because only browsers send one — the
+//! CLI and every other non-browser client do not, and refusing them would
+//! break the terminal for the people least placed to work out why.
+//!
 //! # One agent connection, many browsers
 //!
 //! `unihelm-web` multiplexes every browser it serves over a *single* IPC
@@ -59,7 +71,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -369,14 +381,41 @@ pub struct WsQuery {
     responses(
         (status = 101, description = "Upgraded. Messages are JSON: `{type:\"input\"|\"resize\"|\"close\"}` up, `{type:\"output\"|\"state\"}` down; `data` is base64 because a shell writes bytes, not text"),
         (status = 401, description = "`session_invalid`, or a ticket that has expired, been used, or belongs to another account", body = ApiErrorBody),
+        (status = 403, description = "`csrf_invalid`: the handshake carried an `Origin` naming a different host than it was sent to", body = ApiErrorBody),
     ),
 )]
 pub async fn ws(
     State(state): State<SharedState>,
     current: CurrentUser,
+    headers: HeaderMap,
     Query(q): Query<WsQuery>,
     upgrade: WebSocketUpgrade,
 ) -> ApiResult<Response> {
+    // Before the ticket, not after: redeeming is what makes a ticket single-use,
+    // so a handshake we were always going to refuse must not be allowed to burn
+    // the one the operator's own tab is about to present.
+    let origin = headers.get(header::ORIGIN).map(HeaderValue::as_bytes);
+    let host = headers.get(header::HOST).map(HeaderValue::as_bytes);
+    if !origin_permits_upgrade(origin, host) {
+        return Err(ApiError::code(
+            ErrorCode::CsrfInvalid,
+            format!(
+                "refusing a terminal WebSocket sent from {} to host {}: the panel upgrades \
+                 a handshake only when the Origin names the host the request was addressed \
+                 to. If the panel sits behind a proxy, have it forward the browser's own \
+                 Host header rather than rewriting it to the backend's address.",
+                origin.map_or_else(
+                    || "an unnamed origin".into(),
+                    |o| String::from_utf8_lossy(o)
+                ),
+                host.map_or_else(
+                    || "(none: the request carried no Host header)".into(),
+                    |h| String::from_utf8_lossy(h)
+                ),
+            ),
+        ));
+    }
+
     let ticket = tickets().redeem(&q.ticket).await.ok_or_else(|| {
         ApiError::code(
             ErrorCode::SessionInvalid,
@@ -396,6 +435,45 @@ pub async fn ws(
 
     let auth = current.auth.clone();
     Ok(upgrade.on_upgrade(move |socket| bridge(state, socket, ticket, auth)))
+}
+
+/// May a handshake carrying this `Origin`, addressed to this `Host`, be
+/// upgraded?
+///
+/// Three answers, and the reasoning behind each is the point:
+///
+/// - **No `Origin` at all: yes.** Only browsers attach one. The CLI, `wscat`
+///   and anything else scripting the panel send none, and the attack this
+///   guards against is a *browser* being talked into opening a socket with an
+///   operator's cookies attached — which is precisely the case that does
+///   announce itself. Refusing the silent clients would cost the terminal for
+///   users who could not diagnose it and buy nothing.
+/// - **An `Origin` naming this host: yes.** Compared as whole authorities,
+///   port included, so `panel:8443` and `panel:9999` are different origins —
+///   which they are.
+/// - **Anything else: no.** `null` (a sandboxed iframe, a `file://` page) and
+///   custom schemes have no host to match and fall out here. So does an
+///   `Origin` with no `Host` to compare against: "cannot show they agree" is
+///   not "same origin", and on HTTP/1.1 a handshake without a `Host` is
+///   already malformed.
+///
+/// Bytes rather than `&str` deliberately: a header that is not valid UTF-8 must
+/// come out of this as *some* origin that does not match, never as no origin at
+/// all, and a lossy conversion up front is one more place to get that backwards.
+///
+/// See the module docs for why this is defence in depth behind
+/// `SameSite=Strict` rather than the thing currently doing the work.
+fn origin_permits_upgrade(origin: Option<&[u8]>, host: Option<&[u8]>) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Some(authority) = origin
+        .strip_prefix(b"https://")
+        .or_else(|| origin.strip_prefix(b"http://"))
+    else {
+        return false;
+    };
+    host.is_some_and(|host| authority.eq_ignore_ascii_case(host))
 }
 
 /// What the browser sends us.
@@ -922,6 +1000,75 @@ mod tests {
             line: "installing".into(),
         };
         assert!(socket_payload(&kind, Uuid::new_v4(), UserId(7)).is_none());
+    }
+
+    /// Same shape a handshake arrives in, minus the header plumbing.
+    fn upgrade_from(origin: Option<&str>, host: Option<&str>) -> bool {
+        origin_permits_upgrade(origin.map(str::as_bytes), host.map(str::as_bytes))
+    }
+
+    #[test]
+    fn the_panels_own_page_may_open_a_terminal() {
+        // The ordinary case, in the three shapes a real install produces: a
+        // domain on 443, the bare IP a fresh server is first reached on, and
+        // the non-standard port an operator picked. Getting any of these wrong
+        // takes the terminal away from someone who is entitled to it.
+        assert!(upgrade_from(
+            Some("https://panel.example.com"),
+            Some("panel.example.com")
+        ));
+        assert!(upgrade_from(
+            Some("https://198.51.100.7:8443"),
+            Some("198.51.100.7:8443")
+        ));
+        assert!(upgrade_from(
+            Some("http://127.0.0.1:8088"),
+            Some("127.0.0.1:8088")
+        ));
+        // Hostnames are case-insensitive and browsers do not always agree with
+        // the address bar about which case that is.
+        assert!(upgrade_from(
+            Some("https://Panel.Example.COM"),
+            Some("panel.example.com")
+        ));
+    }
+
+    #[test]
+    fn a_handshake_from_another_site_is_refused() {
+        // `SameSite=Strict` already means this request arrives with no session
+        // cookie and dies at `CurrentUser`. This is the second lock, so that the
+        // day the cookie attribute changes is not the day a root shell becomes
+        // reachable from any page on the internet.
+        assert!(!upgrade_from(
+            Some("https://evil.example.net"),
+            Some("panel.example.com")
+        ));
+        // The suffix trick, which a naive `ends_with` would wave through.
+        assert!(!upgrade_from(
+            Some("https://panel.example.com.evil.net"),
+            Some("panel.example.com")
+        ));
+        // A different port is a different origin, and on a panel host that is
+        // exactly where a tenant's own web app is listening.
+        assert!(!upgrade_from(
+            Some("https://panel.example.com:9999"),
+            Some("panel.example.com:8443")
+        ));
+        // A sandboxed iframe or a `file://` page. No host to match, so no.
+        assert!(!upgrade_from(Some("null"), Some("panel.example.com")));
+        // An Origin we cannot compare against anything is not an Origin we can
+        // call same-site.
+        assert!(!upgrade_from(Some("https://panel.example.com"), None));
+    }
+
+    #[test]
+    fn a_client_that_sends_no_origin_is_still_served() {
+        // Only browsers send `Origin`. Rejecting a request without one would
+        // break the CLI and every script against the panel, for no security
+        // gain at all — the browser is the thing being defended against here,
+        // and it always identifies itself.
+        assert!(upgrade_from(None, Some("panel.example.com")));
+        assert!(upgrade_from(None, None));
     }
 
     #[test]

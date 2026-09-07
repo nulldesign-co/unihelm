@@ -336,12 +336,21 @@ impl ManagedFile {
         }
     }
 
-    /// A PHP-FPM pool file. Comments are semicolons, and it is read by the FPM
-    /// master, which runs as root.
+    /// A PHP-FPM pool file. Comments are semicolons, and 0640 because the only
+    /// reader is the FPM master, which opens it as root before dropping to the
+    /// pool's own user — so nothing is lost by closing it to everyone else.
+    ///
+    /// It was 0644, which put one tenant's isolation settings in front of every
+    /// other tenant on the box: their Linux user and group, their socket path,
+    /// their `open_basedir`, and the exact list of functions they may still
+    /// call. Anyone who got a shell as any tenant could read the whole map of
+    /// their neighbours before deciding where to push. Containerised FPM is
+    /// unaffected: `unihelm_ops::fpmcontainer` bind-mounts this directory
+    /// read-only and starts the master with no `--user`, so it is root there too.
     pub fn fpm_pool(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            mode: 0o644,
+            mode: 0o640,
             comment_style: CommentStyle::Semicolon,
         }
     }
@@ -459,6 +468,33 @@ mod tests {
         assert!(raw.starts_with("; UNIHELM-MANAGED"), "got: {raw}");
         assert!(matches!(inspect(&path), FileState::Managed { .. }));
         assert_eq!(read_body(&path).unwrap().as_deref(), Some(body));
+    }
+
+    #[test]
+    fn a_pool_file_is_not_readable_by_the_tenants_it_describes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // At 0644 every tenant on the box could read every other tenant's pool:
+        // their Linux user, their socket, their open_basedir and the exact list
+        // of functions still available to them. Only the FPM master reads this
+        // file, and it does so as root.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unihelm-example_com.conf");
+        let pool = ManagedFile::fpm_pool(&path);
+        assert_eq!(pool.mode, 0o640);
+
+        write_atomic(&path, &with_header("[x]\n", pool.comment_style), pool.mode).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "world can still read a pool file: {mode:o}"
+        );
+
+        // The web servers genuinely run as their own user and must keep reading
+        // their own files, so this tightening is not theirs to inherit.
+        assert_eq!(ManagedFile::nginx("/etc/nginx/x.conf").mode, 0o644);
+        assert_eq!(ManagedFile::apache("/etc/apache2/x.conf").mode, 0o644);
     }
 
     #[test]
