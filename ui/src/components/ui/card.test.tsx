@@ -21,7 +21,7 @@ import { CardBody } from "./card";
 function bodyClasses(className?: string): string[] {
   const markup = renderToStaticMarkup(<CardBody className={className} />);
   const match = /class="([^"]*)"/.exec(markup);
-  return match ? match[1].split(" ") : [];
+  return match?.[1] ? match[1].split(" ") : [];
 }
 
 describe("CardBody's top inset", () => {

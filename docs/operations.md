@@ -257,6 +257,94 @@ passed explicitly rather than left to Docker's default so the operation's
 timeout can be derived from it. Stopping an already-stopped container succeeds
 and changes nothing.
 
+### `docker.template.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | *(none)* |
+
+The curated container templates the panel ships: a handful of things people
+actually run on a hosting box, each with a pinned image, its ports, its volumes
+and the environment it needs.
+
+**Compiled in, for the reason the stack catalogue is.** A template names an
+image, and an image runs as root on this machine a moment later; as
+`/etc/unihelm/templates.toml` it would hand "start this image with these mounts"
+to every account and every stray `chmod`. The price is the same and it is real —
+a pin only moves in a release — and keeping these tags current is part of cutting
+one. This is *not* a second gate in front of `docker.create`, which still takes
+any image reference an operator types; it is a shortcut with the sharp edges
+already filed off.
+
+**Every tag is an exact published release.** Never `latest` and never a moving
+series: a tag that changes under a running server is how a restart becomes a
+major-version upgrade nobody asked for. A catalogue entry pointing at a tag that
+404s is worse than no catalogue, because the pull fails minutes in and the
+operator cannot tell a typo in the panel from a network they cannot reach.
+
+Each entry says who can sign in the moment the container starts, because the
+images disagree and none of them says so on its tin. `first_run` is either
+`wizard` — there is no account at all until somebody opens it, so the first
+browser to arrive is the administrator — or `credential`, naming the account and
+the variable its generated password is in. On loopback the first is contained; on
+a published port it is a giveaway, which is why the answer travels with the list
+rather than being left to be discovered.
+
+Anything needing a flag `docker.create` has no field for is deliberately absent
+rather than present and broken: a container wanting the daemon socket, a bind
+mount or its own command is not one this panel can honestly offer. Databases and
+caches are absent too — those are `engine.install`'s, which knows how to seal
+their credentials and how `db.create` reaches them.
+
+### `docker.template.prepare`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `template`; `name` *(optional)* |
+
+Fills one template in for this machine and answers with a draft `docker.create`
+accepts. Creates nothing.
+
+**A template that needs a password generates one, and there is no default.**
+`admin`/`admin` in a catalogue is a published credential for every install of
+this panel, so where an image takes an administrative secret in its environment
+the value is minted per call from a CSPRNG — the same alphabet and length the
+engine containers use. Unlike an engine, **the panel keeps no copy**: the
+container is the operator's own, so the secret exists in this one answer and
+nowhere else. It cannot be read back afterwards — not by re-running this
+operation, which mints a different one, and not from any panel record, because
+there is none. Whoever runs this must copy the password out of the answer before
+the form is closed, or the container will have to be recreated. `DraftEnv`'s
+`Debug` is redacted by hand so a generated value cannot reach a log through a
+tracing call, and a test asserts that any variable whose name says it holds a
+secret is generated rather than compiled in.
+
+**Nothing is published on every interface.** Every port in a draft carries
+`public: false` and the loopback address it will answer on. Opening one is the
+operator's own switch on the create form, with the sentence about Docker's rule
+being evaluated ahead of the firewall's attached to it — a template must not be a
+way past that control.
+
+A preferred host port that something already publishes is **moved, not refused**:
+a box already running something on 3000 is the common case, and the draft names
+the container that held it in `port_notes` rather than leaving the operator to
+find out from a browser that will not connect. Where the whole window is held the
+preferred port comes back and `docker.create`'s own pre-flight refuses it by
+name, because an empty answer from `docker ps` is "we could not tell" and not
+"nothing is published".
+
+`server_manage` rather than `server_read`, though nothing on the server changes:
+the answer is a credential, and the only operation that can spend it is
+`docker.create`, which needs that permission anyway. A reader handed one could
+not use it, so handing them one would be giving away a secret for nothing.
+
+An unknown template is a `not_found` naming what was asked for and listing the
+templates that exist.
+
 ### `docker.volume.remove`
 
 | | |
@@ -512,6 +600,99 @@ the collector throttles refreshes, and a room full of open dashboards costs one
 sweep per second rather than one per viewer. The agent knows its own pid; the
 web process passes `web_pid` because the agent has no reliable way to identify
 it.
+
+### `process.list`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | `sort` *(optional: `cpu` (default) or `memory`)*; `limit` *(optional, clamped to 200)*; `search` *(optional)*; `web_pid` *(optional u32)* |
+
+What is running, what it is using, and whose it is — the breakdown
+`metrics.snapshot` cannot give. Before this existed the panel could say the
+machine was at 96% and not what was at 96%, so the only way to find out was an
+SSH session and `top`.
+
+Three numbers here are stated rather than left to be assumed:
+
+**Memory is `RssAnon`, and every row says so.** `svc.status` learned that a
+cgroup's `MemoryCurrent` is not the memory a unit is using — it carries the page
+cache that unit touched — and now reports `anon` from the unit's own
+`memory.stat`. `RssAnon` is the per-process form of that number, which is the
+only reading the two pages can be compared on. A kernel too old to split the RSS
+falls back to `VmRSS`, and `memory_source` says `resident` instead of `anonymous`
+so the fallback is visible rather than mixed in.
+
+**CPU is a rate over a stated window.** Total CPU time over a process's lifetime
+is an average since boot: a process that pinned a core last night and is idle now
+would sit at the top of a page about what is busy *right now*. So every `cpu_pct`
+is two samples divided, `cpu_window_ms` says how far apart they were, and a
+process with nothing to diff against reports `null` — never `0`, which would be a
+claim of idleness.
+
+**`refresh_seconds` is the interval the client is asked to poll on**, so a page
+cannot ask again faster than the counters underneath it move.
+
+`search` is applied to the whole machine before the sort and the limit: filtering
+the forty rows that came back would report "no matches" for a process sitting at
+rank two hundred.
+
+A process is attributed to a tenant when it runs as that subscription's Linux
+account or when systemd put it in that subscription's slice. Nothing is inferred
+from a document root — nginx serves every tenant as `www-data`, and guessing
+there would put one customer's name on another customer's traffic. If the panel
+database cannot be asked, `tenant_lookup_error` says so rather than leaving the
+column silently blank.
+
+Every row the panel would refuse to signal arrives carrying `protected` — the
+rule and the sentence `process.kill` would answer with — so a client can disable
+the button *and* say why before anybody presses anything.
+
+`server_read`, not `server_manage`: the person who needs to see what is eating
+the machine is not always the account allowed to stop it.
+
+### `process.kill`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `pid`; `confirm_command`; `confirm_user`; `signal` *(optional: `term` (default) or `kill`)*; `web_pid` *(optional u32)* |
+
+Sends SIGTERM or SIGKILL to one process. **Killing the wrong thing takes the
+machine down**, so three whole categories are refused rather than aimed at:
+
+| rule | what it refuses, and why |
+|---|---|
+| `init` | pid 1. Killing it panics the kernel. |
+| `panel` | the panel's own units (`unihelm-web`, `unihelm-agentd`), the agent's own pid, and the web pid the caller named in `web_pid`. Signalling one of these is the panel taking itself off the network mid-request, with nothing left running that could put it back. |
+| `system_account` | every process owned by a uid below 1000 — root, `www-data`, `mysql`, `redis`, `sshd`. A system process is part of a service, and killing one worker out from under it takes sites down without restarting anything; the refusal names the unit to stop or restart instead. |
+
+What is left is what the page exists for: an ordinary account's runaway — a
+tenant's PHP script, a Node app, a cron job that will not end. The refusal names
+what was refused, which rule applied, and the way to do what the caller wanted
+instead.
+
+**A pid is not consent.** `confirm_command` and `confirm_user` are the command
+and owner the caller was shown, echoed back, and the agent compares them against
+the process actually behind that pid before it signals anything. Pids are reused
+in seconds on a busy machine, so without that a stale listing is a kill of
+whatever now holds the number. It is also why this cannot be driven from a row
+click: a client that has not shown a human both fields has nothing to put in
+them.
+
+`pid` `0` and any value that would reach `kill(2)` as a negative number are
+refused before the process table is even read — those are process groups to the
+kernel, and the agent runs as root.
+
+**The answer says the signal was sent, never that the process exited.** SIGTERM
+is a request the process may ignore; SIGKILL cannot end a process stuck in
+uninterruptible I/O either. The `note` says so in both cases rather than leaving
+a caller to infer a death nobody observed.
+
+Immediate rather than a task: a task id would outlive the answer it exists to
+give, and would leave a pid in a log that a later reader takes for a current one.
 
 ## Services
 
@@ -931,6 +1112,130 @@ Has somebody edited this site's generated files? Compares each managed file
 against the hash recorded when the panel last wrote it and reports what
 diverged (spec §10.4, and `docs/config-safety.md` for what happens next).
 
+### `git.status`
+
+| | |
+|---|---|
+| Permission | `site_read` |
+| Execution | immediate |
+| Input | `site_id` |
+
+What repository this site deploys from, and what is actually in its document
+root. The two are reported separately on purpose: `attachment` is the panel's own
+note, `root_state` and `checkout` are readings of the disk, and
+`checkout.remote_matches_attachment` is the difference between them. A checkout
+that pulls from a repository nobody attached is shown as the disagreement it is
+rather than quietly corrected.
+
+`root_state` is one of `missing` (no document root — the site never finished
+provisioning), `empty`, `holding_page` (nothing but the page `site.create`
+wrote), `checkout`, or `occupied` (files the panel did not put there).
+`git_installed` is false on a server without git. The two operations that
+actually run git — `git.clone` and `git.pull` — refuse on such a server, naming
+the package to install, rather than reporting a deploy that could not have
+happened; `git.attach` and `git.detach` only touch the panel's own record and
+work either way, which is why the page shows the flag rather than hiding the
+buttons.
+
+### `git.attach`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | immediate |
+| Input | `site_id`; `repository`; `branch` *(optional)* |
+
+Records which repository and branch a site deploys from. Writes nothing to disk.
+
+**Public HTTPS only.** `ssh://`, `git+ssh://` and the scp-like `git@host:path`
+are refused with the reason: an SSH remote needs a deploy key, and this build has
+nowhere to keep one that could not be read alongside the site's own files.
+`http://`, `git://`, `file://` and git's `<helper>::` transport forms are refused
+as well — `ext::` in particular executes a command of the address's choosing. A
+URL carrying a username or token is refused because git copies the remote
+verbatim into `.git/config` inside the document root, in plain text.
+
+Omitting `branch` means the repository's default branch, and `git.clone` writes
+back the branch it actually landed on, so a later deploy fast-forwards that
+branch instead of guessing `main`.
+
+Attaching a *different* repository forgets the commit the old one deployed: that
+commit no longer describes anything. Re-attaching the same repository keeps it.
+
+### `git.detach`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | immediate |
+| Input | `site_id` |
+
+Forgets the repository. **The checkout and the site's files are left exactly
+where they are** — the answer says `files_kept: true`, and `detached` reports
+whether there was anything to remove, so a second call is not read as a removal
+that happened this time.
+
+### `git.clone`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — not cancellable, **not** idempotent |
+| Input | `site_id` |
+
+Clones the attached repository into the site's document root, as the site's own
+Linux account.
+
+**A non-empty document root stops the clone; it is never emptied to make room.**
+The operation is refused when the root already holds a checkout, when it holds
+files the panel did not put there — the refusal names them — and when it does not
+exist at all. The **only** file it will ever delete is the holding page
+`site.create` writes, identified by its content rather than by its name, so a
+hand-written `index.html` reads as an occupied root and stops the clone. That one
+deletion happens through the file-manager helper, as the tenant, because the
+document root is tenant-controlled and a root process deleting a path inside it
+can be aimed somewhere else with a symlink. Clearing a root that has somebody's
+site in it is a decision for the operator and `fs.delete`, not a side effect of
+pressing Deploy.
+
+Not idempotent: a second run meets its own checkout and is refused. Not
+cancellable: a clone killed halfway leaves a partial tree the next run would have
+to refuse.
+
+### `git.pull`
+
+| | |
+|---|---|
+| Permission | `site_manage` |
+| Execution | task — not cancellable, idempotent |
+| Input | `site_id` |
+
+The deploy: fetches the attached branch and **fast-forwards** the checkout onto
+it. There is no `reset --hard` on this path and there is not meant to be — a
+reset is how a panel loses work.
+
+Four refusals, each of which leaves the document root untouched:
+
+- there is no checkout (clone first);
+- the checkout pulls from a repository other than the one attached;
+- tracked files have uncommitted changes — the refusal lists them. Files git does
+  **not** track (uploads, caches, generated config) are deliberately not counted,
+  because refusing to deploy over `var/cache` would make the feature unusable;
+  git still refuses on its own if a fast-forward would clobber one, and names the
+  file;
+- the histories have diverged, so no fast-forward exists.
+
+Idempotent: a second run moves nothing and answers `updated: false`, which is
+also how an already-current deploy is told from a release.
+
+**Where the work happens.** Every git command runs as the site's Linux account,
+not as root: the panel drops privilege with `setpriv --reuid= --regid=
+--clear-groups --no-new-privs` before exec'ing git, and refuses to run at all on
+a server without `setpriv`. Each invocation also carries `protocol.allow=never`,
+`protocol.https.allow=always` and an emptied `credential.helper`, so a redirect, a
+submodule URL or an `insteadOf` rewrite in a tenant-owned config cannot reach a
+transport the panel refused.
+
 ## Certificates
 
 ### `cert.list`
@@ -1106,6 +1411,147 @@ sees no zones is rejected with the scopes it needs, because a stored token that
 cannot do the job turns every future issuance into a failure discovered minutes
 into a task. Re-sending the same label rotates that credential in place rather
 than accumulating a dead row whose revoked token would be tried first.
+
+### `dns.provider.get`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Which DNS credential is stored, and what it can still reach: each row's label,
+the Cloudflare accounts and zones the token administers, and whether it answered
+Cloudflare on this call. **Never the token** — `StoredProviderView` has no field
+that could carry one.
+
+There was a `PUT` and no `GET`, so a page reload left an operator with an empty
+form and no way to tell whether a credential was stored at all; they generated
+and pasted a new token every time. Reading a secret's *metadata* back is not
+reading the secret. Returning the token itself would put it in a browser cache, a
+proxy log and the screenshot on the next support ticket, and that is still
+refused.
+
+`reachable` is checked live rather than remembered. A token revoked in the
+Cloudflare dashboard is still a row in `dns_providers`, and reporting it as
+active would be a false claim about the credential every renewal depends on. A
+credential whose seal will not open, or whose token Cloudflare rejects, is
+reported as unreachable with the reason rather than dropped from the list — a
+list that is short by one looks complete.
+
+### `dns.zones.list`
+
+| | |
+|---|---|
+| Permission | `dns_manage` |
+| Execution | immediate |
+| Input | *(none)* |
+
+Every zone the stored credentials administer, each labelled with the credential
+that reaches it and the Cloudflare account it belongs to.
+
+`dns_manage`, not `server_manage`: storing the credential is an admin act, using
+it to edit a zone is what the reseller-held DNS permission is for — the same
+split `cert.issue_wildcard` already makes.
+
+`unreachable` names the credentials that could not be asked. A zone missing from
+the list because one token is revoked looks exactly like a zone that was never
+delegated, and an operator will go and create it a second time.
+
+### `dns.records.list`
+
+| | |
+|---|---|
+| Permission | `dns_manage` |
+| Execution | immediate |
+| Input | `zone` — the zone apex |
+
+Every record in one zone, sorted by name so the records answering at one name sit
+together, with this server's own public addresses alongside so the UI can mark
+the rows that point here without a second round trip.
+
+Each record carries `points_here` and an `impact` list — the sentences saying
+what changing or removing it would cost, from `record_impact`. That judgement
+needs the panel's site list and this server's addresses, so it is made once in
+the agent rather than a second time in the browser, exactly as `dns.check`'s
+`advice` is.
+
+The walk is bounded at 2000 records (twenty pages of a hundred) and `truncated`
+says when it stopped short. A list that is short by fifty rows and looks whole is
+how an operator concludes a record is missing and adds a second one beside it.
+
+Cloudflare's API is rate-limited per token, so this is fetched when a zone is
+chosen and when a write lands. It is not a health probe and must not be polled.
+
+### `dns.records.create`
+
+| | |
+|---|---|
+| Permission | `dns_manage` |
+| Execution | immediate |
+| Input | `zone`; `kind` — `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SRV`, `CAA`; `name`; `content`; `ttl` *(optional)*; `proxied` *(optional)*; `priority` *(optional)* |
+
+Adds one record and answers with it **as Cloudflare stored it** — not as it was
+sent, because Cloudflare normalises names and resolves an automatic TTL, and
+echoing the request back would show a record that does not exist.
+
+Everything checkable without a network call is checked first, naming the field:
+an IPv6 address in an A record, an MX without a priority, a priority on a type
+that has none, a proxy on a type Cloudflare cannot proxy, a TTL set alongside a
+proxy, a TTL outside 60–86400.
+
+`name` is qualified against the zone the way a zone editor does it — `@` and an
+empty string are the apex, a bare label such as `www` becomes `www.example.com` —
+but a **dotted name that is not inside the zone is refused**. Cloudflare reads an
+unrecognised name as relative and appends the zone, so `shop.example.net` sent
+while editing `example.com` would silently create `shop.example.net.example.com`:
+a record that exists, is reported as created, and answers nothing.
+
+A refusal from Cloudflare is passed through with its own words. A 403 is
+additionally named for what it is in practice — the token is `Zone:Read` and not
+`Zone:DNS:Edit`, or it is scoped to a different zone — because that is a fix an
+operator can make in half a minute if the panel says so.
+
+### `dns.records.update`
+
+| | |
+|---|---|
+| Permission | `dns_manage` |
+| Execution | immediate |
+| Input | `zone`; `id`; `kind`; `name`; `content`; `ttl` *(optional)*; `proxied` *(optional)*; `priority` *(optional)*; `confirm_name`; `confirm_content` |
+
+A whole-record replace, validated exactly as a create is, answering with the new
+record and the one it replaced.
+
+PUT rather than Cloudflare's PATCH: a PATCH sends only the fields that changed, so
+a field the form omitted keeps its old value silently. The record's existing
+comment is carried across the write, so a record the panel wrote for mail or for
+ACME does not lose the note saying where it came from — `record_impact` reads
+that note.
+
+`confirm_name` and `confirm_content` are what the caller was shown. The agent
+re-reads the record and refuses with `conflict` if it is no longer that: a record
+id addresses whatever now sits under it, and somebody editing the same record in
+the Cloudflare dashboard must not have their change overwritten by a form that
+was opened five minutes ago.
+
+### `dns.records.delete`
+
+| | |
+|---|---|
+| Permission | `dns_manage` |
+| Execution | immediate |
+| Input | `zone`; `id`; `confirm_name`; `confirm_content` |
+
+Removes one record and answers with what was removed, including the `impact`
+sentences it carried while it existed — which are also written to the task log
+before the delete is sent, so the reason survives the browser that started it.
+
+The confirmations are the same bargain `db.drop` makes with `confirm_name`, and
+for a larger reason: deleting the wrong DNS record takes a site off the internet
+and stops its certificate renewing over HTTP-01. A record that changed since it
+was shown is a `conflict`; a record that is already gone says so rather than
+surfacing a bare 404.
 
 ## Databases
 
@@ -1517,6 +1963,151 @@ held only for the duration of the operation: hashed in-process, installed into
 
 Closes SFTP access by removing the tenant from the group, and touches nothing
 else — the drop-in, the home ownership and the account all stay as they are.
+
+## Panel accounts
+
+Who may sign in to the panel, as what. Every entry here is scoped: an admin sees
+the whole panel, a reseller sees itself and the accounts beneath it, and a
+customer reaches none of it — an id outside the caller's scope answers
+`not_found`, exactly as a non-existent one does, so none of these can be used to
+enumerate accounts.
+
+**Changing your own password is not an operation.** It is `POST
+/api/account/password`, answered by `unihelm-web` beside login and logout, and
+`unihelm user passwd` from a root shell. An operation has to declare the one
+permission its caller must hold, and there is no permission that means "your own
+account" — a customer holds neither `user_manage` nor anything that could stand
+in for it, so filing it under a permission every role happens to have would be a
+false claim in this table and in the audit trail. The route requires the current
+password from everybody, the admin included, verifies it on a blocking thread
+inside the panel's argon2 budget, hashes the new one through the same
+`unihelm_db::password` configuration the login path verifies against, and revokes
+every session for the account — re-issuing the caller's on the response, so the
+reply carries a new cookie and a new CSRF token.
+
+**The panel must keep an administrator.** `user.role.set`, `user.status.set` and
+`user.delete` each refuse when their subject is the only administrator who can
+still sign in, because there is no recovery from the other answer: an account
+demoted, suspended or deleted while it is the last one leaves a panel nobody can
+administer — no way to create a second admin, no way to undo the change, and
+nothing in the web interface that can put it back. The refusal is `UNI-1404`, it
+names the account, and it says to create a second administrator first. The count
+it is made of is in `user.list` as `admin_count`, so a client can grey the action
+out rather than discovering the refusal on the click.
+
+### `user.list`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `limit` *(optional i64, default 200)*, `offset` *(optional i64, default 0)* |
+
+Accounts in the caller's scope, newest first. Each row carries the three counts
+that would block deleting it — `subscriptions`, `owned_plans`, `customers` — so a
+client can disable the action with a reason instead of discovering it on the
+click. `admin_count` is the number of administrators who can still sign in, and
+is `null` outside a global scope: a reseller's list holds no administrators for it
+to be about.
+
+No password hash is in the response. The view type has no field for one — `User`
+itself is not even `Serialize` (spec §12 rule 6).
+
+### `user.create`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `username`, `email`, `role`, `password`, `full_name` *(optional)* |
+
+Creates an account. `username` and `email` are newtypes, so a bad one is
+`UNI-1203`/`UNI-1200` from the parser before the body runs; the password is
+checked against the panel policy (at least 12 characters) and hashed by the
+repository, which is the only place in the tree that hashes one. A password that
+fails the policy leaves no row behind.
+
+Ownership comes from who is asking, never from the body. An admin's accounts
+stand on their own; a reseller's belong to that reseller, and a reseller sending
+any `role` other than `customer` gets `permission_denied`.
+
+The password is never logged, never returned, and never written to an audit
+`detail`.
+
+### `user.role.set`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `user_id`, `role` |
+
+Changes an account's role and revokes its sessions, so the next panel it draws is
+the one the new role actually has.
+
+**The last administrator cannot be demoted.** Taking `admin` off the only account
+that can still sign in as one leaves nobody who can put it back, so it is refused
+with `UNI-1404` naming the account and saying to create a second administrator
+first. The check runs *before* the not-yourself one, which is the only ordering
+that gives a true message: the reachable case is the sole administrator demoting
+their own account, and "you cannot do this to the account you are signed in as"
+would send them looking for another sign-in when what they actually have to do is
+create a second administrator.
+
+Refused, in this order: a reseller reaching for anything that is not a customer
+(`UNI-1300`, in both directions — a reseller may not promote anybody, and may not
+touch an account that is not a customer even to leave it as it was); the only
+administrator who can sign in (`UNI-1404`); and the account the caller is signed
+in as (`UNI-1300`).
+
+### `user.status.set`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `user_id`, `status` (`active` \| `suspended`) |
+
+Suspends an account or lets it back in, and reports how many sessions the
+suspension ended. `locked` is not accepted: it is a throttle state lifted with
+`unihelm user unlock`, not an administrative decision, and offering it here would
+be a state the same screen could not undo.
+
+Suspending revokes every session. `lookup_session` already refuses a session
+whose account cannot log in, so the block takes effect either way — revoking is
+what stops the rows sitting there unrevoked and being handed back the moment the
+account is reinstated. The last-administrator and not-yourself refusals apply to
+suspension, in that order: suspending the last administrator locks the panel as
+thoroughly as deleting them. Reinstating is never refused.
+
+### `user.delete`
+
+| | |
+|---|---|
+| Permission | `user_manage` |
+| Execution | immediate |
+| Input | `user_id`, `confirm_username` |
+
+Deletes an account. `confirm_username` is the account's own username, retyped — an
+id in a URL is not something an operator can check by eye, and this is the one
+action on the page that cannot be undone by clicking the other way — and a
+mismatch is `UNI-1200` with nothing deleted.
+
+**The last administrator cannot be deleted.** Refused with `UNI-1404` for the
+only administrator who can still sign in, before the confirmation is even
+compared: an account that is deleted is not coming back, and a panel with no
+administrator left has no path to making another one. Refused, too, for the
+account the caller is signed in as, and while the account still holds
+subscriptions, plans it owns, or accounts beneath it. All three of those are
+`ON DELETE RESTRICT` in the schema, so without the check the operator's answer
+would be a foreign-key error naming a table; the refusal names each one and its
+count, and deletes nothing.
+
+On success the result says what went with it: `sessions_ended`,
+`api_tokens_removed` and `webhooks_removed` (all `ON DELETE CASCADE` — the
+webhooks stop delivering), and `audit_entries_kept`, which is the count that
+stays: `audit_log.actor_username` is denormalised, so what the account did is
+still readable after the row is gone.
 
 ## Plans and subscriptions
 
@@ -2242,7 +2833,7 @@ listing, so one broken app cannot blank the page.
 |---|---|
 | Permission | `node_apps` |
 | Execution | task — not cancellable, **not** idempotent |
-| Input | `name`; `entry` — tenant-home-relative path to the entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)*; `runtime` *(optional: node, python, ruby, bun, deno, go — default node)*; `runtime_version` *(optional string)*; `mode` *(optional: `container` \| `host`)* |
+| Input | `name`; `entry` — tenant-home-relative path to the entry point; `subscription_id` *(optional)*; `env` *(optional list of `{key, value}`)*; `node_env` *(optional, `production` \| `development` \| `test`, default `production`)*; `memory_mb` *(optional u32)*; `proxy_domain` *(optional)*; `runtime` *(optional: node, python, ruby, bun, deno, go — default node)*; `runtime_version` *(optional string)*; `mode` *(optional: `container` \| `host`)*; `start_command` *(optional string — refused for a container)* |
 
 Allocates a port, creates `<home>/apps/<name>` owned by the tenant at `0750`,
 writes the slice drop-in, writes and verifies the unit, enables it (so a reboot
@@ -2264,6 +2855,44 @@ node-flavoured vhost, so domain-conflict detection, the plan's site limit, the
 nginx validate/rollback cycle and logrotate all keep working from one
 implementation. It also requires `site_manage` **in addition to** `node_apps`:
 creating a site is creating a site, whichever operation asks for it.
+
+#### What starts it
+
+An application is not always `<interpreter> <entry>`. `start_command` is one
+program and its arguments — `npm start`, `node dist/server.js` — run from the
+application's own directory, and it becomes the whole `ExecStart` line. Omit it
+and the panel reads `package.json`: a `scripts.start` becomes `npm start` (or
+`bun run start`), and an application that declares none runs its entry file
+exactly as it always did.
+
+A defaulted command that cannot run — a `scripts.start` on a server with no npm —
+falls back to the entry file and says so in the task log and in `next_steps`.
+That is the panel *offering* package.json's answer rather than being asked for
+one, and refusing a create over an offer would break the single-file path that
+already worked. A command the caller asked for explicitly is never softened that
+way: it fails, naming the program that is missing.
+
+There is no shell anywhere on this path (spec §12 rule 2), and the refusals say
+so. `npm run build && npm test` is two commands joined by an operator only a
+shell understands; handed to `execve` it reaches npm as an argument, npm ignores
+what it does not recognise, and half the work never happens under a panel
+reporting success. Shell syntax, a `%` (a systemd specifier, expanded before the
+line is a command at all), a `"` or `\` inside a word, and a first word
+containing `/` are each refused and named. Double quotes group a word containing
+spaces, and that is the only word that is quoted on the way into the unit —
+everything that could unbalance those quotes was refused, which is what makes the
+quoting airtight rather than careful.
+
+A **container is refused** a start command. Its argv is built from the image and
+the entry file and a `docker run` has no `ExecStart`; accepting the field and
+starting the entry file anyway would be the panel reporting work it did not do.
+The refusal names the way round: create the application as a service on this
+host.
+
+The command has nowhere to live but the unit file — `node_apps` has no column for
+one — so it is read back out of that file wherever the unit is re-rendered,
+exactly as the tenant's `Environment=` lines are, and `app.list` reports it per
+row so the page can show what an application actually starts with.
 
 #### `mode`: a container, or a unit
 
@@ -2325,7 +2954,7 @@ allocation, so a re-run is a second attempt rather than a converging one.
 |---|---|
 | Permission | `node_apps` |
 | Execution | task |
-| Input | `app_id`, `runtime` *(optional)*, `runtime_version` *(optional, nullable)* |
+| Input | `app_id`; `runtime` *(optional)*; `runtime_version` *(optional, nullable)*; `start_command` *(optional, nullable)*; `mode` *(optional, echo only)* |
 
 Moves an application to a different language or version. Re-renders its unit and
 restarts it, keeping the port, the proxy site in front of it, and everything in
@@ -2340,7 +2969,12 @@ loss of all three.
 alone; send an explicit `null` to unpin back to whatever a bare command name
 resolves to. On the CLI those are the default and `--unpin`.
 
-There is deliberately no `mode` here. See [`app.create`](#mode-a-container-or-a-unit).
+`mode` is accepted but cannot **change** anything: it is refused unless it names
+the mode the application is already in. An app cannot move between a container
+and a host unit in place — the two keep their state in different places — so the
+field exists only to let a caller that echoes back a whole record avoid being
+refused for a field it did not mean to change. Changing mode is delete and
+recreate. See [`app.create`](#mode-a-container-or-a-unit).
 
 The interpreter is resolved **before** anything is written, so a version that is
 not installed fails with the application still running on what it had, rather
@@ -2349,6 +2983,20 @@ than with a unit naming a binary the machine does not have.
 The tenant's own `Environment=` lines are carried across. They live only in the
 unit file — nothing persists them — so re-rendering from the database alone would
 silently wipe every variable the app was configured with.
+
+So is the start command, and for the same reason: it lives in the unit file and
+nowhere else. The rendered default always ends with the app's entry file,
+absolute, so anything else in `ExecStart` was written from a start command and is
+carried across a runtime change verbatim. Without that, moving an application
+from Node to Bun would put one started by `npm start` back on `node server.js`
+while reporting a runtime change and nothing else.
+
+`start_command` distinguishes absent from null on the same rule `runtime_version`
+does. Omit the key to leave whatever starts it alone; send an explicit `null` to
+put it back on its entry file. On the CLI those are the default and
+`--entry-file`. Asking a *container* for one is refused whole, before the row is
+touched, rather than half-applied as a runtime change that leaves the caller
+believing the command took as well.
 
 ### `app.delete`
 
@@ -2383,6 +3031,65 @@ app with open connections is seconds. A missing unit gets a sentence saying the
 unit file is gone and the app should be recreated, rather than systemd's "Unit
 not found" — the two failures look identical from the outside and have entirely
 different fixes.
+
+### `app.build`
+
+| | |
+|---|---|
+| Permission | `node_apps` |
+| Execution | task — not cancellable, idempotent |
+| Input | `app_id`; `command` *(optional string)*; `install` *(optional bool, default true)* |
+
+Installs an application's dependencies and runs its build, **as the tenant**, in
+the application's own directory, with the output streamed into the task log.
+
+The plan comes from `package.json` when the caller names no command: `npm
+install` (or `bun install`) followed by `npm run build` where a `build` script
+exists. A package.json with no build script is the common shape of a Node
+application and installing its dependencies is the whole job, so that is a valid
+build rather than a refusal. `install: false` is for the operator re-running a
+build who does not want to pay for a second install.
+
+When there is nothing to run it is refused with the reason that applies — there
+is no package.json, or there is one and it declares no `build` script, or the
+runtime has no package.json convention to read at all (Python's
+`pyproject.toml`, Ruby's `Rakefile` and Go's `go.mod` all describe a build and
+none of them describes it as `scripts.build`; reading a package.json answer into
+them would be the panel inventing a convention). Every one of them still takes a
+command the operator names.
+
+Each step runs through
+`systemd-run --quiet --collect --wait --pipe --slice=<tenant slice> --uid=<user>
+--working-directory=<app dir> -- <argv>` — the same wrapper `cron.set` puts in
+front of a scheduled job, and for the same reason. A build is the tenant's own
+code (a `postinstall` script is arbitrary execution by design) and `npm install`
+on a large tree will take every core and several gigabytes if nothing stops it,
+so running it as root or outside the ceiling the plan sold is refused rather than
+degraded to. What is absent is cron's quoting: a crontab line is parsed by a root
+shell, this is an argv array, and a quote here would arrive as part of the slice
+name.
+
+**A build that fails shows why.** `--wait --pipe` makes the unit's exit status
+the command's and its output arrive on pipes rather than in the journal, so every
+line reaches the task log while it happens. The error itself names the step, the
+command, the exit status, the directory and the last twenty lines the tool
+printed, and says the whole output is in the task's log. A tool that failed
+silently gets a sentence saying so rather than a blank space where the reason
+should be.
+
+Every program is resolved before the first step runs: a two-step build whose
+second command names something this machine does not have fails before `npm
+install` has rewritten `node_modules`, not after. The timeout is thirty minutes
+per step, because the 120 seconds `Cmd` defaults to would kill a real install and
+report a stopwatch as a failure.
+
+A container application can be built — its directory is what the container
+mounts, so what is built here is what it runs — and the log says out loud that
+the build ran on the server rather than inside the image, because anything
+compiled against this machine's interpreter may not match the image's.
+
+The build writes files; the process started before them is still running the old
+ones, and the log says to restart.
 
 ### `app.logs`
 

@@ -1,10 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { Boxes, Plus, RotateCw, ScrollText, SlidersHorizontal, Trash2, X } from "lucide-react";
+import {
+  Boxes,
+  Hammer,
+  Play,
+  Plus,
+  RotateCw,
+  ScrollText,
+  SlidersHorizontal,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useState } from "react";
 import { useFieldArray, useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
+import { TaskLogPanel } from "@/components/task-notice";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
@@ -16,6 +27,7 @@ import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { PageHeader } from "@/components/ui/page-header";
 import { Select } from "@/components/ui/select";
 import { ListSkeleton, Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import {
   ApiError,
   DEFAULT_LOG_LINES,
@@ -23,11 +35,18 @@ import {
   type AppMode,
   type AppRuntime,
   type AppView,
-  type CreateAppRequest,
   type NodeEnv,
   type StackComponentView,
   type UnitState,
 } from "@/lib/api";
+import {
+  appEndpoints,
+  commandForEditing,
+  commandProblem,
+  takesStartCommand,
+  type AppWithStart,
+  type CreateAppBody,
+} from "@/lib/apps-api";
 import { staggerStyle } from "@/lib/motion";
 import { cn, formatBytes } from "@/lib/utils";
 // Imported rather than re-derived. "Is there a container runtime on this
@@ -197,7 +216,7 @@ export function AppsPage() {
   );
 }
 
-function AppRow({ app }: { app: AppView }) {
+function AppRow({ app }: { app: AppWithStart }) {
   const { t, i18n } = useTranslation();
   const state = unitState(app.state);
 
@@ -216,10 +235,18 @@ function AppRow({ app }: { app: AppView }) {
             it would carry the same weight as the state, which is the one thing
             on this row worth looking at twice. The path keeps the title as well
             as the truncation — it is still the longest thing here — and the
-            mode keeps its full width, because a truncated mode says nothing. */}
+            mode keeps its full width, because a truncated mode says nothing.
+
+            The start command replaces the entry file rather than joining it,
+            because an app started by `npm start` is not running its entry file
+            at all: showing the path anyway would be this page stating something
+            about the server that is not true. */}
         <p className="flex items-baseline gap-1.5 text-xs text-ink-subtle">
-          <span className="min-w-0 truncate font-mono" title={app.entry}>
-            {app.entry}
+          <span
+            className="min-w-0 truncate font-mono"
+            title={app.start_command ?? app.entry}
+          >
+            {app.start_command ?? app.entry}
           </span>
           <span aria-hidden>·</span>
           <span className="shrink-0">{t(`apps.modeName.${modeOf(app)}`)}</span>
@@ -267,12 +294,14 @@ function AppRow({ app }: { app: AppView }) {
   );
 }
 
-function AppActions({ app }: { app: AppView }) {
+function AppActions({ app }: { app: AppWithStart }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [changingRuntime, setChangingRuntime] = useState(false);
+  const [changingStart, setChangingStart] = useState(false);
+  const [building, setBuilding] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const invalidate = () => void queryClient.invalidateQueries({ queryKey: ["apps"] });
@@ -312,6 +341,17 @@ function AppActions({ app }: { app: AppView }) {
         >
           {t("apps.changeRuntime")}
         </MenuItem>
+        {/* Above the separator with the other two: changing what starts an app
+            and changing what it runs on are the same kind of edit, and both
+            restart it. */}
+        <MenuItem icon={<Play aria-hidden />} onClick={() => setChangingStart(true)}>
+          {t("apps.startCommand")}
+        </MenuItem>
+        {/* Build is not an edit — it is the long-running one, and the only item
+            here whose output is the answer rather than a side effect. */}
+        <MenuItem icon={<Hammer aria-hidden />} onClick={() => setBuilding(true)}>
+          {t("apps.build")}
+        </MenuItem>
         <MenuSeparator />
         <MenuItem danger icon={<Trash2 aria-hidden />} onClick={() => setConfirming(true)}>
           {t("apps.delete")}
@@ -325,6 +365,14 @@ function AppActions({ app }: { app: AppView }) {
         open={changingRuntime}
         onClose={() => setChangingRuntime(false)}
       />
+
+      <StartCommandDialog
+        app={app}
+        open={changingStart}
+        onClose={() => setChangingStart(false)}
+      />
+
+      <BuildDialog app={app} open={building} onClose={() => setBuilding(false)} />
 
       <Dialog
         open={confirming}
@@ -525,6 +573,232 @@ function RuntimeDialog({
   );
 }
 
+/**
+ * Change what starts an application.
+ *
+ * The field takes what a person types on a shell prompt — `npm start`, `node
+ * dist/server.js` — and the agent turns it into one `ExecStart` line. It is not
+ * a shell: `npm run build && npm test` is refused there, and `commandProblem`
+ * says so here rather than letting somebody find out from a red task.
+ *
+ * **Empty means the entry file.** The field is prefilled with whatever the app
+ * starts with now, so clearing it is a deliberate act with an obvious meaning,
+ * and the hint under it says which. That is the only way back, and a control
+ * that could set a command but never remove one would be half a feature.
+ *
+ * A container has no unit file to hold a command, so it gets the sentence
+ * instead of the field — the same shape `RuntimeDialog` uses for a version it
+ * cannot honestly offer.
+ */
+function StartCommandDialog({
+  app,
+  open,
+  onClose,
+}: {
+  app: AppWithStart;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const current = commandForEditing(app.start_command);
+  const [command, setCommand] = useState(current);
+  const [error, setError] = useState<string | null>(null);
+
+  const supported = takesStartCommand(modeOf(app));
+  const problem = commandProblem(command);
+
+  const save = useMutation({
+    mutationFn: () =>
+      appEndpoints.updateApp(app.id, {
+        // An empty field is an explicit null — "run the entry file" — and not
+        // an omission, which would mean "leave whatever it starts with alone".
+        // The two are different requests and the agent reads them as such.
+        start_command: command.trim() === "" ? null : command.trim(),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["apps"] });
+      onClose();
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("apps.startCommandTitle", { name: app.name })}
+      description={t("apps.startCommandDialogHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            loading={save.isPending}
+            disabled={!supported || problem !== null}
+            onClick={() => save.mutate()}
+          >
+            {t("apps.startCommandSave")}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {error}
+        </Callout>
+      ) : null}
+
+      {!supported ? (
+        <p className="text-sm text-ink-muted">{t("apps.startCommandContainer")}</p>
+      ) : (
+        <>
+          <Callout tone="info" className="mb-4">
+            {t("apps.startCommandRestart")}
+          </Callout>
+
+          <Field
+            label={t("apps.startCommand")}
+            htmlFor="app-start-command"
+            error={problem ? t(`apps.commandProblem.${problem.key}`) : undefined}
+          >
+            <Input
+              id="app-start-command"
+              className="font-mono text-xs"
+              placeholder="npm start"
+              aria-describedby="app-start-command-hint"
+              aria-invalid={problem !== null}
+              value={command}
+              onChange={(event) => setCommand(event.target.value)}
+            />
+          </Field>
+          <p id="app-start-command-hint" className="-mt-1 text-xs text-ink-muted">
+            {t("apps.startCommandClearHint")}
+          </p>
+        </>
+      )}
+    </Dialog>
+  );
+}
+
+/**
+ * Install dependencies and run an application's build.
+ *
+ * The log is the feature. A build takes minutes and fails for reasons only its
+ * own output explains, so this opens a task and streams it — a panel that
+ * reported "build failed" and nothing else would be worse than one with no
+ * build button at all.
+ *
+ * Nothing is prefilled and nothing has to be typed: the agent reads the command
+ * out of `package.json`, which is the file that knows. The field is for the
+ * project whose build is not spelled the usual way.
+ */
+function BuildDialog({
+  app,
+  open,
+  onClose,
+}: {
+  app: AppWithStart;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [command, setCommand] = useState("");
+  const [install, setInstall] = useState(true);
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const problem = commandProblem(command);
+
+  const run = useMutation({
+    mutationFn: () =>
+      appEndpoints.buildApp(app.id, {
+        ...(command.trim() === "" ? {} : { command: command.trim() }),
+        // Sent either way. It is a switch somebody looked at, and letting the
+        // request fall back to a default is how the state on screen and the
+        // work on the server drift apart.
+        install,
+      }),
+    onSuccess: (accepted) => {
+      setError(null);
+      setTaskId(accepted.task_id);
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      wide
+      title={t("apps.buildTitle", { name: app.name })}
+      description={t("apps.buildHint")}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.close")}
+          </Button>
+          <Button
+            variant="primary"
+            loading={run.isPending}
+            disabled={problem !== null}
+            onClick={() => run.mutate()}
+          >
+            <Hammer className="h-4 w-4" aria-hidden />
+            {t("apps.buildRun")}
+          </Button>
+        </>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {error}
+        </Callout>
+      ) : null}
+
+      <Field
+        label={t("apps.buildCommand")}
+        htmlFor="app-build-command"
+        error={problem ? t(`apps.commandProblem.${problem.key}`) : undefined}
+      >
+        <Input
+          id="app-build-command"
+          className="font-mono text-xs"
+          placeholder="npm run build"
+          aria-describedby="app-build-command-hint"
+          aria-invalid={problem !== null}
+          value={command}
+          onChange={(event) => setCommand(event.target.value)}
+        />
+      </Field>
+      <p id="app-build-command-hint" className="-mt-1 mb-2 text-xs text-ink-muted">
+        {t("apps.buildCommandHint")}
+      </p>
+
+      <Switch
+        checked={install}
+        onChange={setInstall}
+        label={t("apps.buildInstall")}
+        description={t("apps.buildInstallHint")}
+      />
+
+      {taskId ? (
+        <TaskLogPanel
+          taskId={taskId}
+          // The build wrote into the app's directory; the row's own state and
+          // memory are what the page shows, and both can move when a restart
+          // follows. Refreshing on settle keeps the list honest either way.
+          onSettled={() => void queryClient.invalidateQueries({ queryKey: ["apps"] })}
+        />
+      ) : (
+        <p className="mt-3 text-xs text-ink-muted">{t("apps.buildRestartHint")}</p>
+      )}
+    </Dialog>
+  );
+}
+
 function LogsDialog({
   app,
   open,
@@ -633,6 +907,7 @@ interface CreateForm {
   entry: string;
   runtime: AppRuntime;
   mode: AppMode;
+  start_command: string;
   node_env: NodeEnv;
   memory_mb: string;
   proxy_domain: string;
@@ -675,6 +950,7 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
       // move: what it runs on comes from an image rather than from whatever
       // this server happens to have installed this week.
       mode: "container",
+      start_command: "",
       node_env: "production",
       memory_mb: "",
       proxy_domain: "",
@@ -684,6 +960,8 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
 
   const env = useFieldArray({ control, name: "env" });
   const mode = watch("mode");
+  const startCommand = watch("start_command");
+  const startProblem = commandProblem(startCommand);
 
   // Only while the dialog is open, and shared with the Stack page's own cache —
   // the question is small and the answer is the same one that page renders.
@@ -702,7 +980,11 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
     // the form and never touches it. The callout explaining it is already on
     // screen, so there is nothing to say here that is not already said.
     if (modeUnavailable(values.mode, stack.data?.components)) return;
-    const body: CreateAppRequest = {
+    // Same reasoning as the line above: the footer button is disabled for this,
+    // but Enter in any field submits without touching it, and the error is
+    // already under the field it belongs to.
+    if (commandProblem(values.start_command) !== null) return;
+    const body: CreateAppBody = {
       name: values.name.trim(),
       entry: values.entry.trim(),
       node_env: values.node_env,
@@ -724,9 +1006,17 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
 
     if (values.memory_mb.trim() !== "") body.memory_mb = Number(values.memory_mb);
     if (values.proxy_domain.trim() !== "") body.proxy_domain = values.proxy_domain.trim();
+    // Omitted when empty, not sent as an empty string: absent is what asks the
+    // agent for package.json's own answer, and "" would be a command that is
+    // not a command. Omitted for a container too, where the agent refuses one —
+    // the field is hidden there, but a mode switched after typing would
+    // otherwise leave a value behind that only a failed task would explain.
+    if (takesStartCommand(values.mode) && values.start_command.trim() !== "") {
+      body.start_command = values.start_command.trim();
+    }
 
     try {
-      await endpoints.createApp(body);
+      await appEndpoints.createApp(body);
       reset();
       onClose();
       void queryClient.invalidateQueries({ queryKey: ["apps"] });
@@ -752,7 +1042,7 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
             // A container on a server with no Docker is a click whose only
             // ending is a red task. The callout at the mode field says so and
             // says what to do about it; this stops the round trip.
-            disabled={unavailable}
+            disabled={unavailable || startProblem !== null}
             onClick={() => void submit()}
           >
             {t("apps.create")}
@@ -850,6 +1140,37 @@ function CreateAppDialog({ open, onClose }: { open: boolean; onClose: () => void
             {t("apps.dockerNeeded")}
           </Callout>
         ) : null}
+
+        {/* After the mode, because that is what decides whether it exists: a
+            container's command comes from its image and there is no unit file
+            to put one in. The sentence takes the field's place rather than a
+            disabled input — a control somebody can click and not use is a
+            question with no answer. */}
+        {takesStartCommand(mode) ? (
+          <>
+            <Field
+              label={t("apps.startCommand")}
+              htmlFor="app-start-command-new"
+              error={startProblem ? t(`apps.commandProblem.${startProblem.key}`) : undefined}
+            >
+              <Input
+                id="app-start-command-new"
+                className="font-mono text-xs"
+                placeholder="npm start"
+                aria-describedby="app-start-hint"
+                aria-invalid={startProblem !== null}
+                {...register("start_command")}
+              />
+            </Field>
+            <p id="app-start-hint" className="-mt-1 mb-3 text-xs text-ink-muted">
+              {t("apps.startCommandHint")}
+            </p>
+          </>
+        ) : (
+          <p className="-mt-1 mb-3 text-xs text-ink-muted">
+            {t("apps.startCommandContainer")}
+          </p>
+        )}
 
         <Field label={t("apps.nodeEnv")} htmlFor="app-node-env">
           <Select id="app-node-env" {...register("node_env")}>

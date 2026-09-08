@@ -35,6 +35,10 @@ const PAGES = [
   "../routes/terminal.tsx",
   "../routes/firewall.tsx",
   "../routes/site-detail.tsx",
+  "../routes/wordpress.tsx",
+  "../routes/processes.tsx",
+  "../routes/users.tsx",
+  "../routes/dns.tsx",
 ];
 
 /** Every `t("literal")` in a file. Template-literal keys are handled below. */
@@ -80,10 +84,74 @@ const DYNAMIC_KEYS = [
   "docker.confirm.remove.hint",
   "docker.confirm.remove.confirm",
   "docker.confirm.remove.body",
+  // The repository field's three refusals, chosen by
+  // `siteDetail.gitProblem.${problem}`.
+  "siteDetail.gitProblem.required",
+  "siteDetail.gitProblem.https",
+  "siteDetail.gitProblem.credentials",
+  // The WordPress page renders `wordpress.queued.${kind}` above a task log,
+  // and five `…Problem.${reason}` families under form fields; a missing one
+  // is a raw key rendered as the error message on the install form.
+  "wordpress.queued.install",
+  "wordpress.queued.core",
+  "wordpress.queued.plugins",
+  "wordpress.titleProblem.required",
+  "wordpress.titleProblem.tooLong",
+  "wordpress.titleProblem.control",
+  "wordpress.titleProblem.metacharacter",
+  "wordpress.adminUserProblem.required",
+  "wordpress.adminUserProblem.length",
+  "wordpress.adminUserProblem.start",
+  "wordpress.adminUserProblem.charset",
+  "wordpress.emailProblem.required",
+  "wordpress.emailProblem.length",
+  "wordpress.emailProblem.charset",
+  "wordpress.emailProblem.shape",
+  "wordpress.subdirectoryProblem.absolute",
+  "wordpress.subdirectoryProblem.backslash",
+  "wordpress.subdirectoryProblem.control",
+  "wordpress.subdirectoryProblem.emptyComponent",
+  "wordpress.subdirectoryProblem.traversal",
+  "wordpress.subdirectoryProblem.tooLong",
+  "wordpress.cliArgProblem.empty",
+  "wordpress.cliArgProblem.tooLong",
+  "wordpress.cliArgProblem.nonAscii",
+  "wordpress.cliArgProblem.control",
+  "wordpress.cliArgProblem.metacharacter",
+  "wordpress.cliArgProblem.malformedFlag",
+  "wordpress.cliArgProblem.reservedFlag",
+  "wordpress.cliArgProblem.shortFlag",
+  // The Users page builds these from template literals too.
+  "users.state.active",
+  "users.state.suspended",
+  "users.state.locked",
+  "users.blocked.self",
+  "users.blocked.lastAdmin",
+  "users.blocked.owns",
+  "users.password.problem.required",
+  "users.password.problem.tooShort",
+  "users.password.problem.tooLong",
+  "users.password.problem.same",
+  "users.password.problem.mismatch",
+  "users.suspendDialog.title",
+  "users.suspendDialog.body",
+  "users.suspendDialog.submit",
+  "users.restoreDialog.title",
+  "users.restoreDialog.body",
+  "users.restoreDialog.submit",
 ];
 
 /** i18next pluralises by appending `_other`; both forms must exist. */
-const PLURAL_KEYS = ["plans.subscriptionsOn", "plans.liveCount", "plans.goDark"];
+const PLURAL_KEYS = [
+  "plans.subscriptionsOn",
+  "plans.liveCount",
+  "plans.goDark",
+  "siteDetail.gitDirty",
+  "users.password.changedWith",
+  "users.owns.subscriptions",
+  "users.owns.plans",
+  "users.owns.customers",
+];
 
 function lookup(bundle: unknown, key: string): unknown {
   return key

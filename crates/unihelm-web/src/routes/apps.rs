@@ -114,6 +114,18 @@ pub struct CreateRequest {
     pub node_env: Option<String>,
     /// Which language: node, python, ruby, bun, deno, go. Absent means node.
     pub runtime: Option<String>,
+    /// `container` or `host`. Absent lets the agent decide: a container, except
+    /// for a runtime that has no image.
+    #[serde(default)]
+    #[schema(example = "container")]
+    pub mode: Option<String>,
+    /// What starts the app, instead of running its entry file: `npm start`,
+    /// `node dist/server.js`. Absent uses `package.json`'s start script when
+    /// there is one, and the entry file when there is not. The agent refuses it
+    /// for a container, which has no unit file to put it in.
+    #[serde(default)]
+    #[schema(example = "npm start")]
+    pub start_command: Option<String>,
     /// Per-app `MemoryMax`, inside the tenant slice's own ceiling.
     #[serde(default)]
     pub memory_mb: Option<u32>,
@@ -223,6 +235,18 @@ fn create_input(body: &CreateRequest) -> ApiResult<serde_json::Value> {
     if let Some(runtime) = &body.runtime {
         object.insert("runtime".into(), json!(runtime));
     }
+    // `AppMode` is the same shape again — and this key was missing entirely
+    // until now, so the mode chosen in the dialog was dropped here and the
+    // agent's own default silently took its place. A page that says "Service on
+    // this server" while a container starts is the defect this panel is judged
+    // on, and it is also why a start command was unreachable from the UI: it
+    // only exists on the host.
+    if let Some(mode) = &body.mode {
+        object.insert("mode".into(), json!(mode));
+    }
+    if let Some(command) = &body.start_command {
+        object.insert("start_command".into(), json!(command));
+    }
     if let Some(domain) = &body.proxy_domain {
         let domain = unihelm_core::Domain::parse(domain)
             .map_err(|e| ApiError::new(e.with_field("proxy_domain")))?;
@@ -245,6 +269,13 @@ fn create_audit_detail(body: &CreateRequest) -> serde_json::Value {
         "memory_mb": body.memory_mb,
         "proxy_domain": body.proxy_domain,
         "subscription_id": body.subscription_id,
+        "mode": body.mode,
+        // The command itself, not just that there was one: it is what the
+        // server will run as this tenant from now on, and "somebody changed
+        // what starts this app" is unanswerable without it. Unlike an
+        // environment value it is not a place secrets go — it is a program name
+        // and its flags, and the agent refuses anything a shell would read.
+        "start_command": body.start_command,
         "env_keys": body.env.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
     })
 }
@@ -303,6 +334,15 @@ pub struct UpdateRequest {
     /// flattened: without the distinction, unpinning would be unreachable.
     #[serde(default, deserialize_with = "double_option")]
     pub runtime_version: Option<Option<String>>,
+    /// What starts the app. Send an explicit `null` to put it back on its entry
+    /// file; omit the key to leave whatever it starts with alone.
+    ///
+    /// Absent and null differ here for the same reason they do above: the
+    /// command lives in the unit file, so "leave it" and "clear it" are two
+    /// requests and collapsing them would make going back unreachable.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(example = "npm start")]
+    pub start_command: Option<Option<String>>,
 }
 
 /// `Option<Option<T>>` where absent and null are distinguishable.
@@ -356,6 +396,10 @@ pub async fn update(
     // This one is the opposite: an explicit null is meaningful — it unpins.
     if let Some(version) = &body.runtime_version {
         object.insert("runtime_version".into(), json!(version));
+    }
+    // And so is this one: null puts the app back on its entry file.
+    if let Some(command) = &body.start_command {
+        object.insert("start_command".into(), json!(command));
     }
 
     audit(
@@ -417,6 +461,83 @@ pub async fn restart(
         json!({ "app_id": id }),
     )
     .await
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BuildRequest {
+    /// Run this instead of the build command `package.json` declares.
+    ///
+    /// One program and its arguments. The agent starts it directly, with no
+    /// shell, so `npm run build && npm test` is refused rather than half-run.
+    #[serde(default)]
+    #[schema(example = "npm run build")]
+    pub command: Option<String>,
+    /// Install dependencies first. Absent means yes.
+    #[serde(default)]
+    pub install: Option<bool>,
+}
+
+/// Install dependencies and run an application's build, as the tenant.
+///
+/// A task rather than a request, and not as a matter of taste: `npm install` on
+/// a cold cache is minutes, so the output has to arrive as a log somebody can
+/// read while it happens. A build that fails and shows nothing is the least
+/// useful thing this panel could do.
+#[utoipa::path(
+    post,
+    path = "/api/apps/{id}/build",
+    tag = "apps",
+    request_body = BuildRequest,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = i64, Path, description = "App id")),
+    responses(
+        (status = 202, description = "Queued; poll the task for the build's output", body = ops::TaskAccepted),
+        (status = 200, description = "Finished immediately", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: nothing to build, or a command that would need a shell", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no such app, its directory is missing, or the command names a program this server does not have", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: this tenant has no resource-limit slice, so a build could only run unconfined", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn build(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    current: CurrentUser,
+    Json(body): Json<BuildRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::NodeApps)
+        .map_err(ApiError::from)?;
+
+    let mut input = json!({ "app_id": id });
+    let object = input.as_object_mut().expect("just built as an object");
+    // Both omitted rather than sent as null, by the rule this module's docs
+    // state: the agent's defaults are "whatever package.json says" and "yes,
+    // install first", and an absent key is how a caller asks for them.
+    if let Some(command) = &body.command {
+        object.insert("command".into(), json!(command));
+    }
+    if let Some(install) = body.install {
+        object.insert("install".into(), json!(install));
+    }
+
+    audit(
+        &state,
+        &current,
+        &headers,
+        &peer,
+        "app.build",
+        &id.to_string(),
+        input.clone(),
+    )
+    .await?;
+
+    ops::invoke(&state, &current.auth, "app.build", input).await
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -615,6 +736,55 @@ mod tests {
         }));
         let err = create_input(&body).expect_err("expected a refusal");
         assert_eq!(err.inner.field.as_deref(), Some("proxy_domain"));
+    }
+
+    /// The mode the dialog offers has to arrive, or the page and the server
+    /// disagree about what was created.
+    ///
+    /// It did not, until now: `CreateRequest` had no `mode` field at all, so
+    /// the UI's "Service on this server" was dropped here and the agent's own
+    /// default — a container — took its place, with the page reporting the
+    /// choice it had made. That is silent feature loss, and it is also what put
+    /// a start command out of reach, because only a host application has a unit
+    /// file to hold one.
+    #[test]
+    fn the_mode_and_the_start_command_reach_the_agent() {
+        let body = request(json!({
+            "name": "blog",
+            "entry": "apps/blog/server.js",
+            "mode": "host",
+            "start_command": "npm start",
+        }));
+        let input = create_input(&body).expect("a valid request builds an input");
+        assert_eq!(input["mode"], json!("host"));
+        assert_eq!(input["start_command"], json!("npm start"));
+
+        // And neither is sent as null when nobody chose one: both are bare
+        // enums or `#[serde(default)]` options in the agent, where an explicit
+        // null is a deserialization error and an absent key is the default.
+        let bare = request(json!({ "name": "blog", "entry": "apps/blog/server.js" }));
+        let input = create_input(&bare).expect("a valid request builds an input");
+        let object = input.as_object().expect("object");
+        assert!(!object.contains_key("mode"), "{input}");
+        assert!(!object.contains_key("start_command"), "{input}");
+    }
+
+    /// The audit row records the start command itself, unlike an environment
+    /// value — it is a program name and its flags, it is what this server will
+    /// run as the tenant from now on, and "who changed what starts this app"
+    /// cannot be answered without it.
+    #[test]
+    fn a_create_audit_row_records_the_start_command() {
+        let body = request(json!({
+            "name": "blog",
+            "entry": "apps/blog/server.js",
+            "mode": "host",
+            "start_command": "npm start",
+        }));
+        let rendered =
+            serde_json::to_string(&create_audit_detail(&body)).expect("detail serializes");
+        assert!(rendered.contains("npm start"), "{rendered}");
+        assert!(rendered.contains("host"), "{rendered}");
     }
 
     /// `AppName::parse` lowercases and trims; sending the raw string instead

@@ -47,6 +47,31 @@
 //! bounds. That ordering is the whole reason the drop-in is written before the
 //! unit is enabled rather than after.
 //!
+//! # Starting, and building
+//!
+//! An application is not always `<interpreter> <entry>`. Most of them are a
+//! `package.json` with a `start` script, a dependency tree that has to be
+//! installed, and often a `build` step before either means anything. Two things
+//! answer that here:
+//!
+//! - A **start command** ([`RunCommand`]) replaces the interpreter-and-entry
+//!   `ExecStart`, and defaults to what `package.json` says when it says
+//!   anything. It has nowhere to live but the unit file — `node_apps` has no
+//!   column for it — so it is read back out of that file on an update, exactly
+//!   as the tenant's `Environment=` lines are, and for the same reason: a
+//!   re-render from the database alone would silently put an application
+//!   started by `npm start` back on `node server.js`.
+//! - A **build** is [`Build`], its own operation with its own log, because
+//!   `npm install` on a cold cache is minutes and a request is not.
+//!
+//! A **start command is refused for a container**: its command is built by
+//! [`crate::appcontainer`] from the image and the entry file, and there is no
+//! `ExecStart` in a `docker run`. Refusing says so; accepting the field and
+//! running something else would be the failure this panel is judged on. A
+//! *build* is not refused there, because the thing a container runs is the
+//! tenant's own directory on this host — the same directory a build writes
+//! into — but it says out loud that it ran here rather than inside the image.
+//!
 //! # What this module deliberately does not do
 //!
 //! - **It does not install Node.** `app.create` refuses, naming what to
@@ -63,6 +88,7 @@
 //!   changes only which path that is.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -413,6 +439,427 @@ fn check_entry(entry: &TenantPath) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Commands: what starts an application, and what builds it
+// ---------------------------------------------------------------------------
+
+/// Longest accepted start or build command.
+///
+/// Not a systemd limit — a bound, in the spirit of [`MAX_ENV_VALUE`]. A command
+/// this long is a script that wants a file of its own, and saying so is more
+/// use than rendering it into a unit nobody can read.
+const MAX_COMMAND_CHARS: usize = 512;
+
+/// Most words one command may have. Same reasoning as [`MAX_ENV_VARS`]: a
+/// malformed client does not get to turn one field into a unit file.
+const MAX_COMMAND_WORDS: usize = 32;
+
+/// A command the panel will execute: an absolute program and its arguments.
+///
+/// Kept as an argv rather than a string all the way through, because that is
+/// what both destinations want — `execve` for a build step (spec §12 rule 2)
+/// and one `ExecStart=` line for a start command, which systemd splits back
+/// into an argv itself.
+#[derive(Debug, Clone)]
+struct RunCommand {
+    /// Absolute, because `ExecStart` does no lookup and because a poisoned
+    /// `PATH` must not choose what a tenant's application starts.
+    program: PathBuf,
+    /// The words after the program, exactly as they were typed.
+    args: Vec<String>,
+    /// The words as the operator wrote them, program name included.
+    /// **Display only** — the same contract [`Cmd::display`] states, and for
+    /// the same reason: it is never parsed back into a command.
+    words: Vec<String>,
+}
+
+impl RunCommand {
+    /// What to call this in a log line or a reply.
+    fn display(&self) -> String {
+        self.words.join(" ")
+    }
+}
+
+/// Split a command into the argv the panel will execute.
+///
+/// **There is no shell anywhere on this path** (spec §12 rule 2), and the
+/// refusals below are that fact made visible rather than tidiness. `npm run
+/// build && npm test` is two commands joined by an operator only a shell
+/// understands: handed to `execve` it passes `&&` to npm as an argument, npm
+/// ignores what it does not recognise, and the panel reports a build that ran
+/// half of what was asked. A refusal naming the reason is the whole difference.
+///
+/// The rules, in the order somebody hits them:
+///
+/// 1. **Double quotes group a word containing spaces**, and nothing else does.
+///    `npm run "build all"` is three words. An unclosed quote is refused rather
+///    than guessed at.
+/// 2. **A shell metacharacter is refused, named.** `&`, `|`, `;`, `$`, a
+///    backtick, a glob, a `~`: each means something to a shell and nothing to
+///    `execve`, so a command carrying one was written for a program that is not
+///    going to run it.
+/// 3. **`%` is refused rather than escaped.** systemd expands specifiers in
+///    `ExecStart` before the line is a command at all, so `%h` would arrive as
+///    a home directory in the middle of an argument. Escaping to `%%` is
+///    possible — [`environment_line`] does it — but a percent sign in a build
+///    command is a mistake far more often than a plan, and refusing it keeps
+///    *one* rule for a string that has to be legal both in a unit file and on
+///    `systemd-run`'s argv.
+/// 4. **A `"` or a `\` inside a word is refused**, which is what makes the
+///    quoting in [`quote_exec_word`] airtight: after this, the only reason a
+///    word ever needs quoting is a space, and nothing inside it can end the
+///    quotes. Refuse what you cannot quote.
+fn split_command(what: &'static str, field: &'static str, raw: &str) -> Result<Vec<String>> {
+    let refuse =
+        |detail: String| UnihelmError::new(ErrorCode::InvalidInput, detail).with_field(field);
+
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(refuse(format!("the {what} is empty")));
+    }
+    if text.chars().count() > MAX_COMMAND_CHARS {
+        return Err(refuse(format!(
+            "a {what} may be at most {MAX_COMMAND_CHARS} characters. Put this in a script \
+             inside your application and name that script here."
+        )));
+    }
+    if let Some(bad) = text.chars().find(|c| c.is_control()) {
+        return Err(refuse(format!(
+            "the {what} contains {}, which cannot be part of a command",
+            describe_char(bad)
+        )));
+    }
+    // Named on its own before the general rule below, because this is the one
+    // somebody meant: two commands, and the panel runs one.
+    if text.contains("&&") || text.contains("||") || text.contains(';') || text.contains('|') {
+        return Err(refuse(format!(
+            "the {what} runs one program directly, with no shell to join two of them \
+             together. Put the steps in a script inside your application and name that \
+             script here."
+        )));
+    }
+    if let Some(bad) = text.chars().find(|c| {
+        matches!(
+            c,
+            '&' | ';'
+                | '|'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '\\'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+                | '#'
+                | '!'
+                | '\''
+                | '%'
+        )
+    }) {
+        return Err(refuse(format!(
+            "the {what} contains `{bad}`, which only means something to a shell — and \
+             the panel starts your program itself, without one. Remove it, or put the \
+             command in a script inside your application and name that script here."
+        )));
+    }
+
+    // The split. `started` is what separates `""` (a word the operator wrote,
+    // and an empty argument is refused below) from the whitespace between two
+    // words, which produces none.
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in text.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return Err(refuse(format!(
+            "the {what} has an opening double quote with no closing one"
+        )));
+    }
+    if started {
+        words.push(current);
+    }
+
+    if words.len() > MAX_COMMAND_WORDS {
+        return Err(refuse(format!(
+            "a {what} may be at most {MAX_COMMAND_WORDS} words"
+        )));
+    }
+    if words.iter().any(String::is_empty) {
+        return Err(refuse(format!(
+            "the {what} has an empty argument (`\"\"`); remove it"
+        )));
+    }
+    Ok(words)
+}
+
+/// Resolve a command's program against the trusted system directories.
+///
+/// The first word names a **program on this server** — `npm`, `node`, `pnpm` —
+/// and not a file in the tenant's application, which is why a `/` in it is
+/// refused rather than joined onto anything. Two reasons, and the second is the
+/// one that matters: `ExecStart` does no path lookup, so the unit needs an
+/// absolute path either way; and resolving a tenant-writable path here would
+/// mean the panel deciding, as root, that a file the tenant controls is a
+/// program — a directory swap away from starting something else entirely. The
+/// way to run a file from the application is the way it is always written:
+/// `node dist/server.js`.
+fn resolve_command(what: &'static str, field: &'static str, raw: &str) -> Result<RunCommand> {
+    let words = split_command(what, field, raw)?;
+    let program = words.first().cloned().unwrap_or_default();
+
+    if program.contains('/') {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "the first word of a {what} names a program installed on this server, so \
+                 `{program}` cannot be a path. To run a file from your application, name \
+                 the interpreter first — `node dist/server.js`."
+            ),
+        )
+        .with_field(field));
+    }
+
+    let path = unihelm_distro::exec::resolve_program(&program).map_err(|_| {
+        UnihelmError::new(
+            ErrorCode::NotFound,
+            format!(
+                "`{program}` is not installed on this server, so the {what} `{}` cannot \
+                 run. Install it, or name a program that is here.",
+                words.join(" ")
+            ),
+        )
+        .with_field(field)
+    })?;
+
+    Ok(RunCommand {
+        args: words[1..].to_vec(),
+        program: path,
+        words,
+    })
+}
+
+/// The whole `ExecStart=` value for a command.
+fn exec_start_value(command: &RunCommand) -> String {
+    let mut line = command.program.display().to_string();
+    for arg in &command.args {
+        line.push(' ');
+        line.push_str(&quote_exec_word(arg));
+    }
+    line
+}
+
+/// One `ExecStart` word, quoted only where systemd would otherwise split it.
+///
+/// Nothing is escaped here and nothing needs to be: [`split_command`] has
+/// already refused `"`, `\`, `%` and every control character, so the only word
+/// that reaches the quoted branch is one containing a space, and there is
+/// nothing inside it that could end the quotes.
+fn quote_exec_word(word: &str) -> String {
+    if word.chars().any(char::is_whitespace) {
+        format!("\"{word}\"")
+    } else {
+        word.to_string()
+    }
+}
+
+/// What an application's `package.json` declares that this module can act on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Manifest {
+    /// There is a `package.json` at all — which is what makes an install step
+    /// worth running, whether or not anything else is declared.
+    present: bool,
+    start: bool,
+    build: bool,
+}
+
+/// The biggest `package.json` this will read. Well past any real one, and short
+/// of letting a tenant hand the agent a gigabyte to parse.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read `<app dir>/package.json` for the two scripts this module can use.
+///
+/// Absent, unreadable, oversized or not JSON all come back the same way — as
+/// "it says nothing" — because every one of them leaves the caller with the
+/// same job: fall back to the entry file, or ask for a command. There is
+/// nothing to report to an operator in the difference.
+///
+/// A **symlink is not followed**, and that is not the same kind of decision.
+/// The application directory belongs to the tenant, so `package.json` is an
+/// entry they can point at `/etc/shadow`, and this runs as root — the same
+/// swap [`check_app_dir_target`] refuses one directory up. Reading through it
+/// for a fact this module can do without is not a trade worth making.
+fn read_manifest(app_dir: &Path) -> Manifest {
+    let path = app_dir.join("package.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if md.file_type().is_file() && md.len() <= MAX_MANIFEST_BYTES => {}
+        _ => return Manifest::default(),
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Manifest::default();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Manifest::default();
+    };
+    let scripts = &json["scripts"];
+    Manifest {
+        present: true,
+        start: scripts["start"].is_string(),
+        build: scripts["build"].is_string(),
+    }
+}
+
+/// The commands one runtime's projects are installed, started and built with.
+#[derive(Debug, Clone, Copy)]
+struct ScriptRunner {
+    install: &'static str,
+    start: &'static str,
+    build: &'static str,
+}
+
+/// Which runtimes the panel will read a `package.json` for.
+///
+/// Node and Bun, and the omissions are answers rather than gaps. Python's
+/// `pyproject.toml`, Ruby's `Rakefile` and Go's `go.mod` all describe a build,
+/// and none of them describes it as `scripts.build` — reading a package.json
+/// answer into those would be the panel inventing a convention. Deno is the
+/// near miss: it *does* run `package.json` scripts, but whether its
+/// dependencies come from `node_modules` or from an import map is a property of
+/// the project, and installing the wrong one is worse than asking. Every one of
+/// them still takes a command the operator names.
+fn script_runner(runtime: AppRuntime) -> Option<ScriptRunner> {
+    match runtime {
+        AppRuntime::Node => Some(ScriptRunner {
+            install: "npm install",
+            start: "npm start",
+            build: "npm run build",
+        }),
+        AppRuntime::Bun => Some(ScriptRunner {
+            install: "bun install",
+            start: "bun run start",
+            build: "bun run build",
+        }),
+        AppRuntime::Python | AppRuntime::Ruby | AppRuntime::Deno | AppRuntime::Go => None,
+    }
+}
+
+/// What an application will start with, and what to tell the operator about it.
+#[derive(Debug, Default)]
+struct StartPlan {
+    /// `None` is the entry file — the path every app created before this
+    /// existed runs on, unchanged.
+    command: Option<RunCommand>,
+    /// A sentence for the create's log and next steps, present exactly when the
+    /// panel chose something the operator did not type. A default taken in
+    /// silence is a default nobody can correct.
+    note: Option<String>,
+}
+
+/// Resolve what starts an application, before anything on the machine moves.
+///
+/// Three answers, in order:
+///
+/// 1. **The operator named a command.** Taken as given, once it survives
+///    [`resolve_command`] — and a failure there is the whole create's failure,
+///    because they asked for this specifically.
+/// 2. **`package.json` declares a `start` script.** That file is the
+///    application's own answer to "how is this started", and `npm start` is
+///    what its deploy instructions say. A defaulted command that cannot run —
+///    a `scripts.start` on a server with no npm — falls back to the entry file
+///    and *says so*, because this is the panel offering an answer rather than
+///    being asked for one, and refusing a create over an offer would break the
+///    single-file path that already worked.
+/// 3. **Neither.** The entry file, exactly as before.
+fn resolve_start_command(
+    mode: AppMode,
+    requested: Option<&str>,
+    runtime: AppRuntime,
+    app_dir: &Path,
+) -> Result<StartPlan> {
+    if mode == AppMode::Container {
+        return match requested {
+            Some(_) => Err(refuse_a_container_start_command()),
+            // The package.json default is not consulted either. A container
+            // that quietly ran `npm start` because a file in the directory said
+            // so would be running something this module cannot render into its
+            // `docker run`, report in its reply, or take back out again.
+            None => Ok(StartPlan::default()),
+        };
+    }
+
+    if let Some(raw) = requested {
+        return Ok(StartPlan {
+            command: Some(resolve_command("start command", "start_command", raw)?),
+            note: None,
+        });
+    }
+
+    let Some(runner) = script_runner(runtime) else {
+        return Ok(StartPlan::default());
+    };
+    if !read_manifest(app_dir).start {
+        return Ok(StartPlan::default());
+    }
+
+    match resolve_command("start command", "start_command", runner.start) {
+        Ok(command) => Ok(StartPlan {
+            note: Some(format!(
+                "package.json declares a start script, so this app starts with `{}`",
+                command.display()
+            )),
+            command: Some(command),
+        }),
+        Err(e) => Ok(StartPlan {
+            command: None,
+            note: Some(format!(
+                "package.json declares a start script, but it cannot run here ({}), so \
+                 this app starts from its entry file instead",
+                e.detail
+            )),
+        }),
+    }
+}
+
+/// Why a container cannot be given a start command.
+///
+/// The same shape of answer as [`refuse_a_mode_change`], and for the same
+/// reason: the honest sentence in this step, plus the path that does work,
+/// beats a field the panel accepts and then ignores.
+fn refuse_a_container_start_command() -> UnihelmError {
+    UnihelmError::new(
+        ErrorCode::NotImplemented,
+        "a container application starts from its entry file: its command is built from \
+         the image, and a `docker run` has no unit file for the panel to put a start \
+         command in. Create this application as a service on this host to use one, or \
+         point its entry file at the file you would have started.",
+    )
+    .with_field("start_command")
+}
+
 /// The `Environment=` lines already in a unit, minus the two the panel owns.
 ///
 /// `PORT` and the runtime's own env var are rebuilt by `AppUnitContext` from the
@@ -431,6 +878,35 @@ fn carried_environment(unit_path: &Path) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+/// The `ExecStart=` already in a unit, when it is not the one this module would
+/// render from the row.
+///
+/// A start command has nowhere else to live: `node_apps` has no column for it,
+/// so the unit file **is** the record — exactly as it is for the tenant's
+/// `Environment=` lines, and [`carried_environment`] exists for the same
+/// reason. Without this, an `app.update` that changed a runtime would re-render
+/// from the database alone and put an application started by `npm start` back
+/// on `node server.js`, while reporting a runtime change and nothing else.
+///
+/// How the two are told apart: the rendered default always **ends with the
+/// app's entry file, absolute**, in both of its forms — interpreter and entry,
+/// or (for a compiled program) the entry alone. Anything else was written from
+/// a start command. A hand-typed command that happens to end there too is read
+/// as the default and re-rendered, which produces the same line — the one case
+/// where being wrong costs nothing.
+fn carried_start_command(unit_path: &Path, app: &NodeApp, user: &LinuxUser) -> Option<String> {
+    let text = std::fs::read_to_string(unit_path).ok()?;
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))?
+        .trim();
+    let entry = paths::tenant_home(user.as_str())
+        .join(app.entry.as_str())
+        .to_string_lossy()
+        .into_owned();
+    (!line.is_empty() && !line.ends_with(entry.as_str())).then(|| line.to_string())
 }
 
 /// The interpreter an application runs under, or `None` when it is compiled.
@@ -646,10 +1122,11 @@ struct AppUnitContext {
     name: String,
     linux_user: String,
     working_dir: String,
-    /// The whole `ExecStart` line: interpreter and entry, or the entry alone
-    /// when the program is compiled. Built here rather than in the template
-    /// because whether there is an interpreter at all is a property of the
-    /// runtime, and a template deciding that would be a template making a
+    /// The whole `ExecStart` line: a start command where the application has
+    /// one, and otherwise interpreter and entry — or the entry alone when the
+    /// program is compiled. Built here rather than in the template because
+    /// which of the three it is depends on the runtime and on what the operator
+    /// asked for, and a template deciding that would be a template making a
     /// language decision.
     exec_start: String,
     /// What to call this in the unit's Description. `Node.js`, not `node`.
@@ -660,11 +1137,16 @@ struct AppUnitContext {
 }
 
 impl AppUnitContext {
+    /// `exec_start` is an already-rendered `ExecStart=` value — a start
+    /// command, or one carried over from the unit being replaced. `None` is the
+    /// entry-file form, which is what every application created before start
+    /// commands existed runs on.
     fn new(
         app: &NodeApp,
         name: &AppName,
         user: &LinuxUser,
         interpreter: Option<&Path>,
+        exec_start: Option<String>,
         env: Vec<String>,
         memory_max_mb: Option<u32>,
     ) -> Self {
@@ -688,7 +1170,7 @@ impl AppUnitContext {
             working_dir: paths::app_dir(user.as_str(), name.as_str())
                 .to_string_lossy()
                 .into_owned(),
-            exec_start: {
+            exec_start: exec_start.unwrap_or_else(|| {
                 let entry = paths::tenant_home(user.as_str())
                     .join(app.entry.as_str())
                     .to_string_lossy()
@@ -697,7 +1179,7 @@ impl AppUnitContext {
                     Some(bin) => format!("{} {entry}", bin.display()),
                     None => entry,
                 }
-            },
+            }),
             runtime_label: app.runtime.label().to_string(),
             environment,
             // A cap below a few megabytes cannot start a Node process at all;
@@ -772,10 +1254,11 @@ async fn apply_app_unit_at(
     name: &AppName,
     user: &LinuxUser,
     interpreter: Option<&Path>,
+    exec_start: Option<String>,
     env: Vec<String>,
     memory_max_mb: Option<u32>,
 ) -> Result<ApplyOutcome> {
-    let context = AppUnitContext::new(app, name, user, interpreter, env, memory_max_mb);
+    let context = AppUnitContext::new(app, name, user, interpreter, exec_start, env, memory_max_mb);
     ctx.config()
         .apply(ApplyRequest {
             // 0600, not the 0644 `managed_for` hands out. This file holds every
@@ -919,6 +1402,20 @@ pub struct AppView {
     pub state: UnitState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// What this application actually starts with, when it is not its entry
+    /// file. Read out of the unit, because the unit is where a start command
+    /// lives — the row has no column for one.
+    ///
+    /// Reported rather than left out because the page shows `entry` beside
+    /// every app, and an application started by `npm start` is not running its
+    /// entry file at all: a list that showed one while the server ran the other
+    /// would be the panel stating something untrue about every row.
+    ///
+    /// One file read per host application, on a list bounded at 500 rows, for
+    /// the same reason the state costs one `systemctl` call each: the page's
+    /// whole job is to say what is true of the machine right now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -953,7 +1450,7 @@ impl TypedOperation for List {
                 .by_id(app.subscription_id)
                 .await
                 .map_err(UnihelmError::from)?;
-            let (unit, state, memory_bytes) = match subscription {
+            let (unit, state, memory_bytes, start_command) = match subscription {
                 Some(sub) => {
                     let user = LinuxUser::parse(&sub.linux_user)?;
                     let name = AppName::parse(&app.name)?;
@@ -968,6 +1465,7 @@ impl TypedOperation for List {
                                     .map(|s| s.state)
                                     .unwrap_or(UnitState::Unknown),
                                 status.and_then(|s| s.memory_bytes),
+                                carried_start_command(&app_unit_path(&user, &name), &app, &user),
                             )
                         }
                         // Reported in systemd's vocabulary on purpose. The UI
@@ -993,17 +1491,23 @@ impl TypedOperation for List {
                                     .map(|s| s.state)
                                     .unwrap_or(UnitState::Unknown),
                                 status.and_then(|s| s.memory_bytes),
+                                // A container has no unit and cannot be given a
+                                // start command, so there is none to report —
+                                // and reporting one would be inventing a fact
+                                // about how it runs.
+                                None,
                             )
                         }
                     }
                 }
-                None => (String::new(), UnitState::Unknown, None),
+                None => (String::new(), UnitState::Unknown, None, None),
             };
 
             views.push(AppView {
                 state,
                 memory_bytes,
                 unit,
+                start_command,
                 app,
             });
         }
@@ -1075,6 +1579,15 @@ pub struct CreateInput {
     /// their row, and `app.update` will not move them.
     #[serde(default)]
     pub mode: Option<AppMode>,
+    /// What starts the application, instead of running its entry file.
+    ///
+    /// `npm start`, `node dist/server.js`, `npm run serve` — one program and
+    /// its arguments, run from the application's own directory. Omit it and
+    /// `package.json`'s `start` script is used when there is one, and the entry
+    /// file when there is not. Refused for a container, which has no unit file
+    /// to put it in.
+    #[serde(default)]
+    pub start_command: Option<String>,
     /// Publish the app behind this domain as a reverse-proxy site.
     #[serde(default)]
     pub proxy_domain: Option<Domain>,
@@ -1093,6 +1606,11 @@ pub struct CreateOutput {
     /// `host` or `container`, so the panel can tell somebody which of the two
     /// they just got rather than making them guess from the name.
     pub mode: String,
+    /// The command this application starts with, as it went into the unit.
+    /// Absent when it starts from its entry file, which is what a reply looked
+    /// like before start commands existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
     /// The image a container application was built from. Absent for a host
     /// application, which has no image — and absent rather than null so a host
     /// create's reply is byte-for-byte what it was before this field existed.
@@ -1126,6 +1644,17 @@ impl TypedOperation for Create {
 
         let mode = input.mode.unwrap_or_else(|| default_mode(input.runtime));
 
+        // Needed before the row for the start command below, which reads the
+        // application's directory — the tenant may already have deployed into
+        // it, and `package.json` is the file that knows how this is started.
+        let user = LinuxUser::parse(&subscription.linux_user)?;
+        let start = resolve_start_command(
+            mode,
+            input.start_command.as_deref(),
+            input.runtime,
+            &paths::app_dir(user.as_str(), input.name.as_str()),
+        )?;
+
         // Resolved here rather than stored: a path goes stale when a version
         // manager moves its directories, and a version does not. A compiled
         // runtime resolves to nothing, because the entry is the program.
@@ -1156,7 +1685,6 @@ impl TypedOperation for Create {
             ctx.auth().require(Permission::SiteManage)?;
         }
 
-        let user = LinuxUser::parse(&subscription.linux_user)?;
         let app = ctx
             .db()
             .create_node_app(NewNodeApp {
@@ -1175,8 +1703,14 @@ impl TypedOperation for Create {
             app.port,
             input.name.as_str()
         ));
+        // Said before the work rather than only in the reply: a defaulted start
+        // command is the panel choosing something the operator did not type,
+        // and the log is where they find out it happened.
+        if let Some(note) = &start.note {
+            ctx.log(note);
+        }
 
-        match provision_app(ctx, &app, &input, &user, &launch, env_lines).await {
+        match provision_app(ctx, &app, &input, &user, &launch, &start, env_lines).await {
             Ok(provisioned) => {
                 let handle = app_handle(mode, &user, &input.name);
                 ctx.log(format!("{handle} is running"));
@@ -1190,9 +1724,10 @@ impl TypedOperation for Create {
                         .into_owned(),
                     linux_user: subscription.linux_user,
                     mode: mode.as_str().to_string(),
+                    start_command: start.command.as_ref().map(RunCommand::display),
                     image: provisioned.image,
                     site_id: provisioned.site_id,
-                    next_steps: next_steps(&input, mode, app.port, provisioned.listening),
+                    next_steps: next_steps(&input, mode, app.port, provisioned.listening, &start),
                 })
             }
             Err(e) => {
@@ -1212,10 +1747,17 @@ fn next_steps(
     mode: AppMode,
     port: i64,
     listening: Option<bool>,
+    start: &StartPlan,
 ) -> Vec<String> {
     let mut steps = vec![format!(
         "Your app must listen on port {port} — read it from process.env.PORT"
     )];
+    // The note, repeated where somebody reads the result rather than the log:
+    // "it starts with npm start" is a fact about the application from now on,
+    // not an event during its creation.
+    if let Some(note) = &start.note {
+        steps.push(note.clone());
+    }
     // Said out loud because it is the one thing about a container that is not
     // obvious and that costs a support ticket when it is not: the code is not
     // baked into the image, it is the same directory as before, so deploying is
@@ -1261,6 +1803,7 @@ async fn provision_app(
     input: &CreateInput,
     user: &LinuxUser,
     launch: &Launch,
+    start: &StartPlan,
     env_lines: Vec<String>,
 ) -> Result<Provisioned> {
     // 1. The account and the app directory — the same in both modes. A
@@ -1289,6 +1832,7 @@ async fn provision_app(
                 &input.name,
                 user,
                 interpreter.as_deref(),
+                start.command.as_ref().map(exec_start_value),
                 env_lines,
                 input.memory_mb,
             )
@@ -1749,6 +2293,15 @@ pub struct UpdateInput {
     /// answer in this step rather than a shortcoming of it.
     #[serde(default)]
     pub mode: Option<AppMode>,
+    /// The command this application starts with.
+    ///
+    /// Nested for the same reason `runtime_version` is: absent leaves whatever
+    /// the unit already runs alone — including a start command, which is read
+    /// back out of the unit file because nothing else holds it — while an
+    /// explicit null puts the application back on its entry file. Flattening
+    /// the two would make going back unreachable.
+    #[serde(default, deserialize_with = "double_option")]
+    pub start_command: Option<Option<String>>,
 }
 
 /// `Option<Option<T>>` where absent and null mean different things.
@@ -1773,6 +2326,10 @@ pub struct UpdateOutput {
     /// `host` or `container`. Unchanged by this operation; reported so the
     /// reply says what the application is, not only what changed about it.
     pub mode: String,
+    /// The command it now starts with, or null when it starts from its entry
+    /// file. Reported on every update, changed or not, because a runtime change
+    /// is exactly when somebody needs to know this survived.
+    pub start_command: Option<String>,
     /// The image a container application now runs. Absent for a host one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -1841,6 +2398,15 @@ impl TypedOperation for Update {
             return Err(refuse_a_mode_change(&name, app.mode, wanted));
         }
 
+        // Whole, for the same reason. A container has no `ExecStart`, so a
+        // request naming one cannot be half-applied as a runtime change that
+        // leaves the caller believing the command took as well. `Some(None)` —
+        // "put it back on the entry file" — is what a container already does,
+        // and is accepted so a client echoing the row back is not punished.
+        if matches!(input.start_command, Some(Some(_))) && app.mode == AppMode::Container {
+            return Err(refuse_a_container_start_command());
+        }
+
         let runtime = input.runtime.unwrap_or(app.runtime);
         let version = match &input.runtime_version {
             Some(v) => v.clone(),
@@ -1862,6 +2428,21 @@ impl TypedOperation for Update {
         // a container never reaches `resolve_interpreter`, which is what lets a
         // Docker-only server hold Node applications at all.
         let launch = plan_launch(app.mode, runtime, version.as_deref(), "node").await?;
+
+        // What the unit will start, resolved before the row moves for the same
+        // reason the interpreter is: a command naming a program this machine
+        // does not have must fail with the application still running on what it
+        // had. Absent means "whatever the unit already says", which is the only
+        // place a start command is recorded.
+        let start_command = match &input.start_command {
+            None => carried_start_command(&app_unit_path(&user, &name), &app, &user),
+            Some(None) => None,
+            Some(Some(raw)) => Some(exec_start_value(&resolve_command(
+                "start command",
+                "start_command",
+                raw,
+            )?)),
+        };
 
         let updated = ctx
             .db()
@@ -1888,6 +2469,7 @@ impl TypedOperation for Update {
                     &name,
                     &user,
                     interpreter.as_deref(),
+                    start_command.clone(),
                     env,
                     None,
                 )
@@ -1929,6 +2511,7 @@ impl TypedOperation for Update {
             runtime_version: version,
             interpreter: launch.interpreter(),
             mode: app.mode.as_str().to_string(),
+            start_command: start_command.clone(),
             // The image is `launch`'s answer, which is the same string
             // `appcontainer` built the container from — `plan_image` is called
             // once, by `plan_launch`, and both this reply and the run read it.
@@ -2085,6 +2668,360 @@ impl TypedOperation for Logs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// app.build
+// ---------------------------------------------------------------------------
+
+/// How long one build step may take before it is killed.
+///
+/// `npm install` on a cold cache over somebody's uplink is minutes, and a
+/// bundler on a small VPS is minutes more — the 120 seconds [`Cmd`] defaults to
+/// would kill both and report a failure that was a stopwatch. Thirty minutes is
+/// past any honest build and still short of a task that hangs until an operator
+/// notices it in a week.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How much of a failed build's own output travels in the error.
+///
+/// The whole of it is already in the task log, line by line, because that is
+/// what [`Cmd::run_streaming`] was for. This is the part that has to fit in an
+/// error message a page can render: the end, which for every build tool is
+/// where it says what went wrong.
+const FAILURE_TAIL_LINES: usize = 20;
+
+/// One command a build runs, before its program has been resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildStep {
+    /// `install` or `build` — what to call this in the log, so a failure in the
+    /// dependency step is not read as a failure of the build itself.
+    what: &'static str,
+    command: String,
+}
+
+pub struct Build;
+
+#[derive(Debug, Deserialize)]
+pub struct BuildInput {
+    pub app_id: i64,
+    /// Run this instead of the build command `package.json` declares.
+    ///
+    /// One program and its arguments; the panel starts it directly, with no
+    /// shell, so there is nothing here that can chain two commands together.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Install dependencies first. On unless it is turned off.
+    ///
+    /// Off is for the operator who has already installed and is re-running a
+    /// build, where a second `npm install` is minutes bought for nothing.
+    #[serde(default)]
+    pub install: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BuildOutput {
+    pub app_id: i64,
+    pub name: String,
+    /// The directory the build ran in, as the tenant.
+    pub working_dir: String,
+    /// Every command that ran, in order, as it was run. A reply that named only
+    /// the build would leave an operator guessing whether dependencies were
+    /// installed.
+    pub commands: Vec<String>,
+}
+
+#[async_trait]
+impl TypedOperation for Build {
+    type Input = BuildInput;
+    type Output = BuildOutput;
+
+    const NAME: &'static str = "app.build";
+    const PERMISSION: Permission = Permission::NodeApps;
+    // A build is minutes, not a request. Idempotent because running it twice
+    // produces what running it once did — which is what makes it safe for the
+    // task engine to retry.
+    const EXECUTION: Execution = Execution::Task {
+        cancellable: false,
+        idempotent: true,
+    };
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let (app, user, name) = app_and_user(ctx, input.app_id).await?;
+        let dir = paths::app_dir(user.as_str(), name.as_str());
+
+        if !dir.is_dir() {
+            return Err(UnihelmError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "{} does not exist, so there is nothing to build. Deploy this \
+                     application's files there first.",
+                    dir.display()
+                ),
+            ));
+        }
+
+        let steps = plan_build(
+            app.runtime,
+            read_manifest(&dir),
+            input.command.as_deref(),
+            input.install.unwrap_or(true),
+        )?;
+
+        // Every program resolved before the first one runs. A two-step build
+        // whose second command names something this machine does not have must
+        // fail before `npm install` has rewritten node_modules, not after.
+        let resolved = steps
+            .iter()
+            .map(|step| {
+                resolve_command("build command", "command", &step.command)
+                    .map(|command| (step.what, command))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let placement = build_placement(&user, &dir)?;
+
+        // Said out loud, because it is the one thing about building a container
+        // application that is not obvious and that turns into a support ticket
+        // when it is not: the build is real and its output is what the container
+        // runs, but it was not built inside the image.
+        if app.mode == AppMode::Container {
+            ctx.log(
+                "this build runs on the server, not inside the container — the \
+                 application's directory is what the container mounts, so what is built \
+                 here is what it runs, but anything compiled against this machine's \
+                 interpreter may not match the image's",
+            );
+        }
+
+        let mut commands = Vec::with_capacity(resolved.len());
+        for (what, command) in &resolved {
+            ctx.log(format!("{what}: {}", command.display()));
+
+            let out = Cmd::new("systemd-run")
+                .args(systemd_run_argv(&placement, command))
+                .timeout(BUILD_TIMEOUT)
+                .run_streaming(|line| ctx.log(line))
+                .await
+                .map_err(UnihelmError::from)?;
+
+            if !out.success() {
+                return Err(build_failed(what, command, &dir, &out));
+            }
+            commands.push(command.display());
+        }
+
+        // The build wrote files; the process started before them is still
+        // running the old ones. Saying so is the difference between an operator
+        // who restarts and one who reports that the panel built nothing.
+        ctx.log(format!(
+            "restart {} to run what this build produced",
+            app_handle(app.mode, &user, &name)
+        ));
+
+        Ok(BuildOutput {
+            app_id: app.id,
+            name: app.name.clone(),
+            working_dir: dir.to_string_lossy().into_owned(),
+            commands,
+        })
+    }
+}
+
+/// The commands a build will run, in order.
+///
+/// Pure — it is handed a manifest rather than a directory, and starts no
+/// process — so the half of `app.build` worth arguing about can be read in a
+/// test rather than on somebody's server.
+///
+/// Install before build, because a build script that has never had its
+/// dependencies installed fails on its first import, and an operator reading
+/// that failure has to guess which of the two things went wrong.
+fn plan_build(
+    runtime: AppRuntime,
+    manifest: Manifest,
+    requested: Option<&str>,
+    install: bool,
+) -> Result<Vec<BuildStep>> {
+    let runner = script_runner(runtime);
+    let mut steps = Vec::new();
+
+    if install
+        && manifest.present
+        && let Some(runner) = runner
+    {
+        steps.push(BuildStep {
+            what: "install",
+            command: runner.install.to_string(),
+        });
+    }
+
+    match (requested, runner) {
+        (Some(raw), _) => steps.push(BuildStep {
+            what: "build",
+            command: raw.to_string(),
+        }),
+        (None, Some(runner)) if manifest.build => steps.push(BuildStep {
+            what: "build",
+            command: runner.build.to_string(),
+        }),
+        // An install with nothing to build afterwards is still a build in the
+        // sense that matters: dependencies are what most applications are
+        // missing, and a package.json with no `build` script is the common
+        // shape of a Node application.
+        (None, _) => {}
+    }
+
+    if steps.is_empty() {
+        return Err(nothing_to_build(runtime, manifest));
+    }
+    Ok(steps)
+}
+
+/// Why there was nothing to run, in the caller's own terms.
+///
+/// Three different situations that all end with an empty plan, and they have
+/// three different fixes — a panel that answered "nothing to build" to all of
+/// them would be technically correct and no help at all.
+fn nothing_to_build(runtime: AppRuntime, manifest: Manifest) -> UnihelmError {
+    let detail = match (script_runner(runtime).is_some(), manifest.present) {
+        (false, _) => format!(
+            "a {} application does not declare its build in a package.json, so there is \
+             nothing here for the panel to read. Name the command to run.",
+            runtime.label()
+        ),
+        (true, false) => "this application has no package.json, so there are no \
+             dependencies to install and no build script to read. Deploy your files \
+             first, or name the command to run."
+            .to_string(),
+        (true, true) => "this application's package.json declares no `build` script, and \
+             installing dependencies was turned off, so there is nothing to run. Add a \
+             `build` script, leave the install on, or name the command to run."
+            .to_string(),
+    };
+    UnihelmError::new(ErrorCode::InvalidInput, detail).with_field("command")
+}
+
+/// Where a build runs: the tenant's slice, their account, their directory.
+struct BuildPlacement {
+    slice: String,
+    linux_user: String,
+    dir: PathBuf,
+}
+
+/// Resolve that placement, or refuse rather than run the build somewhere worse.
+///
+/// Both refusals are the same refusal [`crate::cron`] makes about a scheduled
+/// job, for the same reason. A build is the tenant's own code — a `postinstall`
+/// script is arbitrary execution by design — and `npm install` on a large tree
+/// will take every core and several gigabytes if nothing stops it. Running it
+/// as root, or outside the ceiling the plan sold, is not a degraded version of
+/// this feature; it is the failure this panel keeps a slice for.
+///
+/// Neither refusal is reachable on an application this panel created:
+/// `app.create` provisions the tenant, which writes the slice unit, and
+/// `systemd-run` ships with systemd. They are here for the account that
+/// predates slices and the unit somebody removed by hand.
+fn build_placement(user: &LinuxUser, dir: &Path) -> Result<BuildPlacement> {
+    if !unihelm_distro::exec::program_available("systemd-run") {
+        return Err(UnihelmError::new(
+            ErrorCode::NotFound,
+            "`systemd-run` is not on this server, and it is how the panel runs a build \
+             as your account inside your plan's memory and CPU limits. Without it a \
+             build could only run as root or unconfined, and the panel will do neither.",
+        ));
+    }
+
+    let slice = crate::slices::slice_file_name(user);
+    if !paths::systemd_unit(&slice).exists() {
+        return Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "`{}` has no resource-limit slice on this host: {} is missing, so a \
+                 build for this subscription could only run with the whole machine's \
+                 memory and CPU. The panel will not run it unconfined. Re-provision \
+                 this subscription to write the slice unit, then build again.",
+                user.as_str(),
+                paths::systemd_unit(&slice).display()
+            ),
+        ));
+    }
+
+    Ok(BuildPlacement {
+        slice,
+        linux_user: user.as_str().to_string(),
+        dir: dir.to_path_buf(),
+    })
+}
+
+/// The argv that runs one build step as the tenant, inside their slice.
+///
+/// The same wrapper `crate::cron` puts in front of a scheduled job, minus its
+/// quoting — and the missing quotes are the point rather than an omission. A
+/// crontab line is text a root shell parses, so the slice name is wrapped in
+/// single quotes there to protect the `\x2d` that escapes a hyphen in an
+/// account name. This is an argv array handed to `execve` (spec §12 rule 2):
+/// the value crosses as itself, and a quote would arrive as part of the slice
+/// name and ask systemd for a slice nobody has.
+///
+/// `--wait --pipe` is what makes the output readable: the unit's exit status
+/// becomes `systemd-run`'s, and its stdout and stderr come back on pipes
+/// instead of going to the journal, which is what [`Cmd::run_streaming`] turns
+/// into a live task log. `--quiet` keeps systemd's "Running as unit" banner out
+/// of it, and `--collect` reaps the transient unit even when it failed.
+fn systemd_run_argv(placement: &BuildPlacement, command: &RunCommand) -> Vec<String> {
+    let mut argv = vec![
+        "--quiet".to_string(),
+        "--collect".to_string(),
+        "--wait".to_string(),
+        "--pipe".to_string(),
+        format!("--slice={}", placement.slice),
+        format!("--uid={}", placement.linux_user),
+        format!("--working-directory={}", placement.dir.display()),
+        // Ends option parsing: everything after it is the command, whatever it
+        // happens to start with.
+        "--".to_string(),
+        command.program.display().to_string(),
+    ];
+    argv.extend(command.args.iter().cloned());
+    argv
+}
+
+/// The error a failed build step reports.
+///
+/// A build failure with no log is the least useful thing a panel can produce,
+/// and this is the half of the answer that has to survive being rendered on a
+/// page: what was asked, where, what happened, and the end of what the tool
+/// itself said. The whole output is already in the task's log, and the message
+/// says so rather than leaving somebody to wonder whether more exists.
+fn build_failed(
+    what: &str,
+    command: &RunCommand,
+    dir: &Path,
+    out: &unihelm_distro::CmdOutput,
+) -> UnihelmError {
+    let tail = tail_lines(&out.failure_text(), FAILURE_TAIL_LINES);
+    let said = if tail.is_empty() {
+        "It printed nothing.".to_string()
+    } else {
+        format!("The end of what it said:\n{tail}")
+    };
+    UnihelmError::new(
+        ErrorCode::CommandFailed,
+        format!(
+            "the {what} step `{}` failed with exit {} in {}. {said}\nThe whole output is \
+             in this task's log.",
+            command.display(),
+            out.status,
+            dir.display(),
+        ),
+    )
+}
+
+/// The last `count` non-empty lines of a command's output.
+fn tail_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2126,11 +3063,21 @@ mod tests {
     }
 
     fn render(app: &NodeApp, env: Vec<String>, memory_mb: Option<u32>) -> String {
+        render_with_start(app, None, env, memory_mb)
+    }
+
+    fn render_with_start(
+        app: &NodeApp,
+        exec_start: Option<String>,
+        env: Vec<String>,
+        memory_mb: Option<u32>,
+    ) -> String {
         let context = AppUnitContext::new(
             app,
             &name(),
             &user(),
             Some(Path::new("/usr/bin/node")),
+            exec_start,
             env,
             memory_mb,
         );
@@ -2527,6 +3474,446 @@ mod tests {
         );
     }
 
+    // -- start commands -----------------------------------------------------
+
+    fn command(raw: &str) -> RunCommand {
+        // Built by hand rather than through `resolve_command`, which looks the
+        // program up on the machine running the test: what these assertions are
+        // about is the rendering, not whether this laptop has npm.
+        let words = split_command("start command", "start_command", raw).unwrap();
+        RunCommand {
+            program: PathBuf::from("/usr/bin").join(&words[0]),
+            args: words[1..].to_vec(),
+            words,
+        }
+    }
+
+    #[test]
+    fn a_start_command_replaces_the_entry_file_in_exec_start() {
+        // The whole point of the feature: an application whose deploy
+        // instructions say `npm start` could not be hosted at all, because the
+        // unit could only ever run one file through one interpreter.
+        let body = render_with_start(
+            &app_row(20_000, "apps/blog/server.js"),
+            Some(exec_start_value(&command("npm start"))),
+            vec![],
+            None,
+        );
+        assert!(body.contains("ExecStart=/usr/bin/npm start\n"), "{body}");
+        assert!(
+            !body.contains("/home/uh_abc12345/apps/blog/server.js"),
+            "the entry file is not also started — {body}"
+        );
+        // And the directory it starts in is still the app's own, which is what
+        // makes `npm start` find the package.json it is named in.
+        assert!(
+            body.contains("WorkingDirectory=/home/uh_abc12345/apps/blog\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn the_entry_file_path_renders_exactly_as_it_did_before_start_commands() {
+        // Somebody is relying on this. A start command is an addition, and an
+        // application that declared none must produce the byte-identical line.
+        let body = render(&app_row(20_000, "apps/blog/server.js"), vec![], None);
+        assert!(
+            body.contains("ExecStart=/usr/bin/node /home/uh_abc12345/apps/blog/server.js\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_start_command_argument_with_a_space_is_quoted_as_one_argument() {
+        // Unquoted, systemd splits ExecStart on whitespace and the program is
+        // handed two arguments where it was given one — the same truncation
+        // `environment_line` exists to stop, one directive further down.
+        let rendered = exec_start_value(&command(r#"npm run "build all""#));
+        assert_eq!(rendered, "/usr/bin/npm run \"build all\"");
+    }
+
+    #[test]
+    fn a_command_that_needs_a_shell_is_refused_and_says_which_shell_thing_it_was() {
+        // Handed to execve, `&&` becomes an argument to npm, npm ignores what
+        // it does not recognise, and the panel reports a build that ran half of
+        // what was asked. That is the defect class this whole codebase is
+        // judged on, one character wide.
+        for hostile in [
+            "npm run build && npm test",
+            "npm run build || true",
+            "npm run build; npm test",
+            "npm run build | tee out.log",
+            "npm run build > out.log",
+            "npm run $(whoami)",
+            "npm run `whoami`",
+            "npm run ~/build",
+            "npm run build.*",
+            "npm run 100%build",
+            "npm run back\\slash",
+            "npm run it's",
+        ] {
+            let err = split_command("build command", "command", hostile).unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "expected `{hostile}` refused"
+            );
+            assert_eq!(err.field.as_deref(), Some("command"), "{hostile}");
+        }
+    }
+
+    #[test]
+    fn a_command_is_split_into_words_with_double_quotes_grouping_one() {
+        assert_eq!(
+            split_command("start command", "start_command", "  npm   start  ").unwrap(),
+            vec!["npm", "start"]
+        );
+        assert_eq!(
+            split_command(
+                "start command",
+                "start_command",
+                r#"node --title="my app" dist/server.js"#
+            )
+            .unwrap(),
+            vec!["node", "--title=my app", "dist/server.js"]
+        );
+
+        for bad in [r#"npm run "build"#, "", "   ", r#"npm "" start"#] {
+            assert!(
+                split_command("start command", "start_command", bad).is_err(),
+                "expected `{bad}` refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_word_of_a_command_names_a_program_not_a_file_in_the_application() {
+        // Resolving a tenant-writable path here would be the agent deciding, as
+        // root, that a file the tenant controls is a program.
+        let err = resolve_command("start command", "start_command", "./bin/server").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.detail.contains("node dist/server.js"), "{}", err.detail);
+
+        let err = resolve_command(
+            "start command",
+            "start_command",
+            "definitely-not-installed-here",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.detail.contains("not installed"), "{}", err.detail);
+    }
+
+    #[test]
+    fn a_start_command_survives_a_runtime_change_because_the_unit_is_where_it_lives() {
+        // The regression this codebase has shipped six times: correct work
+        // connected to nothing. `app.update` re-renders from the row, and the
+        // row has no column for a start command — so without this read-back a
+        // Node-to-Bun change would silently put the app on `node server.js`
+        // while reporting a runtime change and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("unihelm-app-uh_abc12345-blog.service");
+        let app = app_row(20_000, "apps/blog/server.js");
+
+        std::fs::write(
+            &unit,
+            render_with_start(
+                &app,
+                Some(exec_start_value(&command("npm start"))),
+                vec![],
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            carried_start_command(&unit, &app, &user()).as_deref(),
+            Some("/usr/bin/npm start")
+        );
+
+        // …and the entry-file form is not mistaken for one, or every runtime
+        // change would freeze the interpreter the app was created with.
+        std::fs::write(&unit, render(&app, vec![], None)).unwrap();
+        assert_eq!(carried_start_command(&unit, &app, &user()), None);
+
+        // Including for a compiled program, whose default is the entry alone.
+        let compiled = AppUnitContext::new(&app, &name(), &user(), None, None, vec![], None);
+        std::fs::write(
+            &unit,
+            format!("[Service]\nExecStart={}\n", compiled.exec_start),
+        )
+        .unwrap();
+        assert_eq!(carried_start_command(&unit, &app, &user()), None);
+
+        // A unit that is not there at all reads as "no start command", which is
+        // what lets an update repair an app whose file somebody deleted.
+        assert_eq!(
+            carried_start_command(&dir.path().join("gone.service"), &app, &user()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_container_is_refused_a_start_command_rather_than_quietly_ignoring_it() {
+        // There is no ExecStart in a `docker run`. Taking the field and
+        // starting the entry file anyway is the exact shape of defect the
+        // house rules put first.
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_start_command(
+            AppMode::Container,
+            Some("npm start"),
+            AppRuntime::Node,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert_eq!(err.field.as_deref(), Some("start_command"));
+        assert!(
+            err.detail.contains("service on this host"),
+            "{}",
+            err.detail
+        );
+
+        // And a container asked for nothing gets nothing, silently — that is
+        // its ordinary create, unchanged.
+        let plan =
+            resolve_start_command(AppMode::Container, None, AppRuntime::Node, dir.path()).unwrap();
+        assert!(plan.command.is_none() && plan.note.is_none());
+    }
+
+    #[test]
+    fn a_package_json_start_script_is_taken_as_the_default_and_said_out_loud() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No package.json: the entry file, and nothing to announce. This is the
+        // path every application created before this existed takes.
+        let plan =
+            resolve_start_command(AppMode::Host, None, AppRuntime::Node, dir.path()).unwrap();
+        assert!(plan.command.is_none() && plan.note.is_none());
+
+        // One that declares nothing useful is the same answer.
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"blog"}"#).unwrap();
+        let plan =
+            resolve_start_command(AppMode::Host, None, AppRuntime::Node, dir.path()).unwrap();
+        assert!(plan.command.is_none() && plan.note.is_none());
+
+        // One that declares a start script is honoured — or, on a machine with
+        // no npm, is not, and the note says which happened. Either way the
+        // operator is told; a default taken in silence is one nobody can
+        // correct.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        let plan =
+            resolve_start_command(AppMode::Host, None, AppRuntime::Node, dir.path()).unwrap();
+        let note = plan.note.expect("a chosen default is always announced");
+        assert!(note.contains("start script"), "{note}");
+        if let Some(command) = &plan.command {
+            assert_eq!(command.words, vec!["npm", "start"]);
+        } else {
+            assert!(note.contains("entry file"), "{note}");
+        }
+
+        // A Python application has no package.json convention to read, so it
+        // is left alone rather than started with npm.
+        let plan =
+            resolve_start_command(AppMode::Host, None, AppRuntime::Python, dir.path()).unwrap();
+        assert!(plan.command.is_none() && plan.note.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_package_json_is_not_read() {
+        // The application directory is the tenant's, so `package.json` is an
+        // entry they can point at /etc/shadow — and this reads it as root.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.json");
+        std::fs::write(&secret, r#"{"scripts":{"start":"node x.js"}}"#).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("package.json")).unwrap();
+
+        assert_eq!(read_manifest(dir.path()), Manifest::default());
+    }
+
+    // -- building -----------------------------------------------------------
+
+    #[test]
+    fn a_build_installs_dependencies_before_it_runs_the_build_script() {
+        let manifest = Manifest {
+            present: true,
+            start: true,
+            build: true,
+        };
+        let steps = plan_build(AppRuntime::Node, manifest, None, true).unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| (s.what, s.command.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("install", "npm install"), ("build", "npm run build")]
+        );
+
+        // Bun projects are the same shape with a different tool.
+        let steps = plan_build(AppRuntime::Bun, manifest, None, true).unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(),
+            vec!["bun install", "bun run build"]
+        );
+
+        // A package.json with no build script is the common shape of a Node
+        // application, and installing its dependencies is the whole job.
+        let steps = plan_build(
+            AppRuntime::Node,
+            Manifest {
+                present: true,
+                start: true,
+                build: false,
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(),
+            vec!["npm install"]
+        );
+
+        // A named command wins, and still gets its dependencies first.
+        let steps = plan_build(AppRuntime::Node, manifest, Some("npm run bundle"), true).unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(),
+            vec!["npm install", "npm run bundle"]
+        );
+
+        // …and installing can be turned off by somebody re-running a build.
+        let steps = plan_build(AppRuntime::Node, manifest, None, false).unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(),
+            vec!["npm run build"]
+        );
+    }
+
+    #[test]
+    fn a_build_with_nothing_to_run_is_refused_with_the_reason_that_applies() {
+        // Three situations, three fixes. "Nothing to build" for all of them
+        // would be correct and no use.
+        let err = plan_build(AppRuntime::Node, Manifest::default(), None, true).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.detail.contains("no package.json"), "{}", err.detail);
+
+        let err = plan_build(
+            AppRuntime::Node,
+            Manifest {
+                present: true,
+                start: false,
+                build: false,
+            },
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.detail.contains("no `build` script"), "{}", err.detail);
+
+        let err = plan_build(AppRuntime::Go, Manifest::default(), None, true).unwrap_err();
+        assert!(err.detail.contains("Go application"), "{}", err.detail);
+
+        // A named command reaches every one of them, including Go.
+        assert!(plan_build(AppRuntime::Go, Manifest::default(), Some("make"), true).is_ok());
+    }
+
+    #[test]
+    fn a_build_step_runs_as_the_tenant_inside_their_slice_and_in_their_directory() {
+        // A snapshot, because every flag here is a separate way to get this
+        // wrong: without `--uid` the build is root running a tenant's
+        // `postinstall`, without `--slice` it is one customer's `npm install`
+        // with the whole machine, and without `--wait --pipe` there is no
+        // output to show and no exit status to believe.
+        let placement = BuildPlacement {
+            slice: crate::slices::slice_file_name(&user()),
+            linux_user: user().as_str().to_string(),
+            dir: PathBuf::from("/home/uh_abc12345/apps/blog"),
+        };
+        assert_eq!(
+            systemd_run_argv(&placement, &command("npm run build")),
+            vec![
+                "--quiet",
+                "--collect",
+                "--wait",
+                "--pipe",
+                "--slice=unihelm-uh_abc12345.slice",
+                "--uid=uh_abc12345",
+                "--working-directory=/home/uh_abc12345/apps/blog",
+                "--",
+                "/usr/bin/npm",
+                "run",
+                "build",
+            ]
+        );
+
+        // And the slice name crosses as itself. cron quotes this value because
+        // its line is parsed by a root shell; an argv element that carried the
+        // quotes would ask systemd for a slice nobody has.
+        let hyphenated = LinuxUser::parse("uh-legacy").unwrap();
+        let placement = BuildPlacement {
+            slice: crate::slices::slice_file_name(&hyphenated),
+            linux_user: hyphenated.as_str().to_string(),
+            dir: PathBuf::from("/home/uh-legacy/apps/blog"),
+        };
+        assert!(
+            systemd_run_argv(&placement, &command("npm install"))
+                .contains(&"--slice=unihelm-uh\\x2dlegacy.slice".to_string()),
+            "the escape is the slice name, not shell quoting"
+        );
+    }
+
+    #[test]
+    fn a_failed_build_reports_the_command_the_status_and_the_tools_own_words() {
+        // A build failure with no log is the single most useless thing a panel
+        // can produce. The whole output is in the task log; this is what has to
+        // survive being rendered as an error on a page.
+        let out = unihelm_distro::CmdOutput {
+            program: "systemd-run".into(),
+            status: 1,
+            stdout: String::new(),
+            stderr: (1..=30)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            duration: Duration::from_secs(3),
+        };
+        let err = build_failed(
+            "build",
+            &command("npm run build"),
+            Path::new("/home/uh_abc12345/apps/blog"),
+            &out,
+        );
+        assert_eq!(err.code, ErrorCode::CommandFailed);
+        assert!(err.detail.contains("npm run build"), "{}", err.detail);
+        assert!(err.detail.contains("exit 1"), "{}", err.detail);
+        assert!(err.detail.contains("apps/blog"), "{}", err.detail);
+        assert!(err.detail.contains("line 30"), "{}", err.detail);
+        assert!(
+            !err.detail.contains("line 10\n"),
+            "only the tail travels: {}",
+            err.detail
+        );
+        assert!(err.detail.contains("task's log"), "{}", err.detail);
+
+        // A tool that failed silently still gets a sentence rather than a
+        // blank space where the reason should be.
+        let quiet = unihelm_distro::CmdOutput {
+            stderr: String::new(),
+            ..out
+        };
+        let err = build_failed(
+            "install",
+            &command("npm install"),
+            Path::new("/home/uh_abc12345/apps/blog"),
+            &quiet,
+        );
+        assert!(err.detail.contains("printed nothing"), "{}", err.detail);
+    }
+
     // -- entry validation ---------------------------------------------------
 
     #[test]
@@ -2613,6 +4000,7 @@ mod tests {
             &name(),
             &user(),
             Some(Path::new("/bin/sh")),
+            None,
             vec![],
             None,
         )
@@ -2673,6 +4061,7 @@ mod tests {
             &name(),
             &user(),
             Some(Path::new("/bin/sh")),
+            None,
             vec![environment_line(
                 "DATABASE_URL",
                 "postgres://u:hunter2@localhost/db",
@@ -2712,6 +4101,7 @@ mod tests {
             &name(),
             &user(),
             Some(Path::new("/bin/sh")),
+            None,
             vec![environment_line(
                 "DATABASE_URL",
                 "postgres://u:hunter2@localhost/db",
@@ -2761,6 +4151,7 @@ mod tests {
             &name(),
             &user(),
             Some(Path::new("/usr/bin/node")),
+            None,
             vec![],
             None,
         )
@@ -3112,6 +4503,7 @@ mod tests {
                     runtime_version: None,
                     // Host, because what these assert is the host path.
                     mode: Some(AppMode::Host),
+                    start_command: None,
                     proxy_domain: None,
                 },
             )
@@ -3181,6 +4573,7 @@ mod tests {
             runtime: AppRuntime::Node,
             runtime_version: None,
             mode: Some(AppMode::Host),
+            start_command: None,
             proxy_domain: None,
         };
 
@@ -3251,6 +4644,7 @@ mod tests {
                     runtime_version: None,
                     // Host, because what these assert is the host path.
                     mode: Some(AppMode::Host),
+                    start_command: None,
                     proxy_domain: None,
                 },
             )
@@ -4233,6 +5627,7 @@ mod mode_tests {
                 unit: app_handle(mode, &user(), &name()),
                 state: UnitState::Active,
                 memory_bytes: None,
+                start_command: None,
                 app: row(mode),
             })
             .unwrap()
@@ -4245,5 +5640,53 @@ mod mode_tests {
         let container = view(AppMode::Container);
         assert_eq!(container["mode"], "container");
         assert_eq!(container["unit"], "unihelm-app-uh_abc12345-blog");
+    }
+
+    /// The start command reaches the page, and its absence is an absent key.
+    ///
+    /// The page shows `entry` on every row, and an application started by `npm
+    /// start` is not running its entry file — so a row that carried no start
+    /// command would have the panel stating something untrue about it. The
+    /// omission matters too: `undefined` is what tells the page there is
+    /// nothing to prefer over the entry, and a `null` would read as a value.
+    #[test]
+    fn a_list_row_carries_the_start_command_and_omits_it_when_there_is_none() {
+        let app = NodeApp {
+            id: 1,
+            subscription_id: SubscriptionId(1),
+            site_id: None,
+            name: "blog".into(),
+            entry: "apps/blog/server.js".into(),
+            port: 20_001,
+            runtime: AppRuntime::Node,
+            mode: AppMode::Host,
+            node_env: NodeEnv::Production,
+            runtime_version: None,
+            enabled: true,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let with_command = serde_json::to_value(AppView {
+            unit: unit_file_name(&user(), &name()),
+            state: UnitState::Active,
+            memory_bytes: None,
+            start_command: Some("/usr/bin/npm start".into()),
+            app: app.clone(),
+        })
+        .unwrap();
+        assert_eq!(with_command["start_command"], "/usr/bin/npm start");
+
+        let plain = serde_json::to_value(AppView {
+            unit: unit_file_name(&user(), &name()),
+            state: UnitState::Active,
+            memory_bytes: None,
+            start_command: None,
+            app,
+        })
+        .unwrap();
+        assert!(
+            plain.get("start_command").is_none(),
+            "an app with no start command sends no key: {plain}"
+        );
     }
 }

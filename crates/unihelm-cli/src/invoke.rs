@@ -107,6 +107,7 @@ pub struct Secrets {
     pub s3_secret_access_key: Option<String>,
     pub sftp_password: Option<String>,
     pub mail_relay_password: Option<String>,
+    pub account_password: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +192,46 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Status => call("metrics.snapshot", json!({})),
 
         Command::Site(cmd) => site(cmd)?,
+        Command::Git(cmd) => git(cmd),
+        Command::Account(cmd) => match cmd {
+            AccountCommand::List => call("user.list", json!({})),
+            AccountCommand::Create {
+                username,
+                email,
+                role,
+                full_name,
+                password_stdin: _,
+            } => {
+                let password = secrets.account_password.clone().context(
+                    "the account's first password must come from stdin or the environment: \
+                     pass --password-stdin or set UNIHELM_ACCOUNT_PASSWORD",
+                )?;
+                call(
+                    "user.create",
+                    json!({
+                        "username": username,
+                        "email": email,
+                        "role": role,
+                        "password": password,
+                        "full_name": full_name,
+                    }),
+                )
+            }
+            AccountCommand::Role { user_id, role } => {
+                call("user.role.set", json!({ "user_id": user_id, "role": role }))
+            }
+            AccountCommand::Status { user_id, status } => call(
+                "user.status.set",
+                json!({ "user_id": user_id, "status": status }),
+            ),
+            AccountCommand::Delete {
+                user_id,
+                confirm_username,
+            } => call(
+                "user.delete",
+                json!({ "user_id": user_id, "confirm_username": confirm_username }),
+            ),
+        },
         Command::Engine(cmd) => match cmd {
             EngineCommand::Status { component } => {
                 let input = Input::new().maybe("component", component.clone()).done();
@@ -267,6 +308,16 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
                     call("docker.volume.remove", json!({ "volume": volume }))
                 }
             },
+            DockerCommand::Template(cmd) => match cmd {
+                DockerTemplateCommand::List => call("docker.template.list", json!({})),
+                DockerTemplateCommand::Prepare { template, name } => {
+                    let input = Input::new()
+                        .set("template", template.clone())
+                        .maybe("name", name.clone())
+                        .done();
+                    call("docker.template.prepare", input)
+                }
+            },
         },
         Command::Runtime(cmd) => match cmd {
             RuntimeCommand::List => call("runtime.list", json!({})),
@@ -305,6 +356,7 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
             "server.reboot",
             json!({ "confirm_hostname": confirm_hostname }),
         ),
+        Command::Process(cmd) => process(cmd),
     };
     Ok(action)
 }
@@ -689,6 +741,71 @@ fn dns(cmd: &DnsCommand, secrets: &Secrets) -> Result<Action> {
                 json!({ "kind": kind, "label": label, "token": token }),
             )
         }
+        DnsCommand::Provider => call("dns.provider.get", json!({})),
+        DnsCommand::Zones => call("dns.zones.list", json!({})),
+        DnsCommand::Record(DnsRecordCommand::List { zone }) => {
+            call("dns.records.list", json!({ "zone": zone }))
+        }
+        DnsCommand::Record(DnsRecordCommand::Create {
+            zone,
+            kind,
+            name,
+            content,
+            ttl,
+            proxied,
+            priority,
+        }) => {
+            let input = Input::new()
+                .set("zone", zone.clone())
+                .set("kind", kind.clone())
+                .set("name", name.clone())
+                .set("content", content.clone())
+                .set("proxied", *proxied)
+                .maybe("ttl", *ttl)
+                .maybe("priority", *priority)
+                .done();
+            call("dns.records.create", input)
+        }
+        DnsCommand::Record(DnsRecordCommand::Update {
+            id,
+            zone,
+            kind,
+            name,
+            content,
+            ttl,
+            proxied,
+            priority,
+            confirm_name,
+            confirm_content,
+        }) => {
+            let input = Input::new()
+                .set("zone", zone.clone())
+                .set("id", id.clone())
+                .set("kind", kind.clone())
+                .set("name", name.clone())
+                .set("content", content.clone())
+                .set("proxied", *proxied)
+                .set("confirm_name", confirm_name.clone())
+                .set("confirm_content", confirm_content.clone())
+                .maybe("ttl", *ttl)
+                .maybe("priority", *priority)
+                .done();
+            call("dns.records.update", input)
+        }
+        DnsCommand::Record(DnsRecordCommand::Delete {
+            id,
+            zone,
+            confirm_name,
+            confirm_content,
+        }) => call(
+            "dns.records.delete",
+            json!({
+                "zone": zone,
+                "id": id,
+                "confirm_name": confirm_name,
+                "confirm_content": confirm_content,
+            }),
+        ),
         DnsCommand::IssueWildcard {
             site_id,
             staging,
@@ -788,6 +905,8 @@ fn app(cmd: &AppCommand) -> Result<Action> {
             proxy_domain,
             runtime_version,
             runtime,
+            mode,
+            start_command,
         } => {
             let node_env = node_env.map(|e| match e {
                 NodeEnvArg::Production => "production",
@@ -804,6 +923,8 @@ fn app(cmd: &AppCommand) -> Result<Action> {
                 .maybe("proxy_domain", proxy_domain.clone())
                 .maybe("runtime_version", runtime_version.clone())
                 .maybe("runtime", runtime.clone())
+                .maybe("mode", mode.clone())
+                .maybe("start_command", start_command.clone())
                 .done();
             call("app.create", input)
         }
@@ -814,6 +935,8 @@ fn app(cmd: &AppCommand) -> Result<Action> {
             runtime,
             runtime_version,
             unpin,
+            start_command,
+            entry_file,
         } => {
             let mut input = json!({ "app_id": app_id });
             if let Some(r) = runtime {
@@ -827,7 +950,29 @@ fn app(cmd: &AppCommand) -> Result<Action> {
             } else if let Some(v) = runtime_version {
                 input["runtime_version"] = json!(v);
             }
+            // The same three-way shape one field down: a start command lives in
+            // the unit file, so `--entry-file` is the explicit null that takes
+            // it back out and an absent key leaves whatever starts it alone.
+            if *entry_file {
+                input["start_command"] = serde_json::Value::Null;
+            } else if let Some(c) = start_command {
+                input["start_command"] = json!(c);
+            }
             call("app.update", input)
+        }
+        AppCommand::Build {
+            app_id,
+            command,
+            no_install,
+        } => {
+            let input = Input::new()
+                .set("app_id", *app_id)
+                .maybe("command", command.clone())
+                // Sent either way: the flag is a definite answer, and `true` is
+                // the same thing the agent would have defaulted to.
+                .set("install", !*no_install)
+                .done();
+            call("app.build", input)
         }
         AppCommand::Logs { app_id, lines } => {
             let input = Input::new()
@@ -856,6 +1001,27 @@ pub fn parse_env(pairs: &[String]) -> Result<Vec<Value>> {
             Ok(json!({ "key": key, "value": value }))
         })
         .collect()
+}
+
+fn git(cmd: &GitCommand) -> Action {
+    match cmd {
+        GitCommand::Status { site_id } => call("git.status", json!({ "site_id": site_id })),
+        GitCommand::Attach {
+            site_id,
+            repository,
+            branch,
+        } => {
+            let input = Input::new()
+                .set("site_id", *site_id)
+                .set("repository", repository.clone())
+                .maybe("branch", branch.clone())
+                .done();
+            call("git.attach", input)
+        }
+        GitCommand::Detach { site_id } => call("git.detach", json!({ "site_id": site_id })),
+        GitCommand::Clone { site_id } => call("git.clone", json!({ "site_id": site_id })),
+        GitCommand::Pull { site_id } => call("git.pull", json!({ "site_id": site_id })),
+    }
 }
 
 fn wordpress(cmd: &WordpressCommand) -> Action {
@@ -1420,6 +1586,57 @@ fn quota(cmd: &QuotaCommand) -> Action {
         QuotaCommand::Usage { subscription_id } => {
             call("quota.usage", json!({ "subscription_id": subscription_id }))
         }
+    }
+}
+
+/// The process table, and the signal.
+///
+/// `confirm_command` and `confirm_user` are what the caller typed, not anything
+/// this looked up: the agent compares them against the process actually behind
+/// the pid, and that comparison is what makes a stale listing a refusal instead
+/// of a kill of whatever now holds the number.
+fn process(cmd: &ProcessCommand) -> Action {
+    match cmd {
+        ProcessCommand::List {
+            sort,
+            limit,
+            search,
+        } => {
+            let input = Input::new()
+                .set("sort", process_sort(*sort))
+                .maybe("limit", limit.map(|n| n as u64))
+                .maybe("search", search.clone())
+                .done();
+            call("process.list", input)
+        }
+        ProcessCommand::Kill {
+            pid,
+            command,
+            user,
+            signal,
+        } => {
+            let input = Input::new()
+                .set("pid", *pid)
+                .set("confirm_command", command.clone())
+                .set("confirm_user", user.clone())
+                .set("signal", process_signal(*signal))
+                .done();
+            call("process.kill", input)
+        }
+    }
+}
+
+fn process_sort(sort: ProcessSortArg) -> &'static str {
+    match sort {
+        ProcessSortArg::Cpu => "cpu",
+        ProcessSortArg::Memory => "memory",
+    }
+}
+
+fn process_signal(signal: ProcessSignalArg) -> &'static str {
+    match signal {
+        ProcessSignalArg::Term => "term",
+        ProcessSignalArg::Kill => "kill",
     }
 }
 

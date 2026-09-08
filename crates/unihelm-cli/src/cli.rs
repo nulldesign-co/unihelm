@@ -60,6 +60,9 @@ pub enum Command {
     /// Websites and their vhosts.
     #[command(subcommand)]
     Site(SiteCommand),
+    /// Deploying a site from a Git repository.
+    #[command(subcommand)]
+    Git(GitCommand),
     /// Language runtimes installed on this server.
     #[command(subcommand)]
     Runtime(RuntimeCommand),
@@ -153,6 +156,17 @@ pub enum Command {
     /// Whether this machine is running code it has already replaced.
     #[command(subcommand)]
     Server(ServerCommand),
+    /// What is running on this server, and the fenced kill on it.
+    #[command(subcommand)]
+    Process(ProcessCommand),
+    /// Panel accounts, over the agent socket: list, create, re-role, suspend,
+    /// delete.
+    ///
+    /// `unihelm user` is the local path that has to work before there is an
+    /// agent — the first administrator, and recovery from a root shell. This
+    /// group is scoped to the calling account and writes an audit row.
+    #[command(subcommand)]
+    Account(AccountCommand),
 
     /// Print a shell completion script.
     ///
@@ -209,6 +223,53 @@ pub enum UserCommand {
         /// never reaches the shell history or the process list.
         #[arg(long)]
         password_stdin: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AccountCommand {
+    /// List panel accounts.
+    List,
+    /// Create an account.
+    Create {
+        /// The login name.
+        username: String,
+        /// The account's email address.
+        #[arg(long)]
+        email: String,
+        /// `admin`, `reseller` or `customer`. A reseller may only create customers.
+        #[arg(long, default_value = "customer")]
+        role: String,
+        /// The person's full name.
+        #[arg(long)]
+        full_name: Option<String>,
+        /// Read the password from stdin, so it never reaches the shell history
+        /// or the process list. Otherwise it is read from
+        /// `UNIHELM_ACCOUNT_PASSWORD`.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Change an account's role. Ends that account's sessions.
+    Role {
+        /// The account id, as `unihelm account list` shows it.
+        user_id: i64,
+        /// `admin`, `reseller` or `customer`.
+        role: String,
+    },
+    /// Suspend an account, or let it back in.
+    Status {
+        /// The account id.
+        user_id: i64,
+        /// `active` or `suspended`.
+        status: String,
+    },
+    /// Delete an account. Refused while it still owns anything.
+    Delete {
+        /// The account id.
+        user_id: i64,
+        /// The account's username, retyped. The agent refuses without it.
+        #[arg(long)]
+        confirm_username: String,
     },
 }
 
@@ -300,6 +361,9 @@ pub enum DockerCommand {
     /// The volumes on this server.
     #[command(subcommand)]
     Volume(DockerVolumeCommand),
+    /// The curated container templates, and the draft that starts one.
+    #[command(subcommand)]
+    Template(DockerTemplateCommand),
 }
 
 /// Docker images.
@@ -340,6 +404,28 @@ pub enum DockerVolumeCommand {
     /// holds an engine this panel installed — that is `engine remove
     /// --delete-data`, which forgets the engine's record at the same time.
     Remove { volume: String },
+}
+
+/// Container templates: a short, compiled-in list of things people run on a
+/// hosting box, each pinned to a tag the panel has checked.
+#[derive(Subcommand, Debug)]
+pub enum DockerTemplateCommand {
+    /// Every template: its pinned image, its ports, its volumes, and who can
+    /// sign in the moment it starts.
+    List,
+    /// Fill one in for this machine.
+    ///
+    /// Generates the password where the image needs one — the panel keeps no
+    /// copy, so the value in the answer is the only one there will ever be —
+    /// and moves a host port that something is already publishing. Creates
+    /// nothing: the output is what `docker create` takes.
+    Prepare {
+        /// The template id, as `docker template list` prints it.
+        template: String,
+        /// What to call the container. The template's own suggestion otherwise.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 /// Language runtimes installed on this server.
@@ -897,6 +983,16 @@ pub enum DnsCommand {
         #[arg(long)]
         token_stdin: bool,
     },
+    /// Which DNS credential is stored, and what it can still reach.
+    ///
+    /// Prints the label, the Cloudflare account and the zones the token
+    /// administers. Never the token: there is no command that reads one back.
+    Provider,
+    /// The zones the stored credentials can edit.
+    Zones,
+    /// Read and change the records in one zone.
+    #[command(subcommand)]
+    Record(DnsRecordCommand),
     /// Issue a wildcard certificate over DNS-01.
     #[command(name = "issue-wildcard")]
     IssueWildcard {
@@ -908,6 +1004,83 @@ pub enum DnsCommand {
         /// Contact address for expiry warnings from the CA.
         #[arg(long)]
         contact_email: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DnsRecordCommand {
+    /// Every record in one zone.
+    List {
+        /// The zone apex, as `unihelm dns zones` lists it.
+        #[arg(long)]
+        zone: String,
+    },
+    /// Add a record.
+    Create {
+        #[arg(long)]
+        zone: String,
+        /// A, AAAA, CNAME, MX, TXT, NS, SRV or CAA.
+        #[arg(long)]
+        kind: String,
+        /// `@` for the zone itself; a bare label such as `www` is qualified
+        /// with the zone. A name from another domain is refused, not appended.
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        content: String,
+        /// Seconds. Omitted means Cloudflare's automatic.
+        #[arg(long)]
+        ttl: Option<u32>,
+        /// Put it behind Cloudflare's proxy. A, AAAA and CNAME only, and it
+        /// takes the TTL with it.
+        #[arg(long)]
+        proxied: bool,
+        /// MX and SRV only. Lower is preferred.
+        #[arg(long)]
+        priority: Option<u16>,
+    },
+    /// Replace a record with new values.
+    ///
+    /// A whole-record replace: every field is written, so anything left off
+    /// reverts to its default rather than staying as it was.
+    Update {
+        /// Cloudflare's record id, as `unihelm dns record list` shows it.
+        id: String,
+        #[arg(long)]
+        zone: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        ttl: Option<u32>,
+        #[arg(long)]
+        proxied: bool,
+        #[arg(long)]
+        priority: Option<u16>,
+        /// The record's current name. The write is refused unless it matches,
+        /// so an edit cannot land on a record somebody else has changed.
+        #[arg(long)]
+        confirm_name: String,
+        /// The record's current content, for the same reason.
+        #[arg(long)]
+        confirm_content: String,
+    },
+    /// Remove a record.
+    Delete {
+        /// Cloudflare's record id, as `unihelm dns record list` shows it.
+        id: String,
+        #[arg(long)]
+        zone: String,
+        /// The record's current name. Deleting the wrong DNS record takes a
+        /// site off the internet, so this must match what is there now.
+        #[arg(long)]
+        confirm_name: String,
+        /// The record's current content, for the same reason.
+        #[arg(long)]
+        confirm_content: String,
     },
 }
 
@@ -1046,6 +1219,18 @@ pub enum AppCommand {
         /// Which language it is written in: node, python, ruby, bun, deno, go.
         #[arg(long, value_name = "RUNTIME")]
         runtime: Option<String>,
+        /// Run it as a `container`, or as a service on this `host`.
+        ///
+        /// Without it the agent decides: a container, except for a runtime that
+        /// has no image.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+        /// What starts the app instead of running its entry file, e.g. `npm start`.
+        ///
+        /// Without it, `package.json`'s start script is used when there is one.
+        /// Refused for a container, which has no unit file to hold it.
+        #[arg(long)]
+        start_command: Option<String>,
         /// Publish the app behind this domain as a reverse-proxy site.
         #[arg(long)]
         proxy_domain: Option<String>,
@@ -1076,6 +1261,30 @@ pub enum AppCommand {
         /// Run on whatever a bare command name resolves to.
         #[arg(long)]
         unpin: bool,
+        /// Change what starts the app, e.g. `npm start`.
+        #[arg(long, conflicts_with = "entry_file")]
+        start_command: Option<String>,
+        /// Go back to starting the app's entry file.
+        #[arg(long)]
+        entry_file: bool,
+    },
+    /// Install dependencies and run this application's build.
+    ///
+    /// Runs as the tenant, in the application's own directory, inside their
+    /// plan's memory and CPU limits. A task, because a build is minutes and its
+    /// output is the answer rather than a detail of it.
+    Build {
+        /// Application id.
+        app_id: i64,
+        /// Run this instead of the build command `package.json` declares.
+        ///
+        /// One program and its arguments; there is no shell, so two commands
+        /// joined by `&&` are refused rather than half-run.
+        #[arg(long)]
+        command: Option<String>,
+        /// Do not install dependencies first.
+        #[arg(long)]
+        no_install: bool,
     },
     /// Recent journal output for an application.
     Logs {
@@ -1187,6 +1396,44 @@ pub enum WpSubcommandArg {
     Db,
     Cache,
     Rewrite,
+}
+
+// ---------------------------------------------------------------------------
+// git
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum GitCommand {
+    /// What repository a site deploys from, and what is in its document root.
+    Status {
+        /// The site to look at.
+        site_id: i64,
+    },
+    /// Record the repository and branch a site deploys from. Writes nothing to disk.
+    Attach {
+        /// The site to attach it to.
+        site_id: i64,
+        /// A public HTTPS repository URL. SSH addresses are refused, with the reason.
+        repository: String,
+        /// The branch to deploy; the repository's default branch when omitted.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Forget the repository. The checkout and the site's files stay where they are.
+    Detach {
+        /// The site to detach it from.
+        site_id: i64,
+    },
+    /// Clone the attached repository into the site's document root.
+    Clone {
+        /// The site to clone into.
+        site_id: i64,
+    },
+    /// Deploy: fetch the branch and fast-forward the checkout.
+    Pull {
+        /// The site to deploy.
+        site_id: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1883,6 +2130,68 @@ pub enum ServerCommand {
         /// This machine's hostname, retyped.
         confirm_hostname: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// process
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum ProcessCommand {
+    /// What is running, busiest first.
+    ///
+    /// CPU is a share of one core over the window the answer states, not an
+    /// average since boot: a process that pinned a core last night and is idle
+    /// now reads as idle. Memory is the anonymous resident set — the same
+    /// quantity `unihelm svc status` reports for a service, so the two can be
+    /// read against each other.
+    List {
+        /// What to put at the top.
+        #[arg(long, value_enum, default_value_t = ProcessSortArg::Cpu)]
+        sort: ProcessSortArg,
+        /// How many rows. The agent clamps it to 200.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Substring of the command, its arguments, the owning account or the
+        /// unit. Matched against the whole machine before the list is cut.
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Send a signal to one process.
+    ///
+    /// Pids are reused, so the command and the owner have to be named back: the
+    /// agent refuses unless they still describe the process behind that pid.
+    /// Anything belonging to init, to the panel or to a system account is
+    /// refused outright — stop those through their service manager.
+    Kill {
+        /// The process id.
+        pid: u32,
+        /// The command, as `unihelm process list` shows it.
+        #[arg(long)]
+        command: String,
+        /// The owning account, as `unihelm process list` shows it. Empty names
+        /// a uid with no passwd entry, which is what the listing shows too.
+        #[arg(long, default_value = "")]
+        user: String,
+        /// `term` asks the process to stop and lets it finish what it is doing;
+        /// `kill` stops it where it stands and nothing it holds is written out.
+        #[arg(long, value_enum, default_value_t = ProcessSignalArg::Term)]
+        signal: ProcessSignalArg,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum ProcessSortArg {
+    Cpu,
+    Memory,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+pub enum ProcessSignalArg {
+    Term,
+    Kill,
 }
 
 // ---------------------------------------------------------------------------

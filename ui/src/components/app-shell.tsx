@@ -1,5 +1,6 @@
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
+  Activity,
   Archive,
   BellRing,
   Boxes,
@@ -18,12 +19,14 @@ import {
   Monitor,
   Moon,
   Network,
+  Newspaper,
   Palette,
   Search,
   Settings,
   ShieldCheck,
   Sun,
   TerminalSquare,
+  Users,
   Wallet,
   X,
   type LucideIcon,
@@ -144,6 +147,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             keywords: ["node", "nodejs", "python", "runtime", "service", "process", "port"],
           },
           {
+            to: "/wordpress",
+            label: t("nav.wordpress"),
+            icon: Newspaper,
+            // "wp" and "wp-cli" are what people type; neither is in the label.
+            keywords: ["wp", "wp-cli", "blog", "cms", "plugin", "theme", "install", "site builder"],
+          },
+          {
             to: "/databases",
             label: t("nav.databases"),
             icon: Database,
@@ -223,6 +233,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             icon: Container,
             keywords: ["container", "image", "volume", "registry", "pull"],
           },
+          {
+            to: "/processes",
+            label: t("nav.processes"),
+            // "slow" and "top" are what somebody types when the server is
+            // struggling, and neither appears in the word "Processes".
+            keywords: ["top", "cpu", "memory", "ram", "slow", "kill", "pid", "load", "runaway"],
+            icon: Activity,
+          },
         ],
       },
       {
@@ -245,6 +263,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       {
         label: t("nav.groupAdmin"),
         items: [
+          {
+            to: "/users",
+            label: t("nav.users"),
+            icon: Users,
+            keywords: ["account", "accounts", "password", "admin", "administrator", "reseller", "customer", "suspend", "role", "login", "sign in"],
+          },
           {
             to: "/plans",
             label: t("nav.plans"),

@@ -36,7 +36,7 @@ function markup(className?: string): string {
  */
 function selectClasses(className?: string): string[] {
   const match = /<select[^>]*class="([^"]*)"/.exec(markup(className));
-  return match ? match[1].replaceAll("&amp;", "&").split(" ") : [];
+  return match?.[1] ? match[1].replaceAll("&amp;", "&").split(" ") : [];
 }
 
 describe("the native popup's option rows", () => {

@@ -595,6 +595,115 @@ pub async fn docker_volume_remove(
     Ok(Json(data))
 }
 
+// ---------------------------------------------------------------------------
+// The container templates
+// ---------------------------------------------------------------------------
+
+/// The curated container templates the panel ships.
+#[utoipa::path(
+    get,
+    path = "/api/server/docker/templates",
+    tag = "server",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Every template, with its pinned image, ports and volumes", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server.read`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_templates(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    // `server_read`, the same as the inventory this list appears beside: the
+    // catalogue is compiled in and says nothing about this machine.
+    current
+        .auth
+        .require(Permission::ServerRead)
+        .map_err(ApiError::from)?;
+    let data = ops::invoke_now(&state, &current.auth, "docker.template.list", json!({})).await?;
+    Ok(Json(data))
+}
+
+/// What to call the container a template is being filled in for.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PrepareTemplate {
+    /// The container name. The template's own suggestion when absent.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Fill in one template for this machine.
+///
+/// **A POST for something that changes nothing on the server**, deliberately.
+/// The answer carries a freshly generated password for the templates that need
+/// one, so it must not sit in a URL, in a proxy's cache or in a browser's
+/// history — and it must not be reachable without the CSRF header, because the
+/// only thing it is for is the create form behind it.
+#[utoipa::path(
+    post,
+    path = "/api/server/docker/templates/{id}/prepare",
+    tag = "server",
+    request_body = PrepareTemplate,
+    security(("session_cookie" = [], "csrf_header" = [])),
+    params(("id" = String, Path, description = "Template id, as the list prints it")),
+    responses(
+        (status = 200, description = "A draft `docker.create` accepts, with generated secrets filled in", body = serde_json::Value),
+        (status = 400, description = "`invalid_input`: not a container name", body = ApiErrorBody),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 404, description = "`not_found`: no template of that id", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn docker_template_prepare(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+    Path(id): Path<String>,
+    Json(body): Json<PrepareTemplate>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // `server_manage`, not `server_read`. The draft is a credential, and the
+    // only operation that can spend it is `docker.create`, which needs this. A
+    // reader handed one could not use it, so handing them one would be giving
+    // away a secret for nothing.
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    // Immediate: this reads one `docker ps` and answers. The task is the create
+    // that follows, and a draft the operator has to poll for is a form that
+    // fills itself in some seconds after they asked for it.
+    let data = ops::invoke_now(
+        &state,
+        &current.auth,
+        "docker.template.prepare",
+        prepare_args(&id, &body),
+    )
+    .await?;
+    Ok(Json(data))
+}
+
+/// The request, as the operation spells it.
+///
+/// Its own function so the forwarding can be asserted, exactly like
+/// [`install_args`]. The template id comes from the path and the name from the
+/// body, and neither is checked here: `docker.template.prepare` refuses an id
+/// it does not have by listing the ones it does, and parses the name through
+/// the same `ContainerRef` grammar `docker.create` will. A second copy of
+/// either rule in this file would be a second thing to keep in step.
+fn prepare_args(id: &str, body: &PrepareTemplate) -> serde_json::Value {
+    let mut args = serde_json::Map::new();
+    args.insert("template".into(), json!(id));
+    // Omitted rather than sent as null when the operator did not type one, so
+    // the operation's own default — the template's suggested name — is the only
+    // place that decides what an unnamed container is called.
+    if let Some(name) = &body.name {
+        args.insert("name".into(), json!(name));
+    }
+    serde_json::Value::Object(args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +767,32 @@ mod tests {
                 .unwrap_or_else(|e| panic!("`{reference}` is what the page sends: {e}"));
             assert_eq!(asked.image, reference);
         }
+    }
+
+    /// The template id lives in the path and the name in the body, and both
+    /// have to reach the operation under the names it reads them by. The bug
+    /// this guards against is the one `install_args` replaced: a handler that
+    /// rebuilt the request from one field and dropped the rest, which failed as
+    /// a 400 the page could not explain.
+    #[test]
+    fn a_template_and_the_name_the_operator_typed_both_reach_the_operation() {
+        let named: PrepareTemplate = serde_json::from_value(json!({ "name": "kuma" })).unwrap();
+        assert_eq!(
+            prepare_args("uptime-kuma", &named),
+            json!({ "template": "uptime-kuma", "name": "kuma" })
+        );
+    }
+
+    /// An unnamed draft is the template's suggestion, and only the operation
+    /// knows what that is. Sending `null` would work today and would stop the
+    /// moment anything in the chain read a present key as an answer.
+    #[test]
+    fn a_draft_with_no_name_omits_the_field_rather_than_sending_a_null() {
+        let bare: PrepareTemplate = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            prepare_args("grafana", &bare),
+            json!({ "template": "grafana" })
+        );
     }
 
     /// A prune with no body is a prune, not a listing. An operator who pressed

@@ -24,6 +24,7 @@ import { FirewallPage } from "@/routes/firewall";
 import { LoginPage } from "@/routes/login";
 import { MailPage } from "@/routes/mail";
 import { PlansPage } from "@/routes/plans";
+import { ProcessesPage } from "@/routes/processes";
 import { DiscoverPage } from "@/routes/discover";
 import { DockerPage } from "@/routes/docker";
 import { SettingsPage } from "@/routes/settings";
@@ -32,6 +33,8 @@ import { SitesPage } from "@/routes/sites";
 import { StackPage } from "@/routes/stack";
 import { TasksPage } from "@/routes/tasks";
 import { TerminalPage } from "@/routes/terminal";
+import { UsersPage } from "@/routes/users";
+import { WordPressPage } from "@/routes/wordpress";
 
 /**
  * One gate for the whole app.
@@ -197,6 +200,12 @@ const settingsRoute = createRoute({
   component: SettingsPage,
 });
 
+const usersRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/users",
+  component: UsersPage,
+});
+
 /**
  * The Runtimes page installed Node, Python, Go and Ruby, which the Stack page
  * also installs — two buttons for one job, and the one on this page had never
@@ -224,6 +233,12 @@ const dockerRoute = createRoute({
   component: DockerPage,
 });
 
+const processesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/processes",
+  component: ProcessesPage,
+});
+
 const discoverRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/discover",
@@ -234,6 +249,12 @@ const alertsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/alerts",
   component: AlertsPage,
+});
+
+const wordpressRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/wordpress",
+  component: WordPressPage,
 });
 
 const routeTree = rootRoute.addChildren([
@@ -255,9 +276,12 @@ const routeTree = rootRoute.addChildren([
   tasksRoute,
   terminalRoute,
   settingsRoute,
+  usersRoute,
   runtimesRoute,
   dockerRoute,
+  processesRoute,
   discoverRoute,
+  wordpressRoute,
 ]);
 
 export const router = createRouter({ routeTree, defaultPreload: "intent" });

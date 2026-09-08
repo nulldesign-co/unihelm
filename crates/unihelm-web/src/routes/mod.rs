@@ -18,6 +18,7 @@ pub mod dns;
 pub mod events;
 pub mod files;
 pub mod firewall;
+pub mod git;
 pub mod health;
 pub mod imports;
 pub mod mail;
@@ -26,6 +27,7 @@ pub mod ops;
 pub mod panel_tls;
 pub mod plans;
 pub mod plugins;
+pub mod processes;
 pub mod quota;
 pub mod runtimes;
 pub mod server;
@@ -33,6 +35,7 @@ pub mod sites;
 pub mod stack;
 pub mod tasks;
 pub mod terminal;
+pub mod users;
 pub mod waf;
 pub mod webhooks;
 pub mod wordpress;
@@ -226,7 +229,19 @@ fn protected() -> Router<SharedState> {
             get(firewall::sentinel_get).put(firewall::sentinel_set),
         )
         .route("/api/dns/check", get(dns::check))
-        .route("/api/dns/provider", axum::routing::put(dns::provider_set))
+        .route(
+            "/api/dns/provider",
+            get(dns::provider_get).put(dns::provider_set),
+        )
+        .route("/api/dns/zones", get(dns::zones))
+        .route(
+            "/api/dns/records",
+            get(dns::records_list).post(dns::record_create),
+        )
+        .route(
+            "/api/dns/records/{id}",
+            axum::routing::put(dns::record_update).delete(dns::record_delete),
+        )
         .route(
             "/api/sites/{id}/certificate-wildcard",
             post(dns::issue_wildcard),
@@ -287,6 +302,28 @@ fn protected() -> Router<SharedState> {
         .route("/api/waf/disable", post(waf::disable))
         .route("/api/waf/rules", axum::routing::put(waf::rules_set))
         .route("/api/server/security-posture", get(waf::security_posture))
+        .route("/api/processes", get(processes::list))
+        .route("/api/processes/kill", post(processes::kill))
+        .route("/api/users", get(users::list).post(users::create))
+        .route("/api/users/{id}", axum::routing::delete(users::delete))
+        .route("/api/users/{id}/role", post(users::set_role))
+        .route("/api/users/{id}/status", post(users::set_status))
+        .route("/api/account/password", post(users::change_password))
+        .route("/api/apps/{id}/build", post(apps::build))
+        .route(
+            "/api/sites/{id}/git",
+            get(git::status).post(git::attach).delete(git::detach),
+        )
+        .route("/api/sites/{id}/git/clone", post(git::clone))
+        .route("/api/sites/{id}/git/pull", post(git::pull))
+        .route(
+            "/api/server/docker/templates",
+            get(runtimes::docker_templates),
+        )
+        .route(
+            "/api/server/docker/templates/{id}/prepare",
+            post(runtimes::docker_template_prepare),
+        )
         .route(
             "/api/server/reboot",
             get(server::reboot_status).post(server::reboot),

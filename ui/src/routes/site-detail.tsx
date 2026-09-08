@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, useNavigate } from "@tanstack/react-router";
 import {
+  Download,
   ExternalLink,
   FileDiff,
+  GitBranch,
   Link2,
   Lock,
   LockOpen,
@@ -44,6 +46,7 @@ import {
   type TaskStatus,
   type UpdateSiteRequest,
 } from "@/lib/api";
+import { gitApi, repositoryProblem, shortCommit } from "@/lib/git-api";
 import { staggerStyle } from "@/lib/motion";
 import { aliasProblem, normalizeDomain, sitesApi } from "@/lib/sites-api";
 import { cn } from "@/lib/utils";
@@ -184,6 +187,7 @@ export function SiteDetailPage() {
         <CertificateCard site={site} />
         <AliasesCard site={site} />
       </div>
+      <RepositoryCard site={site} />
       <SettingsCard site={site} />
       <DriftCard siteId={site.id} />
       <DangerZone site={site} />
@@ -700,6 +704,311 @@ function AliasesCard({ site }: { site: SiteDetail }) {
               // card compares against has just been rewritten.
               void queryClient.invalidateQueries({ queryKey: ["sites"] });
               void queryClient.invalidateQueries({ queryKey: ["site-drift", site.id] });
+            }}
+          />
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Repository
+// ---------------------------------------------------------------------------
+
+/**
+ * Where this site's code comes from.
+ *
+ * Deploying used to mean dragging files into the file manager one directory at
+ * a time. This attaches a public repository, clones it into the document root
+ * once, and fast-forwards it on every deploy after that.
+ *
+ * The card never claims more than the server told it. `root_state` is a reading
+ * of the document root, `checkout` is a reading of what git says about itself,
+ * and the attachment is the panel's own note — so when the checkout points at a
+ * different repository than the one attached, that is shown as the
+ * disagreement it is rather than resolved silently. Every button that would be
+ * refused by the agent is disabled here with the reason next to it, because a
+ * button that always fails is worse than no button.
+ */
+function RepositoryCard({ site }: { site: SiteDetail }) {
+  const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const [repository, setRepository] = useState("");
+  const [branch, setBranch] = useState("");
+  const [touched, setTouched] = useState(false);
+  const [task, setTask] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const status = useQuery({
+    queryKey: ["site-git", site.id],
+    queryFn: () => gitApi.status(site.id),
+  });
+
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ["site-git", site.id] });
+  };
+  const failed = (e: unknown) => setError(e instanceof ApiError ? e.message : String(e));
+  const started = (accepted: TaskAccepted) => {
+    setError(null);
+    setTask(accepted.task_id);
+  };
+
+  const attach = useMutation({
+    mutationFn: () => gitApi.attach(site.id, repository, branch),
+    onSuccess: () => {
+      setError(null);
+      setRepository("");
+      setBranch("");
+      setTouched(false);
+      refresh();
+    },
+    onError: failed,
+  });
+  const detach = useMutation({
+    mutationFn: () => gitApi.detach(site.id),
+    onSuccess: () => {
+      setError(null);
+      refresh();
+    },
+    onError: failed,
+  });
+  const clone = useMutation({ mutationFn: () => gitApi.clone(site.id), onSuccess: started, onError: failed });
+  const deploy = useMutation({ mutationFn: () => gitApi.pull(site.id), onSuccess: started, onError: failed });
+
+  const data = status.data;
+  const attachment = data?.attachment ?? null;
+  const checkout = data?.checkout ?? null;
+  const problem = repositoryProblem(repository);
+  // Only once the operator has moved on from the field: complaining about a
+  // half-typed URL is complaining about typing.
+  const showProblem = touched && repository.trim() !== "" && problem !== null;
+  const busy = attach.isPending || detach.isPending || clone.isPending || deploy.isPending;
+  const canClone =
+    !!data?.git_installed && (data.root_state === "empty" || data.root_state === "holding_page");
+  const canDeploy =
+    !!data?.git_installed &&
+    data.root_state === "checkout" &&
+    !!checkout &&
+    !checkout.dirty &&
+    checkout.remote_matches_attachment;
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    setTouched(true);
+    if (problem !== null || busy) return;
+    attach.mutate();
+  };
+
+  return (
+    <Card>
+      <CardHeader
+        title={
+          <span className="inline-flex items-center gap-1.5">
+            <GitBranch className="h-4 w-4" aria-hidden />
+            {t("siteDetail.gitTitle")}
+          </span>
+        }
+        description={t("siteDetail.gitHint")}
+        action={
+          attachment ? (
+            <Button variant="ghost" size="sm" onClick={() => detach.mutate()} loading={detach.isPending}>
+              {t("siteDetail.gitDetach")}
+            </Button>
+          ) : null
+        }
+      />
+      <CardBody>
+        {status.isPending ? (
+          <div role="status" aria-live="polite" className="space-y-3 py-0.5">
+            <Skeleton className="h-4 w-2/3" />
+            <Skeleton className="h-4 w-1/2" />
+            <Skeleton className="h-9 w-40" />
+          </div>
+        ) : status.isError ? (
+          <Callout tone="danger">
+            {status.error instanceof ApiError ? status.error.message : String(status.error)}
+          </Callout>
+        ) : data ? (
+          <div className="space-y-4">
+            {!data.git_installed ? (
+              <Callout tone="warning" title={t("siteDetail.gitMissingTitle")}>
+                {t("siteDetail.gitMissing")}
+              </Callout>
+            ) : null}
+
+            {attachment ? (
+              <>
+                <dl className="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+                  <MetaItem
+                    className="sm:col-span-2"
+                    label={t("siteDetail.gitRepository")}
+                    value={attachment.repository}
+                    mono
+                  />
+                  <MetaItem
+                    label={t("siteDetail.gitBranch")}
+                    value={attachment.branch ?? t("siteDetail.gitBranchDefault")}
+                    mono={!!attachment.branch}
+                  />
+                  <MetaItem
+                    label={t("siteDetail.gitLastDeployed")}
+                    value={
+                      attachment.last_deployed_at ? (
+                        <>
+                          <span>{formatDate(attachment.last_deployed_at, i18n.language)}</span>
+                          {attachment.last_commit ? (
+                            <Badge tone="neutral" className="font-mono">
+                              {shortCommit(attachment.last_commit)}
+                            </Badge>
+                          ) : null}
+                        </>
+                      ) : (
+                        <span className="text-ink-muted">{t("siteDetail.gitNever")}</span>
+                      )
+                    }
+                  />
+                  {checkout?.subject ? (
+                    <MetaItem
+                      className="sm:col-span-2"
+                      label={t("siteDetail.gitCommit")}
+                      value={checkout.subject}
+                    />
+                  ) : null}
+                </dl>
+
+                {data.root_state === "missing" ? (
+                  <Callout tone="warning" title={t("siteDetail.gitRootMissingTitle")}>
+                    {t("siteDetail.gitRootMissing", { root: data.document_root })}
+                  </Callout>
+                ) : null}
+
+                {data.root_state === "occupied" ? (
+                  <Callout tone="danger" title={t("siteDetail.gitOccupiedTitle")}>
+                    <p>{t("siteDetail.gitOccupied", { root: data.document_root })}</p>
+                    <p className="mt-1 font-mono text-xs break-words">
+                      {data.root_entries.join(" · ")}
+                    </p>
+                  </Callout>
+                ) : null}
+
+                {checkout && !checkout.remote_matches_attachment ? (
+                  <Callout tone="danger" title={t("siteDetail.gitMismatchTitle")}>
+                    {t("siteDetail.gitMismatch", { remote: checkout.remote ?? "" })}
+                  </Callout>
+                ) : null}
+
+                {checkout?.dirty ? (
+                  <Callout tone="warning" title={t("siteDetail.gitDirtyTitle")}>
+                    <p>{t("siteDetail.gitDirty", { count: checkout.changed_files.length })}</p>
+                    <p className="mt-1 font-mono text-xs break-words">
+                      {checkout.changed_files.join(" · ")}
+                    </p>
+                  </Callout>
+                ) : null}
+
+                <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
+                  {data.root_state === "checkout" ? (
+                    <Button
+                      variant="primary"
+                      onClick={() => deploy.mutate()}
+                      loading={deploy.isPending}
+                      disabled={busy || !canDeploy}
+                    >
+                      <RefreshCw className="h-4 w-4" aria-hidden />
+                      {t("siteDetail.gitDeploy")}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="primary"
+                      onClick={() => clone.mutate()}
+                      loading={clone.isPending}
+                      disabled={busy || !canClone}
+                    >
+                      <Download className="h-4 w-4" aria-hidden />
+                      {t("siteDetail.gitClone")}
+                    </Button>
+                  )}
+                  <p className="text-xs text-ink-subtle">
+                    {data.root_state === "checkout"
+                      ? t("siteDetail.gitDeployHint")
+                      : data.root_state === "holding_page"
+                        ? t("siteDetail.gitCloneReplacesHint", { root: data.document_root })
+                        : t("siteDetail.gitCloneHint", { root: data.document_root })}
+                  </p>
+                </div>
+              </>
+            ) : (
+              <>
+                <EmptyState
+                  className="py-8"
+                  icon={<GitBranch />}
+                  title={t("siteDetail.gitNone")}
+                  hint={t("siteDetail.gitNoneHint")}
+                />
+                <form onSubmit={submit} className="space-y-3 border-t border-border pt-4">
+                  <Field
+                    label={t("siteDetail.gitRepository")}
+                    htmlFor="git_repository"
+                    error={showProblem ? t(`siteDetail.gitProblem.${problem}`) : undefined}
+                  >
+                    <Input
+                      id="git_repository"
+                      className="font-mono text-xs"
+                      placeholder="https://github.com/owner/project.git"
+                      autoComplete="off"
+                      spellCheck={false}
+                      aria-invalid={showProblem}
+                      disabled={busy}
+                      value={repository}
+                      onChange={(event) => setRepository(event.target.value)}
+                      onBlur={() => setTouched(true)}
+                    />
+                    <p className="text-xs text-ink-subtle">{t("siteDetail.gitRepositoryHint")}</p>
+                  </Field>
+                  <Field label={t("siteDetail.gitBranch")} htmlFor="git_branch">
+                    <div className="flex flex-wrap items-start gap-2">
+                      <Input
+                        id="git_branch"
+                        className="min-w-40 flex-1 font-mono text-xs"
+                        placeholder="main"
+                        autoComplete="off"
+                        spellCheck={false}
+                        disabled={busy}
+                        value={branch}
+                        onChange={(event) => setBranch(event.target.value)}
+                      />
+                      <Button
+                        type="submit"
+                        variant="primary"
+                        loading={attach.isPending}
+                        disabled={busy || repository.trim() === "" || problem !== null}
+                      >
+                        <Plus className="h-4 w-4" aria-hidden />
+                        {t("siteDetail.gitAttach")}
+                      </Button>
+                    </div>
+                    <p className="text-xs text-ink-subtle">{t("siteDetail.gitBranchHint")}</p>
+                  </Field>
+                </form>
+              </>
+            )}
+          </div>
+        ) : null}
+
+        {error ? (
+          <Callout tone="danger" className="mt-3">
+            {error}
+          </Callout>
+        ) : null}
+        {task ? (
+          <TaskNotice
+            key={task}
+            taskId={task}
+            onSettled={() => {
+              // The document root, the checkout and the recorded commit have
+              // all just moved; the sites list has not.
+              refresh();
             }}
           />
         ) : null}

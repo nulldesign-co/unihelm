@@ -6,6 +6,7 @@ import {
   Eraser,
   HardDrive,
   Layers,
+  LayoutTemplate,
   Play,
   RotateCw,
   ScrollText,
@@ -30,6 +31,16 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Table, Td, Th, Tr } from "@/components/ui/table";
 import { ApiError, api, endpoints, type CreateContainerRequest } from "@/lib/api";
+import {
+  dockerTemplatesApi,
+  draftAddresses,
+  draftSecrets,
+  draftToForm,
+  type ContainerTemplate,
+  type DraftForm,
+  type FirstRun,
+  type TemplateDraft,
+} from "@/lib/docker-templates";
 import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
@@ -85,10 +96,38 @@ import { cn } from "@/lib/utils";
  *    "Nothing". Those two pairs look identical on a page and mean opposite
  *    things next to a delete button, and the second of each pair is the one
  *    that ends with somebody's database gone.
+ * 7. **A template fills the form in; it does not press the button.** Starting
+ *    anything used to mean knowing an image, a tag, two port numbers, a data
+ *    path and four environment variables by heart. The catalogue supplies all
+ *    of it — but into the same editable form, on the same create operation,
+ *    with the same loopback default and the same visibility switch. A template
+ *    that quietly created a container would be a shortcut past the one control
+ *    on this page that can open a hole the Firewall page cannot show.
  */
 export function DockerPage() {
   const [creating, setCreating] = useState(false);
+  const [picking, setPicking] = useState(false);
+  // The draft a template produced, and a counter that remounts the create
+  // dialog. The dialog holds its fields in `useState`, so seeding them means
+  // building it again rather than writing over what the operator has typed —
+  // and the counter rather than the template id, because picking the same
+  // template twice is a second draft with a second generated password.
+  const [draft, setDraft] = useState<TemplateDraft | null>(null);
+  const [draftSeq, setDraftSeq] = useState(0);
   const { t } = useTranslation();
+
+  const openBlank = () => {
+    setDraft(null);
+    setDraftSeq((n) => n + 1);
+    setCreating(true);
+  };
+
+  const openWithDraft = (prepared: TemplateDraft) => {
+    setDraft(prepared);
+    setDraftSeq((n) => n + 1);
+    setPicking(false);
+    setCreating(true);
+  };
 
   const list = useQuery({ queryKey: ["docker"], queryFn: fetchDockerInventory });
 
@@ -110,10 +149,16 @@ export function DockerPage() {
               {t("docker.refresh")}
             </Button>
             {list.data?.daemon_running ? (
-              <Button onClick={() => setCreating(true)}>
-                <Plus className="h-4 w-4" aria-hidden />
-                {t("docker.create")}
-              </Button>
+              <>
+                <Button variant="outline" onClick={() => setPicking(true)}>
+                  <LayoutTemplate className="h-4 w-4" aria-hidden />
+                  {t("docker.fromTemplate")}
+                </Button>
+                <Button onClick={openBlank}>
+                  <Plus className="h-4 w-4" aria-hidden />
+                  {t("docker.create")}
+                </Button>
+              </>
             ) : null}
           </>
         }
@@ -123,7 +168,14 @@ export function DockerPage() {
         {t("docker.noRun")}
       </Callout>
 
-      <CreateContainerDialog open={creating} onClose={() => setCreating(false)} />
+      <TemplateDialog open={picking} onClose={() => setPicking(false)} onPicked={openWithDraft} />
+
+      <CreateContainerDialog
+        key={draftSeq}
+        open={creating}
+        draft={draft}
+        onClose={() => setCreating(false)}
+      />
 
       {list.isPending ? (
         <InventorySkeleton />
@@ -246,21 +298,41 @@ const fetchContainerLogs = (id: string) =>
  * already, in exactly this shape, from a compose file or a README. The one
  * thing a line cannot carry is who may reach the port, so that is a toggle per
  * mapping underneath — see `PortVisibility`.
+ *
+ * `draft` is a template, already filled in by the agent. It seeds the same
+ * fields and changes nothing else: the boxes stay editable, the visibility
+ * switches stay off, and the create is the same operation. What it adds is
+ * `DraftNotes` above the form — the generated password the panel keeps no copy
+ * of, where the container will answer, and who can sign in when it starts.
+ * The dialog is remounted per draft (see the `key` at the call site) rather
+ * than syncing state in an effect, so a second draft cannot half-overwrite a
+ * form the operator has already begun editing.
  */
-function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+function CreateContainerDialog({
+  open,
+  onClose,
+  draft = null,
+}: {
+  open: boolean;
+  onClose: () => void;
+  draft?: TemplateDraft | null;
+}) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [image, setImage] = useState("");
-  const [name, setName] = useState("");
-  const [ports, setPorts] = useState("");
+  const seed: DraftForm | null = draft ? draftToForm(draft) : null;
+  const [image, setImage] = useState(seed?.image ?? "");
+  const [name, setName] = useState(seed?.name ?? "");
+  const [ports, setPorts] = useState(seed?.ports ?? "");
   // Which mappings the operator has deliberately opened, keyed by the line they
   // are written on rather than by position: editing a line drops its entry, so
   // a mapping that changes under an open dialog falls back to the private
   // default instead of inheriting a decision made about a different port.
   const [publicPorts, setPublicPorts] = useState<Record<string, boolean>>({});
-  const [env, setEnv] = useState("");
-  const [volumes, setVolumes] = useState("");
-  const [restart, setRestart] = useState<CreateContainerRequest["restart"]>("unless-stopped");
+  const [env, setEnv] = useState(seed?.env ?? "");
+  const [volumes, setVolumes] = useState(seed?.volumes ?? "");
+  const [restart, setRestart] = useState<CreateContainerRequest["restart"]>(
+    seed?.restart ?? "unless-stopped",
+  );
   const [error, setError] = useState<string | null>(null);
 
   const parsedPorts = parsePorts(ports);
@@ -332,6 +404,8 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
         </Callout>
       ) : null}
 
+      {draft ? <DraftNotes draft={draft} /> : null}
+
       <Field label={t("docker.imageField")} htmlFor="dk-image">
         <Input id="dk-image" value={image} onChange={(e) => setImage(e.target.value)} placeholder="nginx:alpine" />
       </Field>
@@ -379,8 +453,242 @@ function CreateContainerDialog({ open, onClose }: { open: boolean; onClose: () =
   );
 }
 
-/** One entry per non-empty line, trimmed. The shape every list field here uses. */
-function lines(text: string): string[] {
+/**
+ * The curated catalogue, and the one button on it that does anything.
+ *
+ * Picking a template does not create a container. It asks the agent to fill a
+ * draft in — a generated password where the image needs one, a host port that
+ * is actually free — and hands that to the same create form an operator would
+ * otherwise have typed themselves. Every field stays editable and every port
+ * stays private, because a template that started something would be a way past
+ * the visibility switch, which is the one control here that can open a hole the
+ * Firewall page cannot show.
+ *
+ * The catalogue is not held on this page. It is compiled into the agent, so a
+ * copy here would be a second list to keep in step and the one on screen would
+ * be the one nobody verified.
+ */
+function TemplateDialog({
+  open,
+  onClose,
+  onPicked,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onPicked: (draft: TemplateDraft) => void;
+}) {
+  const { t } = useTranslation();
+  const [error, setError] = useState<string | null>(null);
+
+  // Only once the dialog is open: the list costs an agent round trip and the
+  // page underneath has no use for it.
+  const catalogue = useQuery({
+    queryKey: ["docker", "templates"],
+    queryFn: dockerTemplatesApi.list,
+    enabled: open,
+  });
+
+  const prepare = useMutation({
+    mutationFn: (id: string) => dockerTemplatesApi.prepare(id),
+    onSuccess: onPicked,
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      wide
+      title={t("docker.templatesTitle")}
+      description={t("docker.templatesHint")}
+      footer={
+        <Button variant="ghost" onClick={onClose}>
+          {t("common.cancel")}
+        </Button>
+      }
+    >
+      {error ? (
+        <Callout tone="danger" className="mb-3">
+          {t("docker.templateFailed", { message: error })}
+        </Callout>
+      ) : null}
+
+      <Callout tone="info" className="mb-4">
+        {t("docker.templatesNote")}
+      </Callout>
+
+      {catalogue.isPending ? (
+        <div className="space-y-3">
+          {Array.from({ length: 3 }, (_, i) => (
+            <Skeleton key={i} className="h-28 w-full" />
+          ))}
+        </div>
+      ) : catalogue.error ? (
+        <Callout tone="danger">
+          {t("docker.templatesFailed", {
+            message:
+              catalogue.error instanceof ApiError
+                ? catalogue.error.message
+                : String(catalogue.error),
+          })}
+        </Callout>
+      ) : catalogue.data.templates.length === 0 ? (
+        <EmptyState icon={<LayoutTemplate aria-hidden />} title={t("docker.templatesEmpty")} />
+      ) : (
+        <div className="space-y-3">
+          {catalogue.data.templates.map((template, i) => (
+            <TemplateChoice
+              key={template.id}
+              template={template}
+              index={i}
+              // The row's own spinner, not the dialog's: two operators' worth of
+              // buttons going grey because one of them was pressed reads as the
+              // page having stopped rather than as one template being fetched.
+              busy={prepare.isPending && prepare.variables === template.id}
+              disabled={prepare.isPending}
+              onUse={() => {
+                setError(null);
+                prepare.mutate(template.id);
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </Dialog>
+  );
+}
+
+/**
+ * One template, and everything it will do before it does any of it.
+ *
+ * The image with its pinned tag, what it will publish and what answers there,
+ * what each volume holds, and who can sign in when it starts. That last one is
+ * the line that is easy to leave out and expensive to leave out: most of these
+ * images have no account at all until somebody opens them, so on a published
+ * port the first stranger to arrive is the administrator.
+ */
+function TemplateChoice({
+  template,
+  index,
+  busy,
+  disabled,
+  onUse,
+}: {
+  template: ContainerTemplate;
+  index: number;
+  busy: boolean;
+  disabled: boolean;
+  onUse: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div
+      className="animate-rise-in rounded-lg border border-border bg-surface-muted/50 px-4 py-3 stagger"
+      style={staggerStyle(index)}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-ink">{template.display_name}</p>
+          <p className="mt-0.5 text-sm text-ink-muted">{template.summary}</p>
+        </div>
+        <Button variant="outline" loading={busy} disabled={disabled} onClick={onUse}>
+          {t("docker.templateUse")}
+        </Button>
+      </div>
+
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        <Badge>{template.image}</Badge>
+        {template.generates_secret ? (
+          <Badge tone="accent">{t("docker.templateGenerates")}</Badge>
+        ) : null}
+      </div>
+
+      <ul className="mt-2 space-y-0.5 text-xs text-ink-muted">
+        {template.ports.map((port) => (
+          <li key={`${port.host}:${port.container}`}>
+            {t("docker.templatePort", {
+              host: port.host,
+              container: port.container,
+              purpose: port.purpose,
+            })}
+          </li>
+        ))}
+        {template.volumes.map((volume) => (
+          <li key={volume.path}>
+            {t("docker.templateVolume", { path: volume.path, holds: volume.holds })}
+          </li>
+        ))}
+        <li>
+          <FirstRunNote firstRun={template.first_run} />
+        </li>
+      </ul>
+    </div>
+  );
+}
+
+/** Who can sign in when the container starts, which is never nobody. */
+function FirstRunNote({ firstRun }: { firstRun: FirstRun }) {
+  const { t } = useTranslation();
+  if (firstRun.kind === "credential") {
+    return <>{t("docker.templateSignIn", { user: firstRun.user, variable: firstRun.variable })}</>;
+  }
+  return <>{t("docker.templateWizard")}</>;
+}
+
+/**
+ * What the agent decided for this draft, above the form it filled in.
+ *
+ * Three separate things, and they are separate on purpose. Where it will answer
+ * is the one an operator checks against the site they are about to point at it.
+ * A moved port is a warning, because the number they were told in the catalogue
+ * is not the number they got, and finding that out from a browser that will not
+ * connect is worse than reading it here. The generated password is the loudest,
+ * because it is the only thing on this page that cannot be recovered: the panel
+ * mints it, shows it once and keeps nothing.
+ */
+function DraftNotes({ draft }: { draft: TemplateDraft }) {
+  const { t } = useTranslation();
+  const secrets = draftSecrets(draft);
+
+  return (
+    <div className="mb-4 space-y-3">
+      <Callout tone="info" title={t("docker.templateDraftTitle", { name: draft.display_name })}>
+        <p>{t("docker.templateExposes", { addresses: draftAddresses(draft).join(", ") })}</p>
+        <p className="mt-1.5">
+          <FirstRunNote firstRun={draft.first_run} />
+        </p>
+        {/* The agent's own sentence, quoted rather than rewritten, like the
+            inventory's `note`: it names the page to open and the order to do it
+            in, and a paraphrase here would be a second source of truth about an
+            image this panel does not run. */}
+        <p className="mt-1.5">{draft.after_start}</p>
+      </Callout>
+
+      {draft.port_notes.map((note) => (
+        <Callout tone="warning" key={note}>
+          {note}
+        </Callout>
+      ))}
+
+      {secrets.length > 0 ? (
+        <Callout tone="warning" title={t("docker.templateSecretTitle")}>
+          {t("docker.templateSecret", { keys: secrets.map((s) => s.key).join(", ") })}
+        </Callout>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * One entry per non-empty line, trimmed. The shape every list field here uses.
+ *
+ * Exported for `lib/docker-templates.test.ts`, which uses it to prove that what
+ * a prepared template writes into these boxes is read back as the same ports,
+ * variables and volumes. That round trip is the seam where a template could
+ * silently lose a port mapping, so the test drives the reader that actually
+ * runs rather than a copy of its grammar.
+ */
+export function lines(text: string): string[] {
   return text
     .split("\n")
     .map((l) => l.trim())
@@ -388,7 +696,7 @@ function lines(text: string): string[] {
 }
 
 /** One line of the ports box, read as a mapping. */
-interface ParsedPort {
+export interface ParsedPort {
   host: number;
   container: number;
   udp: boolean;
@@ -403,7 +711,7 @@ interface ParsedPort {
  * the agent names the bad field in its refusal, and a container created quietly
  * without the port the operator typed is the worse of the two answers.
  */
-function parsePorts(text: string): ParsedPort[] {
+export function parsePorts(text: string): ParsedPort[] {
   return lines(text).map((line) => {
     const udp = line.endsWith("/udp");
     const [host, container] = line.replace(/\/(udp|tcp)$/, "").split(":");

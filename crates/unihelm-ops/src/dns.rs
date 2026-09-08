@@ -108,6 +108,12 @@ impl std::fmt::Debug for SecretToken {
 pub enum CfMethod {
     Get,
     Post,
+    /// A whole-record replace. Cloudflare also offers PATCH, and the panel does
+    /// not use it: a PATCH sends only the fields that changed, so a field the
+    /// edit form forgot to include keeps its old value silently. PUT makes the
+    /// request say what the record will be in full, which is the same shape the
+    /// form already holds.
+    Put,
     Delete,
 }
 
@@ -116,6 +122,7 @@ impl CfMethod {
         match self {
             CfMethod::Get => "GET",
             CfMethod::Post => "POST",
+            CfMethod::Put => "PUT",
             CfMethod::Delete => "DELETE",
         }
     }
@@ -209,6 +216,7 @@ impl CfTransport for HttpTransport {
         let mut builder = match request.method {
             CfMethod::Get => self.client.get(&url),
             CfMethod::Post => self.client.post(&url),
+            CfMethod::Put => self.client.put(&url),
             CfMethod::Delete => self.client.delete(&url),
         };
         if !request.query.is_empty() {
@@ -262,6 +270,66 @@ pub struct Zone {
     pub id: String,
     /// The zone apex, e.g. `example.co.uk`.
     pub name: String,
+    /// The Cloudflare account the zone belongs to, when the API says.
+    ///
+    /// Shown next to the zone so an operator with tokens from several
+    /// Cloudflare accounts can tell which account a zone is being edited in.
+    /// `None` rather than an empty string when the field is absent, because
+    /// "Cloudflare did not say" and "the account is named nothing" are
+    /// different facts and only one of them is worth printing.
+    pub account: Option<String>,
+}
+
+/// The comment the panel stamps on records it creates for a feature of its own.
+///
+/// Read back in [`record_impact`]: a record the panel wrote is one the panel
+/// will write again the next time that feature is applied, so an operator
+/// editing it by hand is editing a copy, not the source.
+pub const PANEL_RECORD_COMMENT: &str = "added by Unihelm";
+
+/// One DNS record as Cloudflare holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfRecord {
+    pub id: String,
+    /// `A`, `CNAME`, `TXT`… Cloudflare's own spelling, upper case.
+    pub kind: String,
+    /// Always fully qualified, as Cloudflare returns it.
+    pub name: String,
+    pub content: String,
+    /// `1` is Cloudflare's "automatic".
+    pub ttl: u32,
+    /// `None` for a type Cloudflare cannot put behind its proxy.
+    pub proxied: Option<bool>,
+    /// MX and SRV only.
+    pub priority: Option<u16>,
+    pub comment: Option<String>,
+}
+
+/// The fields a create or a replace carries.
+///
+/// One struct for both because Cloudflare's POST and PUT take the same body:
+/// two structs would be two places for a field to go missing from, and a field
+/// missing from a PUT body is a value silently reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordWrite {
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+    pub ttl: u32,
+    pub proxied: Option<bool>,
+    pub priority: Option<u16>,
+    pub comment: Option<String>,
+}
+
+/// A page of a zone's records, and whether it is the whole zone.
+///
+/// The flag is not decoration. A zone with more records than the walk below
+/// will read must not be rendered as if it were complete — an operator who
+/// cannot see a record concludes it is not there and adds a second one.
+#[derive(Debug, Clone)]
+pub struct RecordPage {
+    pub records: Vec<CfRecord>,
+    pub truncated: bool,
 }
 
 /// Cloudflare's v4 API, in the four calls this panel makes.
@@ -410,6 +478,12 @@ impl Cloudflare {
                 out.push(Zone {
                     id: id.to_string(),
                     name: name.trim_end_matches('.').to_ascii_lowercase(),
+                    account: item
+                        .get("account")
+                        .and_then(|a| a.get("name"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
                 });
             }
 
@@ -545,6 +619,178 @@ impl Cloudflare {
         .await?;
         Ok(())
     }
+
+    /// Every record in a zone, as far as the walk is allowed to go.
+    ///
+    /// Bounded the same way [`Cloudflare::zones`] is, and for the same reason:
+    /// `total_pages` comes from a remote server and an unbounded loop on it is
+    /// an operation that never returns. Where the bound bites, the caller is
+    /// *told* — `truncated` — rather than handed a short list that looks whole.
+    pub async fn list_records(&self, zone_id: &str) -> Result<RecordPage> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 20;
+
+        let mut records = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let result = self
+                .call(CfRequest {
+                    method: CfMethod::Get,
+                    path: format!("/zones/{zone_id}/dns_records"),
+                    query: vec![
+                        ("per_page".into(), PER_PAGE.to_string()),
+                        ("page".into(), page.to_string()),
+                        // Stable across pages, so a record cannot be skipped or
+                        // seen twice while the walk is in progress.
+                        ("order".into(), "type".into()),
+                    ],
+                    body: None,
+                })
+                .await?;
+
+            let Some(items) = result.as_array() else {
+                return Err(UnihelmError::new(
+                    ErrorCode::CommandFailed,
+                    "Cloudflare returned a record list that is not a list",
+                ));
+            };
+            let batch = items.len();
+            for item in items {
+                records.push(parse_record(item)?);
+            }
+
+            if batch < PER_PAGE {
+                return Ok(RecordPage {
+                    records,
+                    truncated: false,
+                });
+            }
+            truncated = page == MAX_PAGES;
+        }
+
+        Ok(RecordPage { records, truncated })
+    }
+
+    /// One record, by id.
+    ///
+    /// The read that every write in this module makes first: an edit or a
+    /// delete addressed by id alone is a change to whatever now sits under that
+    /// id, and what the operator was looking at is what they meant.
+    pub async fn record(&self, zone_id: &str, record_id: &str) -> Result<CfRecord> {
+        let result = self
+            .call(CfRequest {
+                method: CfMethod::Get,
+                path: format!("/zones/{zone_id}/dns_records/{record_id}"),
+                query: Vec::new(),
+                body: None,
+            })
+            .await?;
+        parse_record(&result)
+    }
+
+    /// Create a record from a full write, and return it as Cloudflare stored it.
+    ///
+    /// The *returned* record, not the one that was sent: Cloudflare normalises
+    /// names, resolves an automatic TTL and refuses a proxy on a type that
+    /// cannot carry one, so echoing the request back would show the operator a
+    /// record that does not exist.
+    pub async fn create_full_record(&self, zone_id: &str, write: &RecordWrite) -> Result<CfRecord> {
+        let result = self
+            .call(CfRequest {
+                method: CfMethod::Post,
+                path: format!("/zones/{zone_id}/dns_records"),
+                query: Vec::new(),
+                body: Some(write.to_body()),
+            })
+            .await?;
+        parse_record(&result)
+    }
+
+    /// Replace a record wholesale, and return it as Cloudflare stored it.
+    pub async fn replace_record(
+        &self,
+        zone_id: &str,
+        record_id: &str,
+        write: &RecordWrite,
+    ) -> Result<CfRecord> {
+        let result = self
+            .call(CfRequest {
+                method: CfMethod::Put,
+                path: format!("/zones/{zone_id}/dns_records/{record_id}"),
+                query: Vec::new(),
+                body: Some(write.to_body()),
+            })
+            .await?;
+        parse_record(&result)
+    }
+}
+
+impl RecordWrite {
+    /// The JSON body Cloudflare's create and replace both take.
+    fn to_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "type": self.kind,
+            "name": self.name,
+            "content": self.content,
+            "ttl": self.ttl,
+        });
+        if let Some(proxied) = self.proxied {
+            body["proxied"] = serde_json::json!(proxied);
+        }
+        if let Some(priority) = self.priority {
+            body["priority"] = serde_json::json!(priority);
+        }
+        // Sent even when it is empty, because a PUT that omits it clears the
+        // comment on the record it replaces — which is how the provenance of a
+        // record the panel wrote would disappear the first time somebody
+        // corrected its TTL.
+        body["comment"] = match &self.comment {
+            Some(comment) => serde_json::json!(comment),
+            None => serde_json::Value::Null,
+        };
+        body
+    }
+}
+
+/// Read one record out of a Cloudflare response object.
+///
+/// Missing `id`, `type`, `name` or `content` is an error rather than a default:
+/// a record with an empty name would be rendered as the zone apex, and a record
+/// with no id is one the panel would offer an Edit button for that could only
+/// fail.
+fn parse_record(item: &serde_json::Value) -> Result<CfRecord> {
+    let field = |key: &str| item.get(key).and_then(|v| v.as_str());
+    let (Some(id), Some(kind), Some(name), Some(content)) =
+        (field("id"), field("type"), field("name"), field("content"))
+    else {
+        return Err(UnihelmError::new(
+            ErrorCode::CommandFailed,
+            "Cloudflare returned a DNS record with no id, type, name or content",
+        ));
+    };
+
+    Ok(CfRecord {
+        id: id.to_string(),
+        kind: kind.to_ascii_uppercase(),
+        name: name.trim_end_matches('.').to_ascii_lowercase(),
+        content: content.to_string(),
+        // 1 is Cloudflare's "automatic"; it is also the value it reports when
+        // the field is absent on a proxied record.
+        ttl: item
+            .get("ttl")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32,
+        proxied: item.get("proxied").and_then(serde_json::Value::as_bool),
+        priority: item
+            .get("priority")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok()),
+        comment: item
+            .get("comment")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Join Cloudflare's `errors` array into one sentence.
@@ -602,20 +848,385 @@ pub fn longest_suffix_zone<'a>(zones: &'a [Zone], name: &str) -> Option<&'a Zone
 
     zones
         .iter()
-        .filter(|zone| {
-            let zone_name = zone.name.trim_end_matches('.');
-            if zone_name.is_empty() {
-                return false;
-            }
-            name == zone_name
-                || name
-                    .strip_suffix(zone_name)
-                    // The character before the zone name must be the label
-                    // separator, or this is a different domain that merely ends
-                    // in the same letters.
-                    .is_some_and(|prefix| prefix.ends_with('.'))
-        })
+        .filter(|zone| name_is_in_zone(&zone.name, name))
         .max_by_key(|zone| zone.name.len())
+}
+
+/// Is `name` the zone apex or a name under it?
+///
+/// Both arguments are expected lower-cased and without a trailing dot. Lifted
+/// out of [`longest_suffix_zone`] when the record editor needed the same test:
+/// two copies of a label-boundary check drift, and the looser copy is the hole
+/// — `evil-example.com` ends with `example.com` as a string, and a bare
+/// `ends_with` would hand whoever registers it the right to have records
+/// written into the victim's zone.
+pub fn name_is_in_zone(zone: &str, name: &str) -> bool {
+    let zone = zone.trim_end_matches('.');
+    if zone.is_empty() {
+        return false;
+    }
+    name == zone
+        || name
+            .strip_suffix(zone)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// Every record type the panel will write.
+///
+/// A closed list rather than whatever the operator typed: Cloudflare supports
+/// several dozen types whose content this panel cannot check at all, and a
+/// refusal naming the eight it does know is a better answer than a request the
+/// API rejects with a schema error.
+pub const RECORD_TYPES: &[&str] = &["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"];
+
+/// The types Cloudflare can put behind its proxy.
+const PROXYABLE_TYPES: &[&str] = &["A", "AAAA", "CNAME"];
+
+/// Cloudflare's "automatic" TTL, and the only TTL a proxied record may carry.
+pub const TTL_AUTOMATIC: u32 = 1;
+
+/// A record as a form or a CLI supplied it, before the panel has judged it.
+#[derive(Debug, Clone)]
+pub struct RecordDraft {
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+    pub ttl: Option<u32>,
+    pub proxied: Option<bool>,
+    pub priority: Option<u16>,
+}
+
+/// The fully-qualified name a typed one means inside `zone`.
+///
+/// `@` and an empty string are the apex, a bare label is qualified with the
+/// zone the way every zone editor does it, and a name that is already inside
+/// the zone is taken as it stands.
+///
+/// The case that earns the refusal is a dotted name that is *not* inside the
+/// zone. Cloudflare treats a name it does not recognise as relative and appends
+/// the zone to it, so sending `shop.example.net` while editing `example.com`
+/// silently creates `shop.example.net.example.com` — a record that exists, that
+/// the API reports as created, and that answers nothing. Refusing is the only
+/// answer that is not a lie about what happened.
+pub fn qualify_record_name(zone: &str, typed: &str) -> Result<String> {
+    let zone = zone.trim_end_matches('.').to_ascii_lowercase();
+    let typed = typed.trim().trim_end_matches('.').to_ascii_lowercase();
+
+    let refuse = |detail: String| {
+        UnihelmError::new(ErrorCode::InvalidInput, detail).with_field("name".to_string())
+    };
+
+    if typed.is_empty() || typed == "@" || typed == zone {
+        return Ok(zone);
+    }
+
+    // A leading `*` is a wildcard label, not part of the name being looked up;
+    // it is put back after the rest has been qualified.
+    let (wildcard, rest) = match typed.strip_prefix("*.") {
+        Some(rest) => (true, rest.to_string()),
+        None if typed == "*" => (true, String::new()),
+        None => (false, typed.clone()),
+    };
+
+    let qualified = if rest.is_empty() || rest == "@" {
+        zone.clone()
+    } else if name_is_in_zone(&zone, &rest) {
+        rest.clone()
+    } else if !rest.contains('.') {
+        format!("{rest}.{zone}")
+    } else {
+        return Err(refuse(format!(
+            "`{typed}` is not a name inside `{zone}`. Cloudflare would read it as a \
+             relative name and create `{typed}.{zone}` instead. Use a name ending in \
+             `{zone}`, a bare label such as `www`, or `@` for the zone itself."
+        )));
+    };
+
+    let full = if wildcard {
+        format!("*.{qualified}")
+    } else {
+        qualified
+    };
+
+    if full.len() > 253 {
+        return Err(refuse(format!(
+            "`{full}` is {} characters; a DNS name may be at most 253.",
+            full.len()
+        )));
+    }
+    for label in full.split('.') {
+        if label == "*" {
+            continue;
+        }
+        if label.is_empty() {
+            return Err(refuse(format!(
+                "`{typed}` has an empty label — two dots in a row, or a dot with \
+                 nothing before it."
+            )));
+        }
+        if label.len() > 63 {
+            return Err(refuse(format!(
+                "`{label}` is {} characters; a DNS label may be at most 63.",
+                label.len()
+            )));
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(refuse(format!(
+                "`{label}` is not a DNS label: letters, digits, `-` and `_` only. \
+                 A space or a stray character is the usual cause."
+            )));
+        }
+    }
+
+    Ok(full)
+}
+
+/// Turn a draft into the write Cloudflare will be sent, or say why not.
+///
+/// Everything here is checkable without a network call, and checking it here is
+/// the difference between a message naming the field and Cloudflare's own
+/// schema error arriving three seconds later against a form that has already
+/// been dismissed. What is deliberately *not* checked is anything Cloudflare
+/// alone knows — a CNAME that would collide with an existing record at the same
+/// name, a zone that is not on a plan allowing this type — because guessing at
+/// those would mean refusing writes the API would have accepted.
+///
+/// `comment` is carried through rather than composed: on an edit it is the
+/// comment the record already had, so a record the panel wrote for mail or for
+/// ACME does not quietly lose the note saying where it came from.
+pub fn record_write(
+    zone: &str,
+    draft: &RecordDraft,
+    comment: Option<String>,
+) -> Result<RecordWrite> {
+    let kind = draft.kind.trim().to_ascii_uppercase();
+    if !RECORD_TYPES.contains(&kind.as_str()) {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "`{}` is not a record type this panel writes. It writes {}.",
+                draft.kind.trim(),
+                RECORD_TYPES.join(", ")
+            ),
+        )
+        .with_field("kind"));
+    }
+
+    let name = qualify_record_name(zone, &draft.name)?;
+
+    let content = draft.content.trim().to_string();
+    let bad_content = |detail: String| {
+        UnihelmError::new(ErrorCode::InvalidInput, detail).with_field("content".to_string())
+    };
+    if content.is_empty() {
+        return Err(bad_content(format!(
+            "a {kind} record needs content — {}.",
+            content_expectation(&kind)
+        )));
+    }
+
+    match kind.as_str() {
+        // The mistake this catches is real and silent: an AAAA address typed
+        // into a form that was on A is refused by Cloudflare with a schema
+        // error that does not say which field, and an IPv4 address in an AAAA
+        // record is accepted by nothing at all.
+        "A" => {
+            if content.parse::<Ipv4Addr>().is_err() {
+                return Err(bad_content(format!(
+                    "an A record's content is an IPv4 address, and `{content}` is not one. \
+                     Use AAAA for an IPv6 address, or CNAME to point at another name."
+                )));
+            }
+        }
+        "AAAA" => {
+            if content.parse::<Ipv6Addr>().is_err() {
+                return Err(bad_content(format!(
+                    "an AAAA record's content is an IPv6 address, and `{content}` is not one. \
+                     Use A for an IPv4 address."
+                )));
+            }
+        }
+        "CNAME" | "NS" => {
+            if content.contains(char::is_whitespace) || !content.contains('.') {
+                return Err(bad_content(format!(
+                    "a {kind} record's content is a host name such as \
+                     `target.example.com`, and `{content}` is not one."
+                )));
+            }
+        }
+        "MX" => {
+            if content.contains(char::is_whitespace) || !content.contains('.') {
+                return Err(bad_content(
+                    "an MX record's content is the mail host's name, such as \
+                     `mail.example.com` — not an address and not a priority."
+                        .to_string(),
+                ));
+            }
+            if draft.priority.is_none() {
+                return Err(UnihelmError::new(
+                    ErrorCode::InvalidInput,
+                    "an MX record needs a priority. Lower is preferred; 10 is the \
+                     conventional value for a single mail host.",
+                )
+                .with_field("priority"));
+            }
+        }
+        _ => {}
+    }
+
+    // Priority belongs to MX and SRV. Sent on anything else Cloudflare either
+    // ignores it or refuses the record, and a value that is ignored is a
+    // setting the operator believes they made.
+    if draft.priority.is_some() && !matches!(kind.as_str(), "MX" | "SRV") {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!("a {kind} record has no priority; only MX and SRV do."),
+        )
+        .with_field("priority"));
+    }
+
+    let proxied = draft.proxied.unwrap_or(false);
+    if proxied && !PROXYABLE_TYPES.contains(&kind.as_str()) {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "Cloudflare can only proxy {} records, not {kind}.",
+                PROXYABLE_TYPES.join(", ")
+            ),
+        )
+        .with_field("proxied"));
+    }
+
+    let ttl = draft.ttl.unwrap_or(TTL_AUTOMATIC);
+    if proxied && ttl != TTL_AUTOMATIC {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            "a proxied record's TTL is Cloudflare's to choose, so a TTL cannot be set \
+             alongside the proxy. Leave the TTL automatic, or turn the proxy off.",
+        )
+        .with_field("ttl"));
+    }
+    if ttl != TTL_AUTOMATIC && !(60..=86_400).contains(&ttl) {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "a TTL of {ttl} seconds is outside what Cloudflare accepts: 60 to 86400, \
+                 or automatic."
+            ),
+        )
+        .with_field("ttl"));
+    }
+
+    Ok(RecordWrite {
+        kind: kind.clone(),
+        name,
+        content,
+        ttl,
+        // Sent only where it means something, so a TXT record is not created
+        // carrying `proxied: false` as if the choice had been available.
+        proxied: PROXYABLE_TYPES.contains(&kind.as_str()).then_some(proxied),
+        priority: draft.priority,
+        comment,
+    })
+}
+
+/// What a type's content is, in one clause, for the "it is empty" refusal.
+fn content_expectation(kind: &str) -> &'static str {
+    match kind {
+        "A" => "an IPv4 address",
+        "AAAA" => "an IPv6 address",
+        "CNAME" | "NS" => "a host name",
+        "MX" => "the mail host's name",
+        "TXT" => "the text to publish",
+        "SRV" => "the service target",
+        "CAA" => "the certificate authority to authorise",
+        _ => "a value",
+    }
+}
+
+/// What changing or removing this record would cost, in sentences.
+///
+/// A pure function, and the panel's only copy of this decision table — the same
+/// arrangement `advice_for` has, and for the same reason: a confirm dialog that
+/// keeps its own version of "is this record load-bearing" is a second version
+/// to keep in step, and the one that goes stale is the one somebody deletes a
+/// live site with.
+///
+/// `hosted` is the domains of the sites this server actually serves, so the
+/// first sentence can name the site rather than describe an address.
+pub fn record_impact(record: &CfRecord, points_here: bool, hosted: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let serves = hosted.iter().find(|domain| {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        record.name == domain || record.name == format!("www.{domain}")
+    });
+
+    if matches!(record.kind.as_str(), "A" | "AAAA" | "CNAME") {
+        if let Some(site) = serves {
+            out.push(format!(
+                "`{}` is how visitors reach {site}, a site on this server. Removing or \
+                 changing it takes {site} off the internet until DNS propagates the \
+                 replacement, and Let's Encrypt cannot renew its certificate over \
+                 HTTP-01 while the name does not resolve here.",
+                record.name
+            ));
+        } else if points_here {
+            out.push(format!(
+                "`{}` resolves to this server's own address ({}). Whatever is served \
+                 from that name stops reaching this machine if it is removed or changed.",
+                record.name, record.content
+            ));
+        }
+    }
+
+    if record.kind == "TXT" && record.name.starts_with("_acme-challenge.") {
+        out.push(format!(
+            "`{}` is the name the panel publishes and removes itself while a DNS-01 \
+             certificate is issued. If an issuance is running now, removing this record \
+             makes that certificate fail; if none is, it is left over from one that \
+             ended and can go.",
+            record.name
+        ));
+    }
+
+    if record.comment.as_deref() == Some(PANEL_RECORD_COMMENT) {
+        out.push(
+            "The panel added this record for one of its own features. Editing it here \
+             does not change the setting that produced it, and applying that setting \
+             again may write the record back."
+                .into(),
+        );
+    }
+
+    out
+}
+
+/// Say what an operator can do about a Cloudflare refusal, without hiding what
+/// Cloudflare said.
+///
+/// A `permission_denied` from the records API means exactly one thing in
+/// practice — the token was scoped `Zone:Read` but not `Zone:DNS:Edit`, or it
+/// was scoped to a different zone — and that is a fix an operator can make in
+/// the Cloudflare dashboard in half a minute *if the panel says so*. Cloudflare's
+/// own sentence is kept and appended rather than replaced: it is the part that
+/// is true even when this guess is not.
+fn explain_write_refusal(error: UnihelmError, zone: &str, label: &str) -> UnihelmError {
+    if error.code != ErrorCode::PermissionDenied {
+        return error;
+    }
+    UnihelmError::new(
+        ErrorCode::PermissionDenied,
+        format!(
+            "the `{label}` Cloudflare token cannot edit DNS in `{zone}`. It needs \
+             Zone:DNS:Edit on that zone; a Zone:Read token can list records and change \
+             none. Cloudflare said: {}",
+            error.detail
+        ),
+    )
 }
 
 /// The name a DNS-01 challenge for `base` is published at.
@@ -1406,6 +2017,645 @@ fn validate_label(label: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// reading the stored credentials back
+// ---------------------------------------------------------------------------
+
+/// Every stored Cloudflare credential, each with a client for it.
+///
+/// The client is a `Result` per row rather than an error for the whole call: a
+/// credential whose seal will not open — `/etc/unihelm/secret.key` restored from
+/// a different backup than the database — must be *named* as broken, because
+/// the alternative is a list that is short by one and looks complete. Nothing
+/// here opens a token into anything but a `SecretToken`.
+async fn cloudflare_credentials(ctx: &OpContext) -> Result<Vec<(i64, String, Result<Cloudflare>)>> {
+    let providers = ctx
+        .db()
+        .dns_providers(DnsProviderKind::Cloudflare)
+        .await
+        .map_err(UnihelmError::from)?;
+
+    Ok(providers
+        .into_iter()
+        .map(|provider| {
+            let client = ctx
+                .master_key()
+                .open_str(&provider.credentials_sealed)
+                .map_err(|e| {
+                    UnihelmError::internal(format!(
+                        "the stored credential could not be decrypted ({e}). If \
+                         /etc/unihelm/secret.key was replaced, set the token again."
+                    ))
+                })
+                .and_then(|token| Cloudflare::with_token(&SecretToken::new(token)));
+            (provider.id, provider.label, client)
+        })
+        .collect())
+}
+
+/// `dns.provider.get` — which DNS credential is stored, and what it can reach.
+///
+/// Issue 44: there was a `PUT` and no `GET`, so a page reload left the operator
+/// with an empty form and no way to tell whether a token was stored at all —
+/// which is how somebody ends up generating and pasting a fourth token to
+/// replace three working ones.
+///
+/// **This returns the account and the zones, never the token.** A GET that
+/// answered with a secret would put it in a browser cache, a proxy log and the
+/// screenshot attached to the next support ticket; `StoredProviderView` has no
+/// field that could carry one and
+/// `a_stored_token_is_never_returned_by_the_read_endpoint` asserts it.
+pub struct ProviderGet;
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderGetInput {}
+
+/// One stored credential, described by everything except its secret.
+#[derive(Debug, Serialize)]
+pub struct StoredProviderView {
+    pub id: i64,
+    pub kind: &'static str,
+    pub label: String,
+    /// Did the token answer Cloudflare just now?
+    ///
+    /// Checked live rather than remembered, because a token revoked in the
+    /// Cloudflare dashboard is still a row in this table, and a panel that
+    /// rendered that row as "Active" would be reporting something untrue about
+    /// the credential every certificate renewal depends on.
+    pub reachable: bool,
+    /// Why it did not, in Cloudflare's own words.
+    pub error: Option<String>,
+    /// The Cloudflare accounts the zones belong to.
+    pub accounts: Vec<String>,
+    /// Every zone the token administers — the credential's blast radius.
+    pub zones: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderGetOutput {
+    pub providers: Vec<StoredProviderView>,
+}
+
+#[async_trait]
+impl TypedOperation for ProviderGet {
+    type Input = ProviderGetInput;
+    type Output = ProviderGetOutput;
+
+    const NAME: &'static str = "dns.provider.get";
+    // The same permission as storing it. The zone list is the set of domains
+    // this operator's customers own, which is not a secret but is not a
+    // customer's business either, and the credential inventory is an admin's
+    // view of an admin's setting.
+    const PERMISSION: Permission = Permission::ServerManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        let mut providers = Vec::new();
+        for (id, label, client) in cloudflare_credentials(ctx).await? {
+            let view = match client {
+                Err(e) => StoredProviderView {
+                    id,
+                    kind: DnsProviderKind::Cloudflare.as_str(),
+                    label,
+                    reachable: false,
+                    error: Some(e.detail),
+                    accounts: Vec::new(),
+                    zones: Vec::new(),
+                },
+                Ok(cloudflare) => match cloudflare.zones().await {
+                    Ok(zones) => {
+                        let mut accounts: Vec<String> =
+                            zones.iter().filter_map(|z| z.account.clone()).collect();
+                        accounts.sort();
+                        accounts.dedup();
+                        StoredProviderView {
+                            id,
+                            kind: DnsProviderKind::Cloudflare.as_str(),
+                            label,
+                            reachable: true,
+                            error: None,
+                            accounts,
+                            zones: zones.into_iter().map(|z| z.name).collect(),
+                        }
+                    }
+                    Err(e) => StoredProviderView {
+                        id,
+                        kind: DnsProviderKind::Cloudflare.as_str(),
+                        label,
+                        reachable: false,
+                        error: Some(e.detail),
+                        accounts: Vec::new(),
+                        zones: Vec::new(),
+                    },
+                },
+            };
+            providers.push(view);
+        }
+        Ok(ProviderGetOutput { providers })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the zone and record editor
+// ---------------------------------------------------------------------------
+
+/// `dns.zones.list` — every zone the stored credentials can edit.
+pub struct ZonesList;
+
+#[derive(Debug, Deserialize)]
+pub struct ZonesListInput {}
+
+#[derive(Debug, Serialize)]
+pub struct ZoneView {
+    pub id: String,
+    pub name: String,
+    pub account: Option<String>,
+    /// Which stored credential administers it.
+    pub provider_label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ZonesListOutput {
+    pub zones: Vec<ZoneView>,
+    /// Credentials that could not be asked, so this list may be short.
+    ///
+    /// Reported rather than skipped: a zone missing from the picker because one
+    /// token is revoked looks exactly like a zone that was never delegated, and
+    /// an operator will go and create it a second time.
+    pub unreachable: Vec<String>,
+}
+
+#[async_trait]
+impl TypedOperation for ZonesList {
+    type Input = ZonesListInput;
+    type Output = ZonesListOutput;
+
+    const NAME: &'static str = "dns.zones.list";
+    // `DnsManage`, not `ServerManage`. Storing the credential is an admin act;
+    // using it to edit a zone is what the reseller-held DNS permission is for —
+    // the same split `cert.issue_wildcard` already makes.
+    const PERMISSION: Permission = Permission::DnsManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        let mut zones = Vec::new();
+        let mut unreachable = Vec::new();
+
+        for (_, label, client) in cloudflare_credentials(ctx).await? {
+            let listed = match client {
+                Ok(cloudflare) => cloudflare.zones().await,
+                Err(e) => Err(e),
+            };
+            match listed {
+                Ok(found) => zones.extend(found.into_iter().map(|zone| ZoneView {
+                    id: zone.id,
+                    name: zone.name,
+                    account: zone.account,
+                    provider_label: label.clone(),
+                })),
+                Err(e) => unreachable.push(format!("{label}: {}", e.detail)),
+            }
+        }
+
+        zones.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(ZonesListOutput { zones, unreachable })
+    }
+}
+
+/// One record, plus what the panel knows about what it is holding up.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordView {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+    pub ttl: u32,
+    pub proxied: Option<bool>,
+    pub priority: Option<u16>,
+    pub comment: Option<String>,
+    /// The content is one of this server's own public addresses.
+    pub points_here: bool,
+    /// What changing or removing it would cost. See [`record_impact`].
+    pub impact: Vec<String>,
+}
+
+fn record_view(record: CfRecord, addresses: &[IpAddr], hosted: &[String]) -> RecordView {
+    let points_here = record
+        .content
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| addresses.contains(&ip));
+    let impact = record_impact(&record, points_here, hosted);
+    RecordView {
+        id: record.id,
+        kind: record.kind,
+        name: record.name,
+        content: record.content,
+        ttl: record.ttl,
+        proxied: record.proxied,
+        priority: record.priority,
+        comment: record.comment,
+        points_here,
+        impact,
+    }
+}
+
+/// The domains of the sites this server serves, in the caller's scope.
+///
+/// Read from the panel's own database rather than guessed from the zone, so
+/// "this record is what points shop.example.com at this box" is a fact and not
+/// an inference. A failure here fails the operation: an impact sentence that
+/// silently went missing is the warning nobody saw.
+async fn hosted_domains(ctx: &OpContext) -> Result<Vec<String>> {
+    const LIMIT: i64 = 1_000;
+    Ok(ctx
+        .db()
+        .sites(ctx.scope())
+        .list(LIMIT, 0)
+        .await
+        .map_err(UnihelmError::from)?
+        .into_iter()
+        .map(|site| site.domain.trim_end_matches('.').to_ascii_lowercase())
+        .collect())
+}
+
+/// `dns.records.list` — every record in one zone.
+pub struct RecordsList;
+
+#[derive(Debug, Deserialize)]
+pub struct RecordsListInput {
+    /// The zone apex, as `dns.zones.list` reports it.
+    pub zone: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordsListOutput {
+    pub zone: String,
+    pub zone_id: String,
+    pub provider_label: String,
+    pub records: Vec<RecordView>,
+    /// This server's own addresses, so the UI can mark the records that point
+    /// here without a second round trip.
+    pub server_addresses: Vec<String>,
+    /// The zone holds more records than this list carries.
+    pub truncated: bool,
+    /// The types this panel writes, sent rather than restated in the front end
+    /// so the form's picker cannot offer a type the agent will refuse.
+    pub record_types: &'static [&'static str],
+    /// Of those, the ones Cloudflare can put behind its proxy — the rows the
+    /// form shows an orange-cloud switch for.
+    pub proxyable_types: &'static [&'static str],
+}
+
+#[async_trait]
+impl TypedOperation for RecordsList {
+    type Input = RecordsListInput;
+    type Output = RecordsListOutput;
+
+    const NAME: &'static str = "dns.records.list";
+    const PERMISSION: Permission = Permission::DnsManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let (provider_label, zone, cloudflare) =
+            resolve_provider(ctx, &normalise_zone(&input.zone)?).await?;
+        let addresses = server_public_addresses(ctx).await;
+        let hosted = hosted_domains(ctx).await?;
+
+        let page = cloudflare.list_records(&zone.id).await?;
+        let mut records: Vec<RecordView> = page
+            .records
+            .into_iter()
+            .map(|record| record_view(record, &addresses, &hosted))
+            .collect();
+        // Grouped by name rather than left in Cloudflare's order, because the
+        // question an operator brings to this table is "what is at this name",
+        // and the two records that answer it must not be forty rows apart.
+        records.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.content.cmp(&b.content))
+        });
+
+        Ok(RecordsListOutput {
+            zone: zone.name,
+            zone_id: zone.id,
+            provider_label,
+            records,
+            server_addresses: addresses.iter().map(ToString::to_string).collect(),
+            truncated: page.truncated,
+            record_types: RECORD_TYPES,
+            proxyable_types: PROXYABLE_TYPES,
+        })
+    }
+}
+
+/// A zone name, cleaned but not invented.
+fn normalise_zone(zone: &str) -> Result<String> {
+    let cleaned = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    if cleaned.is_empty() || !cleaned.contains('.') {
+        return Err(UnihelmError::new(
+            ErrorCode::InvalidInput,
+            format!("`{zone}` is not a zone name. Use the apex, such as `example.com`."),
+        )
+        .with_field("zone"));
+    }
+    Ok(cleaned)
+}
+
+/// What a create or a replace answers with.
+#[derive(Debug, Serialize)]
+pub struct RecordWriteOutput {
+    pub zone: String,
+    /// The record as Cloudflare stored it — not as it was sent. Cloudflare
+    /// normalises names and resolves an automatic TTL, and echoing the request
+    /// back would show a record that does not exist.
+    pub record: RecordView,
+    /// What stood there before, on an edit.
+    pub previous: Option<RecordView>,
+}
+
+/// `dns.records.create` — add one record to a zone.
+pub struct RecordsCreate;
+
+#[derive(Debug, Deserialize)]
+pub struct RecordsCreateInput {
+    pub zone: String,
+    /// `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SRV` or `CAA`.
+    pub kind: String,
+    /// `@` or empty for the zone apex; a bare label is qualified with the zone.
+    pub name: String,
+    pub content: String,
+    /// Seconds, or absent for Cloudflare's automatic.
+    #[serde(default)]
+    pub ttl: Option<u32>,
+    #[serde(default)]
+    pub proxied: Option<bool>,
+    /// MX and SRV only.
+    #[serde(default)]
+    pub priority: Option<u16>,
+}
+
+#[async_trait]
+impl TypedOperation for RecordsCreate {
+    type Input = RecordsCreateInput;
+    type Output = RecordWriteOutput;
+
+    const NAME: &'static str = "dns.records.create";
+    const PERMISSION: Permission = Permission::DnsManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let zone_name = normalise_zone(&input.zone)?;
+        let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
+
+        let draft = RecordDraft {
+            kind: input.kind,
+            name: input.name,
+            content: input.content,
+            ttl: input.ttl,
+            proxied: input.proxied,
+            priority: input.priority,
+        };
+        // A record an operator typed is theirs, so it carries no panel comment:
+        // `PANEL_RECORD_COMMENT` is what the panel writes for its own features,
+        // and stamping it here would make `record_impact` warn that editing a
+        // hand-made record will not change a setting that does not exist.
+        let write = record_write(&zone.name, &draft, None)?;
+
+        let stored = cloudflare
+            .create_full_record(&zone.id, &write)
+            .await
+            .map_err(|e| explain_write_refusal(e, &zone.name, &provider_label))?;
+
+        let addresses = server_public_addresses(ctx).await;
+        let hosted = hosted_domains(ctx).await?;
+        let record = record_view(stored, &addresses, &hosted);
+        ctx.log(format!(
+            "created {} {} in {} through the `{provider_label}` token",
+            record.kind, record.name, zone.name
+        ));
+
+        Ok(RecordWriteOutput {
+            zone: zone.name,
+            record,
+            previous: None,
+        })
+    }
+}
+
+/// `dns.records.update` — replace one record with what the form now holds.
+pub struct RecordsUpdate;
+
+#[derive(Debug, Deserialize)]
+pub struct RecordsUpdateInput {
+    pub zone: String,
+    /// Cloudflare's record id, from `dns.records.list`.
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub content: String,
+    #[serde(default)]
+    pub ttl: Option<u32>,
+    #[serde(default)]
+    pub proxied: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<u16>,
+    /// The name this record had when it was shown.
+    pub confirm_name: String,
+    /// The content it had when it was shown.
+    pub confirm_content: String,
+}
+
+#[async_trait]
+impl TypedOperation for RecordsUpdate {
+    type Input = RecordsUpdateInput;
+    type Output = RecordWriteOutput;
+
+    const NAME: &'static str = "dns.records.update";
+    const PERMISSION: Permission = Permission::DnsManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let zone_name = normalise_zone(&input.zone)?;
+        let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
+
+        let current = record_as_shown(
+            &cloudflare,
+            &zone,
+            &input.id,
+            &input.confirm_name,
+            &input.confirm_content,
+        )
+        .await?;
+
+        let draft = RecordDraft {
+            kind: input.kind,
+            name: input.name,
+            content: input.content,
+            ttl: input.ttl,
+            proxied: input.proxied,
+            priority: input.priority,
+        };
+        // The comment travels across the edit. A PUT that dropped it would strip
+        // the note saying the panel wrote this record for mail or for ACME —
+        // and `record_impact` reads that note to warn the next operator.
+        let write = record_write(&zone.name, &draft, current.comment.clone())?;
+
+        let stored = cloudflare
+            .replace_record(&zone.id, &current.id, &write)
+            .await
+            .map_err(|e| explain_write_refusal(e, &zone.name, &provider_label))?;
+
+        let addresses = server_public_addresses(ctx).await;
+        let hosted = hosted_domains(ctx).await?;
+        let previous = record_view(current, &addresses, &hosted);
+        let record = record_view(stored, &addresses, &hosted);
+        ctx.log(format!(
+            "replaced {} {} = {} with {} {} = {} in {}",
+            previous.kind,
+            previous.name,
+            previous.content,
+            record.kind,
+            record.name,
+            record.content,
+            zone.name
+        ));
+
+        Ok(RecordWriteOutput {
+            zone: zone.name,
+            record,
+            previous: Some(previous),
+        })
+    }
+}
+
+/// `dns.records.delete` — remove one record, named and quoted back.
+pub struct RecordsDelete;
+
+#[derive(Debug, Deserialize)]
+pub struct RecordsDeleteInput {
+    pub zone: String,
+    pub id: String,
+    /// The name of the record being removed, as it was shown.
+    pub confirm_name: String,
+    /// Its content, as it was shown.
+    pub confirm_content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordsDeleteOutput {
+    pub zone: String,
+    /// What was actually removed, with the impact it had while it existed.
+    pub deleted: RecordView,
+}
+
+#[async_trait]
+impl TypedOperation for RecordsDelete {
+    type Input = RecordsDeleteInput;
+    type Output = RecordsDeleteOutput;
+
+    const NAME: &'static str = "dns.records.delete";
+    const PERMISSION: Permission = Permission::DnsManage;
+    const EXECUTION: Execution = Execution::Immediate;
+
+    async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        let zone_name = normalise_zone(&input.zone)?;
+        let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
+
+        let current = record_as_shown(
+            &cloudflare,
+            &zone,
+            &input.id,
+            &input.confirm_name,
+            &input.confirm_content,
+        )
+        .await?;
+
+        let addresses = server_public_addresses(ctx).await;
+        let hosted = hosted_domains(ctx).await?;
+        let deleted = record_view(current, &addresses, &hosted);
+
+        // Logged before the call, so a delete that removes a site's A record or
+        // a live ACME challenge leaves the reason in the task log even when the
+        // browser that started it has gone.
+        for line in &deleted.impact {
+            ctx.log(format!("warning: {line}"));
+        }
+
+        cloudflare
+            .delete_record(&zone.id, &deleted.id)
+            .await
+            .map_err(|e| explain_write_refusal(e, &zone.name, &provider_label))?;
+        ctx.log(format!(
+            "removed {} {} = {} from {}",
+            deleted.kind, deleted.name, deleted.content, zone.name
+        ));
+
+        Ok(RecordsDeleteOutput {
+            zone: zone.name,
+            deleted,
+        })
+    }
+}
+
+/// Fetch the record `id` names and refuse unless it is still the one the
+/// operator was looking at.
+///
+/// A record id addresses whatever now sits under it. Between the list being
+/// rendered and Delete being pressed, somebody in the Cloudflare dashboard can
+/// have edited that record into something else — and then the panel would
+/// remove a record nobody chose, which for an A record is a site off the
+/// internet. So the caller sends back the name and content it displayed, and a
+/// disagreement is a refusal that says what changed, not a delete of the wrong
+/// thing. It is the same bargain `db.drop` makes with `confirm_name`.
+async fn record_as_shown(
+    cloudflare: &Cloudflare,
+    zone: &Zone,
+    id: &str,
+    confirm_name: &str,
+    confirm_content: &str,
+) -> Result<CfRecord> {
+    let current = cloudflare.record(&zone.id, id).await.map_err(|e| {
+        if e.code == ErrorCode::NotFound {
+            UnihelmError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "there is no record `{id}` in `{}` any more — it has probably already \
+                     been removed. Reload the record list.",
+                    zone.name
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
+
+    let expected_name = confirm_name
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let expected_content = confirm_content.trim();
+    if current.name != expected_name || current.content.trim() != expected_content {
+        return Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "record `{id}` in `{}` is now {} {} = {}, not {} = {} as shown. Somebody \
+                 changed it in the meantime. Reload the record list and look again \
+                 before removing or editing it.",
+                zone.name,
+                current.kind,
+                current.name,
+                current.content,
+                expected_name,
+                expected_content
+            ),
+        ));
+    }
+
+    Ok(current)
+}
+
+// ---------------------------------------------------------------------------
 // `cert.issue_wildcard`
 // ---------------------------------------------------------------------------
 
@@ -2085,6 +3335,7 @@ mod tests {
         Zone {
             id: id.into(),
             name: name.into(),
+            account: None,
         }
     }
 
@@ -2846,6 +4097,685 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(err.detail.contains("dns.provider.set"), "{}", err.detail);
         assert!(err.detail.contains("Global API Key"), "{}", err.detail);
+    }
+
+    // -- the record editor: the Cloudflare calls ----------------------------
+
+    fn cf_record(id: &str, kind: &str, name: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "type": kind,
+            "name": name,
+            "content": content,
+            "ttl": 300,
+            "proxied": false,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_zone_carries_the_cloudflare_account_it_belongs_to() {
+        // An operator holding tokens from two Cloudflare accounts needs to know
+        // which account a zone is being edited in before they edit it.
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Get,
+            "/zones",
+            serde_json::json!([
+                { "id": "z1", "name": "example.com", "account": { "id": "a1", "name": "Acme Ltd" } },
+                { "id": "z2", "name": "example.net" },
+            ]),
+        );
+        let zones = Cloudflare::new(transport).zones().await.unwrap();
+        assert_eq!(zones[0].account.as_deref(), Some("Acme Ltd"));
+        // Not `Some("")`: "Cloudflare did not say" is a different fact from "the
+        // account is called nothing", and only one of them is worth printing.
+        assert_eq!(zones[1].account, None);
+    }
+
+    #[tokio::test]
+    async fn a_zone_with_more_records_than_the_walk_reads_is_reported_as_truncated() {
+        // A short list rendered as if it were the whole zone is how an operator
+        // concludes a record is missing and adds a second one beside it.
+        let full: Vec<serde_json::Value> = (0..100)
+            .map(|i| {
+                cf_record(
+                    &format!("r{i}"),
+                    "A",
+                    &format!("h{i}.example.com"),
+                    "203.0.113.1",
+                )
+            })
+            .collect();
+        let mut transport = Arc::new(MockTransport::new());
+        for _ in 0..20 {
+            transport = transport.ok(
+                CfMethod::Get,
+                "/zones/z1/dns_records",
+                serde_json::Value::Array(full.clone()),
+            );
+        }
+        let page = Cloudflare::new(transport).list_records("z1").await.unwrap();
+        assert_eq!(page.records.len(), 2_000);
+        assert!(page.truncated, "a bounded walk must say where it stopped");
+    }
+
+    #[tokio::test]
+    async fn a_short_page_ends_the_record_walk_and_is_not_truncated() {
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Get,
+            "/zones/z1/dns_records",
+            serde_json::json!([cf_record("r1", "a", "WWW.Example.com.", "203.0.113.9")]),
+        );
+        let page = Cloudflare::new(transport.clone())
+            .list_records("z1")
+            .await
+            .unwrap();
+        assert!(!page.truncated);
+        assert_eq!(transport.calls().len(), 1, "one page, one request");
+        // Normalised the way zone names are, so a comparison against a site's
+        // domain is not defeated by a trailing dot or a capital letter.
+        assert_eq!(page.records[0].name, "www.example.com");
+        assert_eq!(page.records[0].kind, "A");
+    }
+
+    #[tokio::test]
+    async fn a_record_missing_its_content_is_an_error_rather_than_a_blank_row() {
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Get,
+            "/zones/z1/dns_records",
+            serde_json::json!([{ "id": "r1", "type": "A", "name": "www.example.com" }]),
+        );
+        let err = Cloudflare::new(transport)
+            .list_records("z1")
+            .await
+            .unwrap_err();
+        assert!(
+            err.detail.contains("no id, type, name or content"),
+            "{}",
+            err.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_sends_every_field_so_a_put_cannot_reset_one() {
+        // PUT replaces the whole record. A body that omitted the comment would
+        // strip the note saying the panel wrote this record for mail — which is
+        // the note `record_impact` reads to warn the next operator.
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Put,
+            "/zones/z1/dns_records/r1",
+            cf_record("r1", "A", "www.example.com", "203.0.113.10"),
+        );
+        let write = RecordWrite {
+            kind: "A".into(),
+            name: "www.example.com".into(),
+            content: "203.0.113.10".into(),
+            ttl: 300,
+            proxied: Some(true),
+            priority: None,
+            comment: Some(PANEL_RECORD_COMMENT.into()),
+        };
+        let stored = Cloudflare::new(transport.clone())
+            .replace_record("z1", "r1", &write)
+            .await
+            .unwrap();
+        assert_eq!(stored.id, "r1");
+
+        let body = transport.bodies()[0].clone().unwrap();
+        assert_eq!(body["type"], "A");
+        assert_eq!(body["name"], "www.example.com");
+        assert_eq!(body["content"], "203.0.113.10");
+        assert_eq!(body["ttl"], 300);
+        assert_eq!(body["proxied"], true);
+        assert_eq!(body["comment"], PANEL_RECORD_COMMENT);
+    }
+
+    // -- the record editor: names -------------------------------------------
+
+    #[test]
+    fn a_bare_label_is_qualified_and_the_apex_can_be_written_three_ways() {
+        assert_eq!(
+            qualify_record_name("example.com", "www").unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(
+            qualify_record_name("example.com", "_dmarc").unwrap(),
+            "_dmarc.example.com"
+        );
+        for apex in ["", "@", "example.com", "Example.COM."] {
+            assert_eq!(
+                qualify_record_name("example.com", apex).unwrap(),
+                "example.com",
+                "`{apex}` names the apex"
+            );
+        }
+        assert_eq!(
+            qualify_record_name("example.com", "*").unwrap(),
+            "*.example.com"
+        );
+        assert_eq!(
+            qualify_record_name("example.com", "*.shop").unwrap(),
+            "*.shop.example.com"
+        );
+        assert_eq!(
+            qualify_record_name("example.com", "*.example.com").unwrap(),
+            "*.example.com"
+        );
+    }
+
+    #[test]
+    fn a_name_from_another_zone_is_refused_rather_than_silently_appended() {
+        // Cloudflare reads a name it does not recognise as relative and appends
+        // the zone, so this would create `shop.example.net.example.com` — a
+        // record that exists, is reported as created, and answers nothing.
+        let err = qualify_record_name("example.com", "shop.example.net").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("name"));
+        assert!(
+            err.detail.contains("shop.example.net.example.com"),
+            "the refusal must show what would have been created: {}",
+            err.detail
+        );
+
+        // The label-boundary trap, in the name field this time.
+        assert!(qualify_record_name("example.com", "evil-example.com").is_err());
+        for junk in ["a b.example.com", "..example.com", "x/y.example.com"] {
+            assert!(
+                qualify_record_name("example.com", junk).is_err(),
+                "accepted `{junk}`"
+            );
+        }
+    }
+
+    // -- the record editor: content -----------------------------------------
+
+    fn draft(kind: &str, name: &str, content: &str) -> RecordDraft {
+        RecordDraft {
+            kind: kind.into(),
+            name: name.into(),
+            content: content.into(),
+            ttl: None,
+            proxied: None,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn an_address_of_the_wrong_family_is_refused_by_the_field_not_by_cloudflare() {
+        // "request failed" three seconds after the dialog closed is not a fix
+        // anybody can act on; naming the field and the other type is.
+        let err =
+            record_write("example.com", &draft("A", "www", "2606:4700::1111"), None).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("content"));
+        assert!(err.detail.contains("AAAA"), "{}", err.detail);
+
+        let err =
+            record_write("example.com", &draft("AAAA", "www", "203.0.113.10"), None).unwrap_err();
+        assert!(err.detail.contains("Use A"), "{}", err.detail);
+
+        let ok = record_write("example.com", &draft("A", "www", " 203.0.113.10 "), None).unwrap();
+        assert_eq!(ok.name, "www.example.com");
+        assert_eq!(ok.content, "203.0.113.10");
+        assert_eq!(ok.ttl, TTL_AUTOMATIC);
+        assert_eq!(ok.proxied, Some(false));
+    }
+
+    #[test]
+    fn a_type_the_panel_cannot_check_is_refused_with_the_list_it_does_write() {
+        let err = record_write("example.com", &draft("LOC", "www", "anything"), None).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("kind"));
+        for kind in RECORD_TYPES {
+            assert!(
+                err.detail.contains(kind),
+                "the refusal lists {kind}: {}",
+                err.detail
+            );
+        }
+        // Case is the operator's business, not the API's.
+        assert_eq!(
+            record_write("example.com", &draft("txt", "@", "v=spf1 -all"), None)
+                .unwrap()
+                .kind,
+            "TXT"
+        );
+    }
+
+    #[test]
+    fn a_priority_belongs_to_mx_and_a_proxy_belongs_to_addresses() {
+        let mut mx = draft("MX", "@", "mail.example.com");
+        let err = record_write("example.com", &mx, None).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("priority"));
+        mx.priority = Some(10);
+        assert_eq!(
+            record_write("example.com", &mx, None).unwrap().priority,
+            Some(10)
+        );
+
+        // A priority on a type that has none is a setting the operator believes
+        // they made and the API discards.
+        let mut txt = draft("TXT", "@", "hello");
+        txt.priority = Some(10);
+        assert_eq!(
+            record_write("example.com", &txt, None)
+                .unwrap_err()
+                .field
+                .as_deref(),
+            Some("priority")
+        );
+
+        let mut proxied_txt = draft("TXT", "@", "hello");
+        proxied_txt.proxied = Some(true);
+        let err = record_write("example.com", &proxied_txt, None).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("proxied"));
+        // And a type that cannot be proxied carries no proxy flag at all, so the
+        // UI does not render a switch that means nothing.
+        assert_eq!(
+            record_write("example.com", &draft("TXT", "@", "hi"), None)
+                .unwrap()
+                .proxied,
+            None
+        );
+    }
+
+    #[test]
+    fn a_proxied_record_cannot_also_carry_a_ttl_and_a_ttl_stays_in_range() {
+        let mut proxied = draft("A", "www", "203.0.113.10");
+        proxied.proxied = Some(true);
+        proxied.ttl = Some(300);
+        let err = record_write("example.com", &proxied, None).unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("ttl"));
+
+        proxied.ttl = None;
+        assert_eq!(
+            record_write("example.com", &proxied, None).unwrap().ttl,
+            TTL_AUTOMATIC
+        );
+
+        let mut slow = draft("A", "www", "203.0.113.10");
+        slow.ttl = Some(30);
+        assert_eq!(
+            record_write("example.com", &slow, None)
+                .unwrap_err()
+                .field
+                .as_deref(),
+            Some("ttl")
+        );
+        slow.ttl = Some(3_600);
+        assert_eq!(record_write("example.com", &slow, None).unwrap().ttl, 3_600);
+    }
+
+    #[test]
+    fn empty_content_is_refused_by_saying_what_the_type_wants() {
+        for (kind, expected) in [("A", "IPv4"), ("TXT", "text"), ("MX", "mail host")] {
+            let err = record_write("example.com", &draft(kind, "@", "   "), None).unwrap_err();
+            assert_eq!(err.field.as_deref(), Some("content"));
+            assert!(err.detail.contains(expected), "{kind}: {}", err.detail);
+        }
+    }
+
+    // -- the record editor: what a change would cost ------------------------
+
+    fn stored(kind: &str, name: &str, content: &str) -> CfRecord {
+        CfRecord {
+            id: "r1".into(),
+            kind: kind.into(),
+            name: name.into(),
+            content: content.into(),
+            ttl: 300,
+            proxied: Some(false),
+            priority: None,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn removing_the_record_that_points_a_site_here_names_the_site_and_the_certificate() {
+        // Deleting the wrong record takes a site off the internet. The confirm
+        // has to say which site, before the click and not after it.
+        let hosted = vec!["shop.example.com".to_string()];
+        let impact = record_impact(
+            &stored("A", "shop.example.com", "203.0.113.10"),
+            true,
+            &hosted,
+        );
+        assert_eq!(impact.len(), 1);
+        assert!(impact[0].contains("shop.example.com"), "{}", impact[0]);
+        assert!(impact[0].contains("off the internet"), "{}", impact[0]);
+        assert!(impact[0].contains("HTTP-01"), "{}", impact[0]);
+
+        // The `www.` form of a hosted domain is the same site.
+        assert_eq!(
+            record_impact(
+                &stored("CNAME", "www.shop.example.com", "shop.example.com"),
+                false,
+                &hosted
+            )
+            .len(),
+            1
+        );
+
+        // A record pointing here for a name this server hosts nothing under
+        // still says so, because something is being served from it.
+        let elsewhere = record_impact(
+            &stored("A", "old.example.com", "203.0.113.10"),
+            true,
+            &hosted,
+        );
+        assert_eq!(elsewhere.len(), 1);
+        assert!(
+            elsewhere[0].contains("this server's own address"),
+            "{}",
+            elsewhere[0]
+        );
+
+        // And a record that is neither is quiet: a warning on every row is a
+        // warning nobody reads.
+        assert!(
+            record_impact(&stored("TXT", "example.com", "v=spf1 -all"), false, &hosted).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_record_the_panel_manages_for_acme_says_so_before_it_is_touched() {
+        let challenge = record_impact(
+            &stored("TXT", "_acme-challenge.example.com", "digest"),
+            false,
+            &[],
+        );
+        assert_eq!(challenge.len(), 1);
+        assert!(challenge[0].contains("DNS-01"), "{}", challenge[0]);
+        assert!(
+            challenge[0].contains("makes that certificate fail"),
+            "{}",
+            challenge[0]
+        );
+
+        // The other half: a record the panel wrote for one of its own features
+        // is a copy of a setting, and editing the copy changes nothing.
+        let mut managed = stored("TXT", "example.com", "v=spf1 -all");
+        managed.comment = Some(PANEL_RECORD_COMMENT.into());
+        let impact = record_impact(&managed, false, &[]);
+        assert_eq!(impact.len(), 1);
+        assert!(
+            impact[0].contains("may write the record back"),
+            "{}",
+            impact[0]
+        );
+    }
+
+    // -- the record editor: the stale-row guard -----------------------------
+
+    #[tokio::test]
+    async fn a_record_that_changed_since_it_was_shown_is_a_refusal_not_a_delete() {
+        // The failure this exists for: the list was rendered, somebody edited
+        // that record in the Cloudflare dashboard, and Delete now addresses a
+        // record nobody chose. For an A record that is a site off the internet.
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Get,
+            "/zones/z1/dns_records/r1",
+            cf_record("r1", "A", "www.example.com", "198.51.100.4"),
+        );
+        let cf = Cloudflare::new(transport.clone());
+        let err = record_as_shown(
+            &cf,
+            &zone("z1", "example.com"),
+            "r1",
+            "www.example.com",
+            "203.0.113.10",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("198.51.100.4"), "{}", err.detail);
+        assert!(err.detail.contains("203.0.113.10"), "{}", err.detail);
+        // Nothing was removed: the guard runs before the DELETE, not after it.
+        assert!(
+            !transport
+                .calls()
+                .iter()
+                .any(|(method, _)| *method == CfMethod::Delete),
+            "{:?}",
+            transport.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_record_the_operator_was_looking_at_passes_the_guard() {
+        let transport = Arc::new(MockTransport::new()).ok(
+            CfMethod::Get,
+            "/zones/z1/dns_records/r1",
+            cf_record("r1", "A", "www.example.com", "203.0.113.10"),
+        );
+        let cf = Cloudflare::new(transport);
+        let current = record_as_shown(
+            &cf,
+            &zone("z1", "example.com"),
+            "r1",
+            // As the table rendered it, trailing dot and capitals included.
+            "WWW.example.com.",
+            " 203.0.113.10 ",
+        )
+        .await
+        .unwrap();
+        assert_eq!(current.id, "r1");
+    }
+
+    #[tokio::test]
+    async fn a_record_that_is_already_gone_says_so_rather_than_reporting_a_404() {
+        // No GET is scripted, so the mock answers 404 — the state an operator
+        // reaches by pressing Delete twice.
+        let cf = Cloudflare::new(Arc::new(MockTransport::new()));
+        let err = record_as_shown(
+            &cf,
+            &zone("z1", "example.com"),
+            "r1",
+            "www.example.com",
+            "203.0.113.10",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.detail.contains("already"), "{}", err.detail);
+        assert!(err.detail.contains("Reload"), "{}", err.detail);
+    }
+
+    #[test]
+    fn a_scope_refusal_names_the_token_and_the_zone_and_keeps_cloudflares_own_words() {
+        // "request failed" is not actionable; "this token cannot edit DNS for
+        // this zone" is, and Cloudflare's sentence is kept because it is the
+        // part that stays true when the guess does not.
+        let refused = UnihelmError::new(
+            ErrorCode::PermissionDenied,
+            "Cloudflare refused `POST /zones/z1/dns_records` (HTTP 403): Actor \
+             'com.cloudflare.api.token' requires permission 'com.cloudflare.api.account.zone.dns_record.create' (code 10000)",
+        );
+        let explained = explain_write_refusal(refused, "example.com", "cf-main");
+        assert_eq!(explained.code, ErrorCode::PermissionDenied);
+        assert!(explained.detail.contains("cf-main"), "{}", explained.detail);
+        assert!(
+            explained.detail.contains("example.com"),
+            "{}",
+            explained.detail
+        );
+        assert!(
+            explained.detail.contains("Zone:DNS:Edit"),
+            "{}",
+            explained.detail
+        );
+        assert!(
+            explained.detail.contains("dns_record.create"),
+            "{}",
+            explained.detail
+        );
+
+        // Everything else travels untouched: a rate limit is not a scope
+        // problem, and dressing it as one sends the operator to the wrong page.
+        let limited = UnihelmError::new(ErrorCode::RateLimited, "too many requests");
+        let same = explain_write_refusal(limited, "example.com", "cf-main");
+        assert_eq!(same.code, ErrorCode::RateLimited);
+        assert_eq!(same.detail, "too many requests");
+    }
+
+    #[test]
+    fn a_zone_input_that_is_not_a_zone_is_refused_by_naming_the_field() {
+        for bad in ["", "   ", "localhost", "."] {
+            let err = normalise_zone(bad).unwrap_err();
+            assert_eq!(err.field.as_deref(), Some("zone"), "`{bad}` was accepted");
+        }
+        assert_eq!(normalise_zone(" Example.COM. ").unwrap(), "example.com");
+    }
+
+    // -- the read endpoint --------------------------------------------------
+
+    #[test]
+    fn a_stored_token_is_never_returned_by_the_read_endpoint() {
+        // Issue 44 asked for a GET. The reason there was none is that a GET
+        // returning a secret puts it in a browser cache, a proxy log and the
+        // screenshot on the next support ticket — so this asserts the shape
+        // that made the GET safe to add.
+        let output = ProviderGetOutput {
+            providers: vec![StoredProviderView {
+                id: 1,
+                kind: "cloudflare",
+                label: "cf-main".into(),
+                reachable: true,
+                error: None,
+                accounts: vec!["Acme Ltd".into()],
+                zones: vec!["example.com".into()],
+            }],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(!json.to_lowercase().contains("token"), "{json}");
+        assert!(!json.to_lowercase().contains("secret"), "{json}");
+        assert!(!json.contains("credentials_sealed"), "{json}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Sorted, because `serde_json::Map` is a `BTreeMap` here and the
+        // declaration order is not the order that reaches the browser.
+        let mut keys: Vec<&str> = parsed["providers"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "accounts",
+                "error",
+                "id",
+                "kind",
+                "label",
+                "reachable",
+                "zones"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_the_provider_with_none_stored_is_an_empty_list_not_an_error() {
+        // The state a fresh install is in. "No credential" is an answer the page
+        // can render; an error is a page that looks broken, which is what sent
+        // operators off to generate a replacement token they did not need.
+        use crate::registry::testing::{auth_for, registry};
+        use unihelm_core::Role;
+
+        let (reg, admin, _) = registry().await;
+        let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+
+        let stored = ProviderGet.run(&ctx, ProviderGetInput {}).await.unwrap();
+        assert!(stored.providers.is_empty());
+
+        let zones = ZonesList.run(&ctx, ZonesListInput {}).await.unwrap();
+        assert!(zones.zones.is_empty());
+        assert!(zones.unreachable.is_empty());
+    }
+
+    #[test]
+    fn reading_the_credential_is_an_admin_act_and_editing_records_is_a_dns_one() {
+        // The split this module already makes between `dns.provider.set` and
+        // `cert.issue_wildcard`, carried onto the new operations. The credential
+        // card's zone list is every domain this operator's customers own, so it
+        // stays with `server_manage`; a reseller holding `dns_manage` may edit
+        // records with the token but may not read the credential inventory or
+        // replace one. A customer holds neither.
+        assert_eq!(
+            <ProviderGet as TypedOperation>::PERMISSION,
+            <ProviderSet as TypedOperation>::PERMISSION,
+        );
+        assert_eq!(
+            <ProviderGet as TypedOperation>::PERMISSION,
+            Permission::ServerManage,
+        );
+        for permission in [
+            <ZonesList as TypedOperation>::PERMISSION,
+            <RecordsList as TypedOperation>::PERMISSION,
+            <RecordsCreate as TypedOperation>::PERMISSION,
+            <RecordsUpdate as TypedOperation>::PERMISSION,
+            <RecordsDelete as TypedOperation>::PERMISSION,
+        ] {
+            assert_eq!(permission, Permission::DnsManage);
+        }
+    }
+
+    #[test]
+    fn the_operation_names_are_the_ones_the_registry_and_the_routes_are_wired_to() {
+        // These strings are the wire: the registry keys operations by them, the
+        // HTTP layer invokes them by name and `parity.rs` files a CLI command
+        // under each. A rename that reached only one of the three is the shape
+        // this codebase has shipped before, so the names are asserted where they
+        // are defined rather than only where they are used.
+        assert_eq!(<ProviderGet as TypedOperation>::NAME, "dns.provider.get");
+        assert_eq!(<ZonesList as TypedOperation>::NAME, "dns.zones.list");
+        assert_eq!(<RecordsList as TypedOperation>::NAME, "dns.records.list");
+        assert_eq!(
+            <RecordsCreate as TypedOperation>::NAME,
+            "dns.records.create"
+        );
+        assert_eq!(
+            <RecordsUpdate as TypedOperation>::NAME,
+            "dns.records.update"
+        );
+        assert_eq!(
+            <RecordsDelete as TypedOperation>::NAME,
+            "dns.records.delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_records_without_a_stored_credential_says_what_to_add() {
+        // The record page's first failure on a fresh install, and it must name
+        // the fix rather than reporting an empty zone list.
+        use crate::registry::testing::{auth_for, registry};
+        use unihelm_core::Role;
+
+        let (reg, admin, _) = registry().await;
+        let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+        let err = RecordsList
+            .run(
+                &ctx,
+                RecordsListInput {
+                    zone: "example.com".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(err.detail.contains("dns.provider.set"), "{}", err.detail);
+
+        // And something that is not a zone is refused before any credential is
+        // looked for, by naming the field the operator typed into.
+        let err = RecordsList
+            .run(
+                &ctx,
+                RecordsListInput {
+                    zone: "not-a-zone".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.field.as_deref(), Some("zone"));
     }
 
     #[tokio::test]
