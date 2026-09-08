@@ -47,6 +47,7 @@ import {
   soleVersion,
   supportFor,
   uncataloguedRuntimes,
+  unitDisagrees,
 } from "./stack";
 
 const version = (over: Partial<CatalogueVersion> & { version: string }): CatalogueVersion => ({
@@ -967,5 +968,36 @@ describe("which web server is serving", () => {
     expect(servingState(php, "nginx", [row({ component: "php", version: "8.3" })])).toBe(
       "unavailable",
     );
+  });
+});
+
+describe("what counts as the panel and systemd disagreeing", () => {
+  it("says nothing about a compiler, which has no service to be running", () => {
+    // Go, Ruby and Node have no systemd unit at all, so the agent sends
+    // `unit_state: "none"` with `unit_active: false`. Reading only the second
+    // field drew a warning on every one of them.
+    for (const component of ["go", "ruby", "node"]) {
+      const compiler = row({
+        component,
+        version: "1",
+        unit_state: "none",
+        unit_active: false,
+      });
+      expect(unitDisagrees(compiler), component).toBe(false);
+    }
+  });
+
+  it("still reports a service that is installed and not running", () => {
+    const stopped = row({
+      component: "nginx",
+      version: "1.28",
+      unit_state: "inactive",
+      unit_active: false,
+    });
+    expect(unitDisagrees(stopped)).toBe(true);
+  });
+
+  it("says nothing about a service that is running", () => {
+    expect(unitDisagrees(row({ component: "nginx", version: "1.28" }))).toBe(false);
   });
 });

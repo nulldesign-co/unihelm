@@ -154,6 +154,24 @@ export function rowsFor(
  * put "Container" on a chip over an apt package and offer to remove a container
  * that does not exist.
  */
+/**
+ * Whether the panel's bookkeeping and systemd actually disagree about this row.
+ *
+ * Our record and systemd can genuinely disagree — somebody removing a package
+ * by hand is the usual way — and the row says so rather than quietly showing
+ * one of the two.
+ *
+ * But `unit_state: "none"` is not a disagreement. The agent sends it for every
+ * component that has no systemd unit at all, and Go, Ruby and Node are
+ * compilers and interpreters rather than services. Testing `unit_active` alone
+ * drew "installed, but the service is not running" on three rows that have
+ * nothing to run: an alarm raised by a correct install, which is the worst kind
+ * to put in front of somebody setting up their first server.
+ */
+export function unitDisagrees(row: StackComponentView): boolean {
+  return row.status === "installed" && row.unit_state !== "none" && !row.unit_active;
+}
+
 export function runtimeOf(row: StackComponentView): StackRuntime {
   return row.runtime === "container" ? "container" : "host";
 }
@@ -1935,9 +1953,7 @@ function InstalledChip({
   // leaving it off MariaDB is how two chips reading 11.8 and 11.4 look like a
   // contradiction instead of two containers.
   const whereMatters = support === "either";
-  // Our bookkeeping and systemd can disagree if somebody removed a package by
-  // hand. Say so rather than quietly showing one of the two.
-  const disagrees = row.status === "installed" && !row.unit_active;
+  const disagrees = unitDisagrees(row);
   // What is riding on this version, beside the button that takes it away. A
   // version nothing uses and a version a dozen sites answer through are the
   // same three characters on this chip otherwise, and only one of them is a
