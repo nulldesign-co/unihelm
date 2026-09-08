@@ -167,10 +167,27 @@ pub fn read_body(path: &Path) -> Result<Option<String>> {
 /// The temporary file is created in the same directory so the rename is a true
 /// atomic replace — a temp file in `/tmp` would be a copy across filesystems and
 /// could leave a half-written config behind.
+///
+/// # The temporary file carries the same secret the final one does
+///
+/// It used to be opened with `File::create`, which asks for 0666 and gets 0644
+/// under the usual umask, and it was chmodded down only *after* the whole body
+/// had been written. For an nginx include that is nothing. For
+/// `/etc/unihelm/mail/<domain>.msmtprc` it meant the operator's upstream SMTP
+/// password sat in a world-readable file, in a directory every account on the
+/// box can traverse, for the length of a write plus an `fsync` — once per site,
+/// back to back, every time the relay was saved. Anything that failed after the
+/// write left that file there for good, because the only cleanup was on the
+/// rename.
+///
+/// So the mode is settled before any byte of `contents` exists on disk: `.mode()`
+/// on the open decides what a newly created file is born as (the umask can only
+/// narrow that, never widen it), and the `set_permissions` immediately after
+/// pins the exact mode for the two cases the open cannot cover — a umask that
+/// took a bit the caller needs, and a leftover temporary file from an older
+/// panel that already exists with a mode of its own. Every failure path takes
+/// the temporary file with it.
 pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = path.parent().ok_or_else(|| ConfigError::BadPath {
         path: path.to_path_buf(),
         reason: "has no parent directory".into(),
@@ -187,27 +204,9 @@ pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
     let mut temp = dir.join(file_name);
     temp.as_mut_os_string().push(".unihelm-tmp");
 
-    {
-        let mut file = std::fs::File::create(&temp).map_err(|e| ConfigError::Io {
-            path: temp.clone(),
-            source: e,
-        })?;
-        file.write_all(contents.as_bytes())
-            .map_err(|e| ConfigError::Io {
-                path: temp.clone(),
-                source: e,
-            })?;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))
-            .map_err(|e| ConfigError::Io {
-                path: temp.clone(),
-                source: e,
-            })?;
-        // Durable before the rename: a power cut between write and rename should
-        // leave the old config, not an empty new one.
-        file.sync_all().map_err(|e| ConfigError::Io {
-            path: temp.clone(),
-            source: e,
-        })?;
+    if let Err(e) = fill_temp(&temp, contents, mode) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
     }
 
     std::fs::rename(&temp, path).map_err(|e| {
@@ -223,6 +222,98 @@ pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
         let _ = dir_handle.sync_all();
     }
     Ok(())
+}
+
+/// Fill the staging file and make it durable.
+///
+/// Split out so [`write_atomic`] has one place to clean up from: every error in
+/// here leaves a file holding some prefix of `contents`, and for a secret a
+/// prefix is still a secret.
+fn fill_temp(temp: &Path, contents: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
+
+    let io = |e: std::io::Error| ConfigError::Io {
+        path: temp.to_path_buf(),
+        source: e,
+    };
+
+    let mut file = create_private(temp, mode)?;
+    file.write_all(contents.as_bytes()).map_err(io)?;
+    // Durable before the rename: a power cut between write and rename should
+    // leave the old config, not an empty new one.
+    file.sync_all().map_err(io)
+}
+
+/// Open the staging file empty and already at `mode`.
+///
+/// The whole point of this function is that it returns a handle to a file that
+/// is *already* as narrow as the finished config will be, so that no byte of a
+/// secret ever exists on disk under a wider one. Two steps, because neither
+/// covers the other: `.mode()` decides what a file being created is born as and
+/// is ignored for a file that already exists, and the `set_permissions` fixes
+/// both the file that already existed — a leftover from a crashed write, or one
+/// written by a panel old enough to have created it 0644 — and a umask strict
+/// enough to have taken a bit the caller needs. The truncate happens at open, so
+/// a leftover's old contents are gone before either.
+fn create_private(temp: &Path, mode: u32) -> Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let io = |e: std::io::Error| ConfigError::Io {
+        path: temp.to_path_buf(),
+        source: e,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(temp)
+        .map_err(io)?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(io)?;
+    Ok(file)
+}
+
+/// Bring an existing file or directory to `mode`, reporting what it was.
+///
+/// `Ok(None)` means nothing moved — it already matched, or there is nothing
+/// there. `Ok(Some(previous))` means it did not match and now does, and the
+/// caller is expected to say so somewhere an operator will read.
+///
+/// This exists because [`crate::ConfigEngine::apply`] short-circuits when the
+/// rendered body is byte-identical to what is on disk: no write, and so no
+/// chmod. That is the right call for churn and the wrong one for migration — a
+/// file a previous version of the panel left at a wide mode keeps that mode for
+/// exactly as long as its content does not change, which for a mail relay
+/// configuration is forever. Callers that own a secret run this on every pass so
+/// a server already in production is fixed by the next apply rather than by a
+/// reinstall.
+pub fn enforce_mode(path: &Path, mode: u32) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = match std::fs::metadata(path) {
+        // The whole low twelve bits, not just rwx: a setgid bit on a config
+        // file is as much a leftover to clear as a group-read bit.
+        Ok(meta) => meta.permissions().mode() & 0o7777,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    if current == mode {
+        return Ok(None);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        ConfigError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    Ok(Some(current))
 }
 
 /// Remove a managed file, refusing to delete one we did not write.
@@ -365,8 +456,39 @@ impl ManagedFile {
         }
     }
 
+    /// One site's outbound mail relay configuration (`unihelm_ops::mail`).
+    ///
+    /// 0640, and the caller gives it to `root:<that site's tenant group>`. Both
+    /// halves are load-bearing and neither is optional:
+    ///
+    /// - group-readable because msmtp runs as the tenant — PHP's `mail()` does —
+    ///   so the account that has to send is the account that has to read it;
+    /// - root-*owned* because an owner may chmod their own file and then write
+    ///   to it, and a tenant who could edit this could point their site's mail
+    ///   at a relay of their own while still sending as the operator's domain.
+    ///
+    /// 0640 is therefore the narrowest mode that still sends. It is not
+    /// isolation and must not be described as any: the relay is one server-wide
+    /// credential, so every one of these files holds the *same* secret, and the
+    /// mode buys "a tenant cannot read another site's copy", not "a tenant
+    /// cannot read the operator's relay password". See `unihelm_ops::mail`.
+    pub fn mail_relay(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: 0o640,
+            comment_style: CommentStyle::Hash,
+        }
+    }
+
     pub fn state(&self) -> FileState {
         inspect(&self.path)
+    }
+
+    /// Hold the file at its declared mode, reporting the mode it had if it was
+    /// wrong. See [`enforce_mode`] for why an apply that writes nothing still
+    /// has to do this.
+    pub fn enforce_mode(&self) -> Result<Option<u32>> {
+        enforce_mode(&self.path, self.mode)
     }
 }
 
@@ -521,6 +643,115 @@ mod tests {
         write_atomic(&path, "key\n", 0o600).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn the_staging_file_is_narrow_before_the_secret_goes_into_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `File::create` asks for 0666 and gets 0644 under the usual umask, and
+        // the old order chmodded down only after the body had been written — so
+        // the mail relay's password was readable by every account on the box for
+        // the length of a write and an fsync. The window is not observable from
+        // a test; the property that removes it is, which is that the file is
+        // already at its final mode while it is still empty.
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("relay.msmtprc.unihelm-tmp");
+        let handle = create_private(&temp, 0o640).unwrap();
+
+        let mode = std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "staging file mode: {mode:o}");
+        assert_eq!(mode & 0o007, 0, "world can read the staging file: {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&temp).unwrap(),
+            "",
+            "the mode has to be settled while there is still nothing to read"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn a_leftover_staging_file_is_narrowed_before_it_is_refilled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A crash mid-write leaves one of these behind, and one written by a
+        // panel old enough to create it 0644 leaves it wide. `.mode()` on the
+        // open applies only to a file being *created*, so this is the case the
+        // chmod covers: the next secret must not be poured into whatever mode
+        // the leftover happened to have.
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("relay.msmtprc.unihelm-tmp");
+        std::fs::write(&temp, "stale\n").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let handle = create_private(&temp, 0o640).unwrap();
+
+        let mode = std::fs::metadata(&temp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "leftover mode survived: {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&temp).unwrap(),
+            "",
+            "the leftover's contents outlived the open"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_readable_copy_of_the_secret_behind() {
+        // Renaming over a non-empty directory is ENOTEMPTY on every unix, which
+        // is the one failure a test can force from outside. The invariant it
+        // locks is the general one: no exit from `write_atomic` leaves a file
+        // holding some or all of `contents`, because for a relay config even a
+        // prefix of it is the operator's password.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.msmtprc");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupied"), "x").unwrap();
+
+        let err = write_atomic(&path, "password hunter2\n", 0o640).unwrap_err();
+        assert!(matches!(err, ConfigError::Io { .. }), "got {err:?}");
+
+        let temp = dir.path().join("relay.msmtprc.unihelm-tmp");
+        assert!(
+            !temp.exists(),
+            "a failed write left the credential at {temp:?}"
+        );
+    }
+
+    #[test]
+    fn enforcing_a_mode_reports_only_the_files_it_actually_moved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // An apply whose rendered body is unchanged writes nothing and therefore
+        // chmods nothing, so a server already running keeps whatever mode its
+        // relay config was created with. This is the step that fixes it on the
+        // next pass, and it has to stay quiet when there is nothing to say —
+        // otherwise every apply logs a tightening that did not happen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relay.msmtprc");
+        std::fs::write(&path, "password hunter2\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(enforce_mode(&path, 0o640).unwrap(), Some(0o644));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        assert_eq!(enforce_mode(&path, 0o640).unwrap(), None);
+        assert_eq!(
+            enforce_mode(&dir.path().join("never-written"), 0o640).unwrap(),
+            None,
+            "a file that is not there is not a file to tighten"
+        );
+    }
+
+    #[test]
+    fn a_relay_config_is_readable_by_the_account_that_sends_and_nobody_else() {
+        // msmtp runs as the tenant, so the group bit has to stay; every other
+        // account on the box has no business with the operator's relay password.
+        let relay = ManagedFile::mail_relay("/etc/unihelm/mail/example.com.msmtprc");
+        assert_eq!(relay.mode, 0o640);
+        assert_eq!(relay.mode & 0o007, 0, "world-readable relay credential");
+        assert_eq!(relay.comment_style, CommentStyle::Hash);
     }
 
     #[test]

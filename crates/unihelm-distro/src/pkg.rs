@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::exec::{Cmd, CmdOutput};
-use crate::{DistroError, Result};
+use crate::{DistroError, DistroInfo, Family, Result};
 
 /// Somewhere for a long-running command to write progress. Task execution wires
 /// this to the live log stream; everything else passes [`NullLog`].
@@ -236,6 +236,113 @@ pub trait PkgBackend: Send + Sync {
 
     async fn is_installed(&self, package: &PackageName) -> Result<bool> {
         Ok(self.query(package).await?.installed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The nginx ModSecurity connector
+// ---------------------------------------------------------------------------
+
+/// A connector package a release genuinely has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorPackage {
+    pub package: &'static str,
+    /// Where it comes from, named the way an operator would have to enable it —
+    /// `universe` and EPEL are not on by default on every image.
+    pub repository: &'static str,
+    /// The nginx it is compiled against. Recorded because an nginx dynamic
+    /// module records its build signature and loads into that nginx and no
+    /// other, which is what makes "install the package" the wrong advice on a
+    /// server whose nginx came from somewhere else.
+    pub built_against: &'static str,
+}
+
+/// What a distribution release offers for nginx's ModSecurity connector.
+///
+/// Three answers, shaped like [`crate::SupportStatus`] on purpose: checked and
+/// present, checked and absent, and not checked. The third is not a hedge — it
+/// is the only honest answer for a release nobody has looked at, and a caller
+/// that renders it as "install this" would be inventing a package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "packaging", rename_all = "snake_case")]
+pub enum ModsecConnector {
+    /// Verified present in a repository this release can reach.
+    Packaged(ConnectorPackage),
+    /// Verified absent: nothing in this release's repositories provides it.
+    /// `checked` names what was searched, so the statement can be re-tested.
+    Unpackaged { checked: String },
+    /// Not checked for this release. `package` is the name the family uses
+    /// where it does exist, offered as somewhere to look and nothing more.
+    Unverified {
+        package: &'static str,
+        release: String,
+    },
+}
+
+/// Debian and Ubuntu's name for the ModSecurity v3 nginx connector.
+const DEB_CONNECTOR: &str = "libnginx-mod-http-modsecurity";
+/// Fedora, EPEL and their rebuilds' name for the same thing.
+const RPM_CONNECTOR: &str = "nginx-mod-modsecurity";
+
+/// What this release has, checked against the distributions' own package
+/// indexes on 2026-09-08.
+///
+/// | release | connector |
+/// |---|---|
+/// | Debian 12 (bookworm), 13 (trixie) | `libnginx-mod-http-modsecurity` 1.0.3, `main` |
+/// | Ubuntu 24.04 (noble) and later | `libnginx-mod-http-modsecurity` 1.0.3, `universe` |
+/// | Ubuntu 22.04 (jammy) | **none** — no such package in any component |
+/// | AlmaLinux / Rocky / RHEL 9 | `nginx-mod-modsecurity` 1.0.4-1.el9, EPEL 9 |
+/// | AlmaLinux / Rocky / RHEL 10 | **none** — EPEL 10 does not build it |
+///
+/// Two of those are releases this panel calls *supported* (`support_status`
+/// returns `Supported` for Ubuntu 22.04 and for EL 10) and on which no WAF can
+/// be made to run without an operator compiling a module themselves. Saying
+/// that is the entire point of the `Unpackaged` variant: the alternative is a
+/// refusal naming a package the operator will spend an afternoon failing to
+/// find. Nothing here installs anything — the connector must match the running
+/// nginx's build signature, and only the operator knows where their nginx came
+/// from.
+///
+/// The Core Rule Set is deliberately not in this table. Debian and Ubuntu ship
+/// `modsecurity-crs` (3.3.7 on trixie), an older major than the 4.29.0 Unihelm
+/// pins, and Unihelm downloads and checksums its own tarball — so the CRS is
+/// never the thing a release is missing.
+pub fn modsec_connector(info: &DistroInfo) -> ModsecConnector {
+    match (info.id.as_str(), info.major()) {
+        ("debian", Some(12..=13)) => ModsecConnector::Packaged(ConnectorPackage {
+            package: DEB_CONNECTOR,
+            repository: "the Debian archive (`main`)",
+            built_against: "Debian's own nginx package",
+        }),
+        // Checked before the `24..` arm below reads as "everything newer", so
+        // that a release verified to be missing it can never be answered from a
+        // range somebody widened later.
+        ("ubuntu", _) if info.version_id == "22.04" => ModsecConnector::Unpackaged {
+            checked: "Ubuntu 22.04 (jammy), all four components".into(),
+        },
+        ("ubuntu", Some(24..)) => ModsecConnector::Packaged(ConnectorPackage {
+            package: DEB_CONNECTOR,
+            repository: "Ubuntu `universe`",
+            built_against: "Ubuntu's own nginx package",
+        }),
+        ("almalinux" | "rocky" | "rhel" | "centos", Some(9)) => {
+            ModsecConnector::Packaged(ConnectorPackage {
+                package: RPM_CONNECTOR,
+                repository: "EPEL 9",
+                built_against: "the EL 9 AppStream nginx",
+            })
+        }
+        ("almalinux" | "rocky" | "rhel" | "centos", Some(10)) => ModsecConnector::Unpackaged {
+            checked: "EPEL 10 and the EL 10 AppStream".into(),
+        },
+        _ => ModsecConnector::Unverified {
+            package: match info.family {
+                Family::Debian => DEB_CONNECTOR,
+                Family::Rhel => RPM_CONNECTOR,
+            },
+            release: info.pretty_name.clone(),
+        },
     }
 }
 
@@ -1063,6 +1170,131 @@ mod tests {
         // Removing a repository that was never added is not a failure.
         let dir = tempfile::tempdir().unwrap();
         assert!(unlink_all(&apt_key_paths(dir.path(), "unihelm-absent")).is_ok());
+    }
+
+    fn os(id: &str, version_id: &str, family: Family) -> DistroInfo {
+        DistroInfo {
+            id: id.into(),
+            version_id: version_id.into(),
+            codename: String::new(),
+            pretty_name: format!("{id} {version_id}"),
+            family,
+            arch: crate::Arch::X86_64,
+            has_systemd: true,
+            has_cgroups_v2: true,
+        }
+    }
+
+    #[test]
+    fn the_releases_that_package_a_modsecurity_connector_are_named_exactly() {
+        for (id, version, family, package, repository) in [
+            (
+                "debian",
+                "12",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+                "main",
+            ),
+            (
+                "debian",
+                "13",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+                "main",
+            ),
+            (
+                "ubuntu",
+                "24.04",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+                "universe",
+            ),
+            (
+                "ubuntu",
+                "26.04",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+                "universe",
+            ),
+            (
+                "almalinux",
+                "9",
+                Family::Rhel,
+                "nginx-mod-modsecurity",
+                "EPEL 9",
+            ),
+            (
+                "rocky",
+                "9",
+                Family::Rhel,
+                "nginx-mod-modsecurity",
+                "EPEL 9",
+            ),
+        ] {
+            match modsec_connector(&os(id, version, family)) {
+                ModsecConnector::Packaged(p) => {
+                    assert_eq!(p.package, package, "{id} {version}");
+                    assert!(
+                        p.repository.contains(repository),
+                        "{id} {version} must name the component or repository an \
+                         operator has to enable, got `{}`",
+                        p.repository
+                    );
+                }
+                other => panic!("{id} {version} should be packaged, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_release_with_no_connector_at_all_says_so_rather_than_naming_a_package() {
+        // Both of these are releases `support_status` calls Supported, and on
+        // neither can a WAF be made to run without compiling a module. Naming
+        // `libnginx-mod-http-modsecurity` to a 22.04 operator, or
+        // `nginx-mod-modsecurity` to an EL 10 one, sends them looking for a
+        // package that has never existed for their release.
+        for (id, version, family, checked) in [
+            ("ubuntu", "22.04", Family::Debian, "jammy"),
+            ("almalinux", "10", Family::Rhel, "EPEL 10"),
+            ("rocky", "10", Family::Rhel, "EPEL 10"),
+        ] {
+            match modsec_connector(&os(id, version, family)) {
+                ModsecConnector::Unpackaged { checked: what } => assert!(
+                    what.contains(checked),
+                    "the refusal has to say what was searched, got `{what}`"
+                ),
+                // Neither of the other two variants carries a package name that
+                // is safe to print here, which is the whole point.
+                other => panic!("{id} {version} must be Unpackaged, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_release_nobody_has_checked_is_reported_as_unchecked_not_as_available() {
+        // Ubuntu 23.10 and EL 8 are outside the tested matrix. Answering
+        // `Packaged` for them would be the panel asserting a fact it does not
+        // have; answering `Unpackaged` would be asserting the opposite one.
+        for (id, version, family, package) in [
+            (
+                "ubuntu",
+                "23.10",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+            ),
+            ("rocky", "8", Family::Rhel, "nginx-mod-modsecurity"),
+            (
+                "linuxmint",
+                "22",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+            ),
+        ] {
+            match modsec_connector(&os(id, version, family)) {
+                ModsecConnector::Unverified { package: p, .. } => assert_eq!(p, package),
+                other => panic!("{id} {version} should be unverified, got {other:?}"),
+            }
+        }
     }
 
     #[test]

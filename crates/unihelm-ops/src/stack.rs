@@ -537,6 +537,34 @@ fn runtime_for(
     Ok(runtime)
 }
 
+/// The `stack_components` row an install claims and settles, and a removal
+/// clears.
+///
+/// **One derivation for both runtimes**, and that is the whole of it: claim,
+/// settle and remove are three writes that have to name one string, and they
+/// did not. `stack.install` claimed [`StackComponent::slug`] — the *host* key —
+/// whichever way it then installed, so a container install marked the host
+/// MariaDB row installed; `stack.status` asked the package manager whether
+/// `mariadb-server` was present, got no, and rewrote that row to `absent`
+/// through the arm that exists to catch somebody removing a package by hand.
+/// The Stack page said "Not installed" over a container that was serving, and
+/// `engine.remove` wrote a *third* key — the container name — so removing the
+/// container could not correct the host row either.
+///
+/// The container's key is the container name and
+/// [`crate::engine::EnginePlan::row_key`] owns that derivation, for the reason
+/// documented there: two versions of one engine are two containers, with two
+/// ports and two data directories, so they are two rows and must not collide
+/// with each other or with the host's one.
+pub fn row_key(component: StackComponent, runtime: catalogue::Runtime) -> Result<String> {
+    match runtime {
+        catalogue::Runtime::Host => Ok(component.slug()),
+        catalogue::Runtime::Container => Ok(crate::engine::EnginePlan::for_component(component)?
+            .row_key()
+            .to_string()),
+    }
+}
+
 fn parse_packages(names: &[&str]) -> Result<Vec<PackageName>> {
     names
         .iter()
@@ -591,11 +619,24 @@ pub struct ComponentView {
     /// Which catalogue version this row is about.
     pub version: String,
     pub category: String,
+    /// Host packages, or a container.
+    ///
+    /// The field this view did not have, which is why the Stack page could not
+    /// tell an apt package from an image even once the rows were right: two
+    /// chips reading `11.8` and `11.4` are a contradiction on the host and two
+    /// containers everywhere else, and the Remove beside them goes to a
+    /// different operation in each case.
+    pub runtime: catalogue::Runtime,
     pub status: String,
     pub installed_version: Option<String>,
     pub last_error: Option<String>,
-    /// The service's own view, which can disagree with ours if somebody removed
-    /// a package by hand. `none` where the entry has no unit at all.
+    /// What is actually running this component, which can disagree with our
+    /// record if somebody removed it by hand.
+    ///
+    /// systemd's word for a host row, and Docker's for a container one —
+    /// `running`, `stopped`, or `unknown` when the daemon could not be asked.
+    /// `none` where there is nothing to run at all: a toolchain installs a
+    /// compiler and has no service either way.
     pub unit_state: String,
     pub unit_active: bool,
     /// Why pressing install on this row could not work on *this* machine, or
@@ -668,6 +709,11 @@ impl TypedOperation for Status {
                 component: candidate.entry.slug.to_string(),
                 version: candidate.version.version.to_string(),
                 category: candidate.entry.category.as_str().to_string(),
+                // These are the package-manager rows and nothing else. What
+                // runs in a container is a separate row from the registry, per
+                // [`container_rows`] — the two cannot be one row, because one
+                // machine can hold both.
+                runtime: catalogue::Runtime::Host,
                 status: match (row, here) {
                     // The panel installed it and its packages are gone: somebody
                     // removed them by hand, and reading the database back would
@@ -705,6 +751,8 @@ impl TypedOperation for Status {
             });
         }
 
+        components.extend(container_rows(ctx, &recorded).await?);
+
         Ok(StatusOutput {
             web_server: crate::webserver::active(ctx).await?.as_str().to_string(),
             components,
@@ -712,6 +760,163 @@ impl TypedOperation for Status {
             unverified_pins: unihelm_distro::repos::UNVERIFIED_PINS,
         })
     }
+}
+
+/// One row per containerised engine the panel installed, cross-checked against
+/// Docker.
+///
+/// **The package manager cannot answer here and must not be asked.** A
+/// container installs no packages, so the question `status_candidates` puts to
+/// `dpkg-query` comes back "not here" for a MariaDB that is up and serving —
+/// which is exactly how a running container came to be reported as
+/// `Not installed`.
+///
+/// So two sources, and neither stands in for the other. The registry is the
+/// panel's own record that it built this container and holds its credential;
+/// Docker is the machine's answer about whether the container is still there
+/// and whether it is up. Three outcomes an operator needs told apart:
+///
+/// - **running** — installed, and answering;
+/// - **stopped** — installed *and down*, which is a different sentence from
+///   absent and is most of the reason somebody opens this page;
+/// - **gone** — somebody ran `docker rm` behind the panel's back, and the row
+///   says so instead of reporting the registry's memory of an install.
+///
+/// A daemon that cannot be reached is a fourth answer and not a quiet "gone",
+/// for the reason [`Presence::Unknown`] exists: telling an operator their
+/// database has disappeared because `docker info` timed out is the same lie in
+/// a different hat.
+/// What Docker was able to say about one engine's container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerState {
+    Running,
+    /// On the machine and not up. **Installed and down**, which is the sentence
+    /// this whole enum exists to keep separate from the next one.
+    Stopped,
+    /// No container of that name: `docker rm` behind the panel's back.
+    Gone,
+    /// No Docker, or a daemon that did not answer. Not a "no".
+    Unasked,
+}
+
+impl ContainerState {
+    /// The row's `unit_state`/`unit_active` pair. A container is what runs this
+    /// component, so it answers the question systemd answers for a host row.
+    fn as_unit(self) -> (String, bool) {
+        match self {
+            ContainerState::Running => ("running".to_string(), true),
+            ContainerState::Stopped => ("stopped".to_string(), false),
+            // Nothing to be running or stopped: the status beside this already
+            // says `absent`, and a state as well would be a second answer to a
+            // question that has one.
+            ContainerState::Gone => ("none".to_string(), false),
+            // Said as its own word rather than as `stopped`. A daemon that did
+            // not answer is not a container that is down, and a page that
+            // spelt the two the same would tell an operator to go and restart
+            // something that is running.
+            ContainerState::Unasked => ("unknown".to_string(), false),
+        }
+    }
+}
+
+/// What one engine's row says, given the panel's stored status and what Docker
+/// could see.
+///
+/// Pure, because this is the decision the defect was in and it is worth pinning
+/// without a Docker daemon in the room.
+fn container_status(stored: Option<ComponentStatus>, state: ContainerState) -> ComponentStatus {
+    match stored {
+        // An operation in flight, or the reason the last one failed, is the
+        // truest thing about this row and Docker cannot contradict it: an
+        // install claims its row before the image has finished pulling, so "no
+        // container yet" is what an install underway looks like.
+        Some(s) if s.is_busy() || s == ComponentStatus::Failed => s,
+        // Nothing was able to disagree with the panel's own record. `absent`
+        // here would be a claim built out of not having looked.
+        stored if state == ContainerState::Unasked => stored.unwrap_or(ComponentStatus::Installed),
+        // The registry record **is** the panel's record of the install, so a
+        // container that is there is installed whether or not
+        // `stack_components` has caught up — and on every machine installed
+        // before the row key was fixed, it has not: the install settled the
+        // host row instead.
+        _ if state != ContainerState::Gone => ComponentStatus::Installed,
+        _ => ComponentStatus::Absent,
+    }
+}
+
+async fn container_rows(
+    ctx: &OpContext,
+    recorded: &[unihelm_db::StackComponent],
+) -> Result<Vec<ComponentView>> {
+    let registry = crate::engine::registry(ctx.db()).await?;
+    // Nothing to ask about. Worth the early return rather than letting the loop
+    // do nothing: `inventory` shells out to `docker info` and `docker ps`, and
+    // this page's first paint should not pay for them on a machine that runs no
+    // containers.
+    if registry.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let inventory = crate::docker::inventory().await;
+    // Whether the machine could be asked at all, kept apart from what it said.
+    let answered = inventory.docker.is_some() && inventory.daemon_running;
+
+    let mut rows = Vec::new();
+    for record in registry.values() {
+        let row = recorded.iter().find(|c| c.slug == record.container);
+        let found = inventory
+            .containers
+            .iter()
+            .find(|c| c.name == record.container);
+
+        let state = match (answered, found) {
+            (false, _) => ContainerState::Unasked,
+            (true, Some(c)) if c.running => ContainerState::Running,
+            (true, Some(_)) => ContainerState::Stopped,
+            (true, None) => ContainerState::Gone,
+        };
+        let status = container_status(row.map(|c| c.status), state);
+        let (unit_state, unit_active) = state.as_unit();
+
+        let known = StackComponent::resolve(&record.slug, Some(&record.version));
+        rows.push(ComponentView {
+            // The container name, which is this row's key everywhere: what
+            // `stack.install` claimed, what `engine.remove` clears.
+            slug: record.container.clone(),
+            display_name: known
+                .map(|c| c.display_name())
+                // A record whose catalogue version this build no longer carries
+                // is a downgrade, not an invitation to hide the row: a
+                // container nobody can see is a container nobody can remove.
+                .unwrap_or_else(|_| record.container.clone()),
+            component: record.slug.clone(),
+            version: record.version.clone(),
+            category: catalogue::entry(&record.slug)
+                .map(|e| e.category.as_str().to_string())
+                // Every recipe names a database or a cache — `engine` pins that
+                // in a test — so this is only reachable on that same downgrade.
+                .unwrap_or_else(|| catalogue::Category::Database.as_str().to_string()),
+            runtime: catalogue::Runtime::Container,
+            status: status.as_str().to_string(),
+            // The version the container was built at, which is the image tag
+            // and not a package version. It is the machine's own answer here:
+            // the tag is part of the container's name.
+            installed_version: match status {
+                ComponentStatus::Installed => Some(record.version.clone()),
+                _ => None,
+            },
+            last_error: row.and_then(|c| c.last_error.clone()),
+            unit_state,
+            unit_active,
+            // Nothing about this machine's packaging can stop a container being
+            // installed; what can — no Docker, a host install already holding
+            // the port — is refused by name at install time.
+            unavailable: None,
+        });
+    }
+
+    rows.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(rows)
 }
 
 /// One row per thing an operator can act on.
@@ -957,13 +1162,17 @@ impl TypedOperation for Install {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let component = input.component;
-        let slug = component.slug();
         let db = ctx.db().clone();
 
         // Before the claim for the same reason the two collision checks are:
         // an unsupported runtime is a refusal, and a refusal must not leave a
         // `failed` row behind for an install that never began.
         let runtime = runtime_for(component, input.runtime)?;
+
+        // The row this install claims, settles and is later removed from,
+        // derived from the runtime it actually lands on rather than assumed to
+        // be the host's. See [`row_key`] for what assuming it cost.
+        let slug = row_key(component, runtime)?;
 
         // Before the claim, not after: a refusal here means nothing was
         // touched, and marking the component `failed` for an install that never
@@ -1779,7 +1988,6 @@ impl TypedOperation for Remove {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let component = input.component;
-        let slug = component.slug();
         let db = ctx.db().clone();
 
         // What is being removed, before anything is removed. Only when the
@@ -1808,6 +2016,11 @@ impl TypedOperation for Remove {
             )
             .with_field("runtime"));
         }
+
+        // Everything past the refusal above is the package manager, so the row
+        // this clears is the host one — derived through the same function the
+        // install used, so the two can never spell it differently.
+        let slug = row_key(component, catalogue::Runtime::Host)?;
 
         // Removing PHP 8.3 while sites are running on it takes those sites down
         // (spec §11.1). Refuse and say which ones.
@@ -3152,6 +3365,181 @@ mod tests {
                 .unwrap()
                 .status,
             "installing"
+        );
+    }
+
+    // -- one row key, whichever runtime it landed on -------------------------
+
+    /// The registry record `engine::install_container` writes beside the row.
+    async fn record_a_container(db: &Db, slug: &str, version: &str, host_port: u16) -> String {
+        let plan = crate::engine::EnginePlan::resolve(slug, Some(version)).unwrap();
+        let container = plan.container().as_str().to_string();
+        let mut engines = crate::engine::EngineRegistry::new();
+        engines.insert(
+            container.clone(),
+            crate::engine::EngineRecord {
+                slug: slug.to_string(),
+                version: version.to_string(),
+                image: plan.image().as_str().to_string(),
+                container: container.clone(),
+                volume: plan.volume().map(str::to_string),
+                host_port,
+                container_port: 3306,
+                root_user: Some("root".into()),
+                root_password_sealed: None,
+            },
+        );
+        db.set_setting(crate::engine::ENGINES_SETTING, &engines)
+            .await
+            .unwrap();
+        container
+    }
+
+    #[test]
+    fn one_row_key_is_derived_for_whichever_runtime_the_install_landed_on() {
+        // The defect this exists for: `stack.install` claimed and settled the
+        // *host* key whatever it had installed, `stack.status` then asked the
+        // package manager about that key, got no, and rewrote it to `absent` —
+        // and `engine.remove` cleared a third key again, so removing the
+        // container could not correct the host row either.
+        assert_eq!(
+            row_key(c("mariadb"), catalogue::Runtime::Host).unwrap(),
+            "mariadb"
+        );
+        assert_eq!(
+            row_key(cv("mariadb", "11.8"), catalogue::Runtime::Container).unwrap(),
+            "unihelm-mariadb-11.8"
+        );
+        // The key `engine.remove` clears is that same string, because both come
+        // out of the plan rather than each spelling it out.
+        let plan = crate::engine::EnginePlan::for_component(cv("mariadb", "11.8")).unwrap();
+        assert_eq!(
+            row_key(cv("mariadb", "11.8"), catalogue::Runtime::Container).unwrap(),
+            plan.row_key()
+        );
+        // Two containers of one engine are two rows: two ports, two data
+        // directories, and a failed install of one must not put a red mark on
+        // the other.
+        assert_ne!(
+            row_key(cv("mariadb", "11.4"), catalogue::Runtime::Container).unwrap(),
+            row_key(cv("mariadb", "11.8"), catalogue::Runtime::Container).unwrap()
+        );
+        // And neither is the host's row, which is a different install of a
+        // different thing on the same machine.
+        assert_ne!(
+            row_key(cv("mariadb", "11.8"), catalogue::Runtime::Container).unwrap(),
+            row_key(c("mariadb"), catalogue::Runtime::Host).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_stopped_container_is_installed_and_down_rather_than_absent() {
+        use ContainerState::*;
+        let installed = Some(ComponentStatus::Installed);
+
+        // What the page reported "Not installed" over: a container that is up.
+        assert_eq!(
+            container_status(installed, Running),
+            ComponentStatus::Installed
+        );
+        // Stopped is a different sentence from gone, and telling the two apart
+        // is most of the reason an operator opens this page.
+        assert_eq!(
+            container_status(installed, Stopped),
+            ComponentStatus::Installed
+        );
+        // `docker rm` behind the panel's back: the row says so rather than
+        // reporting the registry's memory of an install.
+        assert_eq!(container_status(installed, Gone), ComponentStatus::Absent);
+        // A daemon that could not be asked is not a database that has gone.
+        assert_eq!(
+            container_status(installed, Unasked),
+            ComponentStatus::Installed
+        );
+        assert_eq!(container_status(None, Unasked), ComponentStatus::Installed);
+
+        // An operation in flight, or the reason the last one failed, outranks
+        // Docker: an install claims its row before the image has been pulled.
+        for (stored, state) in [
+            (ComponentStatus::Installing, Gone),
+            (ComponentStatus::Removing, Running),
+            (ComponentStatus::Failed, Gone),
+        ] {
+            assert_eq!(container_status(Some(stored), state), stored);
+        }
+
+        // A machine whose row was never written — every one installed before
+        // the key was fixed — still reads off the container that is there.
+        assert_eq!(container_status(None, Running), ComponentStatus::Installed);
+        assert_eq!(container_status(None, Gone), ComponentStatus::Absent);
+
+        // And the words the page reads for each.
+        assert_eq!(Running.as_unit(), ("running".to_string(), true));
+        assert_eq!(Stopped.as_unit(), ("stopped".to_string(), false));
+        assert_eq!(Unasked.as_unit(), ("unknown".to_string(), false));
+    }
+
+    #[tokio::test]
+    async fn a_containerised_engine_gets_a_row_of_its_own_instead_of_none_at_all() {
+        let (ctx, _, _) = op_ctx(Family::Debian).await;
+        let component = cv("mariadb", "11.8");
+        let slug = row_key(component, catalogue::Runtime::Container).unwrap();
+
+        // Exactly what a container install now leaves behind: its own row, and
+        // the registry record beside it.
+        ctx.db()
+            .claim_component(&slug, ComponentStatus::Installing, "task-1")
+            .await
+            .unwrap();
+        ctx.db()
+            .component_installed(&slug, Some("11.8"))
+            .await
+            .unwrap();
+        record_a_container(ctx.db(), "mariadb", "11.8", 3306).await;
+
+        let out = Status.run(&ctx, StatusInput {}).await.unwrap();
+        let row = out
+            .components
+            .iter()
+            .find(|c| c.slug == slug)
+            .expect("no row at all for a container this panel installed");
+        assert_eq!(row.component, "mariadb");
+        assert_eq!(row.version, "11.8");
+        assert_eq!(row.runtime, catalogue::Runtime::Container);
+        assert_eq!(row.display_name, "MariaDB 11.8");
+        assert_eq!(row.category, "database");
+        // Nothing about this machine's packaging can stop a container: what can
+        // is refused by name at install time.
+        assert_eq!(row.unavailable, None);
+        // Whether it is up is Docker's answer, and the machine running this
+        // test may have none — [`container_status`] pins that decision on its
+        // own. What must hold here is that the row exists and is not one about
+        // packages.
+
+        // The host row stays a row about packages, and there are none: this
+        // engine is not on the host, and the install saying it was is the other
+        // half of the same lie.
+        let host = out
+            .components
+            .iter()
+            .find(|c| c.slug == "mariadb")
+            .expect("no host row");
+        assert_eq!(host.runtime, catalogue::Runtime::Host);
+        assert_eq!(host.status, "absent");
+    }
+
+    #[tokio::test]
+    async fn a_machine_with_no_engine_containers_reports_only_package_rows() {
+        // The early return matters twice: nothing to say, and nothing to pay —
+        // `docker info` and `docker ps` are not run on a machine whose registry
+        // is empty, which is every machine before the first engine.
+        let (ctx, _, _) = op_ctx(Family::Debian).await;
+        let out = Status.run(&ctx, StatusInput {}).await.unwrap();
+        assert!(
+            out.components
+                .iter()
+                .all(|c| c.runtime == catalogue::Runtime::Host),
+            "a container row appeared with no engine installed"
         );
     }
 

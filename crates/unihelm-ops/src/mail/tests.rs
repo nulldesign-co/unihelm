@@ -605,6 +605,88 @@ fn the_relay_config_path_is_under_etc_and_not_in_the_tenant_home() {
 }
 
 #[test]
+fn the_relay_config_is_readable_by_the_account_that_sends_and_by_nothing_else() {
+    // msmtp runs as the tenant — PHP's mail() does — so the group bit has to
+    // stay. Root ownership (applied by `chown_to_tenant_group`) is what keeps
+    // the tenant from chmodding their way to writing it and redirecting their
+    // own site's mail while still sending as the operator's domain.
+    let file = ManagedFile::mail_relay(unihelm_config::paths::mail_site_config("example.com"));
+    assert_eq!(file.mode, 0o640);
+    assert_eq!(
+        file.mode & 0o007,
+        0,
+        "the relay credential is world-readable: {:o}",
+        file.mode
+    );
+}
+
+#[test]
+fn the_mail_directory_can_be_traversed_but_not_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // `create_dir_all` gives 0755 under the usual umask, and this directory
+    // holds one file per customer domain — so every account on the box could
+    // read off the server's customer list, and the name of any staging file a
+    // write was in the middle of. msmtp only ever opens one known path.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("etc/unihelm/mail");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(prepare_mail_dir(&dir).unwrap(), Some(0o755));
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o711, "mail dir mode: {mode:o}");
+    assert_eq!(mode & 0o044, 0, "the directory can still be listed");
+
+    assert_eq!(
+        prepare_mail_dir(&dir).unwrap(),
+        None,
+        "an already-correct directory is not reported as tightened"
+    );
+}
+
+#[test]
+fn a_missing_mail_directory_is_created_at_the_narrow_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The first apply on a fresh server creates the whole chain. The mode the
+    // umask happens to give `create_dir_all` is not asserted here — it is the
+    // environment's, not the panel's — only that what is left behind is 0711
+    // and that a second pass has nothing to report.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("etc/unihelm/mail");
+
+    prepare_mail_dir(&dir).unwrap();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o711, "fresh mail dir mode: {mode:o}");
+    assert_eq!(prepare_mail_dir(&dir).unwrap(), None);
+}
+
+#[test]
+fn the_credential_note_does_not_promise_a_containment_the_panel_does_not_have() {
+    // It used to say the tenant could read the credential "for their own site
+    // (and no other site's)", which reads as isolation. There is one relay row
+    // for the whole server, so every site's file holds the same secret and a
+    // tenant reading their own copy is holding the credential the server sends
+    // with. An operator who believes the old sentence pastes in an account
+    // password instead of a send-only key.
+    let relay = relay_for("smtp.example.net", "noreply@acme.example");
+    let note = view(Some(&relay)).credential_note;
+    assert!(
+        !note.contains("no other site"),
+        "the note still claims per-site containment: {note}"
+    );
+    assert!(
+        note.contains("one relay credential"),
+        "the note does not say the credential is shared: {note}"
+    );
+    assert!(
+        note.contains("send-only"),
+        "the note does not say what to do about it: {note}"
+    );
+}
+
+#[test]
 fn each_family_gets_its_own_ca_bundle_path() {
     // A wrong path here makes msmtp refuse to connect; it never makes it
     // connect without verifying.

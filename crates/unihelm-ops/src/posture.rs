@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use unihelm_config::paths;
 use unihelm_core::{Permission, Result, TenantScope};
 use unihelm_db::Db;
+use unihelm_distro::os::{self, RebootRequirement};
 use unihelm_distro::{Cmd, Distro, Family};
 
 use crate::fwops::SentinelSettings;
@@ -222,6 +223,13 @@ pub struct PostureFacts {
     /// How many pending updates the package manager considers security
     /// updates.
     pub security_updates: Observed<usize>,
+    /// Whether the machine is still running the code the last update replaced.
+    ///
+    /// Not an [`Observed`]: [`RebootRequirement`] already carries its own third
+    /// state, and wrapping one three-state answer in another would give this
+    /// module two spellings of "could not tell" that a reader would have to
+    /// keep straight.
+    pub reboot: RebootRequirement,
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +652,10 @@ pub async fn gather(distro: &Distro, db: &Db) -> Result<PostureFacts> {
         sites,
         sentinel_enabled: SentinelSettings::load(db).await.enabled,
         security_updates: gather_security_updates(distro).await,
+        // The companion to the count above, and the half that was missing: a
+        // server can have installed every security update it was offered and
+        // still be running the kernel they replaced.
+        reboot: os::reboot_requirement(distro.info.family).await,
     })
 }
 
@@ -1034,6 +1046,71 @@ pub fn evaluate(facts: &PostureFacts) -> Vec<Finding> {
         Observed::Known(_) => {}
     }
 
+    // -- A restart the machine is waiting for ------------------------------
+    //
+    // Deliberately after the update count, because it is the sentence that
+    // follows it: installing the patch and never restarting leaves the old
+    // code running, and until this check existed the panel confirmed the
+    // install and said nothing about the rest.
+    match &facts.reboot {
+        RebootRequirement::Unknown { reason } => findings.push(Finding {
+            id: "reboot.unknown",
+            severity: Severity::Unknown,
+            title: "Whether this server needs restarting could not be established".into(),
+            risk: "The panel cannot tell whether a kernel or library update is \
+                   installed but not yet running. Reporting that as \"no restart \
+                   needed\" would be a clean bill of health nobody checked."
+                .into(),
+            remedy: format!(
+                "Check by hand — on Debian and Ubuntu, whether {} exists; on \
+                 AlmaLinux and Rocky, `needs-restarting -r`. ({reason})",
+                os::DEBIAN_MARKER
+            ),
+            subject: None,
+        }),
+        RebootRequirement::Required { packages, .. } => {
+            // Naming the packages is the difference between a notice an
+            // operator postpones and a sentence they act on: "reboot required"
+            // says nothing, "the kernel was updated and this server is still
+            // running the old one" says why it cannot wait.
+            let title = match packages.split_first() {
+                None => {
+                    "This server has been updated and is still running the old code".to_string()
+                }
+                Some((first, [])) => {
+                    format!("{first} was updated and this server is still running the old one")
+                }
+                Some((first, rest)) => format!(
+                    "{first} and {} other {} were updated and this server is still \
+                     running the old code",
+                    rest.len(),
+                    if rest.len() == 1 {
+                        "package"
+                    } else {
+                        "packages"
+                    }
+                ),
+            };
+            findings.push(Finding {
+                id: "reboot.required",
+                severity: Severity::High,
+                title,
+                risk: "A kernel or system library is only replaced on disk by an \
+                       update. Until the machine restarts it keeps running the \
+                       code the patch replaced, so the vulnerability the update \
+                       closed is still open on this server."
+                    .into(),
+                remedy: "Restart the server from the dashboard when you can afford \
+                         the downtime. Every site on this machine stops until it is \
+                         back, and the panel goes down with it, so the panel cannot \
+                         tell you when the machine returns."
+                    .into(),
+                subject: (!packages.is_empty()).then(|| packages.join(", ")),
+            });
+        }
+        RebootRequirement::NotRequired => {}
+    }
+
     findings.sort_by_key(|f| f.severity);
     findings
 }
@@ -1132,6 +1209,7 @@ mod tests {
             }],
             sentinel_enabled: true,
             security_updates: Observed::Known(0),
+            reboot: RebootRequirement::NotRequired,
         }
     }
 
@@ -1239,6 +1317,77 @@ mod tests {
             ]
         );
         assert!(findings.iter().all(|f| f.severity == Severity::Unknown));
+    }
+
+    #[test]
+    fn a_pending_restart_names_the_package_that_asked_for_it() {
+        // The defect this check closes: the panel read neither distribution's
+        // restart-pending signal, so an operator who installed a kernel patch
+        // was told it succeeded and never learned the old kernel was still the
+        // one running. "Reboot required" would not have moved them either —
+        // the package name is what makes the sentence worth acting on.
+        let mut facts = clean();
+        facts.reboot = RebootRequirement::Required {
+            packages: vec!["linux-image-6.8.0-45-generic".into(), "linux-base".into()],
+            evidence: "/var/run/reboot-required exists".into(),
+        };
+
+        let findings = evaluate(&facts);
+        assert_eq!(ids(&findings), vec!["reboot.required"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert!(
+            findings[0].title.contains("linux-image-6.8.0-45-generic"),
+            "{}",
+            findings[0].title
+        );
+        assert_eq!(
+            findings[0].subject.as_deref(),
+            Some("linux-image-6.8.0-45-generic, linux-base")
+        );
+    }
+
+    #[test]
+    fn a_restart_nothing_named_is_still_reported() {
+        // The marker file can exist with no package list beside it. Dropping
+        // the finding because the detail is missing would lose the only signal
+        // that matters.
+        let mut facts = clean();
+        facts.reboot = RebootRequirement::Required {
+            packages: Vec::new(),
+            evidence: "/var/run/reboot-required exists".into(),
+        };
+        let findings = evaluate(&facts);
+        assert_eq!(ids(&findings), vec!["reboot.required"]);
+        assert!(findings[0].subject.is_none());
+    }
+
+    #[test]
+    fn a_restart_state_that_could_not_be_read_is_unknown_and_not_a_clean_tick() {
+        // The same rule the rest of this module lives by, applied to the check
+        // most likely to fail quietly: a Debian machine without
+        // `update-notifier-common` never grows the marker file, so its absence
+        // proves nothing and must not read as "no restart needed".
+        let mut facts = clean();
+        facts.reboot = RebootRequirement::Unknown {
+            reason: "update-notifier-common is not installed".into(),
+        };
+        let findings = evaluate(&facts);
+        assert_eq!(ids(&findings), vec!["reboot.unknown"]);
+        assert_eq!(findings[0].severity, Severity::Unknown);
+        assert!(
+            findings[0]
+                .remedy
+                .contains("update-notifier-common is not installed"),
+            "the reason the check failed has to travel with it: {}",
+            findings[0].remedy
+        );
+    }
+
+    #[test]
+    fn a_machine_that_does_not_need_restarting_says_nothing() {
+        // The counterweight: a check that fires on a healthy server is a check
+        // an operator learns to scroll past.
+        assert!(evaluate(&clean()).is_empty());
     }
 
     #[test]

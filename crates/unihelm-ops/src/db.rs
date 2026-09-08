@@ -33,6 +33,7 @@ use unihelm_db::subscriptions::Subscription;
 use unihelm_distro::svc::ManagedUnit;
 use unihelm_distro::{CmdOutput, Family};
 
+use crate::engine::RootConnection;
 use crate::registry::{Execution, OpContext, TypedOperation};
 
 // ---------------------------------------------------------------------------
@@ -54,13 +55,58 @@ pub struct SqlJob {
     pub secret: bool,
 }
 
+/// The environment a client is given, which is the only place a credential may
+/// travel.
+///
+/// **Deliberately not a field of [`SqlJob`].** That type derives `Debug` and
+/// the test recorder keeps every job it is handed, so a password inside it is
+/// one `?job` away from a log line — the same leak rule 2 above puts the SQL on
+/// stdin to avoid. It is also why this carries a hand-written `Debug`, exactly
+/// as `unihelm_db::MasterKey` and `engine::RootConnection` do.
+///
+/// Two names ever go in it: `MYSQL_PWD` and `PGPASSWORD`, which are how the two
+/// clients read a password without one appearing on the command line.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ClientEnv(Vec<(&'static str, String)>);
+
+impl ClientEnv {
+    fn one(name: &'static str, value: String) -> Self {
+        Self(vec![(name, value)])
+    }
+
+    /// The names alone, for the `--env NAME` that tells Docker to take each one
+    /// from the panel's own process rather than from an argv.
+    fn names(&self) -> Vec<&'static str> {
+        self.0.iter().map(|(name, _)| *name).collect()
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.0.iter().map(|(name, value)| (*name, value.as_str()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for ClientEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, _)| format!("{name}=<redacted>")))
+            .finish()
+    }
+}
+
 /// The seam between "which statements" and "actually running a client".
 ///
 /// Production uses [`SystemShell`]; tests install a recorder so operations can
 /// be asserted down to the exact argv and stdin without MariaDB installed.
 #[async_trait]
 pub trait DbShell: Send + Sync {
-    async fn run(&self, job: &SqlJob) -> Result<CmdOutput>;
+    /// `env` is the credential channel and is empty for every host invocation.
+    /// It is a parameter rather than part of the job for the reason
+    /// [`ClientEnv`] gives.
+    async fn run(&self, job: &SqlJob, env: &ClientEnv) -> Result<CmdOutput>;
 }
 
 /// Runs the real client through [`unihelm_distro::Cmd`] — argv array, resolved
@@ -69,20 +115,26 @@ pub struct SystemShell;
 
 #[async_trait]
 impl DbShell for SystemShell {
-    async fn run(&self, job: &SqlJob) -> Result<CmdOutput> {
+    async fn run(&self, job: &SqlJob, env: &ClientEnv) -> Result<CmdOutput> {
         let (program, args) = job
             .argv
             .split_first()
             .ok_or_else(|| UnihelmError::internal("a SqlJob must carry a program"))?;
-        unihelm_distro::Cmd::new(program.clone())
+        let mut cmd = unihelm_distro::Cmd::new(program.clone())
             .args(args)
-            // Local DDL over a unix socket. 30 s is generous; the default 120 s
-            // would hold an Immediate IPC round trip open far too long.
+            // Local DDL, over a unix socket or through `docker exec` into a
+            // container on this same machine. 30 s is generous for either; the
+            // default 120 s would hold an Immediate IPC round trip open far too
+            // long.
             .timeout(Duration::from_secs(30))
-            .stdin_data(job.sql.as_bytes().to_vec())
-            .run()
-            .await
-            .map_err(UnihelmError::from)
+            .stdin_data(job.sql.as_bytes().to_vec());
+        // `Cmd` starts from an empty environment, so this is the whole of what
+        // the client can read — and the value exists nowhere else: not in the
+        // argv, not in the job, not in a file.
+        for (name, value) in env.pairs() {
+            cmd = cmd.env(name, value);
+        }
+        cmd.run().await.map_err(UnihelmError::from)
     }
 }
 
@@ -101,15 +153,19 @@ fn shell() -> Arc<dyn DbShell> {
 /// The public entry point for modules outside this one — `harden` uses it to
 /// run the post-install SQL — so they get the same argv discipline, the same
 /// secret handling, and the same test recorder.
+///
+/// No environment, because every caller of this one builds a host invocation:
+/// hardening runs against a MariaDB this panel has just installed as packages,
+/// where root authenticates over the socket and there is no password to pass.
 pub async fn run_sql(job: &SqlJob) -> Result<CmdOutput> {
-    execute(shell().as_ref(), job).await
+    execute(shell().as_ref(), job, &ClientEnv::default()).await
 }
 
 /// Run a job and turn a non-zero exit into an error — with the client's own
 /// diagnostics when they are safe to show, and without them when the statement
 /// carried a credential (both engines echo parts of a failing statement).
-async fn execute(shell: &dyn DbShell, job: &SqlJob) -> Result<CmdOutput> {
-    let out = shell.run(job).await?;
+async fn execute(shell: &dyn DbShell, job: &SqlJob, env: &ClientEnv) -> Result<CmdOutput> {
+    let out = shell.run(job, env).await?;
     if out.success() {
         return Ok(out);
     }
@@ -194,6 +250,105 @@ fn argv_for(family: Family, engine: DbEngine, query: bool) -> Vec<String> {
     match engine {
         DbEngine::Mysql => mysql_argv(family, query),
         DbEngine::Postgres => postgres_argv(query),
+    }
+}
+
+/// The variable the MySQL-family clients read a password out of, so it never
+/// has to be typed on a command line. Deprecated by Oracle and still the only
+/// non-argv route both `mysql` and `mariadb` honour.
+const MYSQL_PASSWORD_ENV: &str = "MYSQL_PWD";
+
+/// libpq's, read by `psql` and by every client built on it.
+const POSTGRES_PASSWORD_ENV: &str = "PGPASSWORD";
+
+/// The `mariadb`/`mysql` client argv for root **inside the engine's own
+/// container**.
+///
+/// Three differences from [`mysql_argv`], and each one is forced by where this
+/// runs:
+///
+/// - **TCP to the container's own loopback**, not a socket. The socket path
+///   differs between the official image and each distribution's packaging and
+///   the panel does not get to guess; the port the server binds inside the
+///   container is in the engine record and is not a guess. It is the same
+///   choice, for the same reason, that `engine`'s readiness probe makes.
+/// - **A password**, because the image's root is not authenticated by
+///   `unix_socket` — and it arrives through [`MYSQL_PASSWORD_ENV`], never on
+///   the argv. `/proc/<pid>/cmdline` is readable by every local account on the
+///   machine, and that is precisely the boundary sealing the credential exists
+///   to hold.
+/// - **The program and the user come off the record**, because the image
+///   decides both: `mariadb:11.8` carries `mariadb` and `mysql:8.0` carries
+///   `mysql`, and asking either for the other's name is a missing binary on a
+///   server that is perfectly healthy.
+///
+/// `--no-defaults` stays first for the reason it is first there: the clients
+/// only honour it in that position.
+pub fn mysql_container_argv(conn: &RootConnection, query: bool) -> Vec<String> {
+    let mut argv = vec![
+        conn.client.to_string(),
+        "--no-defaults".to_string(),
+        "--protocol=tcp".to_string(),
+        format!("--host={}", conn.host),
+        format!("--port={}", conn.port),
+        format!("--user={}", conn.user),
+        "--batch".to_string(),
+    ];
+    if query {
+        argv.push("--skip-column-names".to_string());
+    }
+    argv
+}
+
+/// The `psql` argv for the superuser inside the engine's own container.
+///
+/// `-v ON_ERROR_STOP=1` and `-f -` are [`postgres_argv`]'s and are here for the
+/// same reasons — psql otherwise runs past a failed statement and still exits
+/// zero, and the batch belongs on stdin. What changes is the address and the
+/// credential: TCP to the container's loopback, and the password in
+/// [`POSTGRES_PASSWORD_ENV`] rather than on the command line.
+pub fn postgres_container_argv(conn: &RootConnection, query: bool) -> Vec<String> {
+    let mut argv = vec![
+        conn.client.to_string(),
+        "-v".to_string(),
+        "ON_ERROR_STOP=1".to_string(),
+        "-U".to_string(),
+        conn.user.clone(),
+        "-h".to_string(),
+        conn.host.to_string(),
+        "-p".to_string(),
+        conn.port.to_string(),
+    ];
+    if query {
+        argv.push("-tA".to_string());
+    }
+    argv.push("-f".to_string());
+    argv.push("-".to_string());
+    argv
+}
+
+/// One client invocation for one engine, wherever that engine turned out to be.
+///
+/// The single place the two paths meet, so no operation can pick one by
+/// accident: everything below this line — the statements, the quoting, the
+/// `LIKE` escaping in a grant, the privilege cleanup after a drop — is
+/// identical whether the server is in a container or on the host.
+fn client_for(
+    home: &EngineHome,
+    family: Family,
+    engine: DbEngine,
+    query: bool,
+) -> (Vec<String>, ClientEnv) {
+    match home {
+        EngineHome::Host => (argv_for(family, engine, query), ClientEnv::default()),
+        EngineHome::Container(conn) => {
+            let (client, variable) = match engine {
+                DbEngine::Mysql => (mysql_container_argv(conn, query), MYSQL_PASSWORD_ENV),
+                DbEngine::Postgres => (postgres_container_argv(conn, query), POSTGRES_PASSWORD_ENV),
+            };
+            let env = ClientEnv::one(variable, conn.password.clone());
+            (conn.exec_argv(&env.names(), client), env)
+        }
     }
 }
 
@@ -518,10 +673,22 @@ const fn engine_unit(engine: DbEngine) -> ManagedUnit {
     }
 }
 
-const fn engine_slug(engine: DbEngine) -> &'static str {
+/// The catalogue slugs that speak one engine's protocol.
+///
+/// A `DbEngine` names a wire format, not a product: MariaDB and MySQL are one
+/// `Mysql`, and an operator who installed either expects `db.create` to find
+/// it. `mysql` was missing here and it is in the catalogue, so a machine that
+/// installed MySQL was told MariaDB was not installed. `postgresql` was in this
+/// list and is **not** a catalogue slug at all — `stack.install postgres`
+/// writes the row `postgres` — so the lookup never matched and every PostgreSQL
+/// answer fell through to the systemd probe below it.
+const fn engine_slugs(engine: DbEngine) -> &'static [&'static str] {
     match engine {
-        DbEngine::Mysql => "mariadb",
-        DbEngine::Postgres => "postgresql",
+        // MariaDB first: it is what the panel installs by default and the one
+        // it hardens, so on the machine that somehow carries both it is the
+        // panel's own that the panel manages.
+        DbEngine::Mysql => &["mariadb", "mysql"],
+        DbEngine::Postgres => &["postgres"],
     }
 }
 
@@ -532,22 +699,55 @@ const fn engine_display(engine: DbEngine) -> &'static str {
     }
 }
 
-/// Refuse to manage objects on an engine that is not there.
+/// Where the engine an operation must talk to actually lives, and therefore how
+/// its client is invoked.
 ///
-/// Same shape as `require_php_installed`: our own bookkeeping first, then
-/// systemd's view for engines installed before (or without) the panel. The
-/// client binary erroring with "not found" later would be true but useless;
-/// this error says what to do about it.
-async fn require_engine_ready(ctx: &OpContext, engine: DbEngine) -> Result<()> {
-    let installed = ctx
-        .db()
-        .component(engine_slug(engine))
-        .await
-        .map_err(UnihelmError::from)?
-        .map(|c| c.status == unihelm_db::ComponentStatus::Installed)
-        .unwrap_or(false);
-    if installed {
-        return Ok(());
+/// The refusal `require_engine_ready` was, plus the answer every operation here
+/// then needs. It has to be one function because the two questions have one
+/// source: "is MariaDB installed" and "is it a container or packages" are
+/// answered by the same lookup, and asking them separately is how the panel
+/// came to say yes to the first and act on the wrong answer to the second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineHome {
+    /// Host packages: the client on this machine, over the local socket. Still
+    /// exactly right for an operator who chose "on the server", where root is
+    /// authenticated by `unix_socket` and there is no password to hold.
+    Host,
+    /// A container the panel installed: the client that ships inside the image,
+    /// run through `docker exec`, authenticating with the sealed root password.
+    Container(RootConnection),
+}
+
+/// Find the engine, or refuse by name.
+///
+/// Registry first, because it is the only thing that knows a container is
+/// there. 0.3.0 made a container the default for every engine in the
+/// catalogue and nothing here was told: the row `stack.install` wrote had no
+/// unit, no packages and — until this release — not even the name this
+/// function looked for, so the panel installed MariaDB, said it worked, and
+/// then answered "MariaDB is not installed" to the first database anybody tried
+/// to create in it.
+///
+/// The two host probes below it are unchanged in spirit: our own bookkeeping,
+/// then systemd's view for an engine installed before (or without) the panel.
+async fn engine_home(ctx: &OpContext, engine: DbEngine) -> Result<EngineHome> {
+    if let Some(conn) =
+        crate::engine::root_connection(ctx.db(), ctx.master_key(), engine_slugs(engine)).await?
+    {
+        return Ok(EngineHome::Container(conn));
+    }
+
+    for slug in engine_slugs(engine) {
+        let installed = ctx
+            .db()
+            .component(slug)
+            .await
+            .map_err(UnihelmError::from)?
+            .map(|c| c.status == unihelm_db::ComponentStatus::Installed)
+            .unwrap_or(false);
+        if installed {
+            return Ok(EngineHome::Host);
+        }
     }
 
     let unit = engine_unit(engine).unit_name(ctx.distro().info.family);
@@ -559,13 +759,14 @@ async fn require_engine_ready(ctx: &OpContext, engine: DbEngine) -> Result<()> {
         .map(|s| s.is_installed())
         .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(EngineHome::Host);
     }
 
     Err(UnihelmError::new(
         ErrorCode::NotFound,
         format!(
-            "{} is not installed. Install it from the Stack Manager first.",
+            "{} is not installed on this server, in a container or as packages. \
+             Install it from the Stack Manager first.",
             engine_display(engine)
         ),
     )
@@ -715,7 +916,10 @@ impl TypedOperation for Create {
         let db = ctx.db().clone();
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
         enforce_db_limit(&db, &subscription).await?;
-        require_engine_ready(ctx, input.engine).await?;
+        // Where the engine is, resolved once and used for both statements
+        // below: a probe that asked the container and a CREATE that asked the
+        // host would be two answers about one machine.
+        let home = engine_home(ctx, input.engine).await?;
 
         // An owner must already exist, in the same subscription and engine —
         // binding someone else's user would be a cross-tenant grant.
@@ -753,12 +957,13 @@ impl TypedOperation for Create {
 
         let sh = shell();
         let family = ctx.distro().info.family;
+        let (argv, env) = client_for(&home, family, input.engine, true);
         let probe = SqlJob {
-            argv: argv_for(family, input.engine, true),
+            argv,
             sql: sql_db_exists(input.engine, &input.name),
             secret: false,
         };
-        if !execute(sh.as_ref(), &probe)
+        if !execute(sh.as_ref(), &probe, &env)
             .await?
             .trimmed_stdout()
             .is_empty()
@@ -784,12 +989,13 @@ impl TypedOperation for Create {
             .await
             .map_err(UnihelmError::from)?;
 
+        let (argv, env) = client_for(&home, family, input.engine, false);
         let create = SqlJob {
-            argv: argv_for(family, input.engine, false),
+            argv,
             sql: sql_create_db(input.engine, &input.name, input.owner.as_ref()),
             secret: false,
         };
-        if let Err(e) = execute(sh.as_ref(), &create).await {
+        if let Err(e) = execute(sh.as_ref(), &create, &env).await {
             // Compensate: the engine refused, so the claim must be released or
             // the name is burned forever.
             let _ = db
@@ -870,12 +1076,14 @@ impl TypedOperation for Drop {
         // describe what still exists; if the row delete fails the next attempt
         // hits `IF EXISTS` and completes.
         let name = DbName::parse(&found.name)?;
+        let home = engine_home(ctx, found.engine).await?;
+        let (argv, env) = client_for(&home, ctx.distro().info.family, found.engine, false);
         let job = SqlJob {
-            argv: argv_for(ctx.distro().info.family, found.engine, false),
+            argv,
             sql: sql_drop_db(found.engine, &name),
             secret: false,
         };
-        execute(shell().as_ref(), &job).await?;
+        execute(shell().as_ref(), &job, &env).await?;
 
         repo.delete(found.id).await.map_err(UnihelmError::from)?;
         ctx.log(format!("dropped database {}", found.name));
@@ -923,7 +1131,7 @@ impl TypedOperation for UserCreate {
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let db = ctx.db().clone();
         let subscription = resolve_subscription(ctx, input.subscription_id).await?;
-        require_engine_ready(ctx, input.engine).await?;
+        let home = engine_home(ctx, input.engine).await?;
 
         if db
             .db_user_by_name_global(input.username.as_str())
@@ -942,12 +1150,13 @@ impl TypedOperation for UserCreate {
 
         let sh = shell();
         let family = ctx.distro().info.family;
+        let (argv, env) = client_for(&home, family, input.engine, true);
         let probe = SqlJob {
-            argv: argv_for(family, input.engine, true),
+            argv,
             sql: sql_user_exists(input.engine, &input.username),
             secret: false,
         };
-        if !execute(sh.as_ref(), &probe)
+        if !execute(sh.as_ref(), &probe, &env)
             .await?
             .trimmed_stdout()
             .is_empty()
@@ -972,12 +1181,13 @@ impl TypedOperation for UserCreate {
             .map_err(UnihelmError::from)?;
 
         let password = generate_password();
+        let (argv, env) = client_for(&home, family, input.engine, false);
         let create = SqlJob {
-            argv: argv_for(family, input.engine, false),
+            argv,
             sql: sql_create_user(input.engine, &input.username, &password)?,
             secret: true,
         };
-        if let Err(e) = execute(sh.as_ref(), &create).await {
+        if let Err(e) = execute(sh.as_ref(), &create, &env).await {
             let _ = db
                 .databases(&unihelm_core::TenantScope::Global)
                 .delete_user(row.id)
@@ -1039,12 +1249,14 @@ impl TypedOperation for UserDrop {
         // PostgreSQL refuses to drop a role that still owns a database; that
         // error surfaces verbatim so the operator knows to drop or reassign the
         // database first, rather than us cascading through owned objects.
+        let home = engine_home(ctx, found.engine).await?;
+        let (argv, env) = client_for(&home, ctx.distro().info.family, found.engine, false);
         let job = SqlJob {
-            argv: argv_for(ctx.distro().info.family, found.engine, false),
+            argv,
             sql: sql_drop_user(found.engine, &input.username),
             secret: false,
         };
-        execute(shell().as_ref(), &job).await?;
+        execute(shell().as_ref(), &job, &env).await?;
 
         repo.delete_user(found.id)
             .await
@@ -1096,12 +1308,14 @@ impl TypedOperation for UserPassword {
             .ok_or_else(|| UnihelmError::not_found("database user"))?;
 
         let password = generate_password();
+        let home = engine_home(ctx, found.engine).await?;
+        let (argv, env) = client_for(&home, ctx.distro().info.family, found.engine, false);
         let job = SqlJob {
-            argv: argv_for(ctx.distro().info.family, found.engine, false),
+            argv,
             sql: sql_set_password(found.engine, &input.username, &password)?,
             secret: true,
         };
-        execute(shell().as_ref(), &job).await?;
+        execute(shell().as_ref(), &job, &env).await?;
 
         db.touch_db_user(found.id)
             .await
@@ -1177,12 +1391,14 @@ impl TypedOperation for Grant {
             .with_field("username"));
         }
 
+        let home = engine_home(ctx, database.engine).await?;
+        let (argv, env) = client_for(&home, ctx.distro().info.family, database.engine, false);
         let job = SqlJob {
-            argv: argv_for(ctx.distro().info.family, database.engine, false),
+            argv,
             sql: sql_grant(database.engine, &input.database, &input.username),
             secret: false,
         };
-        execute(shell().as_ref(), &job).await?;
+        execute(shell().as_ref(), &job, &env).await?;
 
         ctx.log(format!(
             "granted {} access to {}",
@@ -1229,6 +1445,11 @@ pub(crate) mod testing {
     #[derive(Default)]
     pub struct RecordingShell {
         pub jobs: Mutex<Vec<SqlJob>>,
+        /// The environment each job was given, kept beside it rather than in
+        /// it: a test has to be able to assert that the root password reached
+        /// the client *and* that it is nowhere in the argv, and only a recorder
+        /// that sees both can.
+        pub envs: Mutex<Vec<ClientEnv>>,
         pub scripted: Mutex<VecDeque<CmdOutput>>,
     }
 
@@ -1237,8 +1458,13 @@ pub(crate) mod testing {
             self.jobs.lock().expect("shell mutex").clone()
         }
 
+        pub fn environments(&self) -> Vec<ClientEnv> {
+            self.envs.lock().expect("shell mutex").clone()
+        }
+
         pub fn clear(&self) {
             self.jobs.lock().expect("shell mutex").clear();
+            self.envs.lock().expect("shell mutex").clear();
         }
 
         pub fn script(&self, out: CmdOutput) {
@@ -1258,8 +1484,9 @@ pub(crate) mod testing {
 
     #[async_trait]
     impl DbShell for RecordingShell {
-        async fn run(&self, job: &SqlJob) -> Result<CmdOutput> {
+        async fn run(&self, job: &SqlJob, env: &ClientEnv) -> Result<CmdOutput> {
             self.jobs.lock().expect("shell mutex").push(job.clone());
+            self.envs.lock().expect("shell mutex").push(env.clone());
             Ok(self
                 .scripted
                 .lock()
@@ -1281,10 +1508,16 @@ mod tests {
 
     async fn setup() -> (OpRegistry, UserId, UserId, Arc<RecordingShell>) {
         let (reg, admin, customer) = registry().await;
-        // Pretend both engines are installed, the way the Stack Manager records
-        // them (claim creates the row, installed finalises it); the mock
-        // systemd knows no units, so this is the path taken.
-        for slug in ["mariadb", "postgresql"] {
+        // Pretend both engines are installed **on the host**, the way the Stack
+        // Manager records them (claim creates the row, installed finalises it);
+        // the mock systemd knows no units, so this is the path taken.
+        //
+        // The slugs are the catalogue's own. This list read `postgresql` until
+        // the container work, which is not a slug the panel ever writes —
+        // `stack.install postgres` writes `postgres` — so the row lookup never
+        // matched here or on a real server, and every PostgreSQL answer came
+        // out of the systemd fallback instead.
+        for slug in ["mariadb", "postgres"] {
             let db = &reg.services().db;
             db.claim_component(slug, unihelm_db::ComponentStatus::Installing, "test-task")
                 .await
@@ -1597,6 +1830,244 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(err.detail.contains("Stack Manager"));
+    }
+
+    // --- the engine is in a container ---------------------------------------
+
+    /// The registry record `engine::install_container` writes when it brings an
+    /// engine up. On a default install it is the *only* thing on the machine
+    /// that says where that engine is: there are no packages, no unit and no
+    /// socket.
+    async fn record_a_container(
+        reg: &OpRegistry,
+        slug: &str,
+        version: &str,
+        host_port: u16,
+        container_port: u16,
+        root_user: &str,
+        password: &str,
+    ) -> String {
+        let plan = crate::engine::EnginePlan::resolve(slug, Some(version)).unwrap();
+        let container = plan.container().as_str().to_string();
+        let mut engines = crate::engine::EngineRegistry::new();
+        engines.insert(
+            container.clone(),
+            crate::engine::EngineRecord {
+                slug: slug.to_string(),
+                version: version.to_string(),
+                image: plan.image().as_str().to_string(),
+                container: container.clone(),
+                volume: plan.volume().map(str::to_string),
+                host_port,
+                container_port,
+                root_user: Some(root_user.to_string()),
+                root_password_sealed: Some(reg.services().master_key.seal_str(password).unwrap()),
+            },
+        );
+        reg.services()
+            .db
+            .set_setting(crate::engine::ENGINES_SETTING, &engines)
+            .await
+            .unwrap();
+        container
+    }
+
+    #[tokio::test]
+    async fn db_create_runs_the_client_inside_the_container_the_engine_is_in() {
+        // The whole of issue 69: 0.3.0 made a container the default for every
+        // engine in the catalogue, and this file only ever built a socket
+        // client. On the path a fresh install actually takes there is no
+        // socket, because there is no host install to own one — and no
+        // `mariadb` binary on the machine to run against it either.
+        let (reg, _, customer, sh) = setup().await;
+        let container = record_a_container(
+            &reg,
+            "mariadb",
+            "11.8",
+            3306,
+            3306,
+            "root",
+            "s3cret-root-pw",
+        )
+        .await;
+
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "shop_db", "engine": "mysql" }),
+        )
+        .await
+        .unwrap();
+
+        let jobs = sh.recorded();
+        assert_eq!(jobs.len(), 2, "one existence probe, one CREATE");
+        let probe: Vec<&str> = jobs[0].argv.iter().map(String::as_str).collect();
+        assert_eq!(
+            probe,
+            vec![
+                "docker",
+                "exec",
+                // Without `-i` Docker hands the client `/dev/null`, the batch
+                // on stdin is silently empty, and the panel reports a database
+                // it never created.
+                "-i",
+                // The name only. `--env NAME=value` would put the root
+                // password in `/proc/<pid>/cmdline`, which every local account
+                // can read.
+                "--env",
+                "MYSQL_PWD",
+                container.as_str(),
+                "mariadb",
+                "--no-defaults",
+                "--protocol=tcp",
+                "--host=127.0.0.1",
+                // The port *inside* the container, not the one this machine
+                // publishes: a client running in there never crosses that
+                // boundary, and the two numbers differ as soon as a second
+                // version is installed.
+                "--port=3306",
+                "--user=root",
+                "--batch",
+                "--skip-column-names",
+            ]
+        );
+
+        // The statements are untouched. This changes how the client is invoked
+        // and nothing below that line.
+        assert_eq!(
+            jobs[0].sql,
+            "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'shop_db';\n"
+        );
+        assert_eq!(jobs[1].sql, "CREATE DATABASE `shop_db`;\n");
+
+        // The credential reaches the client through the environment and appears
+        // on no command line at all.
+        assert!(
+            !jobs
+                .iter()
+                .any(|j| j.argv.iter().any(|a| a.contains("s3cret-root-pw"))),
+            "the root password reached an argv: {:?}",
+            jobs.iter().map(|j| &j.argv).collect::<Vec<_>>()
+        );
+        let envs = sh.environments();
+        for env in &envs {
+            assert_eq!(
+                env.pairs().collect::<Vec<_>>(),
+                vec![("MYSQL_PWD", "s3cret-root-pw")]
+            );
+            // And a recorder that keeps it must not print it either.
+            assert!(!format!("{env:?}").contains("s3cret"), "{env:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_containerised_postgres_is_reached_with_the_psql_inside_it() {
+        let (reg, _, customer, sh) = setup().await;
+        let container =
+            record_a_container(&reg, "postgres", "17", 5432, 5432, "postgres", "pg-root-pw").await;
+
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "warehouse", "engine": "postgres" }),
+        )
+        .await
+        .unwrap();
+
+        let jobs = sh.recorded();
+        let create: Vec<&str> = jobs[1].argv.iter().map(String::as_str).collect();
+        assert_eq!(
+            create,
+            vec![
+                "docker",
+                "exec",
+                "-i",
+                "--env",
+                "PGPASSWORD",
+                container.as_str(),
+                "psql",
+                // Without this psql runs past a failed statement and still
+                // exits zero, which would turn "the CREATE failed" into silent
+                // success — inside a container exactly as on a socket.
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-U",
+                "postgres",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-f",
+                "-",
+            ]
+        );
+        assert_eq!(jobs[1].sql, "CREATE DATABASE \"warehouse\";\n");
+        assert_eq!(
+            sh.environments()[1].pairs().collect::<Vec<_>>(),
+            vec![("PGPASSWORD", "pg-root-pw")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_install_still_goes_over_its_socket_with_no_credential() {
+        // The other half of the promise: the socket path is not a rewrite, and
+        // an operator who chose "on the server" must keep the client they had.
+        let (reg, _, customer, sh) = setup().await;
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.create",
+            json!({ "name": "on_the_host", "engine": "mysql" }),
+        )
+        .await
+        .unwrap();
+
+        let jobs = sh.recorded();
+        assert_eq!(jobs[1].argv, mysql_argv(Family::Debian, false));
+        assert!(
+            sh.environments().iter().all(ClientEnv::is_empty),
+            "root over the local socket is authenticated by unix_socket; there is no \
+             password to hand it"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_slug_the_catalogue_offers_for_an_engine_is_one_it_is_found_under() {
+        // `require_engine_ready` asked about `mariadb` and `postgresql`.
+        // `postgresql` is not a slug the panel ever writes — `stack.install
+        // postgres` writes `postgres` — so that lookup never matched, and
+        // `mysql` is in the catalogue, reaches this same code, and was in
+        // neither list. Both engines were found only by the systemd fallback,
+        // which answers for neither a container nor a mock.
+        for (slug, engine, name) in [
+            ("mysql", "mysql", "under_mysql"),
+            ("postgres", "postgres", "under_postgres"),
+        ] {
+            let (reg, _, customer) = registry().await;
+            install_shell(Arc::new(RecordingShell::default()));
+            let db = &reg.services().db;
+            db.claim_component(slug, unihelm_db::ComponentStatus::Installing, "t")
+                .await
+                .unwrap();
+            db.component_installed(slug, Some("1.0-mock"))
+                .await
+                .unwrap();
+
+            dispatch(
+                &reg,
+                customer,
+                Role::Customer,
+                "db.create",
+                json!({ "name": name, "engine": engine }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{slug}: {}", e.detail));
+        }
     }
 
     #[tokio::test]

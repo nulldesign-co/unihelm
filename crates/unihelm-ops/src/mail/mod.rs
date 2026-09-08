@@ -32,17 +32,36 @@
 //! local submission agent that holds the secret, which is an MTA, which is
 //! Phase 5.
 //!
-//! What the panel does about it:
+//! **Say the size of that plainly.** There is one relay row for the whole
+//! server (`mail_relay`, `id = 1`), so every per-site file holds the *same*
+//! secret: the credential this machine authenticates to SendGrid, SES or
+//! Postmark with. Any tenant with a PHP site can read it, and what they can do
+//! with it is send as the operator — which is a blacklisting that takes every
+//! other customer's mail down with it. This module used to describe the per-site
+//! `0640` as making "the exposure one tenant per file rather than every user on
+//! the box". That sentence is true about the *file* and false about the
+//! *secret*, and it is the kind of containment claim that stops an operator
+//! reaching for a send-only credential. What the mode actually buys is that a
+//! tenant cannot read another site's copy or edit their own — not that the relay
+//! password is out of their reach.
 //!
-//! - the per-site file is `0640`, owned `root:<that tenant's group>`, so the
-//!   exposure is one tenant per file rather than every user on the box;
+//! So what the panel does about it:
+//!
+//! - the per-site file is `0640`, owned `root:<that tenant's group>` — the
+//!   narrowest mode that still lets the account which sends read it, and root
+//!   ownership so a tenant cannot chmod their way to *writing* it;
 //! - the file is under `/etc/unihelm/mail`, not in the tenant's home, so a
 //!   tenant can read it but never *edit* it — an editable copy would let them
 //!   redirect their site's mail to a relay of their own while still sending as
 //!   the operator's domain;
-//! - the operation output and the documentation both say so, so an operator
-//!   chooses a send-only credential scoped to this server on purpose rather
-//!   than discovering the exposure later.
+//! - the directory is `0711`: traverse, so opening a known path works, and no
+//!   listing, so the box's customer list is not readable from any shell on it;
+//! - the mode is re-asserted on every apply and not only on the applies that
+//!   write something, so a server that has been running since before this was
+//!   settled is fixed by its next mail change rather than by a reinstall;
+//! - the operation output and the documentation both say what is exposed and
+//!   how far, so an operator chooses a send-only credential scoped to this
+//!   server on purpose rather than discovering the exposure later.
 //!
 //! # The shim is a configuration file, not a script
 //!
@@ -61,7 +80,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use unihelm_config::apply::ApplyRequest;
-use unihelm_config::{CommentStyle, ManagedFile, paths};
+use unihelm_config::{ManagedFile, paths};
 use unihelm_core::{ErrorCode, LinuxUser, Permission, Result, TenantScope, UnihelmError};
 use unihelm_db::{MailRelay, NewMailRelay, TlsMode};
 use unihelm_distro::Family;
@@ -89,6 +108,16 @@ const AGENT_TIMEOUT_SECONDS: u32 = 20;
 /// These strings are rendered into a configuration file and into an SMTP
 /// conversation; unbounded ones are a way to make either unreadable.
 const MAX_FIELD: usize = 255;
+
+/// The mode `/etc/unihelm/mail` is held at.
+///
+/// `create_dir_all` alone produces 0755 under the usual umask, which lets every
+/// account on the box list the directory: one file per domain, so the whole
+/// customer list of the server, plus the name of any staging file a write is in
+/// the middle of. Nothing needs to list it — msmtp is handed one known path on
+/// its command line — so the listing bit is pure loss. `0711` keeps the traverse
+/// that opening a known path requires and drops the rest.
+const MAIL_DIR_MODE: u32 = 0o711;
 
 // ---------------------------------------------------------------------------
 // validation
@@ -278,20 +307,22 @@ pub async fn write_site_relay(
         None => None,
     };
 
-    std::fs::create_dir_all(paths::mail_dir()).map_err(|e| {
-        UnihelmError::internal(format!("could not create the mail config directory: {e}"))
-    })?;
+    let mail_dir = paths::mail_dir();
+    if let Some(previous) = prepare_mail_dir(&mail_dir)? {
+        ctx.log(format!(
+            "tightened {} from {previous:04o} to {MAIL_DIR_MODE:04o}: it held one file per \
+             customer domain and every account on this server could list it",
+            mail_dir.display()
+        ));
+    }
+
+    // Readable by the tenant that runs msmtp, by nobody else. The group is set
+    // below; until it is, the file is root-only, which fails closed.
+    let file = ManagedFile::mail_relay(path.clone());
 
     ctx.config()
         .apply(ApplyRequest {
-            file: ManagedFile {
-                path: path.clone(),
-                // Readable by the tenant that runs msmtp, by nobody else. The
-                // group is set below; until it is, the file is root-only,
-                // which fails closed.
-                mode: 0o640,
-                comment_style: CommentStyle::Hash,
-            },
+            file: file.clone(),
             template: "mail/msmtprc",
             context: serde_json::json!({ "mail": {
                 "site_domain": domain,
@@ -320,8 +351,39 @@ pub async fn write_site_relay(
         })
         .await?;
 
+    // Every pass, including the passes that wrote nothing. `ConfigEngine::apply`
+    // returns early when the rendered body is byte-identical to what is on disk,
+    // which means it does not chmod either — so a server whose relay config was
+    // created wide by an earlier version of the panel would keep that mode for
+    // as long as its relay settings did not change, which in practice is
+    // forever. This is the migration: the next thing that touches a site's mail
+    // fixes the file and says in the task log that it did.
+    if let Some(previous) = file.enforce_mode()? {
+        ctx.log(format!(
+            "tightened {} from {previous:04o} to {:04o}: it carries the upstream relay's \
+             username and password",
+            path.display(),
+            file.mode
+        ));
+    }
     chown_to_tenant_group(&path, linux_user)?;
     Ok(Some(sendmail_path(&agent, domain)))
+}
+
+/// Create `/etc/unihelm/mail` and hold it at [`MAIL_DIR_MODE`], reporting the
+/// mode it had if that had to change.
+///
+/// Takes the directory rather than calling `paths::mail_dir()` so the tests can
+/// work in a temporary tree: `paths::set_root` is a process-wide `OnceLock` a
+/// parallel test cannot claim.
+fn prepare_mail_dir(dir: &std::path::Path) -> Result<Option<u32>> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        UnihelmError::internal(format!("could not create the mail config directory: {e}"))
+    })?;
+    // Re-asserted rather than set once at creation, for the same reason the
+    // file's mode is: a directory an older panel created 0755 is only ever
+    // narrowed by a step that runs on a directory that already exists.
+    Ok(unihelm_config::managed::enforce_mode(dir, MAIL_DIR_MODE)?)
 }
 
 fn remove_site_relay(path: &std::path::Path) -> Result<()> {
@@ -651,9 +713,16 @@ pub struct RelayView {
     pub dns: DnsAdvisory,
 }
 
-const CREDENTIAL_NOTE: &str = "PHP's mail() runs as each site's own Linux user, so that user can read the relay \
-     credential for their own site (and no other site's). Use a send-only credential scoped \
-     to this server, and rotate it here rather than reusing an account password.";
+/// This said the tenant could read the credential "for their own site (and no
+/// other site's)", which reads as containment and is not. There is one relay for
+/// the whole server, so a tenant reading their own file is holding the operator's
+/// relay password — the thing an operator has to know before they paste in an
+/// account password instead of a send-only key.
+const CREDENTIAL_NOTE: &str = "This server has one relay credential and PHP's mail() runs as each site's own Linux \
+     user, so every tenant with a PHP site can read the credential this server sends with. \
+     The per-site file is root-owned and 0640, so a tenant cannot edit it or read another \
+     site's copy — but the secret inside every copy is the same one. Use a send-only \
+     credential made for this server, never an account password, and rotate it here.";
 
 fn view(relay: Option<&MailRelay>) -> RelayView {
     RelayView {

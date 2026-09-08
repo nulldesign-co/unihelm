@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import {
   AlertTriangle,
@@ -8,22 +8,28 @@ import {
   Cpu,
   HardDrive,
   MemoryStick,
+  Power,
   Server,
   ShieldCheck,
   Slash,
   Timer,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Field, Input } from "@/components/ui/input";
 import { Meter } from "@/components/ui/meter";
 import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton, StatSkeleton } from "@/components/ui/skeleton";
 import {
+  api,
+  ApiError,
   endpoints,
   type Overview,
   type ServiceStatus,
@@ -37,6 +43,44 @@ import { cn, formatBytes, formatPercent, formatUptime } from "@/lib/utils";
 
 /** A disk this full is a problem the operator should be told about, not shown. */
 const DISK_ALARM_PCT = 90;
+
+/**
+ * `server.reboot.status`, as the agent answers it.
+ *
+ * Three states, not two, and the third is the point: a machine whose
+ * restart-pending flag could not be read reports `unknown` with the reason,
+ * never `not_required`. "This server does not need restarting" and "the panel
+ * could not tell" are different sentences, and rendering them the same turns an
+ * unknown into a reassurance.
+ */
+export type RebootRequirement =
+  | { state: "not_required" }
+  | { state: "required"; packages: string[]; evidence: string }
+  | { state: "unknown"; reason: string };
+
+export interface RebootStatus {
+  requirement: RebootRequirement;
+  /** What the confirmation asks to be retyped; `null` when it could not be read. */
+  hostname: string | null;
+  hostname_error?: string;
+  /** Every site that stops for the duration of the restart. */
+  sites: string[];
+  site_count: number;
+}
+
+interface RebootScheduled {
+  hostname: string;
+  in_seconds: number;
+  sites_stopping: string[];
+  note: string;
+}
+
+const rebootApi = {
+  status: () => api.get<RebootStatus>("/api/server/reboot"),
+  /** The typed hostname goes over the wire; the agent compares it to the machine's own. */
+  reboot: (confirmHostname: string) =>
+    api.post<RebootScheduled>("/api/server/reboot", { confirm_hostname: confirmHostname }),
+};
 
 const SERVICE_TONE: Record<UnitState, "success" | "danger" | "warning" | "neutral"> = {
   active: "success",
@@ -70,6 +114,15 @@ export function DashboardPage() {
     enabled: user?.permissions.includes("server_read") ?? false,
     retry: false,
   });
+  // Not on an interval. A pending restart does not resolve itself while
+  // somebody watches the page — it resolves when they restart the machine, and
+  // that reloads everything anyway.
+  const reboot = useQuery({
+    queryKey: ["reboot-status"],
+    queryFn: rebootApi.status,
+    enabled: user?.permissions.includes("server_read") ?? false,
+    retry: false,
+  });
 
   const data = overview.data;
   const metrics = data?.metrics;
@@ -81,6 +134,7 @@ export function DashboardPage() {
     overview: data,
     services: services.data,
     openAlertCount: openAlerts.data?.events.length ?? null,
+    reboot: reboot.data,
   });
 
   return (
@@ -114,6 +168,12 @@ export function DashboardPage() {
               ) : null}
             </Callout>
           ) : null}
+
+          {/* The banner counts it; this is where it can be acted on. Below the
+              agent notice deliberately: an agent that is not answering cannot
+              restart anything, and the panel should not offer a button that
+              would fail. */}
+          {reboot.data ? <RebootNotice status={reboot.data} /> : null}
 
           {metrics ? (
             <>
@@ -232,6 +292,28 @@ export function DashboardPage() {
   );
 }
 
+/**
+ * How a pending restart is said out loud.
+ *
+ * "Reboot required" moves nobody. "The kernel was updated and this server is
+ * still running the old one" does, which is why the package list is carried all
+ * the way from the marker file to here. Shared by the banner entry and the
+ * notice below it so the two cannot end up describing one machine differently.
+ *
+ * Three keys rather than one plural: with a single package there is no
+ * remainder to count, and `{{count}}` of 0 takes English's *plural* branch —
+ * which is how "and 0 more packages" reaches an operator.
+ */
+function rebootLabel(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  packages: string[],
+  keys: { none: string; one: string; many: string },
+): string {
+  if (packages.length === 0) return t(keys.none);
+  if (packages.length === 1) return t(keys.one, { package: packages[0] });
+  return t(keys.many, { package: packages[0], count: packages.length - 1 });
+}
+
 interface Problem {
   id: string;
   label: string;
@@ -262,12 +344,15 @@ export function collectProblems({
   overview,
   services,
   openAlertCount,
+  reboot,
 }: {
   t: (key: string, options?: Record<string, unknown>) => string;
   locale: string;
   overview?: Overview;
   services?: ServicesResponse;
   openAlertCount: number | null;
+  /** Absent while `server.reboot.status` is in flight, or when it 404s. */
+  reboot?: RebootStatus;
 }): Problem[] {
   const problems: Problem[] = [];
   if (!overview) return problems;
@@ -316,6 +401,30 @@ export function collectProblems({
 
   if (overview.system?.firewall_backend === "none") {
     problems.push({ id: "firewall", label: t("dashboard.health.firewallOff"), to: "/firewall" });
+  }
+
+  // A restart the machine is waiting for, and — separately — a restart state
+  // the panel could not establish.
+  //
+  // The unknown is here rather than swallowed because this banner's green face
+  // says "nothing on this server needs your attention right now", and that is a
+  // claim. On a Debian install without `update-notifier-common` nothing ever
+  // writes the restart flag, so staying silent about it would let the banner
+  // make that claim on evidence nobody gathered. Neither entry links anywhere:
+  // the notice directly under the banner is where a restart is explained and
+  // offered, and it is already on this page.
+  if (reboot?.requirement.state === "required") {
+    problems.push({
+      id: "reboot",
+      label: rebootLabel(t, reboot.requirement.packages, {
+        none: "dashboard.health.rebootRequired",
+        one: "dashboard.health.rebootRequiredFor",
+        many: "dashboard.health.rebootRequiredForMany",
+      }),
+      to: null,
+    });
+  } else if (reboot?.requirement.state === "unknown") {
+    problems.push({ id: "reboot-unknown", label: t("dashboard.health.rebootUnknown"), to: null });
   }
 
   // The panel's own memory is deliberately *not* here. It used to be: an 80 MB
@@ -409,6 +518,206 @@ function HealthBanner({ problems }: { problems: Problem[] }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * The restart this machine is waiting for, and the only place to act on it.
+ *
+ * Nothing is drawn when the answer is "not required" — a notice that appears on
+ * a healthy server is one an operator learns to scroll past. An *unknown* is
+ * drawn, because the banner above it claims "nothing needs your attention" when
+ * it is empty, and that claim must not rest on a check that could not run.
+ *
+ * The restart itself is behind a dialog rather than this button, and the dialog
+ * is behind retyping the hostname. Every site on the machine stops and the
+ * panel stops with them; that is not a single-click action.
+ */
+function RebootNotice({ status }: { status: RebootStatus }) {
+  const { t } = useTranslation();
+  const { user } = useSession();
+  const [open, setOpen] = useState(false);
+
+  const requirement = status.requirement;
+  if (requirement.state === "not_required") return null;
+
+  const required = requirement.state === "required";
+  // A restart nobody can perform is a notice with a dead button on it. The
+  // agent refuses this operation without `server_manage` anyway; not drawing
+  // the control is how the page stops promising what it cannot do.
+  const canRestart =
+    (user?.permissions.includes("server_manage") ?? false) && status.hostname !== null;
+
+  return (
+    <>
+      <Callout
+        tone="warning"
+        title={
+          required
+            ? rebootLabel(t, requirement.packages, {
+                none: "dashboard.reboot.required",
+                one: "dashboard.reboot.requiredFor",
+                many: "dashboard.reboot.requiredForMany",
+              })
+            : t("dashboard.reboot.unknownTitle")
+        }
+        action={
+          canRestart ? (
+            <Button variant="danger" onClick={() => setOpen(true)}>
+              <Power className="h-4 w-4" aria-hidden />
+              {t("dashboard.reboot.action")}
+            </Button>
+          ) : null
+        }
+      >
+        <p>
+          {required ? t("dashboard.reboot.requiredHint") : requirement.reason}
+        </p>
+        <p className="mt-1">
+          {status.site_count > 0
+            ? t("dashboard.reboot.cost", { count: status.site_count })
+            : t("dashboard.reboot.costNoSites")}
+        </p>
+        {/* Said here as well as in the dialog: an operator who cannot restart
+            from the panel needs to know that before they go looking for the
+            button, not after. */}
+        {!canRestart && status.hostname === null ? (
+          <p className="mt-1">{t("dashboard.reboot.noHostname")}</p>
+        ) : null}
+      </Callout>
+
+      {status.hostname !== null ? (
+        <RebootDialog
+          open={open}
+          onClose={() => setOpen(false)}
+          hostname={status.hostname}
+          sites={status.sites}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * Retype the hostname, then restart.
+ *
+ * The typed value is what goes over the wire — the agent compares it against
+ * the machine's own name, so sending back the one we were handed would turn its
+ * check into a no-op.
+ */
+function RebootDialog({
+  open,
+  onClose,
+  hostname,
+  sites,
+}: {
+  open: boolean;
+  onClose: () => void;
+  hostname: string;
+  sites: string[];
+}) {
+  const { t } = useTranslation();
+  const [typed, setTyped] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [scheduled, setScheduled] = useState<RebootScheduled | null>(null);
+
+  const armed = typed.trim() === hostname;
+
+  const restart = useMutation({
+    mutationFn: () => rebootApi.reboot(typed.trim()),
+    // Deliberately not closed on success, and nothing is invalidated: the
+    // machine is going down in a minute and every refetch from here would fail.
+    // What the agent answered is the last true thing this page will say.
+    onSuccess: setScheduled,
+    onError: (e) => setError(e instanceof ApiError ? e.message : String(e)),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={t("dashboard.reboot.dialogTitle", { hostname })}
+      description={scheduled ? undefined : t("dashboard.reboot.dialogHint")}
+      footer={
+        scheduled ? (
+          <Button variant="secondary" onClick={onClose}>
+            {t("common.close")}
+          </Button>
+        ) : (
+          <>
+            <Button variant="ghost" onClick={onClose}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="danger"
+              disabled={!armed}
+              loading={restart.isPending}
+              onClick={() => {
+                setError(null);
+                restart.mutate();
+              }}
+            >
+              {t("dashboard.reboot.confirm")}
+            </Button>
+          </>
+        )
+      }
+    >
+      {scheduled ? (
+        // The agent's own sentence, not a translated paraphrase of it. It is
+        // the only statement anywhere that says the panel cannot tell the
+        // operator when the machine is back, and one copy of that cannot drift
+        // from another.
+        <Callout tone="info" title={t("dashboard.reboot.scheduledTitle")}>
+          {scheduled.note}
+        </Callout>
+      ) : (
+        <div className="space-y-3">
+          <Callout tone="danger" title={t("dashboard.reboot.warning")}>
+            {sites.length > 0 ? (
+              <>
+                <p>{t("dashboard.reboot.stopping", { count: sites.length })}</p>
+                <ul className="mt-1 list-disc space-y-0.5 ps-5 font-mono text-xs">
+                  {/* Capped, with the remainder counted rather than hidden:
+                      a hundred domains would push the confirmation off the
+                      screen, and a truncated list that does not say it is
+                      truncated understates what is about to stop. */}
+                  {sites.slice(0, 8).map((site) => (
+                    <li key={site}>{site}</li>
+                  ))}
+                </ul>
+                {sites.length > 8 ? (
+                  <p className="mt-1">
+                    {t("dashboard.reboot.andMore", { count: sites.length - 8 })}
+                  </p>
+                ) : null}
+              </>
+            ) : (
+              <p>{t("dashboard.reboot.stoppingNoSites")}</p>
+            )}
+          </Callout>
+          <Field
+            label={t("dashboard.reboot.typeHostname", { hostname })}
+            htmlFor="reboot-confirm-hostname"
+            error={typed.length > 0 && !armed ? t("dashboard.reboot.hostnameMismatch") : undefined}
+          >
+            <Input
+              id="reboot-confirm-hostname"
+              autoComplete="off"
+              autoFocus
+              placeholder={hostname}
+              value={typed}
+              onChange={(event) => setTyped(event.target.value)}
+            />
+          </Field>
+          {error ? (
+            <p role="alert" className="text-sm text-danger">
+              {error}
+            </p>
+          ) : null}
+        </div>
+      )}
+    </Dialog>
   );
 }
 

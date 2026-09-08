@@ -300,6 +300,11 @@ pub fn action_for(command: &Command, secrets: &Secrets) -> Result<Action> {
         Command::Quota(cmd) => quota(cmd),
         Command::Sftp(cmd) => sftp(cmd, secrets),
         Command::Security(SecurityCommand::Posture) => call("security.posture", json!({})),
+        Command::Server(ServerCommand::RebootStatus) => call("server.reboot.status", json!({})),
+        Command::Server(ServerCommand::Reboot { confirm_hostname }) => call(
+            "server.reboot",
+            json!({ "confirm_hostname": confirm_hostname }),
+        ),
     };
     Ok(action)
 }

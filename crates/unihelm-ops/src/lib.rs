@@ -56,6 +56,7 @@ pub mod quota;
 pub mod registry;
 pub mod runtime_default;
 pub mod runtimes;
+pub mod server;
 pub mod services;
 pub mod sftp;
 pub mod site;

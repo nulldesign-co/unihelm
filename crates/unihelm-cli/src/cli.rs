@@ -150,6 +150,9 @@ pub enum Command {
     /// Security posture of the server.
     #[command(subcommand)]
     Security(SecurityCommand),
+    /// Whether this machine is running code it has already replaced.
+    #[command(subcommand)]
+    Server(ServerCommand),
 
     /// Print a shell completion script.
     ///
@@ -1857,6 +1860,29 @@ pub enum SftpCommand {
 pub enum SecurityCommand {
     /// Scan the server and report what is weak.
     Posture,
+}
+
+// ---------------------------------------------------------------------------
+// server
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+pub enum ServerCommand {
+    /// Report whether a restart is pending, and what one would stop.
+    ///
+    /// A machine where the check cannot run answers `unknown` rather than a
+    /// clean result: claiming a server does not need restarting when nobody
+    /// could tell is the reassurance that gets a kernel patch left unapplied.
+    RebootStatus,
+    /// Restart the machine.
+    ///
+    /// Every site on it stops until it is back, and the panel goes down with
+    /// it — so the panel cannot tell you when it returns. The hostname has to
+    /// be retyped.
+    Reboot {
+        /// This machine's hostname, retyped.
+        confirm_hostname: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -4,12 +4,19 @@
 # points at. Unihelm runs no mail server: this file is the address of somebody
 # else's submission service plus the credential to use with it.
 #
-# MODE AND OWNERSHIP MATTER. This file is 0640, owned root:{{ mail.group }}.
-# PHP's mail() runs as the site's own Linux user, so that user has to be able
-# to read the credential — that exposure is inherent to relay-only mail and is
-# why the relay credential should be a send-only one, scoped to this server and
-# rotatable without touching anything else (spec §11.18, and the note in
-# unihelm_ops::mail). No other tenant can read it.
+# MODE AND OWNERSHIP MATTER. This file is 0640, owned root:{{ mail.group }}, in
+# a directory that is 0711 so it cannot be listed. PHP's mail() runs as the
+# site's own Linux user, so that user has to be able to read the credential —
+# that exposure is inherent to relay-only mail. Root ownership is what stops
+# them editing it and pointing this site's mail at a relay of their own while
+# still sending as the operator's domain.
+#
+# What the mode does NOT do: this server has one relay, so the username and
+# password below are the same in every site's copy of this file. Any tenant who
+# can read their own copy is holding the credential the server itself sends
+# with. That is why it should be a send-only credential, scoped to this server
+# and rotatable without touching anything else (spec §11.18, and the note in
+# unihelm_ops::mail) — never an account password.
 
 defaults
 # msmtp is told to log through syslog rather than to a file: the process runs

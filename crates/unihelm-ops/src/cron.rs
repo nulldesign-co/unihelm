@@ -2,7 +2,7 @@
 //!
 //! A tenant's crontab is a **rendering of the panel database**, never a file
 //! the panel edits in place. Every change re-renders the whole thing from
-//! `cron_jobs` and installs it with `crontab -u <user> -` on stdin. Two
+//! `cron_jobs` and installs it as `/etc/cron.d/unihelm-<user>`. Two
 //! properties follow from that, and both are the reason for the design:
 //!
 //! * **Deterministic.** The same set of jobs always produces byte-identical
@@ -40,34 +40,100 @@
 //!   Every alias (`@daily`, `@hourly`, …) is expressible in five fields, so
 //!   refusing them costs a tenant nothing.
 //!
+//! # Every job runs inside its tenant's slice
+//!
+//! Until this was fixed the jobs were installed in the tenant's *spool*
+//! crontab (`crontab -u <user> -`), and that is what let a scheduled job escape
+//! the plan: a spool line is executed by cron **as the tenant**, and an
+//! unprivileged process cannot put itself into a system slice —
+//! `systemd-run --slice=` needs authorisation the tenant does not have, and
+//! `systemd-run --user` lands in `user-<uid>.slice`, a different cgroup with
+//! none of the plan's limits on it. So every tenant's jobs ran in
+//! `cron.service`'s own cgroup under `system.slice`: one customer's runaway
+//! loop with the whole machine's memory and CPU, which is the exact failure
+//! `unihelm_ops::slices` exists to prevent, on the one code path that had
+//! opted out of it.
+//!
+//! The jobs therefore live in `/etc/cron.d/unihelm-<user>` instead, whose lines
+//! carry a **user field** — and that field is `root`, because placing a process
+//! in a system slice is a privileged operation and cron is the only privileged
+//! thing in the picture. Each enabled job renders as:
+//!
+//! ```text
+//! <schedule> root systemd-run --quiet --collect --wait --pipe
+//!     --slice='unihelm-<user>.slice' --uid=<user>
+//!     --working-directory=<home> -- /bin/sh%<command>
+//! ```
+//!
+//! Every piece of that is load-bearing:
+//!
+//! * `--slice=` is the fix. The transient unit is created inside the tenant's
+//!   slice, so `MemoryMax`, `CPUQuota` and `TasksMax` bind the job the same way
+//!   they bind the tenant's Node apps.
+//! * `--uid=` keeps the job the tenant's own. systemd sets `User=` from it, and
+//!   with it `$USER`, `$LOGNAME`, `$HOME` and `$SHELL` out of the passwd entry;
+//!   `--working-directory=` reproduces cron's own `cd $HOME`. The one thing
+//!   that does differ from a spool crontab is `$PATH`: it is systemd's default
+//!   rather than cron's `/usr/bin:/bin`, which is a superset, so a command that
+//!   resolved before still resolves.
+//! * `--wait --pipe` is why a failing job is still reported exactly as before:
+//!   the job's exit status becomes `systemd-run`'s, and its output goes to
+//!   cron's pipes rather than into the journal, so cron mails it to the
+//!   `MAILTO=<user>` at the top of the file. `--quiet` keeps the "Running as
+//!   unit …" banner out of that mail and `--collect` reaps the transient unit
+//!   afterwards, including when it failed.
+//! * `%<command>` is cron's own convention, and it is what makes this safe.
+//!   Both cron implementations turn the first unescaped `%` in the command
+//!   field into a newline and feed **everything after it to the command on
+//!   standard input**. So the root shell that starts `systemd-run` parses only
+//!   panel-written text, and the tenant's command arrives at `/bin/sh` as
+//!   *data* on a pipe. There is no quoting step, and therefore no quoting bug
+//!   that could let a command break out of the wrapper and run as root. (The
+//!   `%`s inside the command itself are still escaped to `\%`, as they always
+//!   were, so they stay literal instead of ending the command early.)
+//!
+//! Two things this is **not**:
+//!
+//! * It is not retroactive. A job installed before this change is a line in
+//!   that tenant's spool crontab, and it keeps running outside the slice until
+//!   the panel next re-renders that subscription — at which point the install
+//!   writes the `/etc/cron.d` file and then removes the spool crontab it had
+//!   written, so the jobs move rather than doubling up.
+//! * It is not a claim about jobs the panel did not write. A tenant with shell
+//!   access can still run `crontab -e`, and those lines run under
+//!   `system.slice` like any other user's. The panel refuses to manage cron for
+//!   an account whose spool crontab it did not write ([`ensure_crontab_is_ours`])
+//!   and the refusal says so, which is the most an out-of-band file allows.
+//!
+//! A tenant whose slice unit does not exist has no ceiling to run in, so
+//! [`resolve_placement`] **refuses** rather than rendering a line that would run
+//! unconstrained: silently dropping `--slice=` would be the panel reporting a
+//! confined job it had not confined.
+//!
 //! # Why not the config engine
 //!
 //! Everything else the panel owns goes through `unihelm_config::apply` and its
-//! hash-in-the-header drift detection (spec §10.4). A crontab cannot: the file
-//! lives in cron's spool directory (`/var/spool/cron/crontabs/<user>` on
-//! Debian, `/var/spool/cron/<user>` on RHEL), its permissions and its mtime are
-//! cron's business, and writing it directly is how you get a crontab cron never
-//! reloads. The `crontab` binary is the supported way in, so it is the way this
-//! module goes in.
+//! hash-in-the-header drift detection (spec §10.4). This file does not, for one
+//! reason: its content is a rendering of *rows*, each of which is re-validated
+//! in Rust on the way out (see [`render_crontab`]), and the engine's contract is
+//! a template plus a JSON context. What the engine would add here is revision
+//! history, not safety.
 //!
-//! What does carry over is §10.4 rule 2 — never clobber a human's file. Before
-//! the first install, the account's existing crontab is read and, if it is not
-//! one of ours, the operation **refuses** instead of overwriting it
-//! ([`ensure_crontab_is_ours`]). Beyond that first check the panel does own the
-//! file, and the header says so in as many words.
-//!
-//! # Slices
-//!
-//! Tenant cron jobs do **not** run inside `unihelm-<user>.slice`. That is a real
-//! gap, not an oversight, and it is written up in [`crate::slices`] — the short
-//! version is that the crontab line is executed by cron *as the tenant*, and an
-//! unprivileged process cannot place itself into a system slice.
+//! The part of §10.4 that does carry over is rule 2 — never clobber a human's
+//! file — and it is enforced directly, on **both** files this module touches:
+//! the `/etc/cron.d` file it writes and the spool crontab it retires. Either
+//! one that does not carry the panel's marker makes the operation **refuse**
+//! instead of overwriting it. The check runs on every apply rather than only
+//! the first: ownership is a fact about the file, and somebody who ran
+//! `crontab -e` after the first install has taken it back.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use unihelm_config::paths;
 use unihelm_core::{
     ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantScope, UnihelmError,
 };
@@ -85,7 +151,23 @@ use crate::registry::{Execution, OpContext, TypedOperation};
 /// one that was saved. 1024 characters is comfortably inside every
 /// implementation's budget once the schedule is prepended, and a command longer
 /// than that belongs in a script file the job invokes.
+///
+/// This is the bound on what may be *stored*. What actually reaches cron is the
+/// whole line, wrapper included, and [`MAX_CRONTAB_LINE_CHARS`] is the bound on
+/// that — a command near this cap is refused before it is stored, with a message
+/// saying by how much it overruns.
 pub const MAX_COMMAND_CHARS: usize = 1024;
+
+/// The longest line this module will hand to cron, wrapper and schedule
+/// included.
+///
+/// `MAX_COMMAND` is 1000 in both Vixie cron and cronie, and a longer line is
+/// dropped or truncated by the daemon — either way the tenant's job silently
+/// stops being the job they saved. Placing the job in its slice costs ~150
+/// characters of that budget, which is exactly why this check exists: without
+/// it, adding the wrapper would have turned a legal 1000-character job into a
+/// truncated one with no error anywhere.
+const MAX_CRONTAB_LINE_CHARS: usize = 1000;
 
 /// A sanity bound on the schedule text before it is even split into fields, so
 /// a megabyte of commas cannot become a megabyte of parser work.
@@ -98,6 +180,15 @@ const MANAGED_MARKER: &str = "# UNIHELM-MANAGED cron";
 /// `crontab` reads a file and exits; it has no work to do that could take
 /// longer than this, and a hang here would hold an IPC round trip open.
 const CRONTAB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Mode of the `/etc/cron.d` file the panel writes.
+///
+/// Not the 0644 that packaged cron.d files usually carry: a command field can
+/// hold an API token (`curl -H "Authorization: …"`), and the spool crontab this
+/// file replaces was 0600. Only root reads `/etc/cron.d`, and both cron
+/// implementations check the file is root-owned and not group- or
+/// other-*writable* — neither requires it to be readable by anyone else.
+const CRON_D_MODE: u32 = 0o600;
 
 // ---------------------------------------------------------------------------
 // Schedule validation — pure functions
@@ -371,6 +462,111 @@ fn escape_command(command: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Slice placement
+// ---------------------------------------------------------------------------
+
+/// Where one subscription's jobs run: the tenant's slice, uid and home.
+///
+/// Resolved once per apply and then handed to the renderer, so every line in a
+/// file is placed identically and no code path can render a job without having
+/// first proven there is a ceiling to put it in. Public because
+/// [`render_crontab`] takes one; deliberately not constructible from outside
+/// this module, because [`resolve_placement`] is the only thing that has
+/// checked the slice actually exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlicePlacement {
+    /// `unihelm-<user>.slice`, as [`crate::slices::slice_file_name`] spells it.
+    slice_unit: String,
+    linux_user: String,
+    /// The job's working directory, matching cron's own `cd $HOME`.
+    home: String,
+}
+
+/// The tenant's placement, or a refusal naming what is missing.
+///
+/// The precondition is the slice **unit file**, the same thing
+/// `appcontainer` checks before it passes `--cgroup-parent`. The difference is
+/// what happens when it is absent: a container without a slice still serves the
+/// tenant's site, so that path degrades; a cron job without a slice is the
+/// unbounded job this whole arrangement exists to prevent, so this path refuses.
+/// `provision::ensure_tenant_user` writes the unit when the account is created,
+/// so the only way to reach this refusal is an account provisioned before slices
+/// existed or a unit somebody removed by hand — both fixable, and the message
+/// says how.
+async fn resolve_placement(host: &dyn CronHost, user: &LinuxUser) -> Result<SlicePlacement> {
+    let slice_unit = crate::slices::slice_file_name(user);
+    if !host.slice_unit_exists(&slice_unit).await? {
+        return Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "`{}` has no resource-limit slice on this host: {} is missing, so a \
+                 cron job for this subscription could only run with the whole \
+                 machine's memory and CPU. The panel will not schedule it \
+                 unconfined. Re-provision this subscription to write the slice \
+                 unit, then save the job again.",
+                user.as_str(),
+                paths::systemd_unit(&slice_unit).display()
+            ),
+        ));
+    }
+    Ok(SlicePlacement {
+        slice_unit,
+        linux_user: user.as_str().to_string(),
+        home: paths::tenant_home(user.as_str()).display().to_string(),
+    })
+}
+
+/// Everything on a job line between the schedule and the tenant's own command.
+///
+/// Assembled in one place because it is the security boundary: every character
+/// of it is panel-written, and the tenant's command is appended *after* the `%`
+/// that cron turns into "the rest is stdin". See the module docs for what each
+/// flag is doing there.
+fn slice_wrapper(placement: &SlicePlacement) -> String {
+    // The slice name is the one value here that can contain a backslash: a
+    // hyphen in a Linux account (legal, and what a cPanel import brings in) is
+    // escaped to `\x2d` by `slices::slice_file_name`, because in a *slice* name
+    // a hyphen is a nesting level. The shell that cron hands this line to would
+    // eat that backslash and ask systemd for a slice nobody has — a job that
+    // never runs, under a panel that said it had scheduled one. Single quotes
+    // stop that, and they are airtight here: a Linux account name cannot
+    // contain a quote, so nothing in this value can end them.
+    format!(
+        "root systemd-run --quiet --collect --wait --pipe --slice='{}' --uid={} \
+         --working-directory={} -- /bin/sh",
+        placement.slice_unit, placement.linux_user, placement.home
+    )
+}
+
+/// One job's crontab line, wrapper included.
+///
+/// Shared by the renderer and by `cron.set`'s pre-write check so that a command
+/// which cannot be written is refused *before* it becomes a row, rather than
+/// after — a row that no longer renders would take the tenant's other jobs down
+/// with it on every later apply.
+fn job_line(schedule: &str, command: &str, placement: &SlicePlacement) -> Result<String> {
+    let wrapper = slice_wrapper(placement);
+    // No space around the `%`: it is cron's command/stdin separator, and the
+    // command begins at the character after it.
+    let line = format!("{schedule} {wrapper}%{}", escape_command(command));
+
+    let length = line.chars().count();
+    if length > MAX_CRONTAB_LINE_CHARS {
+        return Err(invalid_command(format!(
+            "this job's crontab line would be {length} characters and cron drops \
+             or truncates a line over {MAX_CRONTAB_LINE_CHARS}; shorten the \
+             command by {} characters, or move it into a script the job calls. \
+             ({} characters of the budget place the job inside `{}`, which is not \
+             optional.)",
+            length - MAX_CRONTAB_LINE_CHARS,
+            wrapper.chars().count() + 1,
+            placement.slice_unit,
+        )));
+    }
+    Ok(line)
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -386,12 +582,20 @@ fn escape_command(command: &str) -> String {
 /// Disabled jobs are rendered as comments. They are part of what the tenant
 /// configured, and an operator reading the file should see the same list the
 /// panel shows.
-pub fn render_crontab(subscription_id: SubscriptionId, jobs: &[CronJob]) -> Result<String> {
+///
+/// The `placement` is not optional and not defaulted: a caller that has not
+/// resolved the tenant's slice cannot render a line, which is what keeps
+/// "the job runs inside the plan's ceiling" true of every line in the file
+/// rather than of the lines somebody remembered to wrap.
+pub fn render_crontab(
+    subscription_id: SubscriptionId,
+    jobs: &[CronJob],
+    placement: &SlicePlacement,
+) -> Result<String> {
     // Deliberately pure ASCII, unlike the rest of this codebase's prose. The
-    // file is handed to `crontab` and then read by the cron daemon, and there
-    // is no reason to find out on somebody's server which of them is the one
-    // that does not like a UTF-8 comment.
-    let mut out = String::with_capacity(256 + jobs.len() * 96);
+    // file is read by the cron daemon, and there is no reason to find out on
+    // somebody's server whether this build of it likes a UTF-8 comment.
+    let mut out = String::with_capacity(512 + jobs.len() * 224);
     out.push_str(MANAGED_MARKER);
     out.push_str(" -- generated by the Unihelm panel (spec 11.8).\n");
     out.push_str("#\n");
@@ -404,6 +608,19 @@ pub fn render_crontab(subscription_id: SubscriptionId, jobs: &[CronJob]) -> Resu
     out.push_str("#\n");
     out.push_str("# Jobs are sorted by schedule, then command, so the same set of jobs\n");
     out.push_str("# always renders the same file.\n");
+    out.push_str("#\n");
+    out.push_str(&format!(
+        "# Each job runs as {} inside {},\n",
+        placement.linux_user, placement.slice_unit
+    ));
+    out.push_str("# so a runaway job is bounded by this subscription's plan and not by\n");
+    out.push_str("# the machine. The command itself reaches /bin/sh on standard input\n");
+    out.push_str("# (cron's % convention), so no part of it is ever parsed by the root\n");
+    out.push_str("# shell that starts systemd-run.\n");
+    // Output and exit status still belong to the tenant, not to root: `--pipe`
+    // hands the job's output back to cron, and this is where cron sends it.
+    // Without it every failing job would mail root instead of the customer.
+    out.push_str(&format!("MAILTO={}\n", placement.linux_user));
 
     for job in jobs {
         let schedule = validate_schedule(&job.schedule).map_err(|e| {
@@ -420,7 +637,12 @@ pub fn render_crontab(subscription_id: SubscriptionId, jobs: &[CronJob]) -> Resu
                 job.id, e.detail
             ))
         })?;
-        let line = format!("{schedule} {}", escape_command(&command));
+        let line = job_line(&schedule, &command, placement).map_err(|e| {
+            UnihelmError::internal(format!(
+                "cron job {} cannot be written to a crontab: {}",
+                job.id, e.detail
+            ))
+        })?;
 
         out.push('\n');
         if job.enabled {
@@ -473,29 +695,63 @@ pub fn is_unihelm_crontab(existing: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Talking to the crontab binary
+// The host side: cron's files and the tenant's slice unit
 // ---------------------------------------------------------------------------
 
-/// Reading and writing one account's crontab.
+/// `/etc/cron.d/unihelm-<user>` — the file this module owns for one tenant.
 ///
-/// A trait so the operations can be tested without a `crontab` binary, a cron
-/// spool, or root — the same seam `plan::VhostSwitcher` uses, and for the same
-/// reason: the interesting behaviour (refusing a foreign crontab, rendering
-/// deterministically) is not the subprocess.
-#[async_trait]
-pub trait CrontabIo: Send + Sync {
-    /// The account's current crontab, or `None` if it has none.
-    async fn read(&self, user: &LinuxUser) -> Result<Option<String>>;
-
-    /// Replace the account's crontab with `content`.
-    async fn install(&self, user: &LinuxUser, content: &str) -> Result<()>;
+/// The name carries no dot, which both cron implementations skip over (Debian's
+/// cron wants `[A-Za-z0-9_-]+` outright; cronie ignores `.` and `~`). That is
+/// also what makes the `.tmp` file the install renames from safe: cron will not
+/// pick it up in the moment it exists.
+fn cron_d_file(user: &LinuxUser) -> PathBuf {
+    cron_d_dir().join(format!("unihelm-{}", user.as_str()))
 }
 
-pub struct LiveCrontab;
+fn cron_d_dir() -> PathBuf {
+    paths::root().join("etc/cron.d")
+}
+
+/// Everything on the machine that scheduling a job touches.
+///
+/// A trait so the operations can be tested without a `crontab` binary, an
+/// `/etc/cron.d`, or root — the same seam `plan::VhostSwitcher` uses, and for
+/// the same reason: the interesting behaviour (refusing a foreign crontab,
+/// refusing a tenant with no slice, rendering deterministically) is not the
+/// subprocess. The slice-unit check lives here rather than reading the
+/// filesystem directly for exactly that reason — `paths::set_root` is a
+/// process-wide `OnceLock`, so a parallel test binary has no other way to say
+/// "this host has no slice for that tenant".
+#[async_trait]
+pub trait CronHost: Send + Sync {
+    /// The account's own spool crontab (`crontab -u <user> -l`), or `None`.
+    ///
+    /// Read on every apply even though the panel no longer writes it: a job
+    /// the panel installed before jobs moved into the slice still lives there,
+    /// and a crontab somebody else wrote is a refusal.
+    async fn read_user_crontab(&self, user: &LinuxUser) -> Result<Option<String>>;
+
+    /// Drop the account's spool crontab (`crontab -u <user> -r`).
+    ///
+    /// Only ever called for a crontab this module has just recognised as its
+    /// own, and only after the replacement file is in place.
+    async fn remove_user_crontab(&self, user: &LinuxUser) -> Result<()>;
+
+    /// The panel's `/etc/cron.d` file for this tenant, or `None`.
+    async fn read_managed(&self, user: &LinuxUser) -> Result<Option<String>>;
+
+    /// Replace the panel's `/etc/cron.d` file for this tenant with `content`.
+    async fn install(&self, user: &LinuxUser, content: &str) -> Result<()>;
+
+    /// Does this host have the tenant's slice unit?
+    async fn slice_unit_exists(&self, unit_file_name: &str) -> Result<bool>;
+}
+
+pub struct LiveCronHost;
 
 #[async_trait]
-impl CrontabIo for LiveCrontab {
-    async fn read(&self, user: &LinuxUser) -> Result<Option<String>> {
+impl CronHost for LiveCronHost {
+    async fn read_user_crontab(&self, user: &LinuxUser) -> Result<Option<String>> {
         let out = Cmd::new("crontab")
             .args(["-u", user.as_str(), "-l"])
             .timeout(CRONTAB_TIMEOUT)
@@ -510,9 +766,9 @@ impl CrontabIo for LiveCrontab {
         // crontab", and neither offers a machine-readable way to say it — the
         // wording of the message differs between them and between locales, so
         // sniffing stderr would be worse than this. Exit 1 for an *unknown*
-        // account also lands here; that is fine, because the install that
-        // follows fails on the same account with a message that says so, and
-        // guessing at the difference from a string would be the fragile half.
+        // account also lands here; that is fine, because there is then nothing
+        // to retire and the install fails on the same account with a message
+        // that says so.
         if out.status == 1 {
             return Ok(None);
         }
@@ -527,19 +783,85 @@ impl CrontabIo for LiveCrontab {
         ))
     }
 
-    async fn install(&self, user: &LinuxUser, content: &str) -> Result<()> {
-        // The content goes in on **stdin**, not through a temporary file: a
-        // file would need a path only this tenant may read, a cleanup on every
-        // failure path, and a window where a job's command sits on disk under
-        // whatever umask the agent happens to have.
-        Cmd::new("crontab")
-            .args(["-u", user.as_str(), "-"])
-            .stdin_data(content.as_bytes().to_vec())
+    async fn remove_user_crontab(&self, user: &LinuxUser) -> Result<()> {
+        let out = Cmd::new("crontab")
+            .args(["-u", user.as_str(), "-r"])
             .timeout(CRONTAB_TIMEOUT)
-            .run_checked()
+            .run()
             .await
             .map_err(UnihelmError::from)?;
+        // Exit 1 again means "no crontab", which is the state this call was
+        // trying to reach: somebody removed it between the read and here.
+        if out.success() || out.status == 1 {
+            return Ok(());
+        }
+        Err(UnihelmError::new(
+            ErrorCode::CommandFailed,
+            format!(
+                "the jobs for `{}` now run in their slice, but their old crontab \
+                 could not be removed (exit {}): {}. Both copies will run until \
+                 `crontab -u {} -r` succeeds.",
+                user.as_str(),
+                out.status,
+                out.failure_text(),
+                user.as_str()
+            ),
+        ))
+    }
+
+    async fn read_managed(&self, user: &LinuxUser) -> Result<Option<String>> {
+        match tokio::fs::read_to_string(cron_d_file(user)).await {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                format!("could not read {}: {e}", cron_d_file(user).display()),
+            )),
+        }
+    }
+
+    async fn install(&self, user: &LinuxUser, content: &str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cron_d_dir();
+        // Not created if missing. A host with no /etc/cron.d has no cron
+        // daemon reading it, and conjuring the directory would let the panel
+        // report jobs as scheduled that nothing on the machine will ever run.
+        if !dir.is_dir() {
+            return Err(UnihelmError::new(
+                ErrorCode::ServiceUnavailable,
+                format!(
+                    "{} does not exist, so there is nowhere for cron to read this \
+                     subscription's jobs from — install a cron daemon (`cron` on \
+                     Debian, `cronie` on RHEL) and save the job again.",
+                    dir.display()
+                ),
+            ));
+        }
+
+        let path = cron_d_file(user);
+        // Written beside the target and renamed over it: cron scans the
+        // directory on its own clock, and a partially written file it reads
+        // mid-write is a partial schedule. The temporary name carries a dot,
+        // which is precisely the shape cron skips.
+        let tmp = dir.join(format!("unihelm-{}.tmp", user.as_str()));
+        let write = async {
+            tokio::fs::write(&tmp, content).await?;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(CRON_D_MODE)).await?;
+            tokio::fs::rename(&tmp, &path).await
+        };
+        if let Err(e) = write.await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(UnihelmError::new(
+                ErrorCode::CommandFailed,
+                format!("could not write {}: {e}", path.display()),
+            ));
+        }
         Ok(())
+    }
+
+    async fn slice_unit_exists(&self, unit_file_name: &str) -> Result<bool> {
+        Ok(paths::systemd_unit(unit_file_name).exists())
     }
 }
 
@@ -598,13 +920,52 @@ async fn ensure_plan_allows_cron(ctx: &OpContext, subscription: &Subscription) -
 
 /// Refuse to touch a crontab the panel did not write (spec §10.4 rule 2).
 ///
+/// Returns whether the account still has a **panel-written** spool crontab, i.e.
+/// jobs from before they moved into the slice, which the install retires once
+/// the replacement is in place.
+///
 /// Checked before the row is written, not after, so a refusal leaves the
 /// database exactly as it found it. It is re-checked on every apply rather than
 /// only on the first: the panel's ownership of the file is a fact about the
 /// file, and somebody who runs `crontab -e` after the first install has taken
 /// it back.
-async fn ensure_crontab_is_ours(io: &dyn CrontabIo, user: &LinuxUser) -> Result<()> {
-    let Some(existing) = io.read(user).await? else {
+///
+/// The refusal outlives the move to `/etc/cron.d`, where nothing of the
+/// tenant's is at risk of being overwritten, because the *other* half of it
+/// still holds: a crontab the panel did not write is a set of jobs the panel
+/// cannot see, running outside the tenant's slice, and managing cron alongside
+/// it would mean showing an operator a job list that is not the whole list.
+async fn ensure_crontab_is_ours(host: &dyn CronHost, user: &LinuxUser) -> Result<bool> {
+    let Some(existing) = host.read_user_crontab(user).await? else {
+        return Ok(false);
+    };
+    if is_unihelm_crontab(&existing) {
+        // Blank or comment-only counts as ours (see `is_unihelm_crontab`), and
+        // there is then nothing to retire — but removing it anyway is harmless
+        // and one less state to reason about, so presence is the answer.
+        return Ok(true);
+    }
+    Err(UnihelmError::new(
+        ErrorCode::Conflict,
+        format!(
+            "`{}` already has a crontab that Unihelm did not write. Its jobs run \
+             outside this subscription's resource limits and the panel cannot \
+             show or replace them. Save a copy (`crontab -u {} -l`), remove it \
+             (`crontab -u {} -r`), then add the jobs here.",
+            user.as_str(),
+            user.as_str(),
+            user.as_str()
+        ),
+    ))
+}
+
+/// The panel's own `/etc/cron.d` file, if a human has not taken it over.
+///
+/// The same rule as the spool crontab, applied to the file this module now
+/// writes: an operator who hand-edited `/etc/cron.d/unihelm-<user>` gets a
+/// refusal rather than a silent overwrite.
+async fn ensure_managed_file_is_ours(host: &dyn CronHost, user: &LinuxUser) -> Result<()> {
+    let Some(existing) = host.read_managed(user).await? else {
         return Ok(());
     };
     if is_unihelm_crontab(&existing) {
@@ -613,14 +974,34 @@ async fn ensure_crontab_is_ours(io: &dyn CrontabIo, user: &LinuxUser) -> Result<
     Err(UnihelmError::new(
         ErrorCode::Conflict,
         format!(
-            "`{}` already has a crontab that Unihelm did not write, and the panel \
-             will not overwrite it. Save a copy (`crontab -u {} -l`), remove it \
-             (`crontab -u {} -r`), then add the jobs here.",
-            user.as_str(),
-            user.as_str(),
-            user.as_str()
+            "{} exists and Unihelm did not write it, so the panel will not replace \
+             it. Move it aside, then save the job again.",
+            cron_d_file(user).display()
         ),
     ))
+}
+
+/// What the apply path proved about the host before anything was written.
+///
+/// Resolved once, before the database is touched, so that every refusal in it —
+/// a foreign crontab, a missing slice — leaves the panel and the machine
+/// agreeing about what is scheduled.
+struct CronTarget {
+    placement: SlicePlacement,
+    /// The tenant still has the panel's pre-slice spool crontab. Removed after
+    /// the `/etc/cron.d` file is in place, so the jobs move rather than run
+    /// twice.
+    legacy_spool_crontab: bool,
+}
+
+async fn prepare(host: &dyn CronHost, user: &LinuxUser) -> Result<CronTarget> {
+    let legacy_spool_crontab = ensure_crontab_is_ours(host, user).await?;
+    ensure_managed_file_is_ours(host, user).await?;
+    let placement = resolve_placement(host, user).await?;
+    Ok(CronTarget {
+        placement,
+        legacy_spool_crontab,
+    })
 }
 
 /// Re-render this subscription's crontab from the database and install it.
@@ -633,8 +1014,9 @@ async fn ensure_crontab_is_ours(io: &dyn CrontabIo, user: &LinuxUser) -> Result<
 /// install, *no* job in it took effect. On success the record is cleared.
 async fn install_from_db(
     ctx: &OpContext,
-    io: &dyn CrontabIo,
+    host: &dyn CronHost,
     subscription: &Subscription,
+    target: &CronTarget,
 ) -> Result<usize> {
     let user = LinuxUser::parse(&subscription.linux_user)?;
     let jobs = ctx
@@ -642,9 +1024,9 @@ async fn install_from_db(
         .cron_jobs_for_render(subscription.id)
         .await
         .map_err(UnihelmError::from)?;
-    let content = render_crontab(subscription.id, &jobs)?;
+    let content = render_crontab(subscription.id, &jobs, &target.placement)?;
 
-    match io.install(&user, &content).await {
+    match host.install(&user, &content).await {
         Ok(()) => {
             ctx.db()
                 .set_cron_last_error(subscription.id, None)
@@ -652,9 +1034,23 @@ async fn install_from_db(
                 .map_err(UnihelmError::from)?;
             let scheduled = jobs.iter().filter(|j| j.enabled).count();
             ctx.log(format!(
-                "installed {scheduled} cron job(s) for {}",
-                user.as_str()
+                "installed {scheduled} cron job(s) for {} in {}",
+                user.as_str(),
+                target.placement.slice_unit
             ));
+
+            // Only now, with the replacement in place: the other order leaves a
+            // window in which the tenant has no jobs at all, and a failed write
+            // in that window would lose them. This order can run a job twice in
+            // the moment between the two calls, which is the cheaper mistake.
+            if target.legacy_spool_crontab {
+                host.remove_user_crontab(&user).await?;
+                ctx.log(format!(
+                    "removed the pre-slice crontab for {}; its jobs now run inside {}",
+                    user.as_str(),
+                    target.placement.slice_unit
+                ));
+            }
             Ok(scheduled)
         }
         Err(error) => {
@@ -746,19 +1142,19 @@ impl TypedOperation for List {
 /// `cron.set` — create a job, or update the one named by `id`, then re-render
 /// and install the subscription's crontab.
 pub struct Set {
-    io: Arc<dyn CrontabIo>,
+    host: Arc<dyn CronHost>,
 }
 
 impl Set {
     pub fn live() -> Self {
         Self {
-            io: Arc::new(LiveCrontab),
+            host: Arc::new(LiveCronHost),
         }
     }
 
     #[cfg(test)]
-    fn with_io(io: Arc<dyn CrontabIo>) -> Self {
-        Self { io }
+    fn with_host(host: Arc<dyn CronHost>) -> Self {
+        Self { host }
     }
 }
 
@@ -856,9 +1252,18 @@ impl TypedOperation for Set {
         let command = validate_command(&input.command)?;
 
         // Before the row is written: a refusal here must leave the database
-        // exactly as it found it.
+        // exactly as it found it. That now covers the tenant's slice as well as
+        // their crontab — a job the panel cannot confine is refused rather than
+        // stored and then scheduled with the whole machine underneath it.
         let user = LinuxUser::parse(&subscription.linux_user)?;
-        ensure_crontab_is_ours(self.io.as_ref(), &user).await?;
+        let target = prepare(self.host.as_ref(), &user).await?;
+
+        // The wrapper costs ~150 characters of cron's line budget, so a command
+        // that fits `MAX_COMMAND_CHARS` may still not fit a line. Checked here,
+        // against the exact line that would be written, rather than after the
+        // row exists: a stored row that cannot render would break every later
+        // apply for this subscription, not just this job.
+        job_line(&schedule, &command, &target.placement)?;
 
         let job = match existing {
             Some(job) => ctx
@@ -886,7 +1291,7 @@ impl TypedOperation for Set {
                 .map_err(UnihelmError::from)?,
         };
 
-        let scheduled = install_from_db(ctx, self.io.as_ref(), &subscription).await?;
+        let scheduled = install_from_db(ctx, self.host.as_ref(), &subscription, &target).await?;
 
         // Re-read so the answer carries the cleared `last_error` rather than
         // whatever the write returned a moment before the install.
@@ -912,19 +1317,19 @@ impl TypedOperation for Set {
 
 /// `cron.delete` — remove a job and re-render the subscription's crontab.
 pub struct Delete {
-    io: Arc<dyn CrontabIo>,
+    host: Arc<dyn CronHost>,
 }
 
 impl Delete {
     pub fn live() -> Self {
         Self {
-            io: Arc::new(LiveCrontab),
+            host: Arc::new(LiveCronHost),
         }
     }
 
     #[cfg(test)]
-    fn with_io(io: Arc<dyn CrontabIo>) -> Self {
-        Self { io }
+    fn with_host(host: Arc<dyn CronHost>) -> Self {
+        Self { host }
     }
 }
 
@@ -972,7 +1377,11 @@ impl TypedOperation for Delete {
         // out — refusing would strand exactly the schedules an operator most
         // wants gone.
         let user = LinuxUser::parse(&subscription.linux_user)?;
-        ensure_crontab_is_ours(self.io.as_ref(), &user).await?;
+        // Resolved before the row goes, for the same reason as on the way in: if
+        // the file cannot be rewritten, the job is still on the machine, and a
+        // panel that had already forgotten the row would be showing a schedule
+        // that is not the one running.
+        let target = prepare(self.host.as_ref(), &user).await?;
 
         ctx.db()
             .cron_jobs(ctx.scope())
@@ -980,7 +1389,7 @@ impl TypedOperation for Delete {
             .await
             .map_err(UnihelmError::from)?;
 
-        let scheduled = install_from_db(ctx, self.io.as_ref(), &subscription).await?;
+        let scheduled = install_from_db(ctx, self.host.as_ref(), &subscription, &target).await?;
         Ok(DeleteOutput {
             id: input.id,
             subscription_id: job.subscription_id.get(),
@@ -1000,21 +1409,42 @@ mod tests {
     use unihelm_db::Db;
     use unihelm_distro::Distro;
 
-    // -- a crontab that lives in memory -------------------------------------
+    // -- a host that lives in memory ----------------------------------------
 
-    /// Records every install and answers reads from what was installed, so a
-    /// test can assert on the exact bytes that would have reached `crontab`.
-    #[derive(Default)]
-    struct FakeCrontab {
-        state: Mutex<HashMap<String, String>>,
+    /// The machine, in a HashMap: the panel's `/etc/cron.d` file, the tenant's
+    /// own spool crontab, and whether their slice unit exists. Records every
+    /// install so a test can assert on the exact bytes cron would have read.
+    struct FakeHost {
+        /// What `crontab -u <user> -l` answers.
+        spool: Mutex<HashMap<String, String>>,
+        /// What is at `/etc/cron.d/unihelm-<user>`.
+        managed: Mutex<HashMap<String, String>>,
         installs: Mutex<Vec<(String, String)>>,
+        retired_spool: Mutex<Vec<String>>,
         fail_install_with: Option<String>,
+        /// A provisioned tenant always has one, so the default says yes and the
+        /// tests that care say otherwise explicitly.
+        slice_unit_exists: bool,
     }
 
-    impl FakeCrontab {
-        fn with_existing(user: &str, content: &str) -> Self {
+    impl Default for FakeHost {
+        fn default() -> Self {
+            Self {
+                spool: Mutex::new(HashMap::new()),
+                managed: Mutex::new(HashMap::new()),
+                installs: Mutex::new(Vec::new()),
+                retired_spool: Mutex::new(Vec::new()),
+                fail_install_with: None,
+                slice_unit_exists: true,
+            }
+        }
+    }
+
+    impl FakeHost {
+        /// An account whose spool crontab already holds `content`.
+        fn with_spool_crontab(user: &str, content: &str) -> Self {
             let me = Self::default();
-            me.state
+            me.spool
                 .lock()
                 .unwrap()
                 .insert(user.to_string(), content.to_string());
@@ -1028,19 +1458,49 @@ mod tests {
             }
         }
 
+        /// A tenant provisioned before slices existed, or whose unit somebody
+        /// removed by hand.
+        fn without_slice_unit() -> Self {
+            Self {
+                slice_unit_exists: false,
+                ..Self::default()
+            }
+        }
+
         fn installed_for(&self, user: &str) -> Option<String> {
-            self.state.lock().unwrap().get(user).cloned()
+            self.managed.lock().unwrap().get(user).cloned()
+        }
+
+        fn spool_for(&self, user: &str) -> Option<String> {
+            self.spool.lock().unwrap().get(user).cloned()
         }
 
         fn install_count(&self) -> usize {
             self.installs.lock().unwrap().len()
         }
+
+        fn retired_spool_for(&self, user: &str) -> bool {
+            self.retired_spool.lock().unwrap().iter().any(|u| u == user)
+        }
     }
 
     #[async_trait]
-    impl CrontabIo for FakeCrontab {
-        async fn read(&self, user: &LinuxUser) -> Result<Option<String>> {
-            Ok(self.state.lock().unwrap().get(user.as_str()).cloned())
+    impl CronHost for FakeHost {
+        async fn read_user_crontab(&self, user: &LinuxUser) -> Result<Option<String>> {
+            Ok(self.spool.lock().unwrap().get(user.as_str()).cloned())
+        }
+
+        async fn remove_user_crontab(&self, user: &LinuxUser) -> Result<()> {
+            self.spool.lock().unwrap().remove(user.as_str());
+            self.retired_spool
+                .lock()
+                .unwrap()
+                .push(user.as_str().to_string());
+            Ok(())
+        }
+
+        async fn read_managed(&self, user: &LinuxUser) -> Result<Option<String>> {
+            Ok(self.managed.lock().unwrap().get(user.as_str()).cloned())
         }
 
         async fn install(&self, user: &LinuxUser, content: &str) -> Result<()> {
@@ -1051,11 +1511,24 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((user.as_str().to_string(), content.to_string()));
-            self.state
+            self.managed
                 .lock()
                 .unwrap()
                 .insert(user.as_str().to_string(), content.to_string());
             Ok(())
+        }
+
+        async fn slice_unit_exists(&self, _unit_file_name: &str) -> Result<bool> {
+            Ok(self.slice_unit_exists)
+        }
+    }
+
+    /// The placement of the tenant every rendering test uses.
+    fn placement() -> SlicePlacement {
+        SlicePlacement {
+            slice_unit: "unihelm-uh_abc12345.slice".into(),
+            linux_user: "uh_abc12345".into(),
+            home: "/home/uh_abc12345".into(),
         }
     }
 
@@ -1204,6 +1677,7 @@ mod tests {
         let err = render_crontab(
             SubscriptionId(7),
             &[job_row(1, "* * * * *", "ok\n* * * * * /bin/sh -i", true)],
+            &placement(),
         )
         .unwrap_err();
         assert!(err.detail.contains("cron job 1"), "{}", err.detail);
@@ -1267,13 +1741,18 @@ mod tests {
         let body = render_crontab(
             SubscriptionId(7),
             &[job_row(1, "0 3 * * *", "/usr/bin/php cron.php", true)],
+            &placement(),
         )
         .unwrap();
 
         assert!(body.starts_with(MANAGED_MARKER), "{body}");
         assert!(body.contains("subscription 7"), "{body}");
         assert!(
-            body.contains("\n# job 1\n0 3 * * * /usr/bin/php cron.php\n"),
+            body.contains(
+                "\n# job 1\n0 3 * * * root systemd-run --quiet --collect --wait --pipe \
+                 --slice='unihelm-uh_abc12345.slice' --uid=uh_abc12345 \
+                 --working-directory=/home/uh_abc12345 -- /bin/sh%/usr/bin/php cron.php\n"
+            ),
             "{body}"
         );
         assert!(
@@ -1291,11 +1770,14 @@ mod tests {
                 job_row(1, "0 3 * * *", "enabled.sh", true),
                 job_row(2, "0 4 * * *", "disabled.sh", false),
             ],
+            &placement(),
         )
         .unwrap();
-        assert!(body.contains("\n0 3 * * * enabled.sh\n"), "{body}");
+        assert!(body.contains("\n0 3 * * * root systemd-run "), "{body}");
+        assert!(body.contains("%enabled.sh\n"), "{body}");
         assert!(body.contains("# job 2 (disabled in the panel)"), "{body}");
-        assert!(body.contains("\n# 0 4 * * * disabled.sh\n"), "{body}");
+        assert!(body.contains("\n# 0 4 * * * root systemd-run "), "{body}");
+        assert!(body.contains("%disabled.sh\n"), "{body}");
         // Nothing that cron would read as a live line.
         assert!(
             !body.lines().any(|l| l.trim_start().starts_with("0 4")),
@@ -1311,16 +1793,24 @@ mod tests {
         let body = render_crontab(
             SubscriptionId(7),
             &[job_row(1, "0 3 * * *", "echo $(date +%Y-%m-%d) 50%", true)],
+            &placement(),
         )
         .unwrap();
         let line = body
             .lines()
             .find(|l| l.starts_with("0 3"))
             .expect("the job line");
-        assert_eq!(line, "0 3 * * * echo $(date +\\%Y-\\%m-\\%d) 50\\%");
+        let (wrapper, command) = line.split_once('%').expect("the command separator");
+        assert_eq!(command, "echo $(date +\\%Y-\\%m-\\%d) 50\\%");
         assert!(
-            !line.replace("\\%", "").contains('%'),
-            "every % must be escaped: {line}"
+            !command.replace("\\%", "").contains('%'),
+            "every % of the tenant's must be escaped, or cron would cut the \
+             command short at it: {line}"
+        );
+        assert!(
+            !wrapper.contains('%'),
+            "the wrapper owns the one unescaped %, and it is the last character \
+             of it: {line}"
         );
     }
 
@@ -1330,19 +1820,136 @@ mod tests {
             job_row(1, "0 3 * * *", "a.sh", true),
             job_row(2, "0 4 * * *", "b.sh", false),
         ];
-        let once = render_crontab(SubscriptionId(7), &jobs).unwrap();
-        let twice = render_crontab(SubscriptionId(7), &jobs).unwrap();
+        let once = render_crontab(SubscriptionId(7), &jobs, &placement()).unwrap();
+        let twice = render_crontab(SubscriptionId(7), &jobs, &placement()).unwrap();
         assert_eq!(once, twice);
     }
 
     #[test]
     fn an_empty_job_list_renders_a_valid_but_empty_managed_crontab() {
-        let body = render_crontab(SubscriptionId(7), &[]).unwrap();
+        let body = render_crontab(SubscriptionId(7), &[], &placement()).unwrap();
         assert!(is_unihelm_crontab(&body));
         assert!(
-            body.lines().all(|l| l.starts_with('#')),
+            body.lines()
+                .all(|l| l.starts_with('#') || l.starts_with("MAILTO=")),
             "no schedule lines: {body}"
         );
+    }
+
+    // -- slice placement ----------------------------------------------------
+
+    #[test]
+    fn a_rendered_job_line_places_the_job_in_its_tenants_own_slice() {
+        // The whole point of the issue this fixes: a line that does not name
+        // the slice is a job with the machine's resources instead of the
+        // plan's, and one runaway loop takes every other tenant down with it.
+        let body = render_crontab(
+            SubscriptionId(7),
+            &[job_row(1, "*/5 * * * *", "/usr/bin/php cron.php", true)],
+            &placement(),
+        )
+        .unwrap();
+        let line = body
+            .lines()
+            .find(|l| l.starts_with("*/5"))
+            .expect("the job line");
+
+        assert!(
+            line.contains("--slice='unihelm-uh_abc12345.slice'"),
+            "the job must land in the tenant's own slice: {line}"
+        );
+        // Placed by root, because putting a process into a system slice is a
+        // privileged operation — and run as the tenant, because it is their
+        // job. Both halves, or the line is either powerless or dangerous.
+        assert!(line.starts_with("*/5 * * * * root systemd-run "), "{line}");
+        assert!(line.contains("--uid=uh_abc12345"), "{line}");
+        assert!(
+            line.contains("--working-directory=/home/uh_abc12345"),
+            "cron runs a job from the tenant's home; so must this: {line}"
+        );
+        // A failing job is still the tenant's to hear about: --wait carries the
+        // exit status back to cron, --pipe carries the output, and MAILTO sends
+        // it to them rather than to root.
+        assert!(line.contains("--wait"), "{line}");
+        assert!(line.contains("--pipe"), "{line}");
+        assert!(body.contains("\nMAILTO=uh_abc12345\n"), "{body}");
+    }
+
+    #[test]
+    fn the_tenants_command_reaches_the_shell_on_stdin_and_never_the_root_line() {
+        // The line is run by cron *as root*, so a command that could reach the
+        // shell parsing it would be a root shell the tenant controls. It never
+        // does: everything before the `%` is panel text, and cron feeds
+        // everything after it to /bin/sh on standard input.
+        for command in [
+            "cd /home/uh_abc12345/site && ./run.sh >> log 2>&1",
+            "echo 'quoted'; id > /tmp/x",
+            "curl -fsS https://example.com/ping | logger",
+            "x=$(whoami); echo \"$x\" `hostname`",
+        ] {
+            let body = render_crontab(
+                SubscriptionId(7),
+                &[job_row(1, "0 3 * * *", command, true)],
+                &placement(),
+            )
+            .unwrap();
+            let line = body
+                .lines()
+                .find(|l| l.starts_with("0 3"))
+                .expect("the job line");
+            let (wrapper, stdin) = line.split_once('%').expect("the command separator");
+
+            assert_eq!(stdin, command, "the command reaches the shell verbatim");
+            assert_eq!(
+                wrapper,
+                &format!("0 3 * * * {}", slice_wrapper(&placement())),
+                "nothing of the tenant's may appear before the % : {line}"
+            );
+            assert!(wrapper.ends_with("/bin/sh"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_hyphenated_account_still_names_the_slice_the_panel_actually_wrote() {
+        // A hyphen is legal in a Linux account and arrives with every cPanel
+        // import. In a *slice* name it is a nesting level, so `slices.rs`
+        // escapes it to `\x2d` — and the shell cron hands this line to would
+        // swallow that backslash, leaving systemd-run asking for a slice that
+        // does not exist. The job would then never run at all, under a panel
+        // that had just reported it scheduled.
+        let user = LinuxUser::parse("uh-legacy").unwrap();
+        let placement = SlicePlacement {
+            slice_unit: crate::slices::slice_file_name(&user),
+            linux_user: user.as_str().to_string(),
+            home: "/home/uh-legacy".into(),
+        };
+        let line = job_line("0 3 * * *", "job.sh", &placement).unwrap();
+
+        assert!(
+            line.contains("--slice='unihelm-uh\\x2dlegacy.slice'"),
+            "the escaped name must reach systemd intact: {line}"
+        );
+    }
+
+    #[test]
+    fn a_job_line_that_would_overflow_crons_budget_is_refused_not_truncated() {
+        // A command inside `MAX_COMMAND_CHARS` can still overflow a cron line
+        // once the wrapper is on it, and a line cron truncates runs *something
+        // else* than what was saved. The refusal names the shortfall.
+        let long = "a".repeat(MAX_COMMAND_CHARS);
+        let err = job_line("0 3 * * *", &long, &placement()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("command"));
+        assert!(err.detail.contains("shorten the command"), "{}", err.detail);
+        assert!(
+            err.detail.contains("unihelm-uh_abc12345.slice"),
+            "the operator has to be able to tell what is eating the budget: {}",
+            err.detail
+        );
+
+        // What fits, still fits.
+        let ok = "a".repeat(700);
+        assert!(job_line("0 3 * * *", &ok, &placement()).is_ok());
     }
 
     // -- ownership ----------------------------------------------------------
@@ -1358,7 +1965,7 @@ mod tests {
         // prepends its own banner — the case that would otherwise make the
         // panel refuse the very file it had just installed.
         assert!(is_unihelm_crontab(
-            &render_crontab(SubscriptionId(1), &[]).unwrap()
+            &render_crontab(SubscriptionId(1), &[], &placement()).unwrap()
         ));
         assert!(is_unihelm_crontab(
             "# DO NOT EDIT THIS FILE - edit the master and reinstall.\n\
@@ -1426,9 +2033,9 @@ mod tests {
     #[tokio::test]
     async fn a_saved_job_reaches_the_tenants_crontab() {
         let (ctx, db, sub) = ctx_with_tenant().await;
-        let io = Arc::new(FakeCrontab::default());
+        let host = Arc::new(FakeHost::default());
 
-        let out = Set::with_io(io.clone())
+        let out = Set::with_host(host.clone())
             .run(
                 &ctx,
                 set_input("*/5 * * * *", "/usr/bin/php cron.php", &sub),
@@ -1440,9 +2047,14 @@ mod tests {
         assert_eq!(out.job.schedule, "*/5 * * * *");
         assert_eq!(out.linux_user, sub.linux_user);
 
-        let installed = io.installed_for(&sub.linux_user).expect("a crontab");
+        let installed = host.installed_for(&sub.linux_user).expect("a crontab");
         assert!(
-            installed.contains("*/5 * * * * /usr/bin/php cron.php"),
+            installed.contains(&format!(
+                "*/5 * * * * root systemd-run --quiet --collect --wait --pipe \
+                 --slice='unihelm-{user}.slice' --uid={user} \
+                 --working-directory=/home/{user} -- /bin/sh%/usr/bin/php cron.php",
+                user = sub.linux_user
+            )),
             "{installed}"
         );
         assert_eq!(db.cron_jobs_for_render(sub.id).await.unwrap().len(), 1);
@@ -1455,9 +2067,9 @@ mod tests {
         // the machine end up disagreeing about what is scheduled.
         let (ctx, db, sub) = ctx_with_tenant().await;
         let theirs = "0 2 * * * /home/me/my-own-backup.sh\n";
-        let io = Arc::new(FakeCrontab::with_existing(&sub.linux_user, theirs));
+        let host = Arc::new(FakeHost::with_spool_crontab(&sub.linux_user, theirs));
 
-        let err = Set::with_io(io.clone())
+        let err = Set::with_host(host.clone())
             .run(&ctx, set_input("0 3 * * *", "panel-job.sh", &sub))
             .await
             .unwrap_err();
@@ -1466,11 +2078,16 @@ mod tests {
         assert!(err.detail.contains("did not write"), "{}", err.detail);
         assert!(err.detail.contains(&sub.linux_user), "{}", err.detail);
         assert_eq!(
-            io.installed_for(&sub.linux_user).as_deref(),
+            host.spool_for(&sub.linux_user).as_deref(),
             Some(theirs),
             "the tenant's own crontab must be untouched"
         );
-        assert_eq!(io.install_count(), 0);
+        assert_eq!(
+            host.installed_for(&sub.linux_user),
+            None,
+            "and nothing of ours may be scheduled beside it"
+        );
+        assert_eq!(host.install_count(), 0);
         assert!(
             db.cron_jobs_for_render(sub.id).await.unwrap().is_empty(),
             "a refused save must leave no row behind"
@@ -1478,17 +2095,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_crontab_the_panel_wrote_is_re_rendered_without_complaint() {
+    async fn the_panels_own_pre_slice_crontab_is_retired_once_the_jobs_are_in_the_slice() {
+        // The upgrade path. A tenant provisioned before jobs moved into the
+        // slice has the panel's old file in their spool, and it keeps running
+        // outside the slice until something rewrites it — so the first apply
+        // after the upgrade writes the new file and then takes the old one
+        // away. Leaving it would run every job twice.
         let (ctx, _db, sub) = ctx_with_tenant().await;
-        let io = Arc::new(FakeCrontab::with_existing(
-            &sub.linux_user,
-            &render_crontab(sub.id, &[]).unwrap(),
-        ));
-        Set::with_io(io.clone())
+        let user = LinuxUser::parse(&sub.linux_user).unwrap();
+        let legacy =
+            format!("{MANAGED_MARKER} -- an install from before slices\n0 3 * * * job.sh\n");
+        let host = Arc::new(FakeHost::with_spool_crontab(&sub.linux_user, &legacy));
+
+        Set::with_host(host.clone())
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap();
-        assert_eq!(io.install_count(), 1);
+
+        assert_eq!(host.install_count(), 1);
+        let installed = host
+            .installed_for(&sub.linux_user)
+            .expect("the cron.d file");
+        assert!(
+            installed.contains(&format!(
+                "--slice='{}'",
+                crate::slices::slice_file_name(&user)
+            )),
+            "{installed}"
+        );
+        assert!(
+            host.retired_spool_for(&sub.linux_user),
+            "the old crontab has to go, or the job runs twice — once confined \
+             and once not"
+        );
+        assert_eq!(host.spool_for(&sub.linux_user), None);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_with_no_slice_is_refused_rather_than_given_an_unconfined_job() {
+        // The refusal that matters most: with no slice unit there is no ceiling
+        // to run in, and rendering the line without `--slice=` would schedule a
+        // job the panel had just told the operator was confined.
+        let (ctx, db, sub) = ctx_with_tenant().await;
+        let host = Arc::new(FakeHost::without_slice_unit());
+
+        let err = Set::with_host(host.clone())
+            .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains(&sub.linux_user), "{}", err.detail);
+        assert!(err.detail.contains(".slice"), "{}", err.detail);
+        assert!(
+            err.detail.contains("Re-provision"),
+            "a refusal has to say what to do about it: {}",
+            err.detail
+        );
+
+        assert_eq!(host.install_count(), 0, "nothing may be scheduled");
+        assert!(
+            db.cron_jobs_for_render(sub.id).await.unwrap().is_empty(),
+            "and the refusal must leave no row the panel would show as active"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_too_long_to_survive_the_wrapper_is_refused_before_it_is_stored() {
+        // Storing it would be worse than refusing it: the row would fail to
+        // render on every later apply, taking this subscription's *other* jobs
+        // with it.
+        let (ctx, db, sub) = ctx_with_tenant().await;
+        let host = Arc::new(FakeHost::default());
+
+        let err = Set::with_host(host.clone())
+            .run(
+                &ctx,
+                set_input("0 3 * * *", &"a".repeat(MAX_COMMAND_CHARS), &sub),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("command"));
+        assert_eq!(host.install_count(), 0);
+        assert!(db.cron_jobs_for_render(sub.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1512,14 +2203,14 @@ mod tests {
             .unwrap();
         db.assign_plan(sub.id, plan.id).await.unwrap();
 
-        let io = Arc::new(FakeCrontab::default());
-        let err = Set::with_io(io.clone())
+        let host = Arc::new(FakeHost::default());
+        let err = Set::with_host(host.clone())
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PlanFeatureDisabled);
         assert!(err.detail.contains("No Cron"), "{}", err.detail);
-        assert_eq!(io.install_count(), 0);
+        assert_eq!(host.install_count(), 0);
         assert!(db.cron_jobs_for_render(sub.id).await.unwrap().is_empty());
 
         // Turning the flag on lifts the refusal — the gate is the flag, not
@@ -1534,18 +2225,18 @@ mod tests {
             )
             .await
             .unwrap();
-        Set::with_io(io.clone())
+        Set::with_host(host.clone())
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap();
-        assert_eq!(io.install_count(), 1);
+        assert_eq!(host.install_count(), 1);
     }
 
     #[tokio::test]
     async fn a_suspended_subscription_cannot_gain_a_job_but_can_lose_one() {
         let (ctx, db, sub) = ctx_with_tenant().await;
-        let io = Arc::new(FakeCrontab::default());
-        let created = Set::with_io(io.clone())
+        let host = Arc::new(FakeHost::default());
+        let created = Set::with_host(host.clone())
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap();
@@ -1558,7 +2249,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = Set::with_io(io.clone())
+        let err = Set::with_host(host.clone())
             .run(&ctx, set_input("0 4 * * *", "another.sh", &sub))
             .await
             .unwrap_err();
@@ -1566,7 +2257,7 @@ mod tests {
 
         // Removal still works: refusing it would strand exactly the schedules
         // an operator suspending an account most wants gone.
-        let removed = Delete::with_io(io.clone())
+        let removed = Delete::with_host(host.clone())
             .run(&ctx, DeleteInput { id: created.job.id })
             .await
             .unwrap();
@@ -1577,11 +2268,9 @@ mod tests {
     #[tokio::test]
     async fn an_install_failure_is_recorded_on_the_job_and_reported() {
         let (ctx, db, sub) = ctx_with_tenant().await;
-        let io = Arc::new(FakeCrontab::failing(
-            "crontab: installing new crontab: EPERM",
-        ));
+        let host = Arc::new(FakeHost::failing("crontab: installing new crontab: EPERM"));
 
-        let err = Set::with_io(io)
+        let err = Set::with_host(host)
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap_err();
@@ -1605,7 +2294,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_install_clears_an_earlier_failure() {
         let (ctx, db, sub) = ctx_with_tenant().await;
-        let created = Set::with_io(Arc::new(FakeCrontab::default()))
+        let created = Set::with_host(Arc::new(FakeHost::default()))
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap();
@@ -1613,7 +2302,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = Set::with_io(Arc::new(FakeCrontab::default()))
+        let out = Set::with_host(Arc::new(FakeHost::default()))
             .run(
                 &ctx,
                 SetInput {
@@ -1652,12 +2341,12 @@ mod tests {
             .unwrap();
         let other_sub = db.create_subscription(other.id).await.unwrap();
 
-        let created = Set::with_io(Arc::new(FakeCrontab::default()))
+        let created = Set::with_host(Arc::new(FakeHost::default()))
             .run(&ctx, set_input("0 3 * * *", "job.sh", &sub))
             .await
             .unwrap();
 
-        let err = Set::with_io(Arc::new(FakeCrontab::default()))
+        let err = Set::with_host(Arc::new(FakeHost::default()))
             .run(
                 &ctx,
                 SetInput {
@@ -1677,8 +2366,8 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_job_leaves_the_crontab_with_nothing_scheduled() {
         let (ctx, _db, sub) = ctx_with_tenant().await;
-        let io = Arc::new(FakeCrontab::default());
-        let out = Set::with_io(io.clone())
+        let host = Arc::new(FakeHost::default());
+        let out = Set::with_host(host.clone())
             .run(
                 &ctx,
                 SetInput {
@@ -1690,8 +2379,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.scheduled, 0);
-        let installed = io.installed_for(&sub.linux_user).unwrap();
-        assert!(installed.contains("# 0 3 * * * job.sh"), "{installed}");
+        let installed = host.installed_for(&sub.linux_user).unwrap();
+        assert!(
+            installed.contains("\n# 0 3 * * * root systemd-run "),
+            "{installed}"
+        );
+        assert!(installed.contains("%job.sh\n"), "{installed}");
+        assert!(
+            !installed.lines().any(|l| l.starts_with("0 3")),
+            "a disabled job must not be a live line: {installed}"
+        );
     }
 
     #[tokio::test]

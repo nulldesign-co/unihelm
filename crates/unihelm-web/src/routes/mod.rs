@@ -287,6 +287,10 @@ fn protected() -> Router<SharedState> {
         .route("/api/waf/disable", post(waf::disable))
         .route("/api/waf/rules", axum::routing::put(waf::rules_set))
         .route("/api/server/security-posture", get(waf::security_posture))
+        .route(
+            "/api/server/reboot",
+            get(server::reboot_status).post(server::reboot),
+        )
         .route("/api/webhooks", get(webhooks::list).post(webhooks::create))
         .route(
             "/api/webhooks/{id}",

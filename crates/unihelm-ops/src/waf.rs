@@ -15,13 +15,33 @@
 //! | `nginx.org/packages/centos/10/x86_64/RPMS/` | acme, image-filter, njs, otel, perl, xslt |
 //!
 //! No `nginx-module-modsecurity` in any of them. A ModSecurity connector *is*
-//! packaged elsewhere — Debian and Ubuntu ship `libnginx-mod-http-modsecurity`,
-//! EPEL 9 ships `nginx-mod-modsecurity` — but both are built against their own
+//! packaged elsewhere — see [`unihelm_distro::pkg::modsec_connector`] for which
+//! release has which — but every one of those is built against its own
 //! distribution's nginx, and an nginx dynamic module records the nginx version
 //! and build signature it was compiled against and is rejected at load time by
 //! any other ("module ... is not binary compatible"). Installing the distro
 //! package next to nginx.org's nginx therefore produces a module that cannot
 //! load, not a working WAF.
+//!
+//! # Two supported releases where there is no package to name at all
+//!
+//! The refusal used to name a package per *family*: Debian-family
+//! operators were sent to `libnginx-mod-http-modsecurity` and RHEL-family ones
+//! to `nginx-mod-modsecurity` in EPEL. On two of the releases this panel calls
+//! supported that advice is for a package that does not exist —
+//! `libnginx-mod-http-modsecurity` was never in Ubuntu 22.04 (jammy), and EPEL
+//! 10 does not build `nginx-mod-modsecurity` — so the panel was stating a fact
+//! about a stranger's package archive that was not true, and an operator could
+//! only find that out by going and looking. The blocker is now built from
+//! [`unihelm_distro::pkg::modsec_connector`], which answers per release and has
+//! a third answer — "nobody has checked yours" — for the releases outside the
+//! matrix. Where a release genuinely has nothing, the refusal says that
+//! instead of naming a package, and the only remaining route is a module
+//! compiled against the running nginx.
+//!
+//! The Core Rule Set is *not* a second package to hunt for: Unihelm downloads
+//! and checksums the pinned 4.29.0 tarball itself (see [`CRS_URL`]), so no
+//! distribution's `modsecurity-crs` is needed, wanted, or read.
 //!
 //! There is a second, independent blocker on the same servers. `load_module` is
 //! a **main-context** directive, and nginx.org's `nginx.conf` — verified by
@@ -89,7 +109,8 @@ use unihelm_config::paths;
 use unihelm_core::{ErrorCode, Permission, Result, SiteId, TenantScope, UnihelmError};
 use unihelm_db::settings::keys;
 use unihelm_db::{Db, NewWafExclusion, WafExclusion, WafMode};
-use unihelm_distro::{Cmd, Family};
+use unihelm_distro::Cmd;
+use unihelm_distro::pkg::ModsecConnector;
 
 use crate::registry::{Execution, OpContext, TypedOperation};
 use crate::services::{NginxValidator, UnitReloader};
@@ -166,36 +187,6 @@ const LOAD_MODULE_DROPIN: &str = "50-unihelm-modsecurity.conf";
 // ---------------------------------------------------------------------------
 // Preflight: is there a WAF to configure at all?
 // ---------------------------------------------------------------------------
-
-/// A packaged ModSecurity connector Unihelm knows about, and the truth about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ModuleCandidate {
-    pub package: &'static str,
-    pub repository: &'static str,
-    /// The nginx these packages are built against. Recorded because it is the
-    /// whole reason installing one does not help on a Unihelm server.
-    pub built_against: &'static str,
-}
-
-/// Every package that could plausibly provide the module on this family.
-///
-/// Deliberately *not* a list of things to install. It exists so the refusal can
-/// name real package names and say why each one is not the answer, instead of
-/// telling an operator "not available" and leaving them to search.
-pub const fn module_candidates(family: Family) -> &'static [ModuleCandidate] {
-    match family {
-        Family::Debian => &[ModuleCandidate {
-            package: "libnginx-mod-http-modsecurity",
-            repository: "the Debian/Ubuntu distribution repositories",
-            built_against: "the distribution's own nginx, not nginx.org's",
-        }],
-        Family::Rhel => &[ModuleCandidate {
-            package: "nginx-mod-modsecurity",
-            repository: "EPEL",
-            built_against: "the EL AppStream nginx, not nginx.org's",
-        }],
-    }
-}
 
 /// Whether a loadable module exists on this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -326,7 +317,9 @@ pub struct Preflight {
     pub web_server: WebServer,
     pub module: ModuleState,
     pub load: LoadPlan,
-    pub candidates: &'static [ModuleCandidate],
+    /// What this *release* — not this family — has for a connector. Carried on
+    /// the preflight so `waf.status` can show it beside the blocker it produced.
+    pub connector: ModsecConnector,
     pub blockers: Vec<Blocker>,
 }
 
@@ -340,11 +333,10 @@ impl Preflight {
 /// version that goes to disk and asks the database which server is serving.
 pub fn assess(
     web_server: WebServer,
-    family: Family,
+    connector: ModsecConnector,
     module: ModuleState,
     load: LoadPlan,
 ) -> Preflight {
-    let candidates = module_candidates(family);
     let mut blockers = Vec::new();
 
     // First, and on its own: on a machine nginx does not serve, nothing below
@@ -385,7 +377,7 @@ pub fn assess(
             web_server,
             module,
             load,
-            candidates,
+            connector,
             blockers,
         };
     }
@@ -394,34 +386,65 @@ pub fn assess(
         let ModuleState::Absent { searched } = &module else {
             unreachable!("just checked it is absent")
         };
-        let named: Vec<String> = candidates
-            .iter()
-            .map(|c| {
-                format!(
-                    "`{}` in {} (built against {})",
-                    c.package, c.repository, c.built_against
-                )
-            })
-            .collect();
-        blockers.push(Blocker {
-            code: "module_missing",
-            detail: format!(
-                "no ModSecurity connector for nginx: `{searched}` does not exist. \
-                 nginx here comes from nginx.org, which publishes no \
-                 nginx-module-modsecurity package for any distribution it serves."
-            ),
-            remedy: format!(
-                "There is a packaged connector — {} — but an nginx dynamic module \
-                 only loads into the exact nginx build it was compiled against, so \
-                 installing it beside nginx.org's nginx produces a module nginx \
-                 refuses with \"is not binary compatible\". The supported fix is a \
-                 module built for this nginx: spec §11.9 plans one in Unihelm's own \
-                 package repository (the same rule as brotli in §11.2), and that \
-                 repository does not exist in this build. Until it does, the WAF \
-                 can only run on a server whose nginx and connector come from the \
-                 same source.",
-                named.join(", ")
-            ),
+        let detail = format!(
+            "no ModSecurity connector for nginx: `{searched}` does not exist. \
+             nginx here comes from nginx.org, which publishes no \
+             nginx-module-modsecurity package for any distribution it serves."
+        );
+        // The last sentence of every remedy below, because it is the one fact
+        // that decides whether *any* package name is worth acting on.
+        const SAME_SOURCE: &str = "The supported fix is a module built for this \
+             nginx: spec §11.9 plans one in Unihelm's own package repository (the \
+             same rule as brotli in §11.2), and that repository does not exist in \
+             this build. Until it does, the WAF can only run on a server whose \
+             nginx and connector come from the same source.";
+        blockers.push(match &connector {
+            // Split from `module_missing` so a client can tell the two apart
+            // without reading prose: one is "install this and it still will not
+            // load here", the other is "there is nothing to install anywhere".
+            ModsecConnector::Unpackaged { checked } => Blocker {
+                code: "module_unpackaged",
+                detail: format!(
+                    "{detail} This release has no connector package either: \
+                     {checked} carry no ModSecurity connector for nginx, so there \
+                     is no package name to give you."
+                ),
+                remedy: format!(
+                    "Nothing can be installed here — the connector is not built \
+                     for this release by anyone. The only way to run a WAF on this \
+                     machine is a `{MODULE_FILENAME}` compiled against the exact \
+                     nginx that is serving it, which means building \
+                     ModSecurity-nginx yourself, or moving this server to a \
+                     release that packages one. {SAME_SOURCE}"
+                ),
+            },
+            ModsecConnector::Packaged(p) => Blocker {
+                code: "module_missing",
+                detail,
+                remedy: format!(
+                    "This release does package a connector — `{}` in {}, built \
+                     against {} — but an nginx dynamic module only loads into the \
+                     exact nginx build it was compiled against, so installing it \
+                     beside nginx.org's nginx produces a module nginx refuses with \
+                     \"is not binary compatible\". It is the answer only if this \
+                     machine is running that distribution's own nginx. \
+                     {SAME_SOURCE}",
+                    p.package, p.repository, p.built_against
+                ),
+            },
+            ModsecConnector::Unverified { package, release } => Blocker {
+                code: "module_missing",
+                detail,
+                remedy: format!(
+                    "Unihelm has not checked what {release} packages, so it will \
+                     not tell you a package is there. Where the connector exists \
+                     on this family it is called `{package}` — look for that \
+                     first. Either way an nginx dynamic module only loads into \
+                     the exact nginx build it was compiled against, so a distro \
+                     package beside nginx.org's nginx produces a module nginx \
+                     refuses with \"is not binary compatible\". {SAME_SOURCE}"
+                ),
+            },
         });
     }
 
@@ -452,7 +475,7 @@ pub fn assess(
         web_server,
         module,
         load,
-        candidates,
+        connector,
         blockers,
     }
 }
@@ -473,7 +496,10 @@ pub async fn preflight(ctx: &OpContext) -> Result<Preflight> {
     };
     Ok(assess(
         web_server,
-        ctx.distro().info.family,
+        // The running release, not just its family: `modsec_connector` is the
+        // difference between naming a package that exists and naming one that
+        // never shipped for this operator's distribution.
+        unihelm_distro::pkg::modsec_connector(&ctx.distro().info),
         module,
         plan_module_load(&nginx_conf, &dropins),
     ))
@@ -1069,7 +1095,18 @@ async fn ensure_module_loaded(ctx: &OpContext, pre: &Preflight) -> Result<()> {
     }
 }
 
-async fn apply_config(ctx: &OpContext) -> Result<()> {
+async fn apply_config(ctx: &OpContext, pre: &Preflight) -> Result<()> {
+    // The check that has to happen before the first byte is written, on every
+    // path and not just `waf.enable`'s. `waf.rules.set` and a per-site
+    // `waf.disable` both re-render these two files, and both used to do it on
+    // nothing but the stored `enabled` flag — so a server that had lost its
+    // connector (an nginx upgrade changes the ABI and the module stops loading)
+    // would have `03-waf.conf` rewritten with `modsecurity` directives nginx no
+    // longer understands. `nginx -t` would then fail the apply, which is the
+    // safe end of a road nothing should have started down.
+    if !pre.is_available() {
+        return Err(refusal(&pre.blockers));
+    }
     let db = ctx.db();
     let settings = WafSettings::load(db).await;
     let views = site_views(db).await?;
@@ -1223,7 +1260,11 @@ pub struct StatusOutput {
     pub web_server: WebServer,
     pub module: ModuleState,
     pub load: LoadPlan,
-    pub candidates: &'static [ModuleCandidate],
+    /// What this release packages, or that it packages nothing. Replaces the
+    /// old per-family `candidates` list, which named `nginx-mod-modsecurity` to
+    /// EL 10 operators and `libnginx-mod-http-modsecurity` to Ubuntu 22.04
+    /// ones — neither of which their release has ever carried.
+    pub connector: ModsecConnector,
     pub nginx_version: Option<String>,
     pub default_mode: WafMode,
     pub default_paranoia: i64,
@@ -1272,7 +1313,7 @@ impl TypedOperation for Status {
             web_server: pre.web_server,
             module: pre.module.clone(),
             load: pre.load.clone(),
-            candidates: pre.candidates,
+            connector: pre.connector.clone(),
             nginx_version: nginx_version().await,
             default_mode: settings.default_mode,
             default_paranoia: settings.default_paranoia,
@@ -1436,7 +1477,7 @@ impl TypedOperation for Enable {
             }
         };
 
-        apply_config(ctx).await?;
+        apply_config(ctx, &pre).await?;
         Ok(EnableOutput {
             scope,
             mode,
@@ -1459,6 +1500,11 @@ pub struct DisableOutput {
     pub scope: String,
     /// True when the nginx include was actually removed (server scope only).
     pub nginx_include_removed: bool,
+    /// Site scope: whether the rules file was re-rendered. False when the
+    /// server-wide WAF is off (nothing to update) and false when this server
+    /// cannot run a WAF at all — in which case the site's `off` row is stored
+    /// and no nginx file was touched, which is a different fact from "done".
+    pub rendered: bool,
 }
 
 /// `waf.disable` — switch the WAF off, server-wide or for one site.
@@ -1493,12 +1539,35 @@ impl TypedOperation for Disable {
                 // Only re-render when the server-wide WAF is on; otherwise
                 // there is no rules file to update and `nginx -t` would be run
                 // for nothing.
-                if WafSettings::load(db).await.enabled {
-                    apply_config(ctx).await?;
-                }
+                //
+                // And only when it *can* run. Switching protection off is the
+                // one thing that must never be refused because the machine is
+                // broken — the row is already stored and the site is already
+                // off — so an unavailable server logs why nothing was rendered
+                // instead of failing the operation.
+                let rendered = if WafSettings::load(db).await.enabled {
+                    let pre = preflight(ctx).await?;
+                    if pre.is_available() {
+                        apply_config(ctx, &pre).await?;
+                        true
+                    } else {
+                        ctx.log(format!(
+                            "nothing was rendered: {}",
+                            pre.blockers
+                                .iter()
+                                .map(|b| b.code)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                        false
+                    }
+                } else {
+                    false
+                };
                 Ok(DisableOutput {
                     scope: site,
                     nginx_include_removed: false,
+                    rendered,
                 })
             }
             None => {
@@ -1532,6 +1601,7 @@ impl TypedOperation for Disable {
                 Ok(DisableOutput {
                     scope: "server".to_string(),
                     nginx_include_removed: removed,
+                    rendered: false,
                 })
             }
         }
@@ -1547,9 +1617,9 @@ pub struct RulesSetInput {
 #[derive(Debug, Serialize)]
 pub struct RulesSetOutput {
     pub exclusions: Vec<WafExclusion>,
-    /// False when the WAF is off, in which case the list was stored but nothing
-    /// was rendered — said out loud so an operator does not read "stored" as
-    /// "in effect".
+    /// False when the WAF is off *or* when this server cannot run one, in
+    /// which case the list was stored but nothing was rendered — said out loud
+    /// so an operator does not read "stored" as "in effect".
     pub applied: bool,
 }
 
@@ -1614,12 +1684,34 @@ impl TypedOperation for RulesSet {
             .map_err(UnihelmError::from)?;
         ctx.log(format!("{} rule exclusion(s) stored", stored.len()));
 
-        let applied = WafSettings::load(db).await.enabled;
-        if applied {
-            apply_config(ctx).await?;
-        } else {
+        // Two ways this list can be stored without being in effect, and both
+        // have to be said out loud. `enabled` is the operator's own switch;
+        // `is_available` is whether this server can load a connector at all —
+        // and a server in the second state used to be re-rendered anyway, which
+        // meant `waf.rules.set` writing `03-waf.conf` on a machine
+        // `waf.enable` would have refused outright.
+        let applied = if !WafSettings::load(db).await.enabled {
             ctx.log("the WAF is disabled, so the list is stored but not in effect");
-        }
+            false
+        } else {
+            let pre = preflight(ctx).await?;
+            if pre.is_available() {
+                apply_config(ctx, &pre).await?;
+                true
+            } else {
+                ctx.log(format!(
+                    "the WAF cannot run on this server ({}), so the list is \
+                     stored but nothing was rendered and no request is being \
+                     inspected",
+                    pre.blockers
+                        .iter()
+                        .map(|b| b.code)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                false
+            }
+        };
         Ok(RulesSetOutput {
             exclusions: stored,
             applied,
@@ -1643,6 +1735,7 @@ async fn require_site(db: &Db, site_id: i64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unihelm_distro::Family;
 
     // The two `nginx.conf` files the nginx.org packages actually ship,
     // transcribed from `nginx-1.30.4-1.el10.ngx.x86_64.rpm` and
@@ -1759,15 +1852,55 @@ http {
         ));
     }
 
+    /// The connector answer for one release, taken from the real table rather
+    /// than hand-written here — a test that invented its own packaging facts
+    /// would pass while the panel told operators the wrong thing.
+    fn connector(id: &str, version_id: &str, family: Family) -> ModsecConnector {
+        unihelm_distro::pkg::modsec_connector(&unihelm_distro::DistroInfo {
+            id: id.into(),
+            version_id: version_id.into(),
+            codename: String::new(),
+            pretty_name: format!("{id} {version_id}"),
+            family,
+            arch: unihelm_distro::Arch::X86_64,
+            has_systemd: true,
+            has_cgroups_v2: true,
+        })
+    }
+
+    fn absent() -> ModuleState {
+        ModuleState::Absent {
+            searched: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
+        }
+    }
+
+    fn present() -> ModuleState {
+        ModuleState::Present {
+            path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
+        }
+    }
+
     #[test]
-    fn a_missing_module_blocks_enabling_on_both_families_and_names_the_package() {
-        for family in [Family::Debian, Family::Rhel] {
+    fn a_missing_module_blocks_enabling_and_names_the_package_this_release_has() {
+        for (id, version, family, package) in [
+            (
+                "debian",
+                "13",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+            ),
+            (
+                "ubuntu",
+                "24.04",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+            ),
+            ("almalinux", "9", Family::Rhel, "nginx-mod-modsecurity"),
+        ] {
             let pre = assess(
                 WebServer::Nginx,
-                family,
-                ModuleState::Absent {
-                    searched: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
-                },
+                connector(id, version, family),
+                absent(),
                 LoadPlan::Nowhere,
             );
             assert!(!pre.is_available());
@@ -1780,8 +1913,9 @@ http {
             );
             let text = format!("{:?}", pre.blockers);
             assert!(
-                text.contains(module_candidates(family)[0].package),
-                "the refusal must name the package that would provide it: {text}"
+                text.contains(package),
+                "the refusal must name the package that would provide it on \
+                 {id} {version}: {text}"
             );
             assert!(
                 text.contains("binary compatible"),
@@ -1791,13 +1925,79 @@ http {
     }
 
     #[test]
+    fn a_release_that_packages_no_connector_is_told_that_instead_of_a_package_name() {
+        // The half of issue 61 this test exists for. Ubuntu 22.04 and EL 10 are
+        // both `Supported` by `support_status`, and on both the old per-family
+        // refusal named a package — `libnginx-mod-http-modsecurity`,
+        // `nginx-mod-modsecurity` — that has never been built for that release.
+        // An operator following that advice finds nothing and has no way to
+        // tell whether they typed it wrong or the panel was wrong.
+        for (id, version, family, never_say) in [
+            (
+                "ubuntu",
+                "22.04",
+                Family::Debian,
+                "libnginx-mod-http-modsecurity",
+            ),
+            ("almalinux", "10", Family::Rhel, "nginx-mod-modsecurity"),
+        ] {
+            let pre = assess(
+                WebServer::Nginx,
+                connector(id, version, family),
+                absent(),
+                LoadPlan::Nowhere,
+            );
+            assert_eq!(
+                pre.blockers.iter().map(|b| b.code).collect::<Vec<_>>(),
+                vec!["module_unpackaged"],
+                "{id} {version} needs its own code: 'install this and it still \
+                 will not load' and 'there is nothing to install' are different \
+                 answers"
+            );
+            let text = format!("{:?}", pre.blockers);
+            assert!(
+                !text.contains(never_say),
+                "{id} {version} does not package `{never_say}`; naming it sends \
+                 an operator looking for something that is not there: {text}"
+            );
+            assert!(
+                text.contains("no package name to give you"),
+                "the refusal must say plainly that there is nothing to install: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchecked_release_is_told_it_is_unchecked_rather_than_given_a_promise() {
+        // Ubuntu 23.10 is outside the tested matrix. The panel may not assert
+        // that a package is there, and may not assert that it is not.
+        let pre = assess(
+            WebServer::Nginx,
+            connector("ubuntu", "23.10", Family::Debian),
+            absent(),
+            LoadPlan::Nowhere,
+        );
+        let text = format!("{:?}", pre.blockers);
+        assert_eq!(
+            pre.blockers.iter().map(|b| b.code).collect::<Vec<_>>(),
+            vec!["module_missing"]
+        );
+        assert!(
+            text.contains("has not checked"),
+            "an unchecked release must be told so: {text}"
+        );
+        assert!(
+            text.contains("libnginx-mod-http-modsecurity"),
+            "and still be given somewhere to look: {text}"
+        );
+    }
+
+    #[test]
     fn a_present_module_with_nowhere_to_load_it_is_its_own_blocker() {
         let pre = assess(
             WebServer::Nginx,
-            Family::Rhel,
-            ModuleState::Present {
-                path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
-            },
+            connector("almalinux", "9", Family::Rhel),
+            present(),
             LoadPlan::Nowhere,
         );
         assert!(!pre.is_available());
@@ -1811,10 +2011,8 @@ http {
     fn a_present_module_with_somewhere_to_load_it_is_available() {
         let pre = assess(
             WebServer::Nginx,
-            Family::Debian,
-            ModuleState::Present {
-                path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
-            },
+            connector("debian", "13", Family::Debian),
+            present(),
             LoadPlan::Dropin {
                 path: "/etc/nginx/modules-enabled/50-unihelm-modsecurity.conf".into(),
             },
@@ -1837,10 +2035,8 @@ http {
         for server in [WebServer::Apache, WebServer::Litespeed] {
             let pre = assess(
                 server,
-                Family::Debian,
-                ModuleState::Present {
-                    path: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
-                },
+                connector("debian", "13", Family::Debian),
+                present(),
                 LoadPlan::Dropin {
                     path: "/etc/nginx/modules-enabled/50-unihelm-modsecurity.conf".into(),
                 },
@@ -1872,10 +2068,8 @@ http {
         // connector for an nginx that is not serving changes nothing.
         let pre = assess(
             WebServer::Apache,
-            Family::Rhel,
-            ModuleState::Absent {
-                searched: "/etc/nginx/modules/ngx_http_modsecurity_module.so".into(),
-            },
+            connector("almalinux", "10", Family::Rhel),
+            absent(),
             LoadPlan::Nowhere,
         );
         assert_eq!(
@@ -2219,6 +2413,49 @@ http {
         assert_eq!(out["available"], serde_json::json!(false));
         assert_eq!(out["web_server"], serde_json::json!("apache"));
         assert_eq!(out["blockers"][0]["code"], serde_json::json!("not_nginx"));
+    }
+
+    #[tokio::test]
+    async fn setting_exclusions_on_a_server_that_cannot_run_a_waf_renders_nothing_and_says_so() {
+        use crate::registry::testing::{auth_for, registry};
+        use unihelm_core::Role;
+
+        let (reg, admin, _) = registry().await;
+        let db = &reg.services().db;
+
+        // The state this guards. `waf.enabled` says on — a successful enable
+        // before an nginx upgrade took the connector away, or a switch to
+        // Apache afterwards — and `waf.rules.set` branched on that flag alone.
+        // It re-rendered `03-waf.conf` and `main.conf` on a machine
+        // `waf.enable` would have refused outright, and reported `applied`.
+        db.set_setting(keys::WAF_ENABLED, &true).await.unwrap();
+        db.set_setting(crate::webserver::WEB_SERVER_SETTING, &WebServer::Apache)
+            .await
+            .unwrap();
+
+        let out = reg
+            .dispatch(
+                "waf.rules.set",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({
+                    "exclusions": [{ "rule_id": 942100, "reason": "known false positive" }]
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out["applied"],
+            serde_json::json!(false),
+            "nothing rendered the list, so the operation may not say it did"
+        );
+        assert_eq!(
+            db.waf_exclusions().await.unwrap().len(),
+            1,
+            "storing it is still right — the list takes effect the day the WAF \
+             can run, and losing it would be a second surprise"
+        );
     }
 
     #[tokio::test]

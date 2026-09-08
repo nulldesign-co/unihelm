@@ -128,6 +128,9 @@ pub const COVERAGE: &[(&str, &[&str])] = &[
     ("security.posture", &["unihelm", "security", "posture"]),
     ("sentinel.settings", &["unihelm", "firewall", "settings"]),
     ("sentinel.settings.set", &["unihelm", "firewall", "settings-set", "--enabled", "true"]),
+
+    ("server.reboot", &["unihelm", "server", "reboot", "web-01"]),
+    ("server.reboot.status", &["unihelm", "server", "reboot-status"]),
     ("sftp.disable", &["unihelm", "sftp", "disable", "1"]),
     ("sftp.enable", &["unihelm", "sftp", "enable", "1"]),
 
@@ -455,6 +458,8 @@ mod tests {
             "runtime.install" => runtimes::InstallInput,
             "runtime.list" => runtimes::ListInput,
             "security.posture" => posture::PostureInput,
+            "server.reboot" => server::RebootInput,
+            "server.reboot.status" => server::RebootStatusInput,
             "sentinel.settings" => fwops::SettingsGetInput,
             "sentinel.settings.set" => fwops::SentinelSettings,
             "sftp.disable" => sftp::DisableInput,

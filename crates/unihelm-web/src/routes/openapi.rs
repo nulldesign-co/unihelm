@@ -175,6 +175,8 @@ pub const API_VERSION: &str = "1.0.0";
         super::waf::disable,
         super::waf::rules_set,
         super::waf::security_posture,
+        super::server::reboot_status,
+        super::server::reboot,
         super::webhooks::list,
         super::webhooks::detail,
         super::webhooks::create,

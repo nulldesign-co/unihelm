@@ -224,6 +224,19 @@ struct Recipe {
     credential: Credential,
     /// The account that password belongs to, as `db.create` must connect as.
     root_user: Option<&'static str>,
+    /// The SQL client that ships **inside this image**, which is the one
+    /// `db.rs` runs with `docker exec`.
+    ///
+    /// Named per recipe rather than derived from the slug, because the images
+    /// disagree: MariaDB renamed every binary in 10.5 and keeps `mysql` only as
+    /// a deprecated symlink, MySQL's image has never carried `mariadb`, and
+    /// PostgreSQL's is `psql` either way. Guessing gets a missing binary on a
+    /// server that is perfectly healthy.
+    ///
+    /// `None` where there is no client for `db.rs` to drive: a cache
+    /// authenticates a connection rather than a login, and MongoDB is not an
+    /// engine `db.create` manages.
+    sql_client: Option<&'static str>,
     /// Environment every container of this kind needs, none of it secret.
     env: &'static [(&'static str, &'static str)],
     /// The command, where the image's own default would not persist anything.
@@ -249,6 +262,7 @@ const RECIPES: &[(&str, Recipe)] = &[
                 variable: "MARIADB_ROOT_PASSWORD",
             },
             root_user: Some("root"),
+            sql_client: Some("mariadb"),
             env: &[],
             command: &[],
             probe: Probe::Exec {
@@ -284,6 +298,7 @@ const RECIPES: &[(&str, Recipe)] = &[
                 variable: "MYSQL_ROOT_PASSWORD",
             },
             root_user: Some("root"),
+            sql_client: Some("mysql"),
             env: &[],
             command: &[],
             probe: Probe::Exec {
@@ -311,6 +326,7 @@ const RECIPES: &[(&str, Recipe)] = &[
                 variable: "POSTGRES_PASSWORD",
             },
             root_user: Some("postgres"),
+            sql_client: Some("psql"),
             env: &[],
             command: &[],
             probe: Probe::Exec {
@@ -331,6 +347,7 @@ const RECIPES: &[(&str, Recipe)] = &[
                 variable: "MONGO_INITDB_ROOT_PASSWORD",
             },
             root_user: Some("root"),
+            sql_client: None,
             // The image creates the administrative user only when *both* halves
             // are present; a password with no username is silently ignored and
             // the server comes up with no authentication at all.
@@ -364,6 +381,7 @@ const RECIPES: &[(&str, Recipe)] = &[
             // create an account. Nothing here is a login `db.create` could use,
             // which is why this stays `None` while the password is real.
             root_user: None,
+            sql_client: None,
             env: &[],
             // The image's own command persists nothing, so a volume at /data
             // would stay empty and "your data survives a restart" would be a
@@ -393,6 +411,7 @@ const RECIPES: &[(&str, Recipe)] = &[
                 mount: CACHE_CONFIG_MOUNT,
             },
             root_user: None,
+            sql_client: None,
             env: &[],
             command: &["valkey-server"],
             probe: Probe::ExecAuthenticated {
@@ -426,6 +445,7 @@ const RECIPES: &[(&str, Recipe)] = &[
             // is not.
             credential: Credential::Unauthenticated,
             root_user: None,
+            sql_client: None,
             env: &[],
             command: &[],
             // The image ships no client at all, so readiness is asked over the
@@ -563,10 +583,12 @@ impl EnginePlan {
     /// a machine whose 11.8 is serving perfectly, and a container install would
     /// mark the *host* MariaDB installed.
     ///
-    /// Nothing is lost by not being a catalogue key: `stack::status` builds its
-    /// rows from the catalogue and looks each one up by name, so a row named
-    /// for a container is simply not one of the host rows. It is derived, so
-    /// any caller holding the same (slug, version) computes the same key.
+    /// Nothing is lost by not being a catalogue key: `stack::status` builds a
+    /// row per container out of the engine registry and reports it beside the
+    /// host rows, so a row named for a container is simply not one of them. It
+    /// is derived, so any caller holding the same (slug, version) computes the
+    /// same key — which is what makes [`crate::stack::row_key`] able to hand
+    /// install, status and removal one string instead of three.
     pub fn row_key(&self) -> &str {
         self.container.as_str()
     }
@@ -702,12 +724,30 @@ async fn forget_engine(db: &Db, container: &str) -> Result<()> {
     save_registry(db, &registry).await
 }
 
-/// What `db.create` needs in order to reach an engine: where it is, and who to
-/// be when it gets there.
+/// What `db.create` needs in order to reach an engine: which container it is
+/// in, where it listens inside that container, and who to be when it gets
+/// there.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RootConnection {
+    /// The container the client is run inside, with `docker exec`.
+    ///
+    /// Inside, and not over the published port, because on a default install
+    /// there is no client on the host to run: the whole point of the container
+    /// is that this server has no MariaDB packages, and `mariadb` is one of
+    /// them. The client that ships in the image is the one that exists.
+    pub container: String,
+    /// The client binary in that image: `mariadb`, `mysql`, `psql`.
+    pub client: &'static str,
+    /// Loopback **inside** the container, where the server binds.
     pub host: &'static str,
+    /// The port the server binds inside the container — not
+    /// [`EngineRecord::host_port`]. A client running inside never crosses the
+    /// publish boundary, and the two numbers differ the moment a second
+    /// version of one engine is installed.
     pub port: u16,
+    /// Where this same server answers on this machine. Carried so a refusal or
+    /// a log line can name the address an operator would connect to by hand.
+    pub host_port: u16,
     pub user: String,
     pub password: String,
 }
@@ -715,56 +755,121 @@ pub struct RootConnection {
 impl std::fmt::Debug for RootConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RootConnection")
+            .field("container", &self.container)
+            .field("client", &self.client)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("host_port", &self.host_port)
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .finish()
     }
 }
 
-/// How to reach the containerised engine for a catalogue slug, or `None` when
-/// there is none and the caller should use the host's socket.
+impl RootConnection {
+    /// Wrap a client invocation in the `docker exec` that runs it inside this
+    /// engine's container.
+    ///
+    /// `-i` is load bearing: `db.rs` puts every statement on the client's
+    /// stdin, and without it Docker hands the child `/dev/null` — the client
+    /// reads EOF, executes nothing, exits zero, and the panel reports a
+    /// database it never created. [`exec_argv`] carries the same note for the
+    /// readiness probes.
+    ///
+    /// `env_names` go on as `--env NAME` with no `=value`, which is Docker's
+    /// own form for "take this one from my environment". The value is set on
+    /// the `docker` child by [`unihelm_distro::Cmd::env`] and appears nowhere
+    /// else: written `--env NAME=secret` the root password would sit in
+    /// `/proc/<pid>/cmdline` for the length of the run, readable by every local
+    /// account on the machine — which is the boundary the sealed credential
+    /// exists to hold. This function is not given the password at all, so there
+    /// is no way to get that wrong from here.
+    ///
+    /// `docker` is named bare and left for [`unihelm_distro::Cmd`] to resolve
+    /// against the trusted directories, as every other program in this codebase
+    /// is. Resolving it here would only move the same failure earlier: a
+    /// registry record exists because [`install_container`] built the container,
+    /// which needs Docker — so a machine holding one and no `docker` is one
+    /// somebody removed it from, and `stack::status` reports those engines as
+    /// unknown rather than as running.
+    pub fn exec_argv(&self, env_names: &[&str], client: Vec<String>) -> Vec<String> {
+        let mut argv = vec![DOCKER.to_string(), "exec".to_string(), "-i".to_string()];
+        for name in env_names {
+            argv.push("--env".to_string());
+            argv.push((*name).to_string());
+        }
+        argv.push(self.container.clone());
+        argv.extend(client);
+        argv
+    }
+}
+
+/// How to reach the containerised engine behind a set of catalogue slugs, or
+/// `None` when there is none and the caller should use the host's socket.
 ///
-/// The entry point `db.rs` calls. Where several versions of one engine are
-/// installed, the lowest-numbered host port wins — that is the container
-/// holding the engine's own default port, which is the one an operator who
-/// typed `mysql` on this server would have reached.
+/// The entry point `db.rs` calls, and until this release it had no callers at
+/// all — the containers were built, health-checked and sealed, and every
+/// database operation went on talking to a host socket that a default install
+/// does not have.
+///
+/// Several slugs rather than one, because `db.create` names a **protocol** and
+/// not a product: MariaDB and MySQL are one `DbEngine` and one wire format, and
+/// an operator who installed either expects `db.create` to find it. Where more
+/// than one container answers — two versions of MariaDB, or a MariaDB beside a
+/// MySQL — the lowest host port wins: that is the container holding the
+/// family's own default port, which is the one an operator who typed `mysql` on
+/// this server, or an application whose connection string predates the second
+/// install, would have reached. The alternative — newest wins — would move
+/// every unversioned caller onto a fresh, empty engine the moment a second one
+/// was installed.
 pub async fn root_connection(
     db: &Db,
     key: &MasterKey,
-    slug: &str,
+    slugs: &[&str],
 ) -> Result<Option<RootConnection>> {
     let registry = registry(db).await?;
-    let Some(record) = primary_record(&registry, slug) else {
+    let Some(record) = primary_record(&registry, slugs) else {
         return Ok(None);
     };
 
-    let (Some(user), Some(password)) = (record.root_user.clone(), record.open_root_password(key)?)
-    else {
-        return Ok(None);
+    let client = recipe(&record.slug).and_then(|r| r.sql_client);
+    // A refusal, never a fall through to the host socket. There is no host
+    // install behind a container record, so "use the socket instead" would send
+    // the caller at a socket that has never existed and hand them the client's
+    // own "can't connect" — an error about a file, for a server that is up.
+    let (Some(user), Some(password), Some(client)) = (
+        record.root_user.clone(),
+        record.open_root_password(key)?,
+        client,
+    ) else {
+        return Err(UnihelmError::new(
+            ErrorCode::ServiceUnavailable,
+            format!(
+                "{} runs in the container `{}`, and the panel cannot administer it: it holds \
+                 no root login for that container. Install {} again from the Stack Manager to \
+                 replace it with one the panel has the credential for.",
+                record.slug, record.container, record.slug
+            ),
+        ));
     };
 
     Ok(Some(RootConnection {
+        container: record.container.clone(),
+        client,
         host: LOOPBACK,
-        port: record.host_port,
+        port: record.container_port,
+        host_port: record.host_port,
         user,
         password,
     }))
 }
 
-/// Which of several installed versions of one engine a caller that named no
-/// version means.
-///
-/// The lowest host port, which is the container holding the engine's own
-/// default: an operator who typed `mysql` on this server, or an application
-/// whose connection string predates the second version, reached that one. The
-/// alternative — newest version wins — would move every unversioned caller onto
-/// a fresh, empty engine the moment a second one was installed.
-fn primary_record<'a>(registry: &'a EngineRegistry, slug: &str) -> Option<&'a EngineRecord> {
+/// Which of several installed engines a caller that named only a protocol
+/// means: the one on the lowest host port. See [`root_connection`].
+fn primary_record<'a>(registry: &'a EngineRegistry, slugs: &[&str]) -> Option<&'a EngineRecord> {
     registry
         .values()
-        .filter(|r| r.slug == slug)
+        .filter(|r| slugs.contains(&r.slug.as_str()))
         .min_by_key(|r| r.host_port)
 }
 
@@ -2731,11 +2836,33 @@ mod tests {
             record("unihelm-postgres-17", "postgres", 5432),
         );
 
-        let chosen = primary_record(&registry, "mariadb").expect("mariadb is installed");
+        let chosen = primary_record(&registry, &["mariadb"]).expect("mariadb is installed");
         assert_eq!(chosen.host_port, 3306);
         assert_eq!(chosen.container, "unihelm-mariadb-11.8");
         // And an engine nobody installed is not somebody else's engine.
-        assert!(primary_record(&registry, "redis").is_none());
+        assert!(primary_record(&registry, &["redis"]).is_none());
+
+        // `db.create` names a protocol, not a product: MariaDB and MySQL are
+        // one `DbEngine`, so both slugs are asked at once and the same
+        // lowest-port rule decides between them.
+        registry.insert(
+            "unihelm-mysql-8.0".into(),
+            record("unihelm-mysql-8.0", "mysql", 3308),
+        );
+        let family = primary_record(&registry, &["mariadb", "mysql"]).expect("one of the two");
+        assert_eq!(family.container, "unihelm-mariadb-11.8");
+        // And a machine carrying only the other one still resolves.
+        let mut only_mysql = EngineRegistry::new();
+        only_mysql.insert(
+            "unihelm-mysql-8.0".into(),
+            record("unihelm-mysql-8.0", "mysql", 3306),
+        );
+        assert_eq!(
+            primary_record(&only_mysql, &["mariadb", "mysql"])
+                .expect("MySQL is what is installed")
+                .slug,
+            "mysql"
+        );
     }
 
     /// The one that had to be caught: an engine removed with its data kept
@@ -2895,14 +3022,53 @@ mod tests {
     #[test]
     fn a_connection_does_not_print_its_password() {
         let conn = RootConnection {
+            container: "unihelm-mariadb-11.8".into(),
+            client: "mariadb",
             host: LOOPBACK,
             port: 3306,
+            host_port: 3307,
             user: "root".into(),
             password: "hunter2-super-secret".into(),
         };
         let rendered = format!("{conn:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(rendered.contains("3306"));
+    }
+
+    /// The credential must not reach an argv, and this is where that is
+    /// decided: `/proc/<pid>/cmdline` is readable by every local account on the
+    /// machine, so a password on the `docker exec` line is readable by every
+    /// tenant shell on a shared host — which is the boundary sealing it exists
+    /// to hold.
+    #[test]
+    fn the_root_password_is_named_on_the_exec_line_and_never_carried_on_it() {
+        let conn = RootConnection {
+            container: "unihelm-mariadb-11.8".into(),
+            client: "mariadb",
+            host: LOOPBACK,
+            port: 3306,
+            host_port: 3306,
+            user: "root".into(),
+            password: "hunter2-super-secret".into(),
+        };
+        let argv = conn.exec_argv(&["MYSQL_PWD"], vec!["mariadb".into(), "--batch".into()]);
+        assert!(
+            !argv.iter().any(|a| a.contains("hunter2")),
+            "the password reached the command line: {argv:?}"
+        );
+        // `--env NAME` with no `=value` is Docker's own form for "take it from
+        // my environment"; `--env NAME=value` is the leak.
+        let named = argv
+            .windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "MYSQL_PWD");
+        assert!(named, "{argv:?}");
+        // Without `-i` Docker hands the client `/dev/null` and every batch on
+        // stdin is silently empty.
+        assert!(argv.contains(&"-i".to_string()), "{argv:?}");
+        assert!(
+            argv.contains(&"unihelm-mariadb-11.8".to_string()),
+            "{argv:?}"
+        );
     }
 
     /// An install reads the registry, then pulls an image, which is minutes on

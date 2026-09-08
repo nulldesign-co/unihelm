@@ -348,6 +348,8 @@ impl OpRegistry {
         registry.register(crate::waf::Disable);
         registry.register(crate::waf::RulesSet);
         registry.register(crate::posture::Posture);
+        registry.register(crate::server::RebootStatus::live());
+        registry.register(crate::server::Reboot::live());
         registry.register(crate::nginx_survey::Discover);
         registry.register(crate::runtimes::List);
         registry.register(crate::runtimes::Install);

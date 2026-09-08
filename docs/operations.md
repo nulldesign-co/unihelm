@@ -1749,12 +1749,38 @@ installs from — `packages/debian`, `packages/ubuntu`, `packages/mainline/debia
 and `packages/centos/10` — the published modules are acme, geoip, image-filter,
 njs, otel, perl and xslt. There is no `nginx-module-modsecurity` in any of them.
 
-A connector *is* packaged elsewhere: `libnginx-mod-http-modsecurity` on
-Debian/Ubuntu, `nginx-mod-modsecurity` in EPEL 9. Both are built against their
-own distribution's nginx, and an nginx dynamic module records the nginx build it
-was compiled against and is rejected by any other (`module ... is not binary
-compatible`). Installing one beside nginx.org's nginx produces a module that
-cannot load.
+A connector *is* packaged elsewhere, but not on every release Unihelm
+supports. Checked on 2026-09-08:
+
+| release | connector package | where |
+|---|---|---|
+| Debian 12 (bookworm), 13 (trixie) | `libnginx-mod-http-modsecurity` 1.0.3 | the Debian archive, `main` |
+| Ubuntu 24.04 (noble) and later | `libnginx-mod-http-modsecurity` 1.0.3 | `universe` |
+| **Ubuntu 22.04 (jammy)** | **none** | no such package in any component |
+| AlmaLinux / Rocky / RHEL 9 | `nginx-mod-modsecurity` 1.0.4-1.el9 | EPEL 9 |
+| **AlmaLinux / Rocky / RHEL 10** | **none** | EPEL 10 does not build it |
+
+Where one exists it is built against its own distribution's nginx, and an nginx
+dynamic module records the nginx build it was compiled against and is rejected
+by any other (`module ... is not binary compatible`). Installing one beside
+nginx.org's nginx produces a module that cannot load.
+
+On Ubuntu 22.04 and on EL 10 there is no package to install at all. A WAF can
+only run on those releases with a `ngx_http_modsecurity_module.so` the operator
+has compiled against the exact nginx that is serving, and the panel says exactly
+that rather than naming a package the operator would spend an afternoon failing
+to find.
+
+Debian and Ubuntu do ship a `modsecurity-crs` package (3.3.7 on trixie), an
+older major than the 4.29.0 Unihelm pins. Unihelm does not use it: it downloads
+and checksums its own tarball, so no distribution's Core Rule Set package is
+needed, wanted, or read — the CRS is never the thing a release is missing.
+
+`module_unpackaged` is a blocker code distinct from `module_missing` on purpose:
+one means "install this, and note it still will not load beside nginx.org's
+nginx", the other means "there is nothing to install anywhere, for anyone, on
+this release". A client that showed them identically would send an operator on
+an errand that cannot succeed.
 
 There is a second, independent blocker on the same servers. `load_module` is a
 main-context directive, and nginx.org's `nginx.conf` — verified by unpacking
@@ -1908,6 +1934,58 @@ When the WAF is off the list is stored but nothing is rendered, and the result
 says `applied: false` so "stored" is not read as "in effect".
 
 ## Security posture
+
+### `server.reboot.status`
+
+| | |
+|---|---|
+| Permission | `server_read` |
+| Execution | immediate |
+| Input | — |
+
+Whether this machine is running code it has already replaced.
+
+A kernel or glibc update leaves the old code running until the machine reboots.
+Debian and Ubuntu write `/var/run/reboot-required` (with the package list in
+`/var/run/reboot-required.pkgs`); the EL family answers `needs-restarting -r`.
+The panel read neither, so an operator who applied updates was told everything
+succeeded and had no way to learn their kernel patch was not actually running.
+
+`requirement` is **required**, **not required**, or **unknown** — never a clean
+result when the check could not run. Telling somebody their server does not need
+restarting when nobody could tell is the false reassurance that leaves a kernel
+patch unapplied for a year.
+
+It also returns the hostname `server.reboot` wants retyped, so a confirmation
+can ask for it, and the sites a restart would stop. A hostname that could not be
+read comes back as null *with* the reason beside it, because that is also the
+state in which the reboot refuses.
+
+`server_read`, not `server_manage`: the person who needs to know a patch is
+installed but not running is whoever is watching the dashboard, and gating it
+behind the permission to restart the machine would keep it from them.
+
+### `server.reboot`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | `confirm_hostname` |
+
+Restarts the machine.
+
+**Immediate rather than a task, deliberately.** The agent goes down with the
+machine, so a task row would be reconciled as failed on the way back up — the
+panel reporting a failure for the one operation that actually worked.
+
+The hostname has to be retyped, and the answer names every site that stops. The
+last field is a sentence the caller must not have to infer: the panel restarts
+with the machine and **cannot observe it coming back**, so it says so rather
+than implying otherwise by handing over something to watch.
+
+The audit row is written before the machine goes down. Afterwards would never
+happen.
 
 ### `security.posture`
 
