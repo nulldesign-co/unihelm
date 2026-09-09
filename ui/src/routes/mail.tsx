@@ -44,10 +44,12 @@ import { cn } from "@/lib/utils";
  * The page has to be honest about three things, and each one is a design
  * decision rather than a label:
  *
- * 1. **Unihelm runs no mail server.** This configures somebody else's SMTP
- *    relay and points every PHP site's `mail()` at it. There are no mailboxes
- *    to manage here and the page says so, because a "Mail" item in a hosting
- *    panel's navigation promises mailboxes to almost everybody who clicks it.
+ * 1. **Unihelm receives no mail.** This configures somebody else's SMTP relay
+ *    and makes the machine able to send through it — saving one installs and
+ *    configures the server's own null client, so every language on the box
+ *    reaches it, not only PHP. There are no mailboxes to manage here and the
+ *    page says so, because a "Mail" item in a hosting panel's navigation
+ *    promises mailboxes to almost everybody who clicks it.
  * 2. **The password is write-only.** It cannot be read back from anywhere, so
  *    the field is left empty on load and an empty field means "keep the stored
  *    one". That is stated next to the input rather than discovered by an

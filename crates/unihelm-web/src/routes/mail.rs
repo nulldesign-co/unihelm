@@ -10,9 +10,15 @@
 //! by writing a per-site msmtp configuration and pointing each FPM pool's
 //! `sendmail_path` at it, which put the server's one relay credential in every
 //! tenant's reach and meant nothing but PHP could send at all. The server now
-//! runs a Postfix null client that holds the credential as root; `GET
-//! /api/mail/mta` is the state of it, and `POST /api/mail/mta/install` is the
-//! migration.
+//! runs a Postfix null client that holds the credential as root, and `GET
+//! /api/mail/mta` is the state of it.
+//!
+//! There are three ways in and only one of them is a person deciding something.
+//! Saving a relay (`PUT /api/mail/relay`) installs and configures it, because
+//! that is the operator saying where mail goes. An upgraded server queues the
+//! move itself the first time the new agent starts. `POST
+//! /api/mail/mta/install` is the third, and it exists for the case that needs a
+//! human: adopting a `main.cf` the panel did not write.
 //!
 //! What this layer *is* responsible for is the direction the relay password
 //! travels. It goes in through `PUT /api/mail/relay` and is sealed with the
@@ -119,12 +125,21 @@ pub struct RelayRequest {
 /// allowed, and the task log names each site as it goes, which is the only way
 /// to see which one did not take.
 ///
-/// On a server that has no local MTA configured yet this **stores the relay and
-/// changes nothing else**, and says so in the task log: re-rendering a pool
-/// there would take away the `sendmail_path` those sites are still sending
-/// through and leave nothing behind it. `POST /api/mail/mta/install` is the
-/// operation that moves a server across, in an order that keeps it delivering
-/// the whole way.
+/// On a server that has no local MTA yet, this **installs one**. Saving a relay
+/// is the operator saying where mail goes, so everything needed to honour that
+/// happens here rather than in a second command they have to be told about —
+/// the relay is asked whether it accepts a message, Postfix is installed and
+/// configured, and only then are the per-site files those sites were sending
+/// through taken away.
+///
+/// The row is stored first and stays stored whatever follows. A failure comes
+/// back as "the relay is stored — you will not have to enter the password again
+/// — but this server is not sending through it yet", and the task goes red: the
+/// operator retries without retyping the password.
+///
+/// It never *adopts*. A `main.cf` that was on the machine before this operation
+/// began belongs to somebody else, and taking it over is a decision a person
+/// makes at `POST /api/mail/mta/install`.
 #[utoipa::path(
     put,
     path = "/api/mail/relay",
@@ -132,7 +147,7 @@ pub struct RelayRequest {
     security(("session_cookie" = [], "csrf_header" = [])),
     request_body = RelayRequest,
     responses(
-        (status = 202, description = "Stored; the per-site wiring runs as a task", body = ops::TaskAccepted),
+        (status = 202, description = "Stored. The task installs and configures the local MTA if the server has none, verifies the relay, and re-renders any per-site wiring. The relay stays stored even when that fails — the answer says the server is not sending through it yet.", body = ops::TaskAccepted),
         (status = 400, description = "`invalid_input`: a malformed host or address, or a username without TLS", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),

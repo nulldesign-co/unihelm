@@ -194,6 +194,35 @@ async fn run(args: Args, config: UnihelmConfig) -> Result<()> {
     let terminal_agent = agent.clone();
     let factory = Arc::new(AgentFactory { agent });
 
+    // The third thing a start reconciles, and the only one that is about an
+    // upgrade rather than a crash. A 0.7 server has a working relay and no MTA
+    // of the panel's, and its operator has no reason to re-save a relay that is
+    // already correct — so the machine notices for itself, once, rather than
+    // waiting for somebody to read a release note and run a command.
+    //
+    // Here and not inside `reconcile_interrupted_work`, for two reasons that
+    // are both ordering: that pass fails every row left in `queued` or
+    // `running`, so a task created before it would be failed by the same start
+    // that queued it; and running one needs the registry and the bus, which do
+    // not exist until the templates have compiled. Queued rather than installed
+    // inline because `apt` on a small VPS is minutes: boot must not wait on it,
+    // and a mirror that is down must not be why the agent did not come up.
+    if let Some(task) = tasks::queue_mta_migration(
+        &registry.services().db,
+        unihelm_ops::mail::mta::Layout::system().state(),
+    )
+    .await
+    {
+        tasks::spawn_task(
+            registry.clone(),
+            bus.clone(),
+            task.id,
+            task.op,
+            unihelm_core::AuthContext::system("mail-mta-migration"),
+            task.input,
+        );
+    }
+
     notify::ready();
     notify::status("ready");
     tracing::info!("unihelm-agentd ready");

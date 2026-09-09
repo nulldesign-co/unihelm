@@ -116,11 +116,26 @@
 //!
 //! # What this module deliberately does not do
 //!
-//! - **It does not install Node.** `app.create` refuses, naming what to
-//!   install, when no `node` binary is on the machine. Adding the NodeSource
-//!   repository belongs with the other pinned repositories in
-//!   `unihelm_distro::repos` (spec §11.1: install only from official upstream
-//!   repos, pinned by full fingerprint) and is future work.
+//! - **It does not install Bun, Deno, or Node on the RHEL family.** It installs
+//!   the other three. This bullet used to read "it does not install Node" and
+//!   the refusal that went with it said `Install nodejs first, then create the
+//!   app again` — homework, in a root shell, for a package `stack.install` had
+//!   been able to install all along: `node`, `python` and `ruby` are entries in
+//!   [`crate::catalogue`] and the NodeSource repository is pinned in
+//!   `unihelm_distro::repos`. A host application whose runtime is missing now
+//!   installs it through `stack.install`, as a step in this operation's own
+//!   task and log.
+//!
+//!   What is left is a refusal because the panel genuinely cannot do it, not
+//!   because nobody has wired it up. Bun and Deno ship as single vendor
+//!   binaries with no signed repository to pin, and adding an unpinned one
+//!   would break spec §11.1; NodeSource lays its RPM repositories out per
+//!   release in a way `repos::nodesource` does not resolve. A **caller without
+//!   `StackManage`** is refused too, for a different reason — installing server
+//!   software is not theirs to do — and is given the Stack Manager entry an
+//!   administrator would click. All three name what the panel *can* do instead
+//!   of what to type: a container carries its own runtime and needs nothing
+//!   installed on this host.
 //! - **It does not delete a tenant's domain.** Deleting an app leaves its
 //!   proxy site standing, named in the operation's output. Removing a vhost as
 //!   a side effect of removing an application is the kind of surprise a panel
@@ -147,8 +162,10 @@ use unihelm_db::subscriptions::Subscription;
 use unihelm_distro::svc::{SvcAction, UnitName, UnitState};
 use unihelm_distro::{Cmd, Distro};
 
+use crate::catalogue;
 use crate::registry::{Execution, OpContext, TypedOperation};
 use crate::services::SkipValidation;
+use crate::stack::StackComponent;
 
 /// The serialisation key every systemd unit write shares.
 ///
@@ -962,9 +979,10 @@ fn carried_start_command(unit_path: &Path, app: &NodeApp, user: &LinuxUser) -> O
 /// line is the entry alone, and pinning a version would be meaningless: which
 /// Go built the binary is a fact about the build, not about this server.
 async fn resolve_interpreter(
+    ctx: &OpContext,
     runtime: AppRuntime,
     version: Option<&str>,
-    fallback_program: &str,
+    program: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     if runtime.is_compiled() {
         if version.is_some() {
@@ -983,7 +1001,7 @@ async fn resolve_interpreter(
 
     Ok(Some(match version {
         Some(want) => resolve_pinned(runtime, want).await?,
-        None => locate_default(runtime, fallback_program)?,
+        None => ensure_default_binary(ctx, runtime, program).await?,
     }))
 }
 
@@ -1004,54 +1022,276 @@ fn survey_runtime(runtime: AppRuntime) -> Option<crate::runtimes::Runtime> {
     })
 }
 
-/// The interpreter a bare command name resolves to.
+/// The program names a runtime's interpreter installs under, most preferred
+/// first — or the single name a caller has put in their place.
+///
+/// `python3`, not `python`: modern distributions ship no bare `python` on
+/// purpose. Go's list is empty because a compiled program has no interpreter,
+/// and [`resolve_interpreter`] returns before it ever asks for one.
+///
+/// The override used to exist for Node alone, described as somewhere an
+/// operator could point the lookup — which nothing did, and nothing could:
+/// `Create::live` hard-coded `node`. It is now what it always was, a test seam,
+/// and it applies to every runtime because the machine running the tests has a
+/// `python3` on it and the paths below have to be reachable without one.
+fn interpreter_candidates(runtime: AppRuntime, program: Option<&str>) -> Vec<&str> {
+    if let Some(name) = program {
+        return vec![name];
+    }
+    match runtime {
+        AppRuntime::Node => vec!["node"],
+        AppRuntime::Python => vec!["python3", "python"],
+        AppRuntime::Ruby => vec!["ruby"],
+        AppRuntime::Bun => vec!["bun"],
+        AppRuntime::Deno => vec!["deno"],
+        AppRuntime::Go => Vec::new(),
+    }
+}
+
+/// The interpreter a bare command name resolves to, or `None` when this machine
+/// has none of them.
 ///
 /// Searched through a fixed list of system directories rather than `$PATH`, so a
 /// poisoned environment cannot point tenant apps at something else — and systemd
 /// needs the absolute path anyway, since `ExecStart` does not do lookups.
-fn locate_default(runtime: AppRuntime, fallback_program: &str) -> Result<PathBuf> {
-    // Node keeps the operation's configured program name so an operator can
-    // point it somewhere; the others have no such setting and use the name their
-    // ecosystem installs under. `python3`, not `python`: modern distributions
-    // ship no bare `python` on purpose.
-    let candidates: &[&str] = match runtime {
-        AppRuntime::Node => &[fallback_program],
-        AppRuntime::Python => &["python3", "python"],
-        AppRuntime::Ruby => &["ruby"],
-        AppRuntime::Bun => &["bun"],
-        AppRuntime::Deno => &["deno"],
-        AppRuntime::Go => &[],
+fn locate_default(runtime: AppRuntime, program: Option<&str>) -> Option<PathBuf> {
+    interpreter_candidates(runtime, program)
+        .into_iter()
+        .find_map(|name| unihelm_distro::exec::resolve_program(name).ok())
+}
+
+/// The Stack Manager entry that installs this runtime's host packages, or the
+/// reason there is none for this machine.
+///
+/// Three of the six runtimes are catalogue entries that install as ordinary
+/// packages: Node from NodeSource, Python and Ruby from the distribution's own
+/// repositories. Go is catalogued too but never arrives here — a Go program is
+/// compiled, and [`resolve_interpreter`] answers before it looks for anything.
+///
+/// The `Err` is a sentence rather than a code, because it is the second half of
+/// something an operator reads, and every one of them names an action **in the
+/// panel**. What must never come back is the sentence this replaced —
+/// `Install nodejs first, then create the app again` — which was a package
+/// manager in a root shell, for a package the Stack Manager had been able to
+/// install all along.
+fn host_install_for(
+    runtime: AppRuntime,
+    distro: &Distro,
+) -> std::result::Result<StackComponent, String> {
+    let slug = match runtime {
+        AppRuntime::Node => "node",
+        AppRuntime::Python => "python",
+        AppRuntime::Ruby => "ruby",
+        // Bun and Deno are absent from the catalogue deliberately, and this is
+        // where that decision is said out loud instead of looking like an
+        // omission. Each ships as a single binary from its own vendor and
+        // neither publishes a signed package repository, so installing one
+        // would mean fetching an executable and trusting it — exactly what
+        // spec §11.1 forbids. That is a real refusal and it stays one; what
+        // changes is that it now ends in something the panel can do, because
+        // both have images and a container needs nothing installed here at all.
+        AppRuntime::Bun | AppRuntime::Deno => {
+            return Err(format!(
+                "Unihelm does not install {label} on the host: it ships as a single binary \
+                 from its own vendor rather than in a signed package repository, and this \
+                 panel installs only from official upstream repositories pinned by full \
+                 fingerprint. It can still run this application — a {label} container \
+                 carries its own {label} and needs nothing installed on this server. \
+                 Create the app without `mode: host`.",
+                label = runtime.label()
+            ));
+        }
+        // Unreachable while `is_compiled` answers first; a sentence rather than
+        // a panic for the day that stops being true.
+        AppRuntime::Go => {
+            return Err(format!(
+                "a {} program is compiled, so there is no interpreter for the panel to \
+                 install",
+                runtime.label()
+            ));
+        }
     };
 
-    for name in candidates {
-        if let Ok(path) = unihelm_distro::exec::resolve_program(name) {
-            return Ok(path);
-        }
+    let component = StackComponent::resolve(slug, None).map_err(|e| e.detail)?;
+
+    // Whether those packages can be reached on *this* machine is the repository
+    // resolver's answer rather than a second copy of the rule kept here:
+    // `stack.install` routes `node` through the same function, so the refusal
+    // below and the install it would otherwise perform cannot drift into
+    // disagreeing about one server. A distribution package has no repository to
+    // add, and both supported families carry every name this asks for — which
+    // is why Python and Ruby never reach this block.
+    if component.version().source == catalogue::Source::Vendor {
+        let major = component
+            .version()
+            .version
+            .split('.')
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "{} has no major version to select a repository with",
+                    component.display_name()
+                )
+            })?;
+        match slug {
+            "node" => unihelm_distro::repos::nodesource(&distro.info, major).map_err(|why| {
+                format!(
+                    "{why}. A {} container carries its own {} and needs nothing installed \
+                     on this server — create the app without `mode: host`.",
+                    runtime.label(),
+                    runtime.label(),
+                )
+            })?,
+            other => {
+                return Err(format!(
+                    "{other} installs from a vendor repository, and this module has no \
+                     resolver for it"
+                ));
+            }
+        };
     }
 
-    // Naming the package, not just the binary. "no `ruby` binary" tells somebody
-    // what is missing; "apt install ruby-full" tells them what to do about it,
-    // and the second is the sentence worth writing.
-    let package = match runtime {
-        AppRuntime::Node => "nodejs",
-        AppRuntime::Python => "python3",
-        AppRuntime::Ruby => "ruby-full",
-        // Bun and Deno ship as single binaries from their vendors rather than
-        // in any distribution, so there is no package to name.
-        AppRuntime::Bun => "bun (from bun.sh)",
-        AppRuntime::Deno => "deno (from deno.land)",
-        AppRuntime::Go => "golang",
-    };
+    Ok(component)
+}
 
-    Err(UnihelmError::new(
+/// A runtime this machine has not got, and the one thing to do about it.
+///
+/// The `remedy` every caller supplies is a **panel** action — a Stack Manager
+/// entry, or a container. The half of this sentence that was removed said
+/// `Install nodejs first, then create the app again`: a package manager, in a
+/// shell, for something the panel installs itself. Nothing here may go back to
+/// that shape, which
+/// `runtime_tests::a_missing_runtime_is_never_answered_with_a_package_manager`
+/// pins by walking every refusal this path can produce.
+fn refuse_missing_runtime(runtime: AppRuntime, program: &str, remedy: &str) -> UnihelmError {
+    UnihelmError::new(
         ErrorCode::NotFound,
         format!(
-            "{} is not installed on this server: no `{}` binary in the system \
-             directories. Install {package} first, then create the app again.",
-            runtime.label(),
-            candidates.first().copied().unwrap_or(runtime.as_str())
+            "{} is not installed on this server: no `{program}` binary in the system \
+             directories. {remedy}",
+            runtime.label()
         ),
-    ))
+    )
+}
+
+/// The interpreter for an application with no pinned version, installing the
+/// runtime first where this machine has not got it.
+///
+/// **This was a refusal and nothing else**, and the refusal was homework: it
+/// named a distribution package and told the operator to install it by hand
+/// before starting again. That is the one thing this product does not ask of
+/// anybody — one installation command, and everything the panel needs after it
+/// happens from the panel — and it was not even necessary, because `node`,
+/// `python` and `ruby` are catalogue entries the Stack Manager installs.
+///
+/// So it installs them, inside the task `app.create` already is, with the
+/// package manager's output in the same log. What remains a refusal is what the
+/// panel genuinely cannot install, and each of those says what it *can* do
+/// instead — see [`host_install_for`].
+///
+/// The install happens **before the row exists**, along with everything else
+/// that can fail, so a create that dies afterwards has nothing to unwind. It is
+/// the one effect a rollback does not undo, and that is deliberate: a runtime
+/// installed on the host is a fact about the machine, not part of this
+/// application, and removing it would be uninstalling something another
+/// tenant's app may already have started using.
+async fn ensure_default_binary(
+    ctx: &OpContext,
+    runtime: AppRuntime,
+    program: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(path) = locate_default(runtime, program) {
+        return Ok(path);
+    }
+
+    // The name the refusals below report as missing: the first thing looked for,
+    // which is the one an operator would type. `unwrap_or` rather than an index
+    // because Go's list is empty, and a panic there would be a crash instead of
+    // a sentence.
+    let missing = interpreter_candidates(runtime, program)
+        .first()
+        .copied()
+        .unwrap_or(runtime.as_str())
+        .to_string();
+
+    let component = match host_install_for(runtime, ctx.distro()) {
+        Ok(component) => component,
+        Err(why) => return Err(refuse_missing_runtime(runtime, &missing, &why)),
+    };
+
+    // Borrowing the Stack Manager borrows its permission. `app.create` is gated
+    // on NodeApps, which every customer on a shared machine holds, and
+    // installing server software is gated on StackManage, which they do not —
+    // so without this check NodeApps would quietly come to mean "may run the
+    // package manager as root". It is the same rule this operation already
+    // applies a few lines further on, where publishing a proxy site requires
+    // SiteManage on top of NodeApps.
+    //
+    // What follows is still not the old refusal in new words: it names the page,
+    // the entry and the version, so the administrator who does hold the
+    // permission has one thing to click and nothing to type.
+    if ctx.auth().require(Permission::StackManage).is_err() {
+        return Err(refuse_missing_runtime(
+            runtime,
+            &missing,
+            &format!(
+                "Unihelm installs it from the Stack Manager — {} — but this account may \
+                 not install server software, so an administrator has to add it there. \
+                 A {} container needs nothing installed on this server and can be created \
+                 now: leave `mode` unset.",
+                component.display_name(),
+                runtime.label(),
+            ),
+        ));
+    }
+
+    ctx.log(format!(
+        "{} is not installed on this server; installing {} from the Stack Manager before \
+         creating the app",
+        runtime.label(),
+        component.display_name()
+    ));
+    let installed = crate::stack::Install
+        .run(
+            ctx,
+            crate::stack::InstallInput {
+                component,
+                // PHP's alone; a language runtime has none.
+                extensions: Vec::new(),
+                // The host, named rather than left to the catalogue's default.
+                // What is missing is a binary on *this* machine for a unit's
+                // `ExecStart`, and a container of the same runtime would leave
+                // it exactly as absent as it is now.
+                runtime: Some(catalogue::Runtime::Host),
+            },
+        )
+        .await?;
+    ctx.log(format!(
+        "{} installed{}",
+        component.display_name(),
+        installed
+            .installed_version
+            .map(|v| format!(" ({v})"))
+            .unwrap_or_default()
+    ));
+
+    // Asked again rather than assumed. "The package manager reported success" and
+    // "there is a binary in the system directories" are two different facts, and
+    // writing an `ExecStart` for a path that is not there would be the panel
+    // reporting an application it had not created — the failure this module is
+    // written against.
+    locate_default(runtime, program).ok_or_else(|| {
+        UnihelmError::new(
+            ErrorCode::NotFound,
+            format!(
+                "Unihelm installed {}, but there is still no `{missing}` binary in this \
+                 server's system directories, so there would be nothing for the \
+                 application's unit to start.",
+                component.display_name()
+            ),
+        )
+    })
 }
 
 /// The absolute path of one installed version of one runtime.
@@ -1060,6 +1300,16 @@ fn locate_default(runtime: AppRuntime, fallback_program: &str) -> Result<PathBuf
 /// quietly starts on 22 is worse than one that refuses to start, because the
 /// first failure happens in production at some later time and the second happens
 /// here, in front of the person who asked.
+///
+/// **Nothing is installed on the way past, unlike the unpinned lookup in
+/// [`ensure_default_binary`]**, and either half of the reason would be enough on
+/// its own. A pin is an exact version — `22.11.0`, the survey's spelling — while
+/// the Stack Manager installs *majors*, so "install the version that was asked
+/// for" is not a request it can honour, and installing the nearest major instead
+/// would be the panel deciding it knew better. And the host holds one Node at a
+/// time: NodeSource ships a single `nodejs` package, so putting 22 on a machine
+/// serving 24 replaces it underneath every other tenant's application. Refusing
+/// costs one create; installing could cost somebody else's site.
 async fn resolve_pinned(runtime: AppRuntime, version: &str) -> Result<PathBuf> {
     let Some(kind) = survey_runtime(runtime) else {
         return Err(UnihelmError::new(
@@ -1090,7 +1340,8 @@ async fn resolve_pinned(runtime: AppRuntime, version: &str) -> Result<PathBuf> {
         ErrorCode::NotFound,
         format!(
             "{} {version} is not installed on this server. Available: {available}. \
-             Install it, or create the app without a version to use the default.",
+             Create the app without a version to run on the default, or as a container, \
+             where the version is the image tag and nothing is installed on this server.",
             runtime.label()
         ),
     )
@@ -1138,14 +1389,15 @@ impl Launch {
 /// version that is not a tag (`22:latest`) be refused here, in front of the
 /// insert, rather than at `docker run` with a port already spent.
 async fn plan_launch(
+    ctx: &OpContext,
     mode: AppMode,
     runtime: AppRuntime,
     version: Option<&str>,
-    fallback_program: &str,
+    program: Option<&str>,
 ) -> Result<Launch> {
     match mode {
         AppMode::Host => Ok(Launch::Unit(
-            resolve_interpreter(runtime, version, fallback_program).await?,
+            resolve_interpreter(ctx, runtime, version, program).await?,
         )),
         AppMode::Container => Ok(Launch::Container(crate::appcontainer::plan_image(
             runtime, version,
@@ -1564,23 +1816,28 @@ impl TypedOperation for List {
 /// `app.create` — allocate a port, write a unit, start it, optionally publish
 /// it behind a domain.
 pub struct Create {
-    /// The program name looked up to find the interpreter. `"node"` in
-    /// production; tests inject a name so they neither depend on the host
-    /// having Node nor go looking for it.
-    node_program: String,
+    /// The program name the host lookup resolves, in place of the names each
+    /// ecosystem installs under.
+    ///
+    /// `None` in production, which resolves Node as `node`, Python as `python3`
+    /// and so on — see [`interpreter_candidates`]. Tests set it so they neither
+    /// depend on this machine having a runtime installed nor go looking for one.
+    /// It used to be a plain `String` that only Node consulted, and only Node
+    /// could be made to miss; every runtime honours it now because the machine
+    /// running the tests has a `python3` on it, and the install path below is
+    /// unreachable while that binary answers.
+    program: Option<String>,
 }
 
 impl Create {
     pub fn live() -> Self {
-        Self {
-            node_program: "node".to_string(),
-        }
+        Self { program: None }
     }
 
     #[cfg(test)]
     fn with_program(program: &str) -> Self {
         Self {
-            node_program: program.to_string(),
+            program: Some(program.to_string()),
         }
     }
 }
@@ -1701,10 +1958,11 @@ impl TypedOperation for Create {
         // manager moves its directories, and a version does not. A compiled
         // runtime resolves to nothing, because the entry is the program.
         let launch = plan_launch(
+            ctx,
             mode,
             input.runtime,
             input.runtime_version.as_deref(),
-            &self.node_program,
+            self.program.as_deref(),
         )
         .await?;
         check_entry(&input.entry)?;
@@ -2469,7 +2727,7 @@ impl TypedOperation for Update {
         // is no question of resolving against the mode somebody asked for — and
         // a container never reaches `resolve_interpreter`, which is what lets a
         // Docker-only server hold Node applications at all.
-        let launch = plan_launch(app.mode, runtime, version.as_deref(), "node").await?;
+        let launch = plan_launch(ctx, app.mode, runtime, version.as_deref(), None).await?;
 
         // What the unit will start, resolved before the row moves for the same
         // reason the interpreter is: a command naming a program this machine
@@ -3132,14 +3390,25 @@ mod tests {
     /// An OpContext over a recorded mock distro and an in-memory database,
     /// built directly (as in `slices.rs`) because these tests need the
     /// recorder and no dispatch happens on the way in.
-    async fn ctx(family: Family) -> (OpContext, SharedRecorder) {
+    pub(super) async fn ctx(family: Family) -> (OpContext, SharedRecorder) {
+        ctx_as(family, Role::Admin).await
+    }
+
+    /// The same, for a caller who is not an administrator.
+    ///
+    /// The role is the whole point of the parameter: `app.create` is gated on
+    /// NodeApps, which a customer and a reseller both hold, and installing a
+    /// runtime is gated on StackManage, which neither does. The scope stays
+    /// global so a test of that boundary is testing the permission and not a
+    /// tenant-visibility rule that would refuse one step earlier.
+    pub(super) async fn ctx_as(family: Family, role: Role) -> (OpContext, SharedRecorder) {
         let (distro, rec) = mock_distro_with_recorder(family);
         let db = Db::open_memory().await.unwrap();
         let services = Arc::new(
             crate::registry::Services::new(distro, db, unihelm_db::MasterKey::generate())
                 .expect("templates compile"),
         );
-        let auth = AuthContext::from_role(UserId(1), Role::Admin, TenantScope::Global, "req-test");
+        let auth = AuthContext::from_role(UserId(1), role, TenantScope::Global, "req-test");
         (OpContext::new(services, auth), rec)
     }
 
@@ -4534,13 +4803,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn app_create_refuses_when_node_is_not_installed() {
-        // A NodeSource repository module is future work; until then the panel
-        // has to say what to install rather than writing a unit whose
-        // ExecStart does not exist.
-        let (ctx, _rec) = ctx(Family::Debian).await;
-        let db = ctx.db().clone();
+    /// A tenant and a subscription for a create that is expected to get as far
+    /// as the runtime.
+    async fn a_tenant(db: &Db) -> unihelm_db::subscriptions::Subscription {
         let customer = db
             .users(&TenantScope::Global)
             .create(unihelm_db::users::NewUser {
@@ -4554,34 +4819,113 @@ mod tests {
             })
             .await
             .unwrap();
-        let sub = db.create_subscription(customer.id).await.unwrap();
+        db.create_subscription(customer.id).await.unwrap()
+    }
+
+    /// A host create of a runtime this machine has not got, in the shape the
+    /// tests below vary.
+    fn create_input(runtime: AppRuntime, sub_id: i64) -> CreateInput {
+        CreateInput {
+            name: name(),
+            entry: TenantPath::parse("apps/blog/server.js").unwrap(),
+            subscription_id: Some(sub_id),
+            env: Vec::new(),
+            node_env: NodeEnv::Production,
+            memory_mb: None,
+            runtime,
+            runtime_version: None,
+            // Host, because what these assert is the host path. A container
+            // carries its own interpreter and never looks at this machine.
+            mode: Some(AppMode::Host),
+            start_command: None,
+            proxy_domain: None,
+        }
+    }
+
+    /// **The behaviour this operation used to refuse to have.**
+    ///
+    /// `app.create` said `Python is not installed on this server … Install
+    /// python3 first, then create the app again` — homework, in a root shell,
+    /// for a package `stack.install` had been able to install all along. It now
+    /// installs it as a step in its own task, and the recorder is what proves
+    /// the package manager actually ran rather than the sentence merely
+    /// changing.
+    ///
+    /// The create still ends in an error here, and that is the *other* half of
+    /// the change being asserted: the lookup is overridden to a program name
+    /// that cannot exist, so after a successful install there is still no
+    /// binary — and the panel says exactly that instead of writing a unit whose
+    /// `ExecStart` points at nothing. Python rather than Node because Python's
+    /// packages come from the distribution: there is no repository to add, so
+    /// no signing key to fetch, so this test never touches the network.
+    #[tokio::test]
+    async fn app_create_installs_a_missing_runtime_instead_of_sending_the_operator_to_a_shell() {
+        let (ctx, rec) = ctx(Family::Debian).await;
+        let db = ctx.db().clone();
+        let sub = a_tenant(&db).await;
+
+        let err = Create::with_program("definitely-not-python-xyz")
+            .run(&ctx, create_input(AppRuntime::Python, sub.id.get()))
+            .await
+            .unwrap_err();
+
+        let installed = rec.lock().unwrap().installed.clone();
+        assert!(
+            installed.iter().any(|p| p == "python3"),
+            "app.create must install the runtime it needs, not ask for it: {installed:?}"
+        );
+
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.detail.contains("Unihelm installed Python")
+                && err
+                    .detail
+                    .contains("still no `definitely-not-python-xyz` binary"),
+            "an install that produced no binary must be reported as exactly that: {}",
+            err.detail
+        );
+        assert_eq!(
+            db.node_apps(&TenantScope::Global)
+                .list(10, 0)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "the runtime is resolved before the row, so a failure allocates nothing"
+        );
+    }
+
+    /// Where the panel genuinely cannot install the runtime it still refuses,
+    /// and the refusal is a reason rather than a chore list.
+    ///
+    /// Node on the RHEL family is that case: NodeSource lays its RPM
+    /// repositories out per distribution release in a way `repos::nodesource`
+    /// does not resolve, and this panel will not add an archive it cannot pin by
+    /// fingerprint (spec §11.1). So there is nothing to install — and the
+    /// sentence says what *can* be done instead, which is a container, rather
+    /// than naming a package for somebody to type into a shell.
+    #[tokio::test]
+    async fn app_create_refuses_when_node_is_not_installed() {
+        let (ctx, rec) = ctx(Family::Rhel).await;
+        let db = ctx.db().clone();
+        let sub = a_tenant(&db).await;
 
         let err = Create::with_program("definitely-not-node-xyz")
-            .run(
-                &ctx,
-                CreateInput {
-                    name: name(),
-                    entry: TenantPath::parse("apps/blog/server.js").unwrap(),
-                    subscription_id: Some(sub.id.get()),
-                    env: Vec::new(),
-                    node_env: NodeEnv::Production,
-                    memory_mb: None,
-                    runtime: AppRuntime::Node,
-                    runtime_version: None,
-                    // Host, because what these assert is the host path.
-                    mode: Some(AppMode::Host),
-                    start_command: None,
-                    proxy_domain: None,
-                },
-            )
+            .run(&ctx, create_input(AppRuntime::Node, sub.id.get()))
             .await
             .unwrap_err();
 
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(
-            err.detail.contains("Node.js is not installed") && err.detail.contains("nodejs"),
-            "the refusal must name what to install: {}",
+            err.detail.contains("Node.js is not installed")
+                && err.detail.contains("cannot install Node")
+                && err.detail.contains("container"),
+            "the refusal must say why and name the panel's own answer: {}",
             err.detail
+        );
+        assert!(
+            rec.lock().unwrap().installed.is_empty(),
+            "a runtime the panel cannot install must not have started a package transaction"
         );
         assert_eq!(
             db.node_apps(&TenantScope::Global)
@@ -4990,14 +5334,15 @@ mod runtime_tests {
     /// fact about the build, not about this server.
     #[tokio::test]
     async fn a_compiled_runtime_takes_no_interpreter_and_refuses_a_version() {
+        let (ctx, _rec) = super::tests::ctx(unihelm_distro::Family::Debian).await;
         assert!(
-            resolve_interpreter(AppRuntime::Go, None, "node")
+            resolve_interpreter(&ctx, AppRuntime::Go, None, None)
                 .await
                 .expect("go needs no interpreter")
                 .is_none()
         );
 
-        let err = resolve_interpreter(AppRuntime::Go, Some("1.22.2"), "node")
+        let err = resolve_interpreter(&ctx, AppRuntime::Go, Some("1.22.2"), None)
             .await
             .expect_err("pinning a compiled runtime must be refused");
         assert!(
@@ -5088,6 +5433,184 @@ mod runtime_tests {
     #[test]
     fn a_missing_unit_carries_nothing_rather_than_failing() {
         assert!(carried_environment(Path::new("/nonexistent/app.service")).is_empty());
+    }
+
+    // -- what the panel can and cannot install ------------------------------
+
+    fn distro(family: unihelm_distro::Family) -> Distro {
+        unihelm_distro::mock::mock_distro_with_recorder(family).0
+    }
+
+    /// Which runtimes the panel can actually install, stated once and asserted
+    /// rather than assumed.
+    ///
+    /// This is the table the refusal is built on, and getting it wrong is worse
+    /// than the defect it replaced: a refusal that sends an operator to a Stack
+    /// Manager entry which would then fail is a lie the panel told, and this
+    /// project has shipped that shape before — `repos::litespeed` was written
+    /// and never wired, so OpenLiteSpeed sat permanently greyed out.
+    ///
+    /// Python and Ruby are distribution packages and so are installable on both
+    /// families. Node is NodeSource's, which is Debian-family only.
+    #[test]
+    fn the_panel_can_install_python_and_ruby_anywhere_and_node_only_on_the_debian_family() {
+        let debian = distro(unihelm_distro::Family::Debian);
+        let rhel = distro(unihelm_distro::Family::Rhel);
+
+        for family in [&debian, &rhel] {
+            for runtime in [AppRuntime::Python, AppRuntime::Ruby] {
+                let component = host_install_for(runtime, family)
+                    .unwrap_or_else(|why| panic!("{} must be installable: {why}", runtime.label()));
+                assert_eq!(
+                    component.version().source,
+                    catalogue::Source::Distro,
+                    "{} is a distribution package on both families",
+                    runtime.label()
+                );
+            }
+        }
+
+        let node = host_install_for(AppRuntime::Node, &debian).expect("NodeSource is Debian's");
+        assert_eq!(node.catalogue_slug(), "node");
+        // The version the refusal and the install both name. Whatever the
+        // catalogue recommends, it has to be one an operator could pick off the
+        // Stack page — not an invented default.
+        assert_eq!(
+            Some(node.version().version),
+            catalogue::default_version("node").map(|v| v.version)
+        );
+
+        let why = host_install_for(AppRuntime::Node, &rhel)
+            .expect_err("NodeSource's RPM layout is not resolved here");
+        assert!(
+            why.contains("cannot install Node") && why.contains("container"),
+            "the refusal must say why and offer the panel's own answer: {why}"
+        );
+    }
+
+    /// Bun and Deno stay a refusal, and it is a reason rather than a download.
+    ///
+    /// Neither is in the catalogue and neither should be: they ship as single
+    /// binaries from their own vendors with no signed package repository, and
+    /// this panel adds only official upstream repositories pinned by full
+    /// fingerprint (spec §11.1). Fetching an executable and trusting it is the
+    /// thing that rule exists to forbid, so "install it for them" is not the
+    /// honest fix — naming the container that runs it with nothing installed
+    /// here is.
+    #[test]
+    fn bun_and_deno_are_refused_with_the_reason_and_the_container_that_answers_it() {
+        let debian = distro(unihelm_distro::Family::Debian);
+        for runtime in [AppRuntime::Bun, AppRuntime::Deno] {
+            let why = host_install_for(runtime, &debian)
+                .expect_err("neither ships in a repository the panel can pin");
+            assert!(
+                why.contains("pinned by full fingerprint"),
+                "{}: the refusal must say why, not merely decline: {why}",
+                runtime.label()
+            );
+            assert!(
+                why.contains("container") && why.contains("mode: host"),
+                "{}: the refusal must name what the panel can do instead: {why}",
+                runtime.label()
+            );
+        }
+    }
+
+    /// A caller who may create applications but not install server software is
+    /// sent to the Stack Manager entry by name, not to a shell.
+    ///
+    /// `app.create` is gated on NodeApps, which every customer holds, and
+    /// installing a runtime is gated on StackManage, which they do not — so the
+    /// install path must not be reachable from a tenant's request. What they get
+    /// instead names the page, the entry and the version an administrator would
+    /// click, and the container that needs no install at all.
+    #[tokio::test]
+    async fn a_caller_without_stack_manage_is_named_the_entry_rather_than_a_command() {
+        let (ctx, rec) =
+            super::tests::ctx_as(unihelm_distro::Family::Debian, unihelm_core::Role::Reseller)
+                .await;
+        let err = ensure_default_binary(&ctx, AppRuntime::Node, Some("definitely-not-node-xyz"))
+            .await
+            .expect_err("a reseller may not install server software");
+
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert!(
+            err.detail.contains("Stack Manager") && err.detail.contains("Node.js 24"),
+            "the refusal must name the entry and its version: {}",
+            err.detail
+        );
+        assert!(
+            rec.lock().unwrap().installed.is_empty(),
+            "a caller without StackManage must not have run the package manager"
+        );
+    }
+
+    /// **The defect, pinned.** No refusal on this path may hand somebody a
+    /// package-manager command to run.
+    ///
+    /// The sentence that was here read `Install nodejs first, then create the
+    /// app again`, and the whole rule of this product is that there is no "go
+    /// and do this by hand, then come back" — one installation command, and
+    /// everything after it happens from the panel. Every refusal below is
+    /// checked for the shapes that would be a regression, and for naming
+    /// something in the panel instead.
+    #[tokio::test]
+    async fn a_missing_runtime_is_never_answered_with_a_package_manager() {
+        let (debian, _rec) =
+            super::tests::ctx_as(unihelm_distro::Family::Debian, unihelm_core::Role::Reseller)
+                .await;
+        let (rhel, _rec2) = super::tests::ctx(unihelm_distro::Family::Rhel).await;
+
+        let mut refusals = Vec::new();
+        // Every runtime the panel will not install for a reseller on Debian:
+        // Bun and Deno because it cannot, Node and the rest because that caller
+        // may not. Go is absent because it is compiled and never asks.
+        for runtime in [
+            AppRuntime::Node,
+            AppRuntime::Python,
+            AppRuntime::Ruby,
+            AppRuntime::Bun,
+            AppRuntime::Deno,
+        ] {
+            refusals.push(
+                ensure_default_binary(&debian, runtime, Some("definitely-not-a-runtime-xyz"))
+                    .await
+                    .expect_err("nothing named that is installed")
+                    .detail,
+            );
+        }
+        // And the one the panel refuses for everybody, administrator included.
+        refusals.push(
+            ensure_default_binary(
+                &rhel,
+                AppRuntime::Node,
+                Some("definitely-not-a-runtime-xyz"),
+            )
+            .await
+            .expect_err("NodeSource has no RPM layout here")
+            .detail,
+        );
+
+        for detail in &refusals {
+            for homework in [
+                "apt install",
+                "apt-get",
+                "dnf install",
+                "yum install",
+                "npm install",
+                "curl",
+                "then create the app again",
+            ] {
+                assert!(
+                    !detail.contains(homework),
+                    "a refusal sent somebody to a shell (`{homework}`): {detail}"
+                );
+            }
+            assert!(
+                detail.contains("Stack Manager") || detail.contains("container"),
+                "a refusal has to name what the panel itself can do: {detail}"
+            );
+        }
     }
 }
 
@@ -5248,11 +5771,13 @@ mod mode_tests {
     /// `node` binary in the first place.
     #[tokio::test]
     async fn a_container_never_goes_looking_for_an_interpreter_on_the_host() {
+        let (ctx, _rec) = super::tests::ctx(unihelm_distro::Family::Debian).await;
         let launch = plan_launch(
+            &ctx,
             AppMode::Container,
             AppRuntime::Node,
             None,
-            "definitely-not-node-xyz",
+            Some("definitely-not-node-xyz"),
         )
         .await
         .expect("a container does not need a host interpreter");
@@ -5265,13 +5790,18 @@ mod mode_tests {
             "a container has no interpreter path on this machine"
         );
 
-        // The host arm is unchanged: it still refuses, and still names what to
-        // install rather than writing a unit whose ExecStart does not exist.
+        // The host arm still goes looking, and on a family where the panel has
+        // no NodeSource repository it still refuses rather than writing a unit
+        // whose ExecStart does not exist. The RHEL context is deliberate: on
+        // Debian this same call would now *install* Node, which is the change,
+        // and a unit test must not run a package manager against the network.
+        let (rhel, _rec) = super::tests::ctx(unihelm_distro::Family::Rhel).await;
         let err = plan_launch(
+            &rhel,
             AppMode::Host,
             AppRuntime::Node,
             None,
-            "definitely-not-node-xyz",
+            Some("definitely-not-node-xyz"),
         )
         .await
         .expect_err("a unit needs a real binary");
@@ -5482,17 +6012,19 @@ mod mode_tests {
     /// for free, and the range it comes out of is 5001 wide.
     #[tokio::test]
     async fn an_impossible_container_is_refused_before_a_port_is_spent() {
-        let err = plan_launch(AppMode::Container, AppRuntime::Go, None, "node")
+        let (ctx, _rec) = super::tests::ctx(unihelm_distro::Family::Debian).await;
+        let err = plan_launch(&ctx, AppMode::Container, AppRuntime::Go, None, None)
             .await
             .expect_err("a Go application has no runtime image");
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert_eq!(err.field.as_deref(), Some("runtime"));
 
         let err = plan_launch(
+            &ctx,
             AppMode::Container,
             AppRuntime::Node,
             Some("22:latest"),
-            "node",
+            None,
         )
         .await
         .expect_err("a version carrying a colon is not a tag");
@@ -5500,7 +6032,7 @@ mod mode_tests {
 
         // And the host arm is untouched by either: a Go unit is still perfectly
         // ordinary, and still resolves to no interpreter at all.
-        let launch = plan_launch(AppMode::Host, AppRuntime::Go, None, "node")
+        let launch = plan_launch(&ctx, AppMode::Host, AppRuntime::Go, None, None)
             .await
             .expect("a Go application is a binary, and needs nothing resolved");
         assert!(launch.interpreter().is_none());

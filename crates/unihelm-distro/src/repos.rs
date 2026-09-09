@@ -584,6 +584,13 @@ pub fn pgdg(info: &DistroInfo) -> Result<ResolvedRepo, String> {
 /// Debian family only. NodeSource's RPM repositories exist but are laid out per
 /// distribution release in a way that needs its own handling, and offering a
 /// half-supported path is worse than saying plainly that it is not here.
+///
+/// The RHEL sentence used to end by telling the reader to install Node from the
+/// distribution's own repository — a package manager, in a shell, which is the
+/// one thing this panel does not send anybody off to do. It states the fact and
+/// stops there now; a caller that has something better to offer (`nodeapp` has:
+/// a container carries its own Node) adds it, because this module has no way to
+/// know what that would be.
 pub fn nodesource(info: &DistroInfo, major: u32) -> Result<ResolvedRepo, String> {
     match info.family {
         Family::Debian => Ok(ResolvedRepo {
@@ -606,8 +613,9 @@ pub fn nodesource(info: &DistroInfo, major: u32) -> Result<ResolvedRepo, String>
             prerequisites: Vec::new(),
         }),
         Family::Rhel => Err(format!(
-            "NodeSource packages for {} are not set up here; install Node from the \
-             distribution's own repository, or use a version already on the machine",
+            "Unihelm cannot install Node on {}: NodeSource lays its RPM repositories out \
+             per distribution release in a way this panel does not resolve yet, and it \
+             will not add an archive it cannot pin by fingerprint",
             info.pretty_name
         )),
     }
@@ -1358,10 +1366,32 @@ mod tests {
         }
     }
 
-    /// Saying plainly that a path is not supported beats half-supporting it.
+    /// Saying plainly that a path is not supported beats half-supporting it —
+    /// and the reason may not be a job for the reader.
+    ///
+    /// This used to assert the sentence `install Node from the distribution's
+    /// own repository`, which is a package manager in a root shell for
+    /// something the panel installs itself everywhere else. The refusal now
+    /// states the fact and stops; whichever caller has a better answer (a Node
+    /// application can run in a container that carries its own Node) adds it,
+    /// because this module cannot know what that answer would be.
     #[test]
-    fn nodesource_refuses_rhel_with_a_reason() {
+    fn nodesource_refuses_rhel_with_a_reason_and_not_with_homework() {
         let err = nodesource(&rhel("9", Arch::X86_64), 22).unwrap_err();
-        assert!(err.contains("distribution's own repository"), "{err}");
+        assert!(
+            err.contains("cannot install Node") && err.contains("pin by fingerprint"),
+            "the refusal must say why: {err}"
+        );
+        for homework in [
+            "distribution's own repository",
+            "dnf",
+            "yum",
+            "install Node from",
+        ] {
+            assert!(
+                !err.contains(homework),
+                "the refusal sent the reader to a shell (`{homework}`): {err}"
+            );
+        }
     }
 }

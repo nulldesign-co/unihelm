@@ -55,11 +55,28 @@
 //! can say what the selector is. Printing a made-up DKIM record would be worse
 //! than printing none.
 //!
-//! # Migration is part of this module, not an afterthought
+//! # Migration is part of this module, and nobody has to ask for it
 //!
 //! Somebody is running the old design right now, with a `.msmtprc` per site and
-//! FPM pools naming it. `mail.mta.install` is the order that gets them across
-//! without a window where mail stops:
+//! FPM pools naming it. The order below is what gets them across without a
+//! window where mail stops — and it is reached three ways, of which only the
+//! last is a person deciding anything:
+//!
+//! * **Saving a relay** ([`RelaySet`]). Where mail goes is the instruction; a
+//!   machine able to carry it there is what honouring that instruction means.
+//! * **The agent starting.** Nothing in this module does that: `unihelm-agentd`
+//!   queues `mail.mta.install` as an ordinary task when it finds a live relay
+//!   and an MTA that is not the panel's. That is the upgraded server, whose
+//!   operator has no reason to re-save a relay that is already correct.
+//! * **`mail.mta.install` itself**, for the two things that are genuinely
+//!   somebody's decision: adopting a `main.cf` a person wrote, and repairing a
+//!   machine that stopped half way.
+//!
+//! Until 0.8.0 only the third existed, so the documented upgrade path was a
+//! command an operator had to know to run — and saving a relay on a machine
+//! with no MTA stored the row, changed nothing, and said nothing loudly enough.
+//!
+//! The order itself:
 //!
 //! 1. verify the relay actually accepts the credential — before anything on the
 //!    machine is touched, so a rejection leaves the old wiring exactly as it
@@ -75,6 +92,13 @@
 //! never safe is the reverse order — deleting the credential file while the
 //! pool still names it takes that site's mail down — so it is not available in
 //! this module in either direction.
+//!
+//! Step 1 is the one step that is about the *old* wiring, so it is the one step
+//! that is skipped where there is none: saving a relay on a machine the panel
+//! has already configured rewrites the configuration and asks the relay
+//! nothing. There is nothing there to lose, the file is rewritten to whatever
+//! was stored either way, and `mail.relay.test` is that question asked when
+//! somebody wants it asked.
 //!
 //! That is also why [`PoolWriter`] and [`rewire_all_sites`] are still here now
 //! that a pool has no mail configuration in it. They no longer *write* mail
@@ -1260,6 +1284,13 @@ impl TypedOperation for MtaInstall {
         // 3. The package, with the SASL mechanism plugin it is useless without,
         //    and the debconf answers that stop the Debian postinst binding port
         //    25 on every address of the machine while we are still rendering.
+        //
+        //    Read before the install, because the install is what changes the
+        //    answer: a machine that has never had an MTA has no `main.cf` until
+        //    postfix's own postinst writes one, and that file is not somebody's
+        //    configuration to adopt. Without this, the first install on every
+        //    fresh server refuses itself. See [`mta::may_adopt`].
+        let main_cf_absent = self.layout.main_cf_absent();
         if self.host.installed(ctx).await? {
             ctx.log("the MTA is already installed");
         } else {
@@ -1285,7 +1316,7 @@ impl TypedOperation for MtaInstall {
                 container_networks: &networks,
                 layout: &self.layout,
             },
-            input.adopt,
+            mta::may_adopt(input.adopt, main_cf_absent),
         )
         .await?;
 
@@ -1353,9 +1384,19 @@ impl TypedOperation for MtaInstall {
 // `mail.relay.set`
 // ---------------------------------------------------------------------------
 
-/// `mail.relay.set` — store the relay, and put the local MTA on it.
+/// `mail.relay.set` — store the relay, and make this server send through it.
+///
+/// Saving a relay is the operator saying where this machine's mail goes. Until
+/// 0.8.0 that stored a row and, on a machine the panel had not already
+/// configured, did nothing else: the MTA that carries a message to the relay
+/// was installed only by somebody running `mail.mta.install` by hand. So the
+/// panel accepted the one instruction that matters and left the machine unable
+/// to follow it — with an operator who had every reason to believe mail was set
+/// up. Everything needed to honour the instruction happens here now; see
+/// [`RelaySet::honour`].
 pub struct RelaySet {
     host: Box<dyn mta::MtaHost>,
+    probe: Box<dyn RelayProbe>,
     pools: Box<dyn PoolWriter>,
     layout: mta::Layout,
     legacy_dir: std::path::PathBuf,
@@ -1365,6 +1406,7 @@ impl RelaySet {
     pub fn live() -> Self {
         Self {
             host: Box::new(mta::LiveHost),
+            probe: Box::new(LiveProbe),
             pools: Box::new(LivePools),
             layout: mta::Layout::system(),
             legacy_dir: paths::mail_dir(),
@@ -1373,12 +1415,14 @@ impl RelaySet {
 
     pub fn with_parts(
         host: Box<dyn mta::MtaHost>,
+        probe: Box<dyn RelayProbe>,
         pools: Box<dyn PoolWriter>,
         layout: mta::Layout,
         legacy_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             host,
+            probe,
             pools,
             layout,
             legacy_dir,
@@ -1416,7 +1460,10 @@ pub struct RelaySetInput {
 #[derive(Debug, Serialize)]
 pub struct RelaySetOutput {
     pub relay: RelayView,
-    /// What was written to the MTA, when there is a configured one to write to.
+    /// What was written to the MTA. `None` only when there was nothing to write
+    /// it for: a relay stored switched off on a machine the panel has never
+    /// configured, where installing an MTA would install a package whose whole
+    /// configuration is a sentence refusing mail.
     pub configuration: Option<mta::ConfigureReport>,
     pub sites: RewireTally,
 }
@@ -1428,11 +1475,12 @@ impl TypedOperation for RelaySet {
 
     const NAME: &'static str = "mail.relay.set";
     const PERMISSION: Permission = Permission::ServerManage;
-    // A task: it rewrites the MTA's configuration and reloads it, and on a
-    // machine still carrying the old per-site wiring it re-renders one pool per
-    // site. On a box with fifty sites that is well past the ~300 ms an
-    // immediate operation is allowed, and the per-site log lines are the only
-    // way to see which site did not take.
+    // A task, and this is what a task is for: on a machine with no MTA it
+    // installs one from a package mirror, then rewrites that MTA's
+    // configuration and reloads it, then re-renders one pool per site on a box
+    // still carrying the old per-site wiring. Any one of those is well past the
+    // ~300 ms an immediate operation is allowed, and the per-step log lines are
+    // the only way to see which part did not take.
     const EXECUTION: Execution = Execution::Task {
         cancellable: false,
         idempotent: true,
@@ -1524,69 +1572,22 @@ impl TypedOperation for RelaySet {
             .await
             .map_err(UnihelmError::from)?;
 
-        // The MTA is rewritten only if the panel configured it. On a machine
-        // that has not been migrated, the pools still name the per-site msmtp
-        // files and those files are what its mail depends on — re-rendering
-        // anything here would take the directive away and leave nothing behind
-        // it.
-        let mut configuration = None;
-        let mut sites = RewireTally::default();
-        if self.layout.state().is_ours() {
-            let password = open_password(ctx, &saved).await?;
-            let hostname = self.host.hostname()?;
-            let domains = hosted_domains(ctx).await?;
-            // Re-discovered rather than carried over from the file: this
-            // rewrites the whole of `main.cf`, and rendering yesterday's
-            // `mynetworks` would drop a network that has appeared since. It
-            // does not touch the firewall — opening a port is not a side effect
-            // of saving a relay — so a network that is new here is reported by
-            // `mail.mta.status` until `mail.mta.install` runs again.
-            let networks = container_networks(ctx, self.host.as_ref(), &self.layout).await;
-            configuration = Some(
-                mta::configure(
-                    ctx,
-                    self.host.as_ref(),
-                    &mta::Settings {
-                        hostname: &hostname,
-                        relay: Some(&saved),
-                        password: password.as_deref(),
-                        trust_file: tls_trust_file(ctx.distro().info.family),
-                        domains: &domains,
-                        container_networks: &networks,
-                        layout: &self.layout,
-                    },
-                    // Never here. Taking over a `main.cf` somebody else wrote is
-                    // a decision an operator makes once, at `mail.mta.install`,
-                    // and not a side effect of saving a relay.
-                    false,
-                )
-                .await?,
-            );
-            if saved.is_live() {
-                ctx.log(
-                    "the local MTA now relays through this relay. Send one message with \
-                     `mail.relay.test` to confirm it accepts the credential — the panel wrote \
-                     what you asked for and cannot know whether the relay agrees.",
-                );
-            } else {
-                ctx.log(
-                    "the relay is switched off, so the MTA now refuses every message as it is \
-                     submitted rather than queueing it somewhere nothing drains. Nothing on \
-                     this server will send until the relay is switched back on.",
-                );
-            }
-            // Sweeps anything an interrupted earlier migration left behind. On
-            // an already-migrated machine this finds nothing and re-renders the
-            // pools it already rendered, which is what idempotent looks like.
-            sites = rewire_all_sites(ctx, self.pools.as_ref(), &self.legacy_dir).await?;
-        } else {
-            ctx.log(
-                "the relay is stored. This server has no local MTA configured, so nothing was \
-                 re-rendered and the sites still carrying the old per-site msmtp wiring keep \
-                 using it. Run `mail.mta.install` to move this machine onto the local MTA — it \
-                 verifies the relay first and re-renders the pools itself.",
-            );
-        }
+        // Everything above this line is the operator's answer to "where does
+        // this server's mail go", and it is now stored. Everything below is the
+        // machine being made able to honour it — which can fail on a mirror, a
+        // package or a unit, and must not cost them the credential they just
+        // typed. The row stays saved either way; a failure here is an answer
+        // that says so.
+        let (configuration, sites) = self.honour(ctx, &saved).await.map_err(|cause| {
+            UnihelmError::new(
+                cause.code,
+                format!(
+                    "the relay is stored — you will not have to enter the password again — but \
+                     this server is not sending through it yet: {}",
+                    cause.detail
+                ),
+            )
+        })?;
 
         Ok(RelaySetOutput {
             relay: view(
@@ -1600,6 +1601,177 @@ impl TypedOperation for RelaySet {
             configuration,
             sites,
         })
+    }
+}
+
+impl RelaySet {
+    /// Make this machine carry the relay that was just saved.
+    ///
+    /// The steps a person used to have to run `mail.mta.install` for: install
+    /// the package if it is missing, write the null client's configuration onto
+    /// it, prove it came up. `mail.mta.install` keeps them for the two cases
+    /// that are genuinely somebody's decision — adopting a `main.cf` a person
+    /// wrote, and repairing a machine — but "there is nowhere for this server's
+    /// mail to go" was never one of them.
+    ///
+    /// The relay is asked whether it accepts a message *first*, and only on a
+    /// machine the panel has not configured before, because that is the machine
+    /// where the last step takes something away: its sites are still sending
+    /// through per-site msmtp files, and a credential the relay rejects must not
+    /// be the reason a server that was delivering mail stops. On a machine the
+    /// already configured there is nothing to lose and nothing to prove — the
+    /// configuration is rewritten to whatever is stored either way, so the file
+    /// and the row cannot disagree — and an SMTP conversation with a third
+    /// party on every save would make correcting a from-name as slow, and as
+    /// failable, as the network to that party. `mail.relay.test` is that
+    /// question, asked when it is wanted.
+    async fn honour(
+        &self,
+        ctx: &OpContext,
+        saved: &MailRelay,
+    ) -> Result<(Option<mta::ConfigureReport>, RewireTally)> {
+        let live = saved.is_live();
+        let already_ours = self.layout.state().is_ours();
+
+        // A relay that is switched off has nothing to carry, and a machine the
+        // panel has never configured has nothing pointed at it. Installing an
+        // MTA here would be installing a package whose entire configuration is
+        // a sentence refusing mail, and re-rendering the pools would take the
+        // msmtp wiring those sites are still sending through away and leave
+        // nothing behind it.
+        if !live && !already_ours {
+            ctx.log(
+                "the relay is stored and switched off, and this server has no local MTA \
+                 configured, so nothing was installed and nothing was re-rendered. Switch the \
+                 relay on and save it again: that installs the MTA and points it here.",
+            );
+            return Ok((None, RewireTally::default()));
+        }
+
+        let password = open_password(ctx, saved).await?;
+        let hostname = self.host.hostname()?;
+
+        // 1. Ask the relay, before anything is installed or taken away — and
+        //    only where something would be taken away. See the note above.
+        if live && !already_ours {
+            ctx.log(format!(
+                "asking {}:{} whether it accepts a message from this server, before changing \
+                 anything",
+                saved.host, saved.port
+            ));
+            let report = self.probe.probe(ctx, saved, password.as_deref()).await;
+            if !report.delivered {
+                return Err(UnihelmError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "the relay did not accept a message from this server, so nothing on \
+                         this machine has been changed and it still sends mail exactly as it \
+                         did. It stopped at {}: {}. {} Correct the relay and save it again.",
+                        report.stage.as_str(),
+                        report.detail,
+                        report.stage.hint(),
+                    ),
+                ));
+            }
+            ctx.log(format!("the relay accepted a message ({})", report.detail));
+        }
+
+        // 2. The package. Read before the install, because the install is what
+        //    changes the answer: see `mta::may_adopt`.
+        let main_cf_absent = self.layout.main_cf_absent();
+        if live {
+            if self.host.installed(ctx).await? {
+                ctx.log("the local MTA is already installed");
+            } else {
+                ctx.log(
+                    "this server has no local mail transfer agent, so nothing on it could hand \
+                     a message to a relay. Installing one.",
+                );
+                self.host.install(ctx, &hostname).await?;
+            }
+        }
+
+        // 3. The three files, and a reload if any of them moved.
+        let domains = hosted_domains(ctx).await?;
+        // Re-discovered rather than carried over from the file: this rewrites
+        // the whole of `main.cf`, and rendering yesterday's `mynetworks` would
+        // drop a network that has appeared since.
+        let networks = container_networks(ctx, self.host.as_ref(), &self.layout).await;
+        let configuration = mta::configure(
+            ctx,
+            self.host.as_ref(),
+            &mta::Settings {
+                hostname: &hostname,
+                relay: Some(saved),
+                password: password.as_deref(),
+                trust_file: tls_trust_file(ctx.distro().info.family),
+                domains: &domains,
+                container_networks: &networks,
+                layout: &self.layout,
+            },
+            // Adoption is still never a side effect of saving a relay: taking
+            // over a `main.cf` somebody else wrote is a decision an operator
+            // makes once, at `mail.mta.install`, and `may_adopt` grants nothing
+            // here beyond the file postfix's own postinst wrote a moment ago
+            // for a machine that had none.
+            mta::may_adopt(false, main_cf_absent),
+        )
+        .await?;
+
+        // 4. Prove it is up before anything is taken away from the sites that
+        //    are still working. A configured MTA that is not running accepts
+        //    messages into a queue nothing drains, which would be the panel
+        //    reporting mail set up for mail that is going nowhere.
+        if live && !self.host.running(ctx).await? {
+            return Err(UnihelmError::new(
+                ErrorCode::ServiceUnavailable,
+                "the MTA is installed and configured but is not running, so nothing on this \
+                 server can hand it a message. Nothing has been taken away from the sites \
+                 still using the old per-site relay files — they keep sending. Look at \
+                 `journalctl -u postfix`, then save the relay again.",
+            ));
+        }
+
+        if live {
+            ctx.log(format!(
+                "the local MTA is running and relays through {}:{}. Send one message with \
+                 `mail.relay.test` to confirm the relay still accepts the credential — the \
+                 panel wrote what you asked for and cannot know whether the relay agrees.",
+                saved.host, saved.port
+            ));
+        } else {
+            ctx.log(
+                "the relay is switched off, so the MTA now refuses every message as it is \
+                 submitted rather than queueing it somewhere nothing drains. Nothing on this \
+                 server will send until the relay is switched back on.",
+            );
+        }
+
+        // 5. The other half of serving containers, which is not Postfix's: a
+        //    packet from a container to the bridge gateway arrives on this
+        //    machine's INPUT chain, so an enabled ufw drops it whatever
+        //    `mynetworks` says. Opened from those subnets and from nowhere
+        //    else, and never fatal — the loopback clients are already sending
+        //    by this point, and `mail.mta.status` reports the gap. A machine
+        //    with no Docker has no subnets here and no rule is written.
+        if live && !networks.is_empty() {
+            crate::fwops::allow_mta_from(ctx, &networks).await;
+        }
+
+        // 6. Only now: re-render each pool, which is how the `sendmail_path`
+        //    an older panel wrote leaves a machine, and delete each site's
+        //    credential file after its own pool has stopped naming it. On an
+        //    already-migrated machine this finds nothing, which is what
+        //    idempotent looks like.
+        let sites = rewire_all_sites(ctx, self.pools.as_ref(), &self.legacy_dir).await?;
+        if sites.rewired > 0 || sites.retired_files > 0 {
+            ctx.log(format!(
+                "{} pool(s) re-rendered, {} failed, {} credential file(s) retired",
+                sites.rewired, sites.failed, sites.retired_files
+            ));
+        }
+
+        Ok((Some(configuration), sites))
     }
 }
 

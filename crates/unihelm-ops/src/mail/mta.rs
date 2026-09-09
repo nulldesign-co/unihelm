@@ -487,6 +487,16 @@ impl Layout {
         }
     }
 
+    /// Was there no `main.cf` at all when this was asked?
+    ///
+    /// Narrower than [`ConfigState::Unwritten`], which also covers a file
+    /// somebody else wrote, and the difference is the whole of [`may_adopt`]:
+    /// there is exactly one file the panel may take over without being asked,
+    /// and it is the one that was not there a moment ago.
+    pub fn main_cf_absent(&self) -> bool {
+        matches!(managed::inspect(&self.main_cf), FileState::Absent)
+    }
+
     /// The non-loopback entries of `mynetworks` in the `main.cf` on disk.
     ///
     /// Read back out of the file rather than re-rendered from what the panel
@@ -964,6 +974,26 @@ impl FileOutcome {
             FileOutcome::Written | FileOutcome::Adopted | FileOutcome::Removed
         )
     }
+}
+
+/// May this pass write over the `main.cf` in front of it?
+///
+/// `adopt` is an operator answering one question — "there is a mail server
+/// configured on this machine that the panel did not write; replace it" — and
+/// that stays a question only a person answers. [`put`] is where the refusal
+/// lives.
+///
+/// A `main.cf` that did not exist when the operation *started* is not that
+/// question. The only thing that can have written one since is the package
+/// postinst this same task just ran, answering the debconf questions this same
+/// task pre-answered seconds earlier; taking it over is the install finishing,
+/// not the panel replacing somebody's mail server. Refusing it would mean a
+/// machine that has never had an MTA cannot get one without a second command
+/// carrying `adopt` — a manual step where nothing is at risk, which is also the
+/// best way to teach an operator to send `adopt` on the machine where
+/// everything is.
+pub const fn may_adopt(operator_asked: bool, main_cf_absent_before: bool) -> bool {
+    operator_asked || main_cf_absent_before
 }
 
 /// Write one managed file, refusing to throw away work that is not ours.
@@ -1568,13 +1598,18 @@ pub fn describe(
     legacy_files: usize,
 ) -> String {
     let mut sentence = match (installed, configured, running, relay_live) {
+        // One instruction, not two. Saving the relay is what installs the MTA
+        // and points it there; naming a second command here was the sentence
+        // that made the migration look like something an operator had to
+        // assemble out of parts.
         (false, _, _, false) => "No local mail transfer agent is installed and no relay is \
              configured, so nothing on this server can send mail. Configure a relay with \
-             `mail.relay.set`, then run `mail.mta.install`."
+             `mail.relay.set`: that installs the agent and points it at the relay."
             .to_string(),
         (false, _, _, true) => "A relay is configured but this server has no local mail \
              transfer agent, so only PHP sites still wired to the per-site msmtp files can \
-             send anything. Run `mail.mta.install`."
+             send anything. Saving the relay again installs one; `mail.mta.install` is the \
+             same steps with the option to take over a `main.cf` the panel did not write."
             .to_string(),
         (true, false, _, _) => "Postfix is installed but the panel has not written its \
              configuration, so what this server does with a message is whatever the package \

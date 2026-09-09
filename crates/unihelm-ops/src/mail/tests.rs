@@ -88,6 +88,14 @@ struct FakeHost {
     /// What Docker looks like from here. Default is none, which is what keeps
     /// the listener on the loopback — the state a case has to opt out of.
     container_networks: Mutex<mta::ContainerNetworks>,
+    /// Why the package install fails, for the machine whose mirror is down.
+    install_fails: Option<&'static str>,
+    /// Where the package's own postinst leaves a `main.cf`, as the real one
+    /// does the moment `apt` finishes. A machine that has never had an MTA has
+    /// no such file until something installs the package, and whether the panel
+    /// may write over the file that then appears is the difference between a
+    /// fresh server configuring itself and one that refuses itself.
+    postinst_main_cf: Option<std::path::PathBuf>,
 }
 
 impl FakeHost {
@@ -101,6 +109,8 @@ impl FakeHost {
             installs: Mutex::new(0),
             activations: Mutex::new(0),
             container_networks: Mutex::new(mta::ContainerNetworks::default()),
+            install_fails: None,
+            postinst_main_cf: None,
         }
     }
 
@@ -112,10 +122,32 @@ impl FakeHost {
         host
     }
 
+    /// A machine whose package install cannot succeed.
+    fn cannot_install(reason: &'static str) -> Self {
+        Self {
+            install_fails: Some(reason),
+            ..Self::bare()
+        }
+    }
+
+    /// A machine whose postinst writes the package's own `main.cf`, which is
+    /// what every Debian install of postfix actually leaves behind.
+    fn with_postinst(layout: &mta::Layout) -> Self {
+        Self {
+            postinst_main_cf: Some(layout.main_cf.clone()),
+            ..Self::bare()
+        }
+    }
+
     fn installs(&self) -> usize {
         *self.installs.lock().unwrap()
     }
 }
+
+/// What Debian's postfix postinst leaves in `main.cf`, near enough: a file with
+/// no header of the panel's, which is all [`mta::put`] reads.
+const PACKAGE_MAIN_CF: &str = "# Debian's own main.cf\nmyhostname = web-01\nmydestination = \
+                               $myhostname, localhost\n";
 
 /// Where the three files go for a test, and nowhere near `/etc`.
 fn layout_in(dir: &std::path::Path) -> mta::Layout {
@@ -155,7 +187,15 @@ impl mta::MtaHost for FakeHost {
 
     async fn install(&self, _ctx: &OpContext, _hostname: &str) -> Result<()> {
         *self.installs.lock().unwrap() += 1;
+        if let Some(reason) = self.install_fails {
+            return Err(UnihelmError::new(ErrorCode::CommandFailed, reason));
+        }
         *self.installed.lock().unwrap() = true;
+        // The postinst, which runs inside the install and writes a `main.cf`
+        // nothing of the panel's has ever touched.
+        if let Some(path) = &self.postinst_main_cf {
+            std::fs::write(path, PACKAGE_MAIN_CF).unwrap();
+        }
         Ok(())
     }
 
@@ -206,6 +246,40 @@ impl mta::MtaHost for SharedHost {
     }
 }
 
+/// A host whose unit never comes up, however often it is activated.
+///
+/// The failure both `mail.mta.install` and `mail.relay.set` have to refuse to
+/// build on: a configured MTA that is not running accepts messages into a queue
+/// nothing drains, so nothing may be taken away from the sites that still work.
+struct DeadUnit(std::sync::Arc<FakeHost>);
+
+#[async_trait]
+impl mta::MtaHost for DeadUnit {
+    async fn container_networks(&self) -> mta::ContainerNetworks {
+        self.0.container_networks().await
+    }
+
+    fn hostname(&self) -> Result<String> {
+        self.0.hostname()
+    }
+    async fn installed(&self, ctx: &OpContext) -> Result<bool> {
+        self.0.installed(ctx).await
+    }
+    async fn install(&self, ctx: &OpContext, hostname: &str) -> Result<()> {
+        self.0.install(ctx, hostname).await
+    }
+    /// Activation does not bring it up: that is the failure being modelled.
+    async fn activate(&self, _ctx: &OpContext) -> Result<()> {
+        Ok(())
+    }
+    async fn running(&self, _ctx: &OpContext) -> Result<bool> {
+        Ok(false)
+    }
+    async fn queued(&self) -> Option<u64> {
+        self.0.queued().await
+    }
+}
+
 /// A relay that answers however the test says, without a relay.
 struct FakeProbe {
     delivered: bool,
@@ -224,6 +298,10 @@ impl FakeProbe {
             delivered: false,
             calls: Mutex::new(0),
         }
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
     }
 }
 
@@ -318,6 +396,33 @@ fn seed_legacy_files(dir: &std::path::Path, domains: &[&str]) {
     }
 }
 
+/// Put a relay row in the database without going through `mail.relay.set`.
+///
+/// Saving a relay is itself the operation that installs and configures an MTA
+/// now, so a test of `mail.mta.install` that arranged its precondition with it
+/// would be asserting against a machine the *other* operation had already
+/// migrated — and would go green whatever the operation under test did.
+async fn store_relay(reg: &OpRegistry, enabled: bool) {
+    let sealed = reg
+        .services()
+        .master_key
+        .seal_str("token-secret")
+        .expect("the test key seals");
+    db_of(reg)
+        .save_mail_relay(unihelm_db::NewMailRelay {
+            host: "smtp.postmarkapp.com".into(),
+            port: 587,
+            tls_mode: TlsMode::Starttls,
+            username: Some("token-user".into()),
+            password_sealed: Some(sealed),
+            from_address: "noreply@acme.example".into(),
+            from_name: Some("Acme Hosting".into()),
+            enabled,
+        })
+        .await
+        .unwrap();
+}
+
 fn relay_input() -> serde_json::Value {
     json!({
         "host": "smtp.postmarkapp.com",
@@ -330,38 +435,47 @@ fn relay_input() -> serde_json::Value {
     })
 }
 
-/// Run `mail.relay.set` against a machine with no MTA configured — the ordinary
-/// state of a server that has not been migrated yet.
+/// Run `mail.relay.set` against a machine with no MTA on it at all — the
+/// ordinary state of a server nobody has configured mail on, and the one where
+/// saving a relay now has the most to do.
+///
+/// The directory is real and empty, because saving a relay writes a null client
+/// into it: a test that pointed this at a path which cannot exist would only
+/// ever exercise the failure.
 async fn run_set(
     reg: &OpRegistry,
     admin: unihelm_core::UserId,
     pools: std::sync::Arc<RecordingPools>,
     input: serde_json::Value,
 ) -> Result<RelaySetOutput> {
-    let nowhere = std::path::Path::new("/nonexistent/unihelm-mail");
+    let dir = tempfile::tempdir().unwrap();
     run_set_on(
         reg,
         admin,
-        FakeHost::bare(),
+        std::sync::Arc::new(FakeHost::bare()),
+        std::sync::Arc::new(FakeProbe::accepting()),
         pools,
         input,
-        layout_in(nowhere),
-        nowhere,
+        layout_in(dir.path()),
+        dir.path(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_set_on(
     reg: &OpRegistry,
     admin: unihelm_core::UserId,
-    host: FakeHost,
+    host: std::sync::Arc<FakeHost>,
+    probe: std::sync::Arc<FakeProbe>,
     pools: std::sync::Arc<RecordingPools>,
     input: serde_json::Value,
     layout: mta::Layout,
     legacy_dir: &std::path::Path,
 ) -> Result<RelaySetOutput> {
     let op = RelaySet::with_parts(
-        Box::new(host),
+        Box::new(SharedHost(host)),
+        Box::new(SharedProbe(probe)),
         Box::new(SharedPools(pools)),
         layout,
         legacy_dir.to_path_buf(),
@@ -430,7 +544,15 @@ async fn the_relay_view_names_the_local_mta_and_not_the_client_it_replaced() {
     assert_eq!(view.agent, "postfix");
     assert_ne!(view.agent, LEGACY_AGENT);
     assert!(!view.agent_installed);
-    assert!(view.mta.summary.contains("mail.mta.install"));
+    // And the way out is one instruction. This used to name `mail.mta.install`
+    // as a second command to run afterwards, which was the sentence that made
+    // the migration look like something an operator had to assemble: saving the
+    // relay is what installs the agent and points it at it.
+    assert!(
+        view.mta.summary.contains("mail.relay.set"),
+        "{}",
+        view.mta.summary
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,23 +584,303 @@ async fn setting_a_relay_stores_it_sealed() {
 }
 
 #[tokio::test]
-async fn saving_a_relay_on_an_unmigrated_machine_leaves_the_old_wiring_alone() {
-    // The regression this exists to stop. `site::render_pool` no longer emits
-    // `sendmail_path` at all, so re-rendering a pool on a machine that has no
-    // local MTA yet would take the msmtp directive away and leave nothing
-    // behind it: that site would stop sending, at the moment an operator was
-    // trying to fix its mail. Nothing is re-rendered until there is an MTA.
+async fn saving_a_relay_on_a_machine_with_no_mta_installs_one_and_points_it_there() {
+    // The mistake this replaces. Saving a relay used to store a row and, on a
+    // machine the panel had not already configured, do nothing else: the MTA
+    // that carries a message to that relay was installed only by somebody
+    // running `mail.mta.install` by hand, from a release note. So the panel
+    // accepted the one instruction that decides where mail goes and left the
+    // machine unable to follow it, in front of an operator with every reason to
+    // believe mail was set up.
+    //
+    // The care the old branch was taking is still taken, and is asserted below:
+    // the pools are only re-rendered *after* there is a working MTA to
+    // re-render them onto, because `site::render_pool` no longer emits
+    // `sendmail_path` and doing it first would take a site's only mail path
+    // away.
     let (reg, admin, customer) = registry().await;
     seed_php_site(&db_of(&reg), customer, "one.example.com", true).await;
+    let dir = tempfile::tempdir().unwrap();
 
+    let host = std::sync::Arc::new(FakeHost::bare());
+    let probe = std::sync::Arc::new(FakeProbe::accepting());
     let pools = std::sync::Arc::new(RecordingPools::default());
-    let out = run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    let layout = layout_in(dir.path());
+    let out = run_set_on(
+        &reg,
+        admin,
+        host.clone(),
+        probe.clone(),
+        pools.clone(),
+        relay_input(),
+        layout.clone(),
+        dir.path(),
+    )
+    .await
+    .unwrap();
 
-    assert!(pools.seen().is_empty(), "a pool was re-rendered anyway");
-    assert_eq!(out.sites.rewired, 0);
+    assert_eq!(host.installs(), 1, "the MTA was not installed");
+    assert_eq!(
+        probe.calls(),
+        1,
+        "the relay must be asked before a machine still on the per-site files is changed"
+    );
+    let configuration = out
+        .configuration
+        .expect("the MTA has to be pointed at the relay that was just saved");
+    assert!(configuration.reloaded);
+    assert_eq!(layout.state(), mta::ConfigState::Ours);
+    assert!(
+        std::fs::read_to_string(&layout.main_cf)
+            .unwrap()
+            .contains("relayhost = [smtp.postmarkapp.com]:587"),
+        "the null client is not pointed at the relay that was saved"
+    );
+
+    // And only then the pools, which is how the old `sendmail_path` leaves a
+    // machine that has one.
+    assert_eq!(pools.seen(), vec!["one.example.com".to_string()]);
+    assert_eq!(out.sites.rewired, 1);
+}
+
+#[tokio::test]
+async fn a_relay_that_refuses_a_message_leaves_the_machine_alone_and_keeps_the_credential() {
+    // Two rules meeting. The machine is still sending through the per-site
+    // msmtp files, and saving a relay is what takes them away — so a credential
+    // the relay rejects must not be the reason a server that was delivering
+    // mail stops. And the password the operator typed is stored anyway: they
+    // cannot read it back to re-type it, so losing it would make correcting a
+    // typo a matter of finding the credential again.
+    let (reg, admin, customer) = registry().await;
+    seed_php_site(&db_of(&reg), customer, "one.example.com", true).await;
+    let dir = tempfile::tempdir().unwrap();
+    seed_legacy_files(dir.path(), &["one.example.com"]);
+
+    let host = std::sync::Arc::new(FakeHost::bare());
+    let pools = std::sync::Arc::new(RecordingPools::default());
+    let err = run_set_on(
+        &reg,
+        admin,
+        host.clone(),
+        std::sync::Arc::new(FakeProbe::rejecting()),
+        pools.clone(),
+        relay_input(),
+        layout_in(dir.path()),
+        dir.path(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.detail.contains("the relay is stored"), "{}", err.detail);
+    assert!(
+        err.detail.contains("still sends mail exactly as it did"),
+        "{}",
+        err.detail
+    );
+    assert_eq!(host.installs(), 0, "a rejected relay installed a package");
+    assert!(!dir.path().join("main.cf").exists());
+    assert!(pools.seen().is_empty());
+    assert!(
+        dir.path().join("one.example.com.msmtprc").exists(),
+        "the wiring this site is still sending through was taken away"
+    );
+
+    // Stored, and stored sealed: the operator corrects the port or the
+    // password and saves again rather than starting over.
+    let relay = db_of(&reg).mail_relay().await.unwrap().unwrap();
+    assert_eq!(relay.host, "smtp.postmarkapp.com");
+    assert!(relay.password_sealed.is_some());
+}
+
+#[tokio::test]
+async fn an_mta_that_cannot_be_installed_stores_the_relay_and_says_mail_is_not_flowing() {
+    // The panel must never report something is true when it is not. A package
+    // mirror that is down is an ordinary failure, and the answer has to be the
+    // whole truth: the credential is kept, and nothing is sending yet.
+    let (reg, admin, _) = registry().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let err = run_set_on(
+        &reg,
+        admin,
+        std::sync::Arc::new(FakeHost::cannot_install(
+            "apt-get: could not reach the mirror",
+        )),
+        std::sync::Arc::new(FakeProbe::accepting()),
+        std::sync::Arc::new(RecordingPools::default()),
+        relay_input(),
+        layout_in(dir.path()),
+        dir.path(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.detail.contains("the relay is stored"), "{}", err.detail);
+    assert!(
+        err.detail.contains("not sending through it yet"),
+        "{}",
+        err.detail
+    );
+    assert!(
+        err.detail.contains("could not reach the mirror"),
+        "{}",
+        err.detail
+    );
+    assert!(
+        db_of(&reg).mail_relay().await.unwrap().is_some(),
+        "the operator has to type the password again to retry"
+    );
+    assert!(
+        !dir.path().join("main.cf").exists(),
+        "a null client was configured onto a machine with no MTA to run it"
+    );
+}
+
+#[tokio::test]
+async fn an_mta_that_will_not_start_is_not_reported_as_a_relay_that_works() {
+    // A configured MTA that is not running accepts messages into a queue
+    // nothing drains, which is the panel reporting mail set up for mail that is
+    // going nowhere.
+    let (reg, admin, customer) = registry().await;
+    seed_php_site(&db_of(&reg), customer, "one.example.com", true).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // Installed, and dead: `activate` is what a real host's unit start is, and
+    // this one comes back down.
+    let host = std::sync::Arc::new(FakeHost::bare());
+    *host.installed.lock().unwrap() = true;
+    let pools = std::sync::Arc::new(RecordingPools::default());
+    let op = RelaySet::with_parts(
+        Box::new(DeadUnit(host.clone())),
+        Box::new(SharedProbe(std::sync::Arc::new(FakeProbe::accepting()))),
+        Box::new(SharedPools(pools.clone())),
+        layout_in(dir.path()),
+        dir.path().to_path_buf(),
+    );
+    let ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+    let err = op
+        .run(
+            &ctx,
+            serde_json::from_value(relay_input()).expect("valid test input shape"),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::ServiceUnavailable);
+    assert!(err.detail.contains("is not running"), "{}", err.detail);
+    assert!(
+        pools.seen().is_empty(),
+        "the sites still on the old wiring were rewired onto an MTA that is down"
+    );
+}
+
+#[tokio::test]
+async fn saving_a_relay_that_is_switched_off_installs_nothing() {
+    // There is nothing to carry. Installing an MTA here would install a package
+    // whose entire configuration is a sentence refusing mail, and the sites
+    // still on the per-site files would be rewired onto it.
+    let (reg, admin, customer) = registry().await;
+    seed_php_site(&db_of(&reg), customer, "one.example.com", true).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let host = std::sync::Arc::new(FakeHost::bare());
+    let probe = std::sync::Arc::new(FakeProbe::accepting());
+    let pools = std::sync::Arc::new(RecordingPools::default());
+    let mut off = relay_input();
+    off["enabled"] = json!(false);
+    let out = run_set_on(
+        &reg,
+        admin,
+        host.clone(),
+        probe.clone(),
+        pools.clone(),
+        off,
+        layout_in(dir.path()),
+        dir.path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(host.installs(), 0);
+    assert_eq!(probe.calls(), 0, "a relay that is off was sent a message");
     assert!(out.configuration.is_none());
+    assert!(pools.seen().is_empty());
+    assert!(!dir.path().join("main.cf").exists());
+}
+
+#[tokio::test]
+async fn the_first_install_takes_over_the_main_cf_its_own_package_just_wrote() {
+    // Every Debian install of postfix ends with the postinst writing a
+    // `main.cf`, and the panel refuses to write over a `main.cf` it did not
+    // write. Without a rule for the file the panel's own install just produced,
+    // the first configuration of every fresh server refuses itself and the
+    // operator is told to re-run with `adopt` — teaching them to send `adopt`
+    // on the one machine where it is dangerous.
+    let (reg, admin, _) = registry().await;
+    let dir = tempfile::tempdir().unwrap();
+    let layout = layout_in(dir.path());
+
+    let out = run_set_on(
+        &reg,
+        admin,
+        std::sync::Arc::new(FakeHost::with_postinst(&layout)),
+        std::sync::Arc::new(FakeProbe::accepting()),
+        std::sync::Arc::new(RecordingPools::default()),
+        relay_input(),
+        layout.clone(),
+        dir.path(),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.configuration.is_some());
+    assert_eq!(layout.state(), mta::ConfigState::Ours);
+    // And the file it displaced is kept, because that is what adoption does —
+    // here it is the package's default, which costs nothing to keep.
+    let kept = std::fs::read_to_string(dir.path().join("main.cf.unihelm-replaced")).unwrap();
+    assert!(kept.contains("Debian's own main.cf"), "{kept}");
+}
+
+#[tokio::test]
+async fn a_main_cf_that_was_already_there_is_still_never_taken_over_by_saving_a_relay() {
+    // The other half, and the one that matters: a machine already running
+    // somebody's mail server looks exactly like a fresh install *except* that
+    // its `main.cf` was there before the operation started. Adoption stays a
+    // decision a person makes, once, at `mail.mta.install`.
+    let (reg, admin, _) = registry().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("main.cf"),
+        "myhostname = mail.somebody.example\nmydestination = $myhostname\n",
+    )
+    .unwrap();
+
+    let err = run_set_on(
+        &reg,
+        admin,
+        std::sync::Arc::new(FakeHost::bare()),
+        std::sync::Arc::new(FakeProbe::accepting()),
+        std::sync::Arc::new(RecordingPools::default()),
+        relay_input(),
+        layout_in(dir.path()),
+        dir.path(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::ConfigDrift);
+    assert!(err.detail.contains("adopt"), "{}", err.detail);
+    assert!(
+        err.detail.contains("the relay is stored"),
+        "the refusal has to say the credential was kept: {}",
+        err.detail
+    );
+    assert!(
+        std::fs::read_to_string(dir.path().join("main.cf"))
+            .unwrap()
+            .contains("somebody"),
+        "somebody's mail server was replaced by a relay being saved"
+    );
 }
 
 #[tokio::test]
@@ -492,11 +894,13 @@ async fn saving_a_relay_on_a_migrated_machine_repoints_the_mta_at_it() {
     let dir = tempfile::tempdir().unwrap();
 
     let layout = migrated_layout(dir.path());
+    let probe = std::sync::Arc::new(FakeProbe::accepting());
     let pools = std::sync::Arc::new(RecordingPools::default());
     let out = run_set_on(
         &reg,
         admin,
-        FakeHost::running(),
+        std::sync::Arc::new(FakeHost::running()),
+        probe.clone(),
         pools.clone(),
         relay_input(),
         layout.clone(),
@@ -504,6 +908,14 @@ async fn saving_a_relay_on_a_migrated_machine_repoints_the_mta_at_it() {
     )
     .await
     .unwrap();
+
+    // No SMTP conversation with a third party, because there is nothing here to
+    // protect: the configuration is rewritten to whatever was stored either
+    // way, so the file and the row cannot disagree, and making every edit of a
+    // from-name wait on somebody else's network would be a cost with no
+    // corresponding risk. `mail.relay.test` asks that question when it is
+    // wanted.
+    assert_eq!(probe.calls(), 0, "saving a relay sent a message to it");
 
     let configuration = out
         .configuration
@@ -805,7 +1217,7 @@ async fn a_relay_that_is_switched_off_is_not_something_to_install_an_mta_for() {
     let pools = std::sync::Arc::new(RecordingPools::default());
     let mut off = relay_input();
     off["enabled"] = json!(false);
-    run_set(&reg, admin, pools.clone(), off).await.unwrap();
+    store_relay(&reg, false).await;
 
     let err = install_with(
         &reg,
@@ -833,9 +1245,7 @@ async fn a_relay_that_rejects_the_credential_leaves_the_machine_exactly_as_it_wa
     seed_legacy_files(dir.path(), &["one.example.com"]);
 
     let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
 
     let host = std::sync::Arc::new(FakeHost::bare());
     let err = install_with(
@@ -882,9 +1292,7 @@ async fn a_site_keeps_its_credential_file_until_its_own_pool_has_been_re_rendere
     seed_legacy_files(dir.path(), &["good.example.com", "stuck.example.com"]);
 
     let pools = std::sync::Arc::new(RecordingPools::failing("stuck.example.com"));
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
 
     let out = install_with(
         &reg,
@@ -933,9 +1341,7 @@ async fn a_finished_migration_leaves_no_copy_of_the_credential_anywhere() {
     );
 
     let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
 
     let out = install_with(
         &reg,
@@ -968,9 +1374,7 @@ async fn installing_twice_installs_once_and_still_re_checks_the_relay() {
     let (reg, admin, _) = registry().await;
     let dir = tempfile::tempdir().unwrap();
     let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
 
     let host = std::sync::Arc::new(FakeHost::running());
     let probe = std::sync::Arc::new(FakeProbe::accepting());
@@ -1022,46 +1426,14 @@ async fn an_mta_that_will_not_start_does_not_get_to_take_the_old_wiring_away() {
     seed_legacy_files(dir.path(), &["one.example.com"]);
 
     let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
 
     let host = std::sync::Arc::new(FakeHost::running());
     // Installed, and dead — an MTA whose unit failed to come up.
     *host.running.lock().unwrap() = false;
-    struct DeadHost(std::sync::Arc<FakeHost>);
-    #[async_trait]
-    impl mta::MtaHost for DeadHost {
-        /// No Docker unless a case says otherwise — the shape that keeps the
-        /// listener on the loopback, which is the state a test should have to
-        /// opt *out* of rather than into.
-        async fn container_networks(&self) -> mta::ContainerNetworks {
-            mta::ContainerNetworks::default()
-        }
-
-        fn hostname(&self) -> Result<String> {
-            self.0.hostname()
-        }
-        async fn installed(&self, ctx: &OpContext) -> Result<bool> {
-            self.0.installed(ctx).await
-        }
-        async fn install(&self, ctx: &OpContext, hostname: &str) -> Result<()> {
-            self.0.install(ctx, hostname).await
-        }
-        // Activation does not bring it up: that is the failure being modelled.
-        async fn activate(&self, _ctx: &OpContext) -> Result<()> {
-            Ok(())
-        }
-        async fn running(&self, _ctx: &OpContext) -> Result<bool> {
-            Ok(false)
-        }
-        async fn queued(&self) -> Option<u64> {
-            self.0.queued().await
-        }
-    }
 
     let op = MtaInstall::with_parts(
-        Box::new(DeadHost(host)),
+        Box::new(DeadUnit(host)),
         Box::new(FakeProbe::accepting()),
         Box::new(SharedPools(pools.clone())),
         layout_in(dir.path()),
@@ -1088,8 +1460,7 @@ async fn the_status_of_a_machine_that_has_not_been_migrated_names_what_is_missin
     let (reg, admin, _) = registry().await;
     let dir = tempfile::tempdir().unwrap();
     seed_legacy_files(dir.path(), &["one.example.com", "two.example.com"]);
-    let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools, relay_input()).await.unwrap();
+    store_relay(&reg, true).await;
 
     let op = MtaStatus::with_parts(
         Box::new(FakeHost::bare()),
@@ -1208,8 +1579,7 @@ async fn a_failed_test_is_an_answer_with_a_stage_not_an_error() {
 #[tokio::test]
 async fn a_test_recipient_that_could_inject_a_command_is_refused() {
     let (reg, admin, _) = registry().await;
-    let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools, relay_input()).await.unwrap();
+    store_relay(&reg, true).await;
 
     let err = reg
         .dispatch(
@@ -1447,9 +1817,7 @@ async fn a_site_whose_subscription_vanished_is_skipped_rather_than_failing_the_r
 
     let dir = tempfile::tempdir().unwrap();
     let pools = std::sync::Arc::new(RecordingPools::default());
-    run_set(&reg, admin, pools.clone(), relay_input())
-        .await
-        .unwrap();
+    store_relay(&reg, true).await;
     let out = install_with(
         &reg,
         admin,

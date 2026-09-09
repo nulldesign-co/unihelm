@@ -4379,13 +4379,18 @@ for a credential the relay rejects is the panel reporting success for mail that
 will silently fail, so the check comes first and a refusal leaves the machine as
 it was.
 
-**`adopt` is the difference between writing a configuration and replacing one.**
-`/etc/postfix/main.cf` always exists before the panel first writes it — the
-package's own postinst generates one — so a foreign file is the normal
-first-install state and cannot simply be refused. But it may equally be a real
-Postfix somebody is running. Without `adopt` the operation refuses and changes
-nothing; with it, the displaced file is kept beside the new one rather than
-deleted.
+**`adopt` is the difference between writing a configuration and replacing
+somebody else's.** It is decided by *when* `/etc/postfix/main.cf` appeared, not
+by whether it exists: Postfix's own postinst always writes one, so the panel may
+take over the file **its own install just produced** — a file that was not there
+when the operation began — and nothing else. A `main.cf` that was already on the
+machine is a real Postfix somebody may be running: without `adopt` the operation
+refuses and changes nothing, and with it the displaced file is kept beside the
+new one rather than deleted.
+
+Getting that distinction wrong made the documented upgrade path unrunnable in
+0.8.0: `adopt: false` refused itself on every machine that had never had an MTA,
+because the package it had just installed had left a `main.cf` behind.
 
 `reached` says how far it got — `sites-migrated`, or `mta-configured` when some
 pools could not be re-rendered. A half-migrated machine still delivers mail: the
@@ -4419,12 +4424,26 @@ somebody would need to work out which provider the credential came from.
 | Execution | task (not cancellable, idempotent) |
 | Input | `host`; `port`; `tls_mode` (`none` \| `starttls` \| `implicit`); `username` *(optional)*; `password` *(optional — see below)*; `from_address`; `from_name` *(optional)*; `enabled` *(optional, default true)* |
 
-Stores the relay and re-renders every PHP site's mail configuration and FPM
-pool. A task, not an immediate operation: it writes one file per site and
-reloads PHP-FPM once per PHP version, and the per-site log lines are the only
-way to see which site did not take. Every site is attempted even when one
-fails; the tally comes back with the first error and a re-run converges the
-stragglers.
+Stores the relay and makes the machine able to send through it.
+
+**On a server with no local MTA, this installs one.** Saving a relay is the
+operator saying where mail goes, so everything needed to honour that happens
+here rather than in a second command they have to be told about: the relay is
+asked whether it accepts a message, Postfix and its SASL plugin are installed,
+the null client's three files are written, the unit is proved up, and only then
+is the pre-0.8.0 per-site wiring those sites were still sending through taken
+away. A task, not an immediate operation, because that is minutes of package
+manager and one FPM reload per PHP version, and the per-site log lines are the
+only way to see which site did not take.
+
+**The row is stored first and stays stored whatever follows.** A failure comes
+back as *the relay is stored — you will not have to enter the password again —
+but this server is not sending through it yet*, and the task goes red. The
+operator retries without retyping the password.
+
+It never adopts. A `main.cf` that was on the machine before this operation began
+belongs to somebody else, and taking it over is a decision a person makes at
+[`mail.mta.install`](#mailmtainstall).
 
 **Omitting `password` keeps the stored one; sending an empty string clears
 it.** The value is write-only, so an operator editing the port of a working
