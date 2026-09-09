@@ -140,7 +140,7 @@ below are real measurements, with where they were taken.
 ## Installing
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/farzam-seyedhashem/unihelm/main/installer/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/nulldesign-co/unihelm/main/installer/install.sh | sudo bash
 ```
 
 That script is a bootstrap and nothing else: it downloads the latest release's

@@ -174,8 +174,8 @@ runner image, not across a runner image that ships a different `tar` or `gzip`.
 ## What operators do with the signature
 
 ```bash
-curl -fsSLO https://github.com/farzam-seyedhashem/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz
-curl -fsSLO https://github.com/farzam-seyedhashem/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz.minisig
+curl -fsSLO https://github.com/nulldesign-co/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz
+curl -fsSLO https://github.com/nulldesign-co/unihelm/releases/download/v0.2.0/unihelm-0.2.0-x86_64.tar.gz.minisig
 
 minisign -Vm unihelm-0.2.0-x86_64.tar.gz -P 'RW…'   # key from the repo, not the download
 tar -xzf unihelm-0.2.0-x86_64.tar.gz

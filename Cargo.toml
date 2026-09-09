@@ -23,7 +23,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 authors = ["farzam"]
-repository = "https://github.com/farzam-seyedhashem/unihelm"
+repository = "https://github.com/nulldesign-co/unihelm"
 
 [workspace.dependencies]
 unihelm-config = { path = "crates/unihelm-config" }

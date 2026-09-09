@@ -401,7 +401,7 @@ jobs:
           verifying the *next* release. The first time, take the key from the
           repository or the release page, not from the file you are checking.
 
-          Documentation: https://github.com/farzam-seyedhashem/unihelm/tree/v${VERSION}/docs
+          Documentation: https://github.com/nulldesign-co/unihelm/tree/v${VERSION}/docs
           EOF
 
           # Deterministic tarball: rebuilding the same tag on the same runner
