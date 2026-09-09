@@ -33,7 +33,8 @@ import {
   type MailRelayResponse,
   type MailTestReport,
   type TlsMode,
-} from "@/lib/api";
+
+  type MtaState,} from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
 import { useSession } from "@/lib/session";
 import { cn } from "@/lib/utils";
@@ -100,9 +101,7 @@ export function MailPage() {
         </Callout>
       ) : (
         <>
-          {relay.data && !relay.data.agent_installed ? (
-            <AgentMissing agent={relay.data.agent} />
-          ) : null}
+          <MailSystemCard mta={relay.data!.mta} />
           <RelayForm relay={relay.data!} />
           {relay.data?.configured ? <TestCard /> : null}
           <DnsCard dns={relay.data!.dns} />
@@ -168,12 +167,111 @@ function MailSkeleton() {
  * Its own banner rather than a field note: no amount of correct relay
  * configuration makes mail work while this is true.
  */
-function AgentMissing({ agent }: { agent: string }) {
+/**
+ * What this server does with a message today.
+ *
+ * The page used to render one line — "the agent is missing" — from
+ * `agent_installed`, which answered a question nobody asks. An operator wants
+ * to know whether mail is *flowing*, and the states that matter are the ones
+ * where the parts disagree: a relay saved with nothing to use it, an MTA
+ * running with no relay behind it, a migration that stopped half way, per-site
+ * credential files still on disk from the design 0.8.0 replaced.
+ *
+ * The agent computes that from the machine and hands back `summary` — one
+ * sentence, already true. Rendering it beats reassembling it here from six
+ * booleans that would drift from the agent's own reading the first time either
+ * side changed.
+ *
+ * Nothing here is a button. Saving a relay installs and configures the MTA, so
+ * an "Install" control would be a second way to do the thing the form above
+ * already does — which is how a panel ends up telling somebody to run one more
+ * step.
+ */
+/**
+ * Whether this server is actually sending, as the badge claims.
+ *
+ * Every part has to hold: the panel's configuration is on disk, the unit is up,
+ * a relay is switched on behind it, and nobody has edited the file since —
+ * `drifted` means what is running is not what the panel would write, so the
+ * settings on this page are not the ones in force.
+ *
+ * Exported because a badge that says "Sending" over a server that is not is the
+ * exact failure this release was about, and it should be testable without
+ * rendering.
+ */
+export function mailIsFlowing(mta: MtaState): boolean {
+  return mta.configured && mta.running && mta.relay_live && !mta.drifted;
+}
+
+function MailSystemCard({ mta }: { mta: MtaState }) {
   const { t } = useTranslation();
+  const flowing = mailIsFlowing(mta);
+  const tone = flowing ? "success" : mta.configured ? "warning" : "neutral";
+
   return (
-    <Callout tone="warning" title={t("mail.agentMissing")}>
-      {t("mail.agentMissingHint", { agent })}
-    </Callout>
+    <Card>
+      <CardHeader
+        title={t("mail.system.title")}
+        description={t("mail.system.hint", { agent: mta.agent })}
+        action={
+          <Badge tone={tone} dot>
+            {flowing ? t("mail.system.flowing") : t("mail.system.notFlowing")}
+          </Badge>
+        }
+      />
+      <CardBody className="space-y-3">
+        <p className="text-sm text-ink">{mta.summary}</p>
+
+        {/* A credential a tenant can still read is the reason 0.8.0 exists, so
+            it is stated on its own rather than folded into the summary. */}
+        {mta.legacy_files > 0 ? (
+          <Callout tone="warning">
+            {t("mail.system.legacyFiles", { count: mta.legacy_files })}
+          </Callout>
+        ) : null}
+
+        {mta.drifted ? <Callout tone="warning">{t("mail.system.drifted")}</Callout> : null}
+
+        <dl className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+          <div>
+            <dt className="text-ink-muted">{t("mail.system.submission")}</dt>
+            <dd className="font-mono text-xs text-ink">{mta.submission}</dd>
+          </div>
+          <div>
+            <dt className="text-ink-muted">{t("mail.system.containers")}</dt>
+            <dd className="text-ink">
+              {mta.containers.submission ?? t("mail.system.containersCannot")}
+            </dd>
+          </div>
+          {/* Only when there is something waiting: "0 queued" invites somebody
+              to read a healthy queue as a problem. */}
+          {mta.queued !== null && mta.queued > 0 ? (
+            <div>
+              <dt className="text-ink-muted">{t("mail.system.queued")}</dt>
+              <dd className="text-ink">{t("mail.system.queuedCount", { count: mta.queued })}</dd>
+            </div>
+          ) : null}
+        </dl>
+
+        {/* Docker's networks change under a configuration written yesterday, and
+            a container on a new one is refused rather than delayed. Naming them
+            is the difference between fixing it and discovering it. */}
+        {mta.containers.uncovered.length > 0 ? (
+          <Callout tone="warning">
+            {t("mail.system.uncovered", {
+              networks: mta.containers.uncovered.map((n) => n.name).join(", "),
+            })}
+          </Callout>
+        ) : null}
+        {mta.containers.unsupported.length > 0 ? (
+          <Callout tone="info">
+            {t("mail.system.unsupported", {
+              networks: mta.containers.unsupported.map((n) => n.name).join(", "),
+            })}
+          </Callout>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }
 

@@ -1366,7 +1366,53 @@ export interface MailRelayResponse {
   agent_installed: boolean;
   agent: string;
   credential_note: string;
+  /**
+   * What this server actually does with a message today.
+   *
+   * Read from the machine, not from the relay row, and the two can disagree —
+   * a relay configured with nothing to use it, an MTA with no relay behind it,
+   * a migration that stopped half way. `summary` is that whole state in one
+   * sentence, which is what gets read.
+   */
+  mta: MtaState;
   dns: { records: MailDnsRecord[]; advice: string };
+}
+
+/** A Docker network named as it is on the machine. */
+export interface MtaContainerNetwork {
+  name: string;
+  driver: string;
+  subnet: string | null;
+}
+
+/** Whether a containerised application can send, and what stops it when it cannot. */
+export interface MtaContainerMail {
+  docker_installed: boolean;
+  /** False with `docker_installed` means the panel could not check, not that there is nothing to check. */
+  daemon_answered: boolean;
+  /** Null when no container can send, so nothing prints an address that does not work. */
+  submission: string | null;
+  relayed_for: string[];
+  /** Bridge networks the configuration on disk does not name: `Relay access denied`. */
+  uncovered: MtaContainerNetwork[];
+  /** Drivers whose containers do not reach the host through a bridge gateway at all. */
+  unsupported: MtaContainerNetwork[];
+}
+
+export interface MtaState {
+  agent: string;
+  installed: boolean;
+  configured: boolean;
+  /** Ours, but edited since — the panel will not overwrite it. */
+  drifted: boolean;
+  running: boolean;
+  relay_live: boolean;
+  queued: number | null;
+  /** Per-site credential files from the design this replaced. Above zero is a password a tenant can still read. */
+  legacy_files: number;
+  submission: string;
+  containers: MtaContainerMail;
+  summary: string;
 }
 
 export interface MailRelayRequest {

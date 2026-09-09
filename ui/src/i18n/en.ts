@@ -2165,9 +2165,29 @@ export const en = {
     subtitle: "Send mail from this server's sites through an external SMTP relay.",
     scopeNote:
       "Unihelm does not run a mail server. There are no mailboxes here: this configures a relay somebody else operates and points every PHP site's mail() at it.",
-    agentMissing: "The sending program is not installed",
-    agentMissingHint:
-      "PHP has nothing to hand a message to, so mail will not send however the relay is configured. Install {{agent}} and save the relay again.",
+
+    system: {
+      title: "This server's mail",
+      hint: "Unihelm receives no mail. It runs {{agent}} so anything on this machine can hand a message to your relay — PHP, an application, a scheduled job.",
+      flowing: "Sending",
+      notFlowing: "Not sending",
+      submission: "Applications send through",
+      containers: "Containers send through",
+      containersCannot: "Cannot send — see below",
+      queued: "Waiting to go out",
+      queuedCount: "{{count}} message",
+      queuedCount_other: "{{count}} messages",
+      legacyFiles:
+        "{{count}} site still has its own copy of the relay password, from the way mail worked before. Any customer on those sites can read it. Saving the relay again finishes moving them.",
+      legacyFiles_other:
+        "{{count}} sites still have their own copy of the relay password, from the way mail worked before. Any customer on those sites can read it. Saving the relay again finishes moving them.",
+      drifted:
+        "The mail configuration on this server has been edited since Unihelm wrote it, so Unihelm will not overwrite it. Anything you change here will not take effect until that file is Unihelm's again.",
+      uncovered:
+        "Containers on {{networks}} are refused with “Relay access denied”: these networks appeared after the mail configuration was written. Saving the relay again takes them in.",
+      unsupported:
+        "Containers on {{networks}} cannot reach this server's mail at all — those network drivers give a container no route to the host. Such an application has to send through the relay itself.",
+    },
     credentialNote:
       "PHP's mail() runs as each site's own Linux user, so that user can read the relay password for their own site — and for no other site. Use a send-only credential made for this server, and rotate it here rather than reusing an account password.",
     relay: {
