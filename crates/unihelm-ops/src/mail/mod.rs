@@ -468,6 +468,38 @@ async fn hosted_domains(ctx: &OpContext) -> Result<Vec<String>> {
     Ok(domains)
 }
 
+/// The Docker subnets this machine's MTA should relay for, beyond the loopback.
+///
+/// Two readings, not one: what Docker says now, and what the `main.cf` on disk
+/// already names. [`mta::relay_subnets`] picks between them, and the case that
+/// makes the second reading necessary is a Docker whose daemon is not answering
+/// — where "there are no networks" is an answer the panel has not earned and
+/// acting on it would narrow the MTA back to the loopback, taking container
+/// mail down the moment `dockerd` returned.
+async fn container_networks(
+    ctx: &OpContext,
+    host: &dyn mta::MtaHost,
+    layout: &mta::Layout,
+) -> Vec<String> {
+    let found = host.container_networks().await;
+    let subnets = mta::relay_subnets(&found, &layout.configured_networks());
+    if found.docker_installed && !found.daemon_answered {
+        ctx.log(format!(
+            "Docker is installed but its daemon did not answer, so the {} network(s) already \
+             in the MTA's `mynetworks` were kept rather than removed — narrowing them here \
+             would stop every container on this machine sending as soon as Docker came back",
+            subnets.len()
+        ));
+    } else if !subnets.is_empty() {
+        ctx.log(format!(
+            "this MTA will accept mail from {} — the Docker network(s) on this machine, and \
+             nothing wider",
+            subnets.join(", ")
+        ));
+    }
+    subnets
+}
+
 // ---------------------------------------------------------------------------
 // the DNS advisory (spec §11.18: guidance, never management)
 // ---------------------------------------------------------------------------
@@ -1149,6 +1181,10 @@ pub struct MtaInstallOutput {
     /// The relay's own answer to a real message, from before anything changed.
     pub relay_check: smtp::SendReport,
     pub configuration: mta::ConfigureReport,
+    /// The Docker subnets `25/tcp` was opened from, if any. Empty on a machine
+    /// with no Docker, with no firewall, or where the backend refused — and
+    /// `state.containers` is where the last of those is spelled out.
+    pub firewall: Vec<String>,
     pub sites: RewireTally,
     pub state: mta::MtaState,
 }
@@ -1232,6 +1268,11 @@ impl TypedOperation for MtaInstall {
 
         // 4. The three files, and a reload if any of them moved.
         let domains = hosted_domains(ctx).await?;
+        // Which networks a containerised application would reach us from. Read
+        // before the render because it decides whether the MTA listens past the
+        // loopback at all; on a machine with no Docker this is empty and the
+        // configuration is exactly what it was.
+        let networks = container_networks(ctx, self.host.as_ref(), &self.layout).await;
         let configuration = mta::configure(
             ctx,
             self.host.as_ref(),
@@ -1241,6 +1282,7 @@ impl TypedOperation for MtaInstall {
                 password: password.as_deref(),
                 trust_file: tls_trust_file(ctx.distro().info.family),
                 domains: &domains,
+                container_networks: &networks,
                 layout: &self.layout,
             },
             input.adopt,
@@ -1260,6 +1302,18 @@ impl TypedOperation for MtaInstall {
             ));
         }
         ctx.log("the MTA is running. Reached: mta-configured");
+
+        // 5b. And the other half of serving containers, which is not Postfix's:
+        //     a packet from a container to the bridge gateway arrives on this
+        //     machine's INPUT chain, so an enabled ufw drops it whatever
+        //     `mynetworks` says. Opened from those subnets and from nowhere
+        //     else; never fatal, because the loopback clients are already
+        //     working by this point and `mail.mta.status` reports the gap.
+        let firewall = if networks.is_empty() {
+            Vec::new()
+        } else {
+            crate::fwops::allow_mta_from(ctx, &networks).await
+        };
 
         // 6. Only now: re-render each pool, and delete each site's credential
         //    file after its own pool has stopped naming it.
@@ -1288,6 +1342,7 @@ impl TypedOperation for MtaInstall {
             reached,
             relay_check,
             configuration,
+            firewall,
             sites,
             state,
         })
@@ -1480,6 +1535,13 @@ impl TypedOperation for RelaySet {
             let password = open_password(ctx, &saved).await?;
             let hostname = self.host.hostname()?;
             let domains = hosted_domains(ctx).await?;
+            // Re-discovered rather than carried over from the file: this
+            // rewrites the whole of `main.cf`, and rendering yesterday's
+            // `mynetworks` would drop a network that has appeared since. It
+            // does not touch the firewall — opening a port is not a side effect
+            // of saving a relay — so a network that is new here is reported by
+            // `mail.mta.status` until `mail.mta.install` runs again.
+            let networks = container_networks(ctx, self.host.as_ref(), &self.layout).await;
             configuration = Some(
                 mta::configure(
                     ctx,
@@ -1490,6 +1552,7 @@ impl TypedOperation for RelaySet {
                         password: password.as_deref(),
                         trust_file: tls_trust_file(ctx.distro().info.family),
                         domains: &domains,
+                        container_networks: &networks,
                         layout: &self.layout,
                     },
                     // Never here. Taking over a `main.cf` somebody else wrote is

@@ -85,6 +85,9 @@ struct FakeHost {
     queued: Option<u64>,
     installs: Mutex<usize>,
     activations: Mutex<usize>,
+    /// What Docker looks like from here. Default is none, which is what keeps
+    /// the listener on the loopback — the state a case has to opt out of.
+    container_networks: Mutex<mta::ContainerNetworks>,
 }
 
 impl FakeHost {
@@ -97,6 +100,7 @@ impl FakeHost {
             queued: Some(0),
             installs: Mutex::new(0),
             activations: Mutex::new(0),
+            container_networks: Mutex::new(mta::ContainerNetworks::default()),
         }
     }
 
@@ -134,6 +138,13 @@ fn migrated_layout(dir: &std::path::Path) -> mta::Layout {
 
 #[async_trait]
 impl mta::MtaHost for FakeHost {
+    /// No Docker unless a case says otherwise — the shape that keeps the
+    /// listener on the loopback, which is the state a test should have to
+    /// opt *out* of rather than into.
+    async fn container_networks(&self) -> mta::ContainerNetworks {
+        self.container_networks.lock().unwrap().clone()
+    }
+
     fn hostname(&self) -> Result<String> {
         Ok(self.hostname.clone())
     }
@@ -168,6 +179,13 @@ struct SharedHost(std::sync::Arc<FakeHost>);
 
 #[async_trait]
 impl mta::MtaHost for SharedHost {
+    /// No Docker unless a case says otherwise — the shape that keeps the
+    /// listener on the loopback, which is the state a test should have to
+    /// opt *out* of rather than into.
+    async fn container_networks(&self) -> mta::ContainerNetworks {
+        self.0.container_networks().await
+    }
+
     fn hostname(&self) -> Result<String> {
         self.0.hostname()
     }
@@ -1014,6 +1032,13 @@ async fn an_mta_that_will_not_start_does_not_get_to_take_the_old_wiring_away() {
     struct DeadHost(std::sync::Arc<FakeHost>);
     #[async_trait]
     impl mta::MtaHost for DeadHost {
+        /// No Docker unless a case says otherwise — the shape that keeps the
+        /// listener on the loopback, which is the state a test should have to
+        /// opt *out* of rather than into.
+        async fn container_networks(&self) -> mta::ContainerNetworks {
+            mta::ContainerNetworks::default()
+        }
+
         fn hostname(&self) -> Result<String> {
             self.0.hostname()
         }

@@ -97,15 +97,22 @@
 //!   write. So `sendmail` from inside an app cannot queue anything. It fails
 //!   loudly rather than silently, which is the right way round, but it is a
 //!   dead end and the hardening is worth more than the convenience.
-//! * **A container is not on the host's loopback.** [`AppMode::Container`] is
-//!   what a new application gets, and `127.0.0.1` inside a container is the
-//!   container. [`crate::appcontainer`] maps `host.docker.internal` to the
-//!   bridge gateway, so the host is *addressable* — but a null client set up
-//!   the hardened way (`inet_interfaces = loopback-only`) is not listening on
-//!   that address, and would not treat the bridge as a network it relays for
-//!   even if it were. **Until the MTA is configured to accept the bridge, a
-//!   containerised application cannot send mail**, and nothing here may tell a
-//!   tenant otherwise. A host-mode application can, today.
+//! * **A container is not on the host's loopback**, so this took work in
+//!   [`crate::mail::mta`] rather than none. `127.0.0.1` inside a container is
+//!   the container; [`crate::appcontainer`] maps `host.docker.internal` to the
+//!   bridge gateway, and the MTA now listens there and names the bridge subnets
+//!   in `mynetworks`. So the address is `host.docker.internal:25` from a
+//!   container and `127.0.0.1:25` from the host, and both work.
+//!
+//!   Two things about that are worth knowing before relying on it. The MTA
+//!   reads Docker's networks **when it is configured**, so a bridge network
+//!   created afterwards is not in `mynetworks` and its containers get
+//!   `Relay access denied` until `mail.mta.install` is run again —
+//!   `mail.mta.status` reports it rather than leaving it to be discovered.
+//!   And a container on a `macvlan`, `ipvlan` or `overlay` network does not
+//!   reach this host through a bridge gateway at all: **those containers
+//!   cannot send mail**, which `ContainerNetworks::others` exists to name
+//!   rather than silently drop.
 //!
 //! # What this module deliberately does not do
 //!

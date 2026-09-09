@@ -27,11 +27,12 @@
 //! # What is here instead
 //!
 //! ```text
-//! PHP    mail()      → /usr/sbin/sendmail ─┐
-//! Node   nodemailer  → 127.0.0.1:25        │
-//! Python smtplib     → 127.0.0.1:25        ├→ Postfix (root, credential 0600) → relay
-//! CLI    mail(1)     → the same            │
-//! cron   MAILTO=     → the same           ─┘
+//! PHP       mail()      → /usr/sbin/sendmail          ─┐
+//! Node      nodemailer  → 127.0.0.1:25                 │
+//! Python    smtplib     → 127.0.0.1:25                 ├→ Postfix (root, credential 0600) → relay
+//! CLI       mail(1)     → the same                     │
+//! cron      MAILTO=     → the same                     │
+//! container anything    → host.docker.internal:25     ─┘
 //! ```
 //!
 //! Postfix's `smtp(8)` opens the credential map in its pre-jail initialisation,
@@ -65,6 +66,62 @@
 //! reported saved while the running daemons keep sending with the old one.
 //! [`configure`] does that, and it is the reason it reloads on a map change and
 //! not only on a `main.cf` change.
+//!
+//! # The one client that is not on the loopback, and what it cost to serve it
+//!
+//! A container has its own network namespace, so its `127.0.0.1` is the
+//! container. [`crate::appcontainer`] already gives it a name for the host —
+//! `host.docker.internal`, mapped to `host-gateway` — but a null client bound
+//! `loopback-only` does not answer there, and `AppMode::Container` is what a
+//! *new* application gets. So the common case could not send at all.
+//!
+//! Serving it means widening an MTA past the loopback, and there are exactly
+//! two ways to do that. This module takes the second, and the reason is not a
+//! preference:
+//!
+//! 1. **Name the bridge gateway addresses in `inet_interfaces`.** Tight — the
+//!    listener exists only where containers are — and wrong for one reason that
+//!    outweighs everything else: `inet_interfaces` is read by `master(8)` at
+//!    start-up, and an address in it that cannot be bound is a **fatal** start,
+//!    not a warning. The bridge gateways exist only while `dockerd` is running,
+//!    nothing orders `postfix.service` after `docker.service`, and a network
+//!    Docker recreates gets a different subnet. A boot that lost that race
+//!    would leave the machine with **no mail at all** — PHP, cron and host-mode
+//!    applications included — which is a strictly worse failure than the one
+//!    being fixed, and a silent one. It also needs a restart, not a reload, to
+//!    take effect.
+//! 2. **`inet_interfaces = all`, with `mynetworks` doing the authorising.**
+//!    Postfix always starts, and a network created later is a `Relay access
+//!    denied` — loud, and visible in `mail.mta.status` — rather than a listener
+//!    that is not there.
+//!
+//! The cost of the second is real and is not hidden: **port 25 answers on every
+//! interface** on a machine that has Docker. Four things bound it, and the
+//! fourth is the one an operator has to act on.
+//!
+//! * `mynetworks` names the loopback and the subnets of this machine's Docker
+//!   bridge networks, and nothing else. Never `mynetworks_style = subnet`,
+//!   which would take in whatever else the host is attached to.
+//! * `smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination`,
+//!   written out rather than inherited: Postfix's built-in default *defers*
+//!   rather than rejects, and also carries `permit_sasl_authenticated`.
+//! * `smtpd_client_restrictions = permit_mynetworks, reject`, so a client from
+//!   outside those networks is refused whatever it asks for, not only when it
+//!   asks to relay.
+//! * The firewall. `mail.mta.install` opens 25 **from the Docker subnets only**
+//!   — without it an enabled ufw drops container traffic to the bridge gateway,
+//!   because that arrives on `INPUT` like any other packet — and
+//!   [`crate::fwops`] refuses to open 25 to the world while this `main.cf` is
+//!   the panel's. On a machine whose firewall is **not running**, none of that
+//!   is enforced and the banner is reachable from the internet. It is not a
+//!   relay — everything outside `mynetworks` is refused — but it is a service
+//!   the machine did not have before, and [`describe_containers`] says so in
+//!   the status rather than leaving the operator to find out.
+//!
+//! **A machine with no Docker is untouched**: no bridge network is found, so
+//! `inet_interfaces` stays `loopback-only`, `mynetworks` is the loopback alone,
+//! and no firewall rule is written. The widening is a consequence of there
+//! being containers to serve, not of installing the MTA.
 //!
 //! # What this is still not
 //!
@@ -111,6 +168,23 @@ pub const AGENT: &str = "postfix";
 /// the whole point of the change is that neither needs a credential.
 pub const SUBMISSION_HOST: &str = "127.0.0.1";
 pub const SUBMISSION_PORT: u16 = 25;
+
+/// Where a *containerised* application hands a message over.
+///
+/// The same name [`crate::appcontainer`] maps to `host-gateway` on every
+/// container it creates, spelled again here rather than shared, because the two
+/// are true for different reasons: there it is how a container reaches a
+/// database, here it is what this MTA has to be listening on. A change to
+/// either has to be a decision about the other, which a shared constant would
+/// hide.
+pub const CONTAINER_SUBMISSION_HOST: &str = "host.docker.internal";
+
+/// The loopback, in the spelling `mynetworks` wants.
+///
+/// Always present, whatever else is: PHP's `sendmail`, cron and every host-mode
+/// application submit from here, and they are the clients that worked before
+/// containers were served at all.
+const LOOPBACK_NETWORKS: [&str; 2] = ["127.0.0.0/8", "[::1]/128"];
 
 /// The `sendmail` PHP's compiled-in default runs, which Postfix provides.
 ///
@@ -181,6 +255,181 @@ pub fn relayhost(host: &str, port: u16) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// the networks a container could reach us from
+// ---------------------------------------------------------------------------
+
+/// One Docker network, as the panel found it.
+///
+/// The name is carried because it is what the operator sees in `docker network
+/// ls` and the only handle they have on a network the panel cannot serve. The
+/// driver is carried because it decides whether serving it is possible at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContainerNetwork {
+    pub name: String,
+    pub driver: String,
+    /// The subnets containers on it appear from, in CIDR form.
+    pub subnets: Vec<String>,
+}
+
+/// Every network on this machine, split by whether its containers can reach us.
+///
+/// The two flags are separate on purpose. "No Docker" and "Docker whose daemon
+/// did not answer" look identical from a distance and must not be treated the
+/// same: the first has no networks to serve, the second has networks the panel
+/// simply cannot see, and narrowing a configuration on the strength of the
+/// second is how a machine stops sending the next time `dockerd` comes back.
+/// See [`relay_subnets`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ContainerNetworks {
+    /// Is there a `docker` on this machine at all?
+    pub docker_installed: bool,
+    /// Did its daemon answer?
+    pub daemon_answered: bool,
+    /// Bridge networks. A container on one of these reaches the host at the
+    /// bridge gateway, which is what `host.docker.internal` resolves to.
+    pub bridges: Vec<ContainerNetwork>,
+    /// Networks on any other driver, kept so they can be *named* rather than
+    /// silently dropped. A container on a `macvlan`, `ipvlan` or `overlay`
+    /// network does not reach this host through a bridge gateway, and nothing
+    /// in this module makes it able to send.
+    pub others: Vec<ContainerNetwork>,
+}
+
+impl ContainerNetworks {
+    /// Every bridge subnet, sorted and deduplicated.
+    ///
+    /// Sorted because the render has to be byte-stable: Docker lists networks
+    /// in whatever order it likes, and an unsorted list would rewrite `main.cf`
+    /// and reload Postfix on every pass for no change at all.
+    pub fn bridge_subnets(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .bridges
+            .iter()
+            .flat_map(|n| n.subnets.iter().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// Which subnets `mynetworks` should carry, beyond the loopback.
+///
+/// Pure, and it takes what is already in `main.cf` as an argument, so the one
+/// decision that is easy to get wrong is a decision a test can drive: a Docker
+/// whose daemon is not answering must **keep** the networks the file already
+/// names. Re-rendering the loopback-only configuration there would narrow
+/// `inet_interfaces` back, and every container on the machine would stop being
+/// able to send the moment `dockerd` came back — with nothing in the panel
+/// having reported a change.
+pub fn relay_subnets(found: &ContainerNetworks, on_disk: &[String]) -> Vec<String> {
+    if !found.docker_installed {
+        // No Docker, no bridge, nothing to widen for. This is the branch that
+        // keeps a machine without containers exactly as it was.
+        return Vec::new();
+    }
+    if !found.daemon_answered {
+        let mut kept: Vec<String> = on_disk.to_vec();
+        kept.sort();
+        kept.dedup();
+        return kept;
+    }
+    found.bridge_subnets()
+}
+
+/// A subnet, in the spelling Postfix's `mynetworks` requires.
+///
+/// IPv6 networks have to be bracketed there — `[fd00::]/64`, not `fd00::/64` —
+/// and Postfix rejects the unbracketed form at start-up rather than ignoring
+/// it, so a machine with an IPv6-enabled Docker network would refuse to start
+/// the MTA at all.
+fn as_mynetworks_entry(subnet: &str) -> String {
+    if subnet.contains(':') && !subnet.starts_with('[') {
+        match subnet.split_once('/') {
+            Some((addr, prefix)) => format!("[{addr}]/{prefix}"),
+            None => format!("[{subnet}]"),
+        }
+    } else {
+        subnet.to_string()
+    }
+}
+
+/// The argv that lists every network's id.
+///
+/// Split from the inspect below because `docker network inspect` with no
+/// arguments is an error, not an empty answer, and the empty case is a real
+/// one on a daemon that has had every network removed.
+fn network_ls_argv() -> [&'static str; 3] {
+    ["network", "ls", "--quiet"]
+}
+
+/// What `docker network inspect` is asked to print, per network.
+///
+/// Whitespace-separated fields rather than a JSON document: Docker's inspect
+/// JSON has changed shape between releases, while a Go template of named fields
+/// has been stable across all of them — the same reasoning, for the same
+/// reason, as [`crate::docker`]'s row parsing. Whitespace is a safe separator
+/// because a Docker network name cannot contain any (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`),
+/// and anything that somehow did would land in `others` and be reported rather
+/// than quietly mis-parsed into `mynetworks`.
+const NETWORK_FORMAT: &str = "{{.Name}} {{.Driver}} {{range .IPAM.Config}}{{.Subnet}} {{end}}";
+
+/// Turn that output into networks.
+///
+/// A line the panel does not understand is skipped rather than guessed at: an
+/// entry in `mynetworks` is a grant of the operator's relay credential, and a
+/// half-parsed one is a grant to something nobody chose.
+pub fn parse_networks(output: &str) -> (Vec<ContainerNetwork>, Vec<ContainerNetwork>) {
+    let mut bridges = Vec::new();
+    let mut others = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(driver)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let subnets: Vec<String> = fields
+            // A CIDR and nothing else. Postfix reads `mynetworks` as a
+            // whitespace-separated list, so a value with anything unexpected in
+            // it would not be a parse error there but a different network.
+            .filter(|s| is_cidr(s))
+            .map(as_mynetworks_entry)
+            .collect();
+        let network = ContainerNetwork {
+            name: name.to_string(),
+            driver: driver.to_string(),
+            subnets,
+        };
+        // A bridge with no subnet at all is not servable and is reported with
+        // the rest: there is no address to admit.
+        if network.driver == "bridge" && !network.subnets.is_empty() {
+            bridges.push(network);
+        } else {
+            others.push(network);
+        }
+    }
+    (bridges, others)
+}
+
+/// Is this a CIDR, in either family, and nothing else?
+///
+/// Deliberately a shape check rather than a parse: the value goes into a
+/// line-oriented configuration file, so what matters is that it cannot be
+/// anything but one network — no spaces, no second token, no `!` exclusion
+/// Postfix would read as a rule of its own.
+fn is_cidr(text: &str) -> bool {
+    let Some((addr, prefix)) = text.split_once('/') else {
+        return false;
+    };
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    !addr.is_empty()
+        && addr
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || matches!(b, b'.' | b':'))
+}
+
+// ---------------------------------------------------------------------------
 // where the three files are
 // ---------------------------------------------------------------------------
 
@@ -237,6 +486,60 @@ impl Layout {
             }
         }
     }
+
+    /// The non-loopback entries of `mynetworks` in the `main.cf` on disk.
+    ///
+    /// Read back out of the file rather than re-rendered from what the panel
+    /// would write today, because those are different answers and only one of
+    /// them is what Postfix is enforcing. A status built from the second would
+    /// tell an operator that containers can send on a machine where a network
+    /// was created after the last install — which is the exact failure this
+    /// whole widening had to be careful of.
+    ///
+    /// Empty for a file the panel never wrote: there is nothing to read, and
+    /// [`ConfigState::Unwritten`] is already how that is reported.
+    pub fn configured_networks(&self) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(&self.main_cf) else {
+            return Vec::new();
+        };
+        parse_mynetworks(&text)
+    }
+}
+
+/// The non-loopback entries of a `main.cf`'s `mynetworks`.
+///
+/// The **last** assignment wins, because that is what Postfix does: `main.cf`
+/// is read top to bottom and a later line replaces an earlier one, so a file a
+/// human appended to has a different value from the one the panel wrote.
+pub fn parse_mynetworks(main_cf: &str) -> Vec<String> {
+    let mut found: Option<Vec<String>> = None;
+    for line in main_cf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("mynetworks") else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('=') else {
+            // `mynetworks_style` starts the same way and is a different
+            // parameter entirely.
+            continue;
+        };
+        found = Some(
+            value
+                .split([',', ' ', '\t'])
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    found
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| !LOOPBACK_NETWORKS.contains(&e.as_str()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +565,13 @@ pub struct Settings<'a> {
     pub trust_file: &'a str,
     /// Every domain this server hosts, sorted, for the sender map.
     pub domains: &'a [String],
+    /// The Docker bridge subnets to relay for, beyond the loopback, already
+    /// through [`relay_subnets`] and in Postfix's spelling.
+    ///
+    /// Empty is the whole of the no-Docker case and is what keeps the listener
+    /// on the loopback: this list is the only thing that widens the MTA, so a
+    /// machine with no containers cannot be widened by accident.
+    pub container_networks: &'a [String],
     /// Where the three files go, and how `main.cf` has to name the other two.
     pub layout: &'a Layout,
 }
@@ -330,18 +640,7 @@ pub fn render_main_cf(settings: &Settings<'_>) -> String {
          it relays through the panel's configured relay\n\n",
     );
 
-    out.push_str(
-        "# --- and it listens to nothing but itself --------------------------\n\
-         # loopback-only, so port 25 is never bound on a public address, and\n\
-         # mynetworks_style = host so the only clients it relays for are on this\n\
-         # machine. Those two lines are the difference between a null client and\n\
-         # an open relay. A containerised application is *not* on this loopback:\n\
-         # a container's 127.0.0.1 is the container, so it cannot reach this MTA\n\
-         # today, and the panel says so rather than implying otherwise.\n",
-    );
-    out.push_str("inet_interfaces = loopback-only\n");
-    out.push_str("inet_protocols = all\n");
-    out.push_str("mynetworks_style = host\n");
+    render_who_may_submit(&mut out, settings);
     out.push_str("smtpd_banner = $myhostname ESMTP\n");
     // Debian's package sets this; on a machine whose hostname has no domain
     // part it would otherwise silently append one to unqualified addresses.
@@ -419,6 +718,70 @@ pub fn render_main_cf(settings: &Settings<'_>) -> String {
     }
 
     out
+}
+
+/// Who may hand this machine a message, and where it listens for them.
+///
+/// The half of `main.cf` that is the difference between a null client and an
+/// open relay, and the only half that changes when there are containers on the
+/// machine. Both shapes are written out in full rather than one being a patch
+/// on the other, because what an operator reading `/etc/postfix/main.cf` needs
+/// is the configuration this machine is actually running.
+fn render_who_may_submit(out: &mut String, settings: &Settings<'_>) {
+    out.push_str("# --- who may hand us a message -------------------------------------\n");
+
+    if settings.container_networks.is_empty() {
+        out.push_str(
+            "# The loopback, and nothing else. Port 25 is never bound on a public\n\
+             # address, so there is no way to reach this MTA that does not start\n\
+             # from a process on this machine. There is no Docker bridge network\n\
+             # here, so there is nothing that needs more than this.\n",
+        );
+        out.push_str("inet_interfaces = loopback-only\n");
+    } else {
+        out.push_str(
+            "# This machine has Docker bridge networks on it, and a container's\n\
+             # 127.0.0.1 is the container — it reaches the host at the bridge\n\
+             # gateway (`host.docker.internal`), which a loopback-only listener\n\
+             # does not answer on. So the listener is opened and `mynetworks`\n\
+             # below is what authorises, rather than the other way round.\n\
+             #\n\
+             # Naming the gateway addresses here instead would be tighter and is\n\
+             # deliberately not done: Postfix binds `inet_interfaces` at start-up\n\
+             # and a *fatal* start is what an address it cannot bind produces.\n\
+             # Those addresses exist only while dockerd does, nothing orders this\n\
+             # unit after docker.service, and a lost race would leave this\n\
+             # machine with no mail at all — cron, PHP and host applications\n\
+             # included. A network created after this file was written is instead\n\
+             # a `Relay access denied`, which is loud and which\n\
+             # `mail.mta.status` reports.\n",
+        );
+        out.push_str("inet_interfaces = all\n");
+    }
+    out.push_str("inet_protocols = all\n");
+
+    out.push_str(
+        "#\n\
+         # Whatever is named here can send through the operator's upstream relay\n\
+         # credential, so it is an explicit list and never `mynetworks_style =\n\
+         # subnet`, which would take in whatever else this host is attached to.\n",
+    );
+    let mut networks: Vec<&str> = LOOPBACK_NETWORKS.to_vec();
+    networks.extend(settings.container_networks.iter().map(String::as_str));
+    out.push_str(&format!("mynetworks = {}\n", networks.join(", ")));
+
+    out.push_str(
+        "#\n\
+         # Written out rather than inherited. Postfix's built-in default for\n\
+         # smtpd_relay_restrictions *defers* an unauthorised destination instead\n\
+         # of rejecting it — a queue that drains into a bounce days later — and\n\
+         # also carries permit_sasl_authenticated, which is a second way in that\n\
+         # this machine has no use for. The client restriction is the same rule\n\
+         # one step earlier: a client outside mynetworks is refused whatever it\n\
+         # asks for, not only when it asks to relay.\n",
+    );
+    out.push_str("smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination\n");
+    out.push_str("smtpd_client_restrictions = permit_mynetworks, reject\n");
 }
 
 /// The TLS and SASL half of `main.cf`, which only exists when a relay does.
@@ -764,6 +1127,15 @@ pub trait MtaHost: Send + Sync {
     /// How many messages are waiting. `None` when that cannot be established,
     /// which is a different answer from zero and is reported as one.
     async fn queued(&self) -> Option<u64>;
+
+    /// Which Docker networks a containerised application could reach us from.
+    ///
+    /// On the trait rather than read inline for the reason the other five are:
+    /// this is the input that decides whether the MTA is opened past the
+    /// loopback, and a test that could not set it could not exercise either
+    /// half of the decision — including the one that matters most, a machine
+    /// with no Docker on it.
+    async fn container_networks(&self) -> ContainerNetworks;
 }
 
 /// The real machine.
@@ -851,6 +1223,82 @@ impl MtaHost for LiveHost {
         }
         parse_queue(&out.stdout)
     }
+
+    async fn container_networks(&self) -> ContainerNetworks {
+        let Ok(docker) = unihelm_distro::exec::resolve_program(DOCKER) else {
+            return ContainerNetworks::default();
+        };
+        let docker = docker.to_string_lossy().into_owned();
+
+        let Some(ids) = docker_output(&docker, &network_ls_argv()).await else {
+            // Installed, but the daemon did not answer. The networks are still
+            // there; only our view of them is missing, which is why this is a
+            // different answer from "no Docker" and not a shorter one.
+            return ContainerNetworks {
+                docker_installed: true,
+                ..ContainerNetworks::default()
+            };
+        };
+
+        let ids: Vec<&str> = ids
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if ids.is_empty() {
+            // A daemon with no networks at all. `network inspect` with no
+            // arguments is an error rather than an empty answer, so this cannot
+            // be left to fall through.
+            return ContainerNetworks {
+                docker_installed: true,
+                daemon_answered: true,
+                ..ContainerNetworks::default()
+            };
+        }
+
+        let mut argv = vec!["network", "inspect", "--format", NETWORK_FORMAT];
+        argv.extend(ids);
+        let Some(text) = docker_output(&docker, &argv).await else {
+            return ContainerNetworks {
+                docker_installed: true,
+                ..ContainerNetworks::default()
+            };
+        };
+        let (bridges, others) = parse_networks(&text);
+        ContainerNetworks {
+            docker_installed: true,
+            daemon_answered: true,
+            bridges,
+            others,
+        }
+    }
+}
+
+/// Docker's own client, not the daemon socket — the same choice, for the same
+/// reason, as [`crate::docker`] and [`crate::appcontainer`].
+const DOCKER: &str = "docker";
+
+/// How long the panel waits for Docker before deciding it did not answer.
+///
+/// Bounded because this runs inside `mail.mta.status`, which is an immediate
+/// operation behind a page: a daemon that is wedged rather than stopped would
+/// otherwise hang the mail page instead of being reported as unavailable.
+const DOCKER_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One Docker read, or `None` for every way it can fail to answer.
+///
+/// Failure is not distinguished here because the caller does not act on the
+/// difference: a missing socket, a permission error and a timeout all mean the
+/// panel does not know what networks exist, and the one thing it must not do in
+/// any of them is assume there are none.
+async fn docker_output(docker: &str, args: &[&str]) -> Option<String> {
+    let out = unihelm_distro::exec::Cmd::new(docker)
+        .args(args)
+        .timeout(DOCKER_BUDGET)
+        .run()
+        .await
+        .ok()?;
+    out.success().then(|| out.trimmed_stdout().to_string())
 }
 
 /// How many messages `postqueue -p` is reporting.
@@ -898,8 +1346,40 @@ pub struct MtaState {
     pub legacy_files: usize,
     /// Where anything that is not PHP hands a message over.
     pub submission: String,
+    /// Whether a *containerised* application can, and what is stopping it when
+    /// it cannot.
+    pub containers: ContainerMail,
     /// The whole of the above in one sentence, because that is what gets read.
     pub summary: String,
+}
+
+/// What a containerised application can do with mail on this machine, as fact.
+///
+/// Every field here is read from the machine as it is now — the `mynetworks`
+/// in the `main.cf` on disk, the networks Docker has this second, the firewall
+/// the backend reports — and not from what the panel would render. The two
+/// disagree exactly when something has changed since the last install, which is
+/// the case this whole structure exists to make visible.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ContainerMail {
+    /// Is there a `docker` on this machine at all?
+    pub docker_installed: bool,
+    /// Did its daemon answer? `false` with `docker_installed` means the panel
+    /// could not check, not that there is nothing to check.
+    pub daemon_answered: bool,
+    /// Where a container hands a message over, when one can. `None` when none
+    /// can, so that nothing downstream can print an address that does not work.
+    pub submission: Option<String>,
+    /// The non-loopback networks the `main.cf` on disk relays for.
+    pub relayed_for: Vec<String>,
+    /// Bridge networks Docker has now whose subnets that file does not name.
+    /// A container on one of these is refused with `Relay access denied`.
+    pub uncovered: Vec<ContainerNetwork>,
+    /// Networks on a driver whose containers do not reach this host through a
+    /// bridge gateway. Nothing here makes those able to send.
+    pub unsupported: Vec<ContainerNetwork>,
+    /// What the firewall is doing about port 25.
+    pub firewall: crate::fwops::MtaPortExposure,
 }
 
 /// Is `sendmail` on this machine at all?
@@ -924,7 +1404,13 @@ pub async fn state(
     // Only worth asking when there is something that could have queued.
     let queued = if installed { host.queued().await } else { None };
 
-    let summary = describe(
+    let containers = container_mail(
+        &host.container_networks().await,
+        &layout.configured_networks(),
+        crate::fwops::mta_port_exposure(ctx).await,
+    );
+
+    let mut summary = describe(
         installed,
         configured,
         running,
@@ -932,6 +1418,14 @@ pub async fn state(
         queued,
         legacy_files,
     );
+    // Appended rather than folded in, because it is a different question with a
+    // different answer: the machine can be sending perfectly for everything on
+    // its loopback while every container on it is refused.
+    if configured && let Some(sentence) = describe_containers(&containers) {
+        summary.push(' ');
+        summary.push_str(&sentence);
+    }
+
     MtaState {
         agent: AGENT,
         installed,
@@ -942,8 +1436,121 @@ pub async fn state(
         queued,
         legacy_files,
         submission: format!("{SUBMISSION_HOST}:{SUBMISSION_PORT}"),
+        containers,
         summary,
     }
+}
+
+/// Compare what Docker has against what `main.cf` relays for.
+///
+/// Pure, and takes all three readings as arguments, so every combination that
+/// matters — a network created since the last install, a driver that cannot be
+/// served, a firewall that is not running — is a test rather than a machine
+/// somebody has to build.
+pub fn container_mail(
+    found: &ContainerNetworks,
+    on_disk: &[String],
+    firewall: crate::fwops::MtaPortExposure,
+) -> ContainerMail {
+    let relayed_for: Vec<String> = on_disk.to_vec();
+    let uncovered: Vec<ContainerNetwork> = found
+        .bridges
+        .iter()
+        .filter(|n| !n.subnets.iter().all(|s| relayed_for.contains(s)))
+        .cloned()
+        .collect();
+    // An address only when there is a network the file relays for *and* the
+    // firewall is not standing in front of it. Anything less would be the panel
+    // printing a host and port that does not work.
+    let submission = (!relayed_for.is_empty() && firewall.admits(&relayed_for))
+        .then(|| format!("{CONTAINER_SUBMISSION_HOST}:{SUBMISSION_PORT}"));
+    ContainerMail {
+        docker_installed: found.docker_installed,
+        daemon_answered: found.daemon_answered,
+        submission,
+        relayed_for,
+        uncovered,
+        unsupported: found.others.clone(),
+        firewall,
+    }
+}
+
+/// The container half of the summary, or `None` when there is nothing to say.
+///
+/// `None` is the machine with no Docker on it: it has no containers, nothing
+/// about it changed, and a sentence explaining that containers are fine would
+/// be a sentence about something that does not exist here.
+pub fn describe_containers(mail: &ContainerMail) -> Option<String> {
+    if !mail.docker_installed {
+        return None;
+    }
+    if !mail.daemon_answered {
+        return Some(format!(
+            "Docker is installed but its daemon did not answer, so the panel could not check \
+             which networks exist; the {} network(s) already in `mynetworks` were kept rather \
+             than removed.",
+            mail.relayed_for.len()
+        ));
+    }
+
+    let mut sentence = match (&mail.submission, mail.relayed_for.is_empty()) {
+        (Some(address), _) => format!(
+            "A containerised application sends by talking to {address} — no credential, no \
+             authentication — and this MTA relays for {} Docker network(s).",
+            mail.relayed_for.len()
+        ),
+        (None, true) => "No Docker network is in `mynetworks`, so a containerised application \
+             cannot send mail at all: its 127.0.0.1 is the container, and this MTA does not \
+             relay for the bridge it would reach the host on. Run `mail.mta.install`."
+            .to_string(),
+        (None, false) => format!(
+            "This MTA relays for {} Docker network(s), but the firewall does not admit \
+             {}/tcp from them, so a containerised application's connection never arrives. \
+             Run `mail.mta.install` again — it opens that port from those subnets and from \
+             nowhere else.",
+            mail.relayed_for.len(),
+            crate::fwops::MTA_PORT,
+        ),
+    };
+
+    if !mail.uncovered.is_empty() {
+        sentence.push_str(&format!(
+            " {} Docker network(s) exist that `mynetworks` does not name ({}); containers on \
+             them are refused with `Relay access denied`. Run `mail.mta.install` again to add \
+             them.",
+            mail.uncovered.len(),
+            names(&mail.uncovered),
+        ));
+    }
+    if !mail.unsupported.is_empty() {
+        sentence.push_str(&format!(
+            " {} Docker network(s) are on a driver whose containers do not reach this host \
+             through a bridge gateway ({}); nothing the panel can configure makes those able \
+             to send.",
+            mail.unsupported.len(),
+            names(&mail.unsupported),
+        ));
+    }
+    if !mail.relayed_for.is_empty() && mail.firewall.active != Some(true) {
+        sentence.push_str(&format!(
+            " Serving containers means {}/tcp is bound on every interface of this machine, and \
+             no firewall is running to close it, so it answers from the internet. It is not a \
+             relay — anything outside `mynetworks` is refused — but it is a service this \
+             machine did not have before. `fw.enable` closes it; the panel never opens it to \
+             the world.",
+            crate::fwops::MTA_PORT,
+        ));
+    }
+    Some(sentence)
+}
+
+/// The names of some networks, for a sentence an operator has to act on.
+fn names(networks: &[ContainerNetwork]) -> String {
+    networks
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The sentence.
@@ -982,9 +1589,14 @@ pub fn describe(
              reason naming the panel — nothing is queued and nothing will leave this machine \
              until a relay is configured."
             .to_string(),
-        (true, true, true, true) => "Postfix accepts mail from anything on this server — PHP's \
-             mail() through /usr/sbin/sendmail, everything else on 127.0.0.1:25 — and relays \
-             it upstream. The relay credential is held by root and no tenant can read it."
+        // "anything on this server" is what this used to say, and it was the
+        // one sentence in the file that was not true: a container is on this
+        // server and was refused. The loopback clients are named, and the
+        // containers get a sentence of their own from `describe_containers`.
+        (true, true, true, true) => "Postfix accepts mail from anything on this server's \
+             loopback — PHP's mail() through /usr/sbin/sendmail, everything else on \
+             127.0.0.1:25 — and relays it upstream. The relay credential is held by root and \
+             no tenant can read it."
             .to_string(),
     };
 
@@ -1150,6 +1762,9 @@ mod tests {
             password: Some("token-secret"),
             trust_file: "/etc/ssl/certs/ca-certificates.crt",
             domains,
+            // No Docker: the loopback-only shape, which every existing case in
+            // this module was written against and must keep rendering.
+            container_networks: &[],
             layout,
         }
     }
@@ -1191,7 +1806,20 @@ mod tests {
     fn the_null_client_listens_on_the_loopback_and_delivers_nothing_locally() {
         let out = render_main_cf(&settings(Some(&relay()), &[], &layout()));
         assert!(out.contains("inet_interfaces = loopback-only"), "{out}");
-        assert!(out.contains("mynetworks_style = host"), "{out}");
+        // An explicit list, never `mynetworks_style`. `host` was what this
+        // rendered before containers were served, and the styles are a family:
+        // whoever widened it one step to `subnet` would have taken in whatever
+        // else the host is attached to, which is the thing `mynetworks` exists
+        // to keep out. Spelling the networks out has no adjacent wrong value.
+        assert!(out.contains("mynetworks = 127.0.0.0/8, [::1]/128"), "{out}");
+        // On a directive line, not in the prose — the comment above it names
+        // `mynetworks_style = subnet` in order to say why it is not used, and
+        // an assertion that cannot tell those apart would forbid explaining it.
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("mynetworks_style")),
+            "{out}"
+        );
         // The empty mydestination is what makes it a null client. Rendered as a
         // bare `mydestination =`, which is a value, not an absent line.
         assert!(out.lines().any(|l| l.trim() == "mydestination ="), "{out}");

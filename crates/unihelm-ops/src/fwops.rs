@@ -851,6 +851,18 @@ impl TypedOperation for PortOpen {
         let rule = port_rule(input.port, &input.proto, input.source.as_deref(), &comment)?;
         let fw = &ctx.distro().fw;
 
+        // The one hole the panel will not make. See `mta_world_open_refusal`:
+        // the null client on 25 binds every interface on a machine with Docker
+        // on it, and this is what keeps that from being an SMTP service on the
+        // internet. Asked of the file rather than of a setting — if `main.cf`
+        // is not the panel's, whatever is on 25 is the operator's own and so is
+        // the decision.
+        if let Some(detail) =
+            mta_world_open_refusal(&rule, crate::mail::mta::Layout::system().state().is_ours())
+        {
+            return Err(UnihelmError::new(ErrorCode::Conflict, detail).with_field("source"));
+        }
+
         // The backend first. An `Unmanaged` host answers with its own message
         // ("no firewall is installed on this host…") and we let that surface
         // verbatim rather than dressing it up as success: a panel that says
@@ -1764,6 +1776,184 @@ async fn ensure_panel_reachable(
 /// Its own string so `fw.port.close` can recognise it and refuse: a rule an
 /// operator can delete is a lockout with an extra step.
 pub const PANEL_RULE_COMMENT: &str = "unihelm panel";
+
+// ---------------------------------------------------------------------------
+// the local MTA's port
+// ---------------------------------------------------------------------------
+
+/// The port the local mail transfer agent answers on.
+///
+/// Named here because the firewall is half of a decision taken next door. The
+/// null client in [`crate::mail::mta`] binds every interface on a machine that
+/// has Docker bridge networks — there is no way to serve a container that does
+/// not — and `mynetworks` is what stops it relaying for anything but the
+/// loopback and those bridges. This module is the other half: it opens 25 from
+/// those bridge subnets and from nowhere else, and it refuses to open it to the
+/// world while that null client is the panel's.
+pub const MTA_PORT: u16 = 25;
+
+/// The comment the panel's own container-mail rules carry.
+///
+/// Deliberately says what the rule is *for* rather than what it is: it appears
+/// in `fw.rules` and in `ufw status` next to a private subnet nobody typed, and
+/// an operator has to be able to tell it from a hole somebody opened by hand.
+pub const MTA_RULE_COMMENT: &str = "unihelm mail from containers";
+
+/// What the firewall is actually doing about the MTA's port.
+///
+/// Read from the backend, never from the `fw_rules` table: the table is the
+/// intent and the backend is the truth, and this value is used to decide
+/// whether the panel may tell a tenant that a containerised application can
+/// send. See the module docs' first rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MtaPortExposure {
+    /// `firewalld`, `ufw`, `nftables`, or `none`.
+    pub backend: String,
+    /// Is the firewall running? `None` when the backend could not be asked,
+    /// which is a third answer and not a quiet `false`.
+    pub active: Option<bool>,
+    /// The sources a panel-managed rule admits [`MTA_PORT`] from.
+    pub allowed_from: Vec<String>,
+    /// Is it open to everybody? The panel never opens it this way, so this can
+    /// only be a rule somebody added by hand — and it is reported rather than
+    /// removed, because a rule the panel did not create is not the panel's to
+    /// delete.
+    pub open_to_the_world: bool,
+}
+
+impl MtaPortExposure {
+    /// Would a connection from every one of these subnets actually arrive?
+    ///
+    /// An inactive firewall admits everything, which is the honest answer here
+    /// even though it is also the exposure [`crate::mail::mta`] reports on. A
+    /// backend that could not be asked is treated as admitting too: the panel
+    /// does not know, and refusing to print a submission address on a machine
+    /// where mail works would be its own kind of wrong answer.
+    pub fn admits(&self, subnets: &[String]) -> bool {
+        if self.active != Some(true) || self.open_to_the_world {
+            return true;
+        }
+        subnets
+            .iter()
+            .all(|s| self.allowed_from.iter().any(|a| a == s))
+    }
+}
+
+/// Read the firewall's answer for [`MTA_PORT`].
+pub async fn mta_port_exposure(ctx: &OpContext) -> MtaPortExposure {
+    let fw = &ctx.distro().fw;
+    let live = fw.list_rules().await.unwrap_or_default();
+    let ours: Vec<&PortRule> = live
+        .iter()
+        .filter(|r| r.port == MTA_PORT && r.proto == Proto::Tcp)
+        .collect();
+    MtaPortExposure {
+        backend: fw.name().to_string(),
+        active: fw.is_active().await.ok(),
+        allowed_from: ours.iter().filter_map(|r| r.source.clone()).collect(),
+        open_to_the_world: ours.iter().any(|r| r.source.is_none()),
+    }
+}
+
+/// Open [`MTA_PORT`] from each of these subnets, and say which ones took.
+///
+/// Called by `mail.mta.install` after it has widened the MTA, and the reason it
+/// has to exist at all is a detail of how container traffic reaches a host: a
+/// packet from a container to the bridge gateway is delivered to this machine
+/// and lands on `INPUT` like any other, so an enabled ufw — whose default
+/// incoming policy is deny — drops it. Without this the panel would render a
+/// perfectly correct `main.cf`, report success, and every container on the
+/// machine would still fail to send.
+///
+/// Never fatal. The MTA is configured and working for everything on the
+/// loopback by the time this runs, and failing the migration over a firewall
+/// rule would take that away too; what a failure produces instead is a log line
+/// here and the plain statement in `mail.mta.status` that containers cannot
+/// reach the port.
+pub async fn allow_mta_from(ctx: &OpContext, subnets: &[String]) -> Vec<String> {
+    let fw = &ctx.distro().fw;
+    // Nothing to open on a host with no firewall: `UnmanagedBackend` answers
+    // every write with a refusal, and turning that into a logged failure on
+    // every install would be noise about a machine that is behaving normally.
+    if fw.name() == "none" {
+        return Vec::new();
+    }
+
+    let mut opened = Vec::new();
+    for subnet in subnets {
+        // Postfix's bracketed IPv6 spelling is not the firewall's, and the two
+        // lists come from the same place.
+        let source = subnet.trim_start_matches('[').replacen("]/", "/", 1);
+        let rule = match port_rule(MTA_PORT, "tcp", Some(&source), MTA_RULE_COMMENT) {
+            Ok(rule) => rule,
+            Err(e) => {
+                ctx.log(format!(
+                    "not opening {MTA_PORT}/tcp from `{source}`: {}",
+                    e.detail
+                ));
+                continue;
+            }
+        };
+        if let Err(e) = fw.open_port(&rule).await {
+            ctx.log(format!(
+                "could not open {MTA_PORT}/tcp from {source} ({e}); containers on that network \
+                 will not be able to send mail until it is open"
+            ));
+            continue;
+        }
+        if let Err(e) = ctx
+            .db()
+            .record_fw_rule(rule.port, rule.proto.as_str(), Some(&source), &rule.comment)
+            .await
+        {
+            ctx.log(format!(
+                "{MTA_PORT}/tcp is open from {source} but the panel could not record it ({e}); \
+                 `fw.rules` will report it as unrecorded"
+            ));
+        }
+        opened.push(source);
+    }
+    if !opened.is_empty() {
+        ctx.log(format!(
+            "opened {MTA_PORT}/tcp from {} — the Docker networks on this machine, and nowhere \
+             else",
+            opened.join(", ")
+        ));
+    }
+    opened
+}
+
+/// Why [`MTA_PORT`] may not be opened to everybody.
+///
+/// `None` for every other request, including a source-restricted rule on the
+/// same port and the same port on a machine whose `main.cf` is not the panel's
+/// — an operator running their own mail server on this box is opening their own
+/// port, and that is their decision to make.
+///
+/// The refusal exists because of what is on 25 when the file *is* the panel's:
+/// a null client that binds every interface as soon as the machine has Docker
+/// on it. Opening that to the world does not make it a relay — everything
+/// outside `mynetworks` is refused — but it puts an SMTP service the operator
+/// never asked for in front of the internet, and the panel is the thing that
+/// put it there.
+pub fn mta_world_open_refusal(rule: &PortRule, mta_is_ours: bool) -> Option<String> {
+    if rule.port != MTA_PORT || rule.proto != Proto::Tcp || !mta_is_ours {
+        return None;
+    }
+    let world = match rule.source.as_deref() {
+        None => true,
+        Some(source) => matches!(source.trim(), "0.0.0.0/0" | "::/0" | "[::]/0"),
+    };
+    world.then(|| {
+        format!(
+            "{MTA_PORT}/tcp is this server's own mail transfer agent, and the panel will not \
+             open it to the internet. It relays only for this machine's loopback and its \
+             Docker networks, so opening it wider buys nothing and puts an SMTP service in \
+             front of the world that this server does not need. `mail.mta.install` opens it \
+             from the Docker subnets, which is the only source that needs it."
+        )
+    })
+}
 
 /// The two ports a machine that serves the web is reached on, the names the rest
 /// of the project already writes on them (`stack::open_web_ports`), and what
