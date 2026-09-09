@@ -347,6 +347,203 @@ pub fn modsec_connector(info: &DistroInfo) -> ModsecConnector {
 }
 
 // ---------------------------------------------------------------------------
+// The Postfix null client (spec §11.18)
+// ---------------------------------------------------------------------------
+
+/// What one family installs to become a Postfix null client.
+///
+/// Two packages, not one, and the second is the one people forget. Postfix
+/// itself contains no SASL mechanisms: `libplain.so` is a Cyrus SASL *plugin*,
+/// packaged separately on both families. Without it `smtp_sasl_auth_enable`
+/// still turns on, the relay still offers `AUTH PLAIN LOGIN`, and Postfix logs
+/// `SASL authentication failed; no mechanism available` — a line an operator
+/// reads as a rejected password and spends the afternoon re-pasting the
+/// credential over. The package is the fix, and it has to be installed in the
+/// same transaction as the MTA so no machine ever exists in the state that
+/// produces that message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostfixPackages {
+    /// The MTA.
+    pub mta: &'static str,
+    /// The Cyrus SASL plugin package providing the PLAIN and LOGIN mechanisms.
+    pub sasl: &'static str,
+    /// Where both come from, named the way an operator would have to enable it
+    /// — the same reason [`ConnectorPackage::repository`] carries it.
+    pub repository: &'static str,
+}
+
+impl PostfixPackages {
+    /// The names, in install order.
+    pub const fn names(&self) -> [&'static str; 2] {
+        [self.mta, self.sasl]
+    }
+
+    /// The names as values a package manager will accept.
+    ///
+    /// Fallible in the type only: every string here is a compile-time constant
+    /// and `postfix_packages_are_installable_names` asserts each one parses on
+    /// both families. It stays a `Result` so this cannot become the one place
+    /// in the crate that reaches a package manager without going through
+    /// [`PackageName`].
+    pub fn parsed(&self) -> Result<Vec<PackageName>> {
+        self.names().iter().map(|n| PackageName::parse(n)).collect()
+    }
+}
+
+/// What this family calls the MTA and its SASL mechanism plugin.
+///
+/// Checked against the distributions' own package indexes on 2026-09-09:
+///
+/// | release | MTA | SASL plugin |
+/// |---|---|---|
+/// | Debian 13 (trixie) | `postfix` 3.10.13, `main` | `libsasl2-modules` 2.1.28, `main` |
+/// | Debian 12 (bookworm) | `postfix` 3.7.11, `main` | `libsasl2-modules` 2.1.28, `main` |
+/// | Ubuntu 24.04 (noble) | `postfix` 3.8.6, `main` | `libsasl2-modules` 2.1.28, `main` |
+/// | Ubuntu 22.04 (jammy) | `postfix` 3.6.4, `main` | `libsasl2-modules` 2.1.27, `main` |
+/// | AlmaLinux / Rocky / RHEL 9 | `postfix` 3.5.25, AppStream | `cyrus-sasl-plain` 2.1.27, BaseOS |
+/// | AlmaLinux / Rocky / RHEL 10 | `postfix` 3.8.5, AppStream | `cyrus-sasl-plain` 2.1.28, BaseOS |
+///
+/// Unlike [`modsec_connector`] there is no `Unverified` case to model here.
+/// Every release above answers with the same two names for its family, and both
+/// come from a repository that is enabled on a stock install — `main` on the
+/// Debian side (not `universe`, which is what made the WAF connector a per
+/// release question), BaseOS and AppStream on the EL side. So the answer is a
+/// property of the family, and taking [`DistroInfo`] rather than [`Family`]
+/// says only that a future release is allowed to disagree.
+pub fn postfix_packages(info: &DistroInfo) -> PostfixPackages {
+    match info.family {
+        Family::Debian => PostfixPackages {
+            mta: "postfix",
+            sasl: "libsasl2-modules",
+            repository: "the distribution's own archive (`main`)",
+        },
+        Family::Rhel => PostfixPackages {
+            mta: "postfix",
+            // `cyrus-sasl-plain`, not `cyrus-sasl`: the base package is the
+            // library and the daemon, and the mechanisms are split out one
+            // subpackage each. Installing `cyrus-sasl` alone gets no PLAIN.
+            sasl: "cyrus-sasl-plain",
+            repository: "AppStream (postfix) and BaseOS (cyrus-sasl-plain)",
+        },
+    }
+}
+
+/// The debconf answers that must be in place *before* `postfix` is installed on
+/// the Debian family.
+///
+/// # The hang this prevents, and the thing that actually prevents it
+///
+/// Debian's `postfix.postinst` asks `postfix/main_mailer_type` at debconf
+/// priority `high`. Under an interactive frontend that is a full-screen menu,
+/// and an unattended install stops dead on it — holding the dpkg lock, so every
+/// later package operation on the machine queues behind a question nobody is
+/// there to answer. What stops that is the *frontend*, not the answers:
+/// `DEBIAN_FRONTEND=noninteractive`, which [`AptBackend::apt`] sets on every
+/// invocation, tells debconf never to block and to take a stored answer or the
+/// default instead. `a_postfix_install_cannot_stop_on_a_debconf_question`
+/// asserts that environment variable is still there, because deleting it is all
+/// it would take to bring the hang back.
+///
+/// # Why preseed at all, then
+///
+/// Because the default that frontend would take is `Internet Site`, and a
+/// Debian postfix configured as an Internet Site comes up with
+/// `inet_interfaces = all` — an MTA listening on port 25 on every address of
+/// the machine, from the moment `apt-get install` finishes until the panel
+/// renders its own `main.cf` and reloads. That window is short and it is real,
+/// and an open relay-adjacent listener is not something to leave to a race with
+/// a config render. `Local only` produces `inet_interfaces = loopback-only` in
+/// the package's own generated configuration, which is the posture the null
+/// client wants anyway, so the machine is never reachable on 25 at any point.
+///
+/// `No configuration` would be the tempting answer — "we write main.cf
+/// ourselves" — and it is the wrong one: it makes the postinst skip
+/// configuration entirely, and `/etc/postfix` is then missing `master.cf` and
+/// the queue directories, which are files the panel does not render and Postfix
+/// cannot start without.
+pub fn postfix_debconf_selections(mailname: &str) -> Result<String> {
+    let name = parse_mailname(mailname)?;
+    // One `<package> <question> <type> <value>` line each. Fed to
+    // `debconf-set-selections` on stdin, so `name` is not reaching a shell —
+    // but it is reaching a line-oriented format, which is why a newline in it
+    // is refused above rather than escaped: it would set a question of the
+    // sender's choosing, for any package on the machine.
+    Ok(format!(
+        "postfix postfix/main_mailer_type select Local only\n\
+         postfix postfix/mailname string {name}\n"
+    ))
+}
+
+/// Accept the value for `postfix/mailname`: the machine's own fully-qualified
+/// name, and nothing that could be a second debconf line.
+fn parse_mailname(input: &str) -> Result<String> {
+    let name = input.trim();
+    if name.is_empty() || name.len() > 253 {
+        return Err(DistroError::InvalidName(
+            "the mail name must be 1-253 characters".into(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        || name.starts_with(['.', '-'])
+        || name.ends_with(['.', '-'])
+        || name.contains("..")
+    {
+        return Err(DistroError::InvalidName(format!(
+            "`{name}` is not a plausible host name for postfix/mailname"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// Store [`postfix_debconf_selections`] so the coming install reads them.
+///
+/// A no-op on the RHEL family, which has no debconf and asks nothing: rpm
+/// scriptlets never prompt, so there is no question to pre-answer and nothing
+/// to fail on. Saying so in the log beats a silent skip, because "did the
+/// preseed run?" is the first thing to check when an install hangs.
+pub async fn preseed_postfix(family: Family, mailname: &str, log: &dyn LogSink) -> Result<()> {
+    if family == Family::Rhel {
+        log.line("no debconf on this family; postfix's rpm scriptlets ask nothing");
+        return Ok(());
+    }
+
+    let selections = postfix_debconf_selections(mailname)?;
+
+    // `debconf-set-selections` is in the `debconf` package, which is Essential
+    // on every Debian-family release — so its absence is not a machine to carry
+    // on installing mail onto. Refusing here beats installing postfix with
+    // whatever answers the package picks and reporting mail configured.
+    if !crate::exec::program_available("debconf-set-selections") {
+        return Err(DistroError::PackageFailed(
+            "`debconf-set-selections` is missing, so postfix's install questions cannot be \
+             answered in advance; refusing rather than installing an MTA whose listening \
+             configuration nobody chose"
+                .into(),
+        ));
+    }
+
+    // On stdin, not in argv and not through a shell: this is the same reason
+    // SQL reaches `mariadb` that way (spec §12 rule 2).
+    let out = Cmd::new("debconf-set-selections")
+        .stdin_data(selections)
+        .run()
+        .await?;
+    if !out.success() {
+        return Err(DistroError::PackageFailed(format!(
+            "could not pre-answer postfix's install questions: {}",
+            out.failure_text()
+        )));
+    }
+    log.line(
+        "pre-answered postfix/main_mailer_type as `Local only`, so the package's own \
+         configuration binds the loopback and never port 25 on a public address",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Debian family
 // ---------------------------------------------------------------------------
 
@@ -1294,6 +1491,135 @@ mod tests {
                 ModsecConnector::Unverified { package: p, .. } => assert_eq!(p, package),
                 other => panic!("{id} {version} should be unverified, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn the_packages_a_postfix_null_client_needs_name_the_sasl_plugin_too() {
+        // The MTA alone authenticates to nothing: the PLAIN mechanism is a
+        // Cyrus SASL plugin in a package of its own on both families, and its
+        // absence produces `no mechanism available`, which reads exactly like a
+        // wrong password. Every supported release of a family answers the same,
+        // which is why this is checked per family rather than per release.
+        for (id, version, family, sasl) in [
+            ("debian", "12", Family::Debian, "libsasl2-modules"),
+            ("debian", "13", Family::Debian, "libsasl2-modules"),
+            ("ubuntu", "22.04", Family::Debian, "libsasl2-modules"),
+            ("ubuntu", "24.04", Family::Debian, "libsasl2-modules"),
+            ("almalinux", "9", Family::Rhel, "cyrus-sasl-plain"),
+            ("rocky", "10", Family::Rhel, "cyrus-sasl-plain"),
+            ("rhel", "9", Family::Rhel, "cyrus-sasl-plain"),
+        ] {
+            let packages = postfix_packages(&os(id, version, family));
+            assert_eq!(packages.mta, "postfix", "{id} {version}");
+            assert_eq!(packages.sasl, sasl, "{id} {version}");
+            assert!(
+                packages.names().contains(&sasl),
+                "{id} {version} would install an MTA that cannot authenticate"
+            );
+            assert!(
+                !packages.repository.is_empty(),
+                "an operator has to be told where these come from"
+            );
+        }
+
+        // `cyrus-sasl` is the library and the daemon; the mechanisms are
+        // separate subpackages, so the base name buys no PLAIN at all.
+        assert_ne!(
+            postfix_packages(&os("almalinux", "9", Family::Rhel)).sasl,
+            "cyrus-sasl"
+        );
+    }
+
+    #[test]
+    fn postfix_packages_are_installable_names() {
+        for family in [Family::Debian, Family::Rhel] {
+            let packages = postfix_packages(&os("x", "1", family));
+            let parsed = packages.parsed().expect("a constant that does not parse");
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].as_str(), packages.mta);
+            assert_eq!(parsed[1].as_str(), packages.sasl);
+        }
+    }
+
+    #[test]
+    fn a_postfix_install_cannot_stop_on_a_debconf_question() {
+        // Debian's postfix.postinst asks `postfix/main_mailer_type` at priority
+        // `high`. Under an interactive frontend that question holds the dpkg
+        // lock forever and every later package operation on the machine queues
+        // behind it. The frontend is what prevents that, not the preseed — so
+        // this asserts the environment variable is still on the invocation.
+        // Read out of `Debug` because `Cmd` keeps its environment private and
+        // `display()` deliberately shows only the argv.
+        let apt = format!("{:?}", AptBackend::new().apt());
+        assert!(
+            apt.contains("DEBIAN_FRONTEND") && apt.contains("noninteractive"),
+            "an install could stop on a debconf prompt: {apt}"
+        );
+    }
+
+    #[test]
+    fn the_preseed_answers_the_question_with_an_mta_that_does_not_open_port_25() {
+        // The default the noninteractive frontend would otherwise take is
+        // `Internet Site`, whose generated main.cf carries
+        // `inet_interfaces = all`: an MTA on port 25 on every address of the
+        // machine, from the end of the install until the panel's own main.cf
+        // lands. `Local only` generates `loopback-only` instead, so that window
+        // never exists.
+        let selections = postfix_debconf_selections("mail.example.com").unwrap();
+        assert!(
+            selections.contains("postfix/main_mailer_type select Local only"),
+            "{selections}"
+        );
+        assert!(
+            !selections.contains("Internet Site"),
+            "the install would come up listening on every address: {selections}"
+        );
+        assert!(
+            !selections.contains("No configuration"),
+            "that answer skips the postinst entirely and leaves /etc/postfix \
+             without master.cf, which the panel does not render: {selections}"
+        );
+        assert!(
+            selections.contains("postfix/mailname string mail.example.com"),
+            "{selections}"
+        );
+        // One setting per line, and exactly the two we mean.
+        assert_eq!(selections.lines().count(), 2, "{selections}");
+    }
+
+    #[tokio::test]
+    async fn preseeding_is_a_no_op_on_a_family_with_no_debconf() {
+        // rpm scriptlets never prompt, so there is no question to pre-answer —
+        // and a `debconf-set-selections` that does not exist must not be the
+        // thing that fails a mail install on AlmaLinux.
+        preseed_postfix(Family::Rhel, "mail.example.com", &NullLog)
+            .await
+            .expect("the RHEL family has nothing to preseed");
+    }
+
+    #[test]
+    fn a_mail_name_cannot_smuggle_a_second_debconf_setting() {
+        assert!(postfix_debconf_selections("mail.example.com").is_ok());
+        assert!(postfix_debconf_selections("  host-1.example.com  ").is_ok());
+        for hostile in [
+            "",
+            "-lead.example.com",
+            "trail.example.com-",
+            ".example.com",
+            "a..b",
+            "host name",
+            // The one that matters: a newline ends the mailname line and
+            // starts a setting for any package on the machine.
+            "mail.example.com\npostfix postfix/main_mailer_type select Internet Site",
+            "mail.example.com\ndebconf debconf/frontend select Dialog",
+            "mail.example.com; rm -rf /",
+            "$(id).example.com",
+        ] {
+            assert!(
+                postfix_debconf_selections(hostile).is_err(),
+                "expected `{hostile}` to be refused"
+            );
         }
     }
 

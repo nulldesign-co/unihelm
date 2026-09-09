@@ -213,6 +213,8 @@ pub const API_VERSION: &str = "1.0.0";
         super::mail::relay_get,
         super::mail::relay_set,
         super::mail::relay_test,
+        super::mail::mta_status,
+        super::mail::mta_install,
         super::mail::dns_publish,
         super::branding::public_get,
         super::branding::asset,

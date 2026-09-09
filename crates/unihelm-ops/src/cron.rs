@@ -79,9 +79,9 @@
 //! * `--wait --pipe` is why a failing job is still reported exactly as before:
 //!   the job's exit status becomes `systemd-run`'s, and its output goes to
 //!   cron's pipes rather than into the journal, so cron mails it to the
-//!   `MAILTO=<user>` at the top of the file. `--quiet` keeps the "Running as
-//!   unit …" banner out of that mail and `--collect` reaps the transient unit
-//!   afterwards, including when it failed.
+//!   `MAILTO=` at the top of the file (see below for what that is). `--quiet`
+//!   keeps the "Running as unit …" banner out of that mail and `--collect`
+//!   reaps the transient unit afterwards, including when it failed.
 //! * `%<command>` is cron's own convention, and it is what makes this safe.
 //!   Both cron implementations turn the first unescaped `%` in the command
 //!   field into a newline and feed **everything after it to the command on
@@ -110,6 +110,31 @@
 //! unconstrained: silently dropping `--slice=` would be the panel reporting a
 //! confined job it had not confined.
 //!
+//! # Where a job's output goes, and why `MAILTO=` is an email address
+//!
+//! This file has always written a `MAILTO=` line, and until the panel grew a
+//! local MTA nothing ever delivered what cron addressed to it: mail was a PHP
+//! pool setting (`sendmail_path`, per site), so a machine with no PHP had no
+//! way to send anything at all and a machine with PHP only had one for its
+//! sites. Every failing job's output has gone nowhere since the feature
+//! shipped.
+//!
+//! The MTA fixes the delivery. It does **not** make the old address work. It is
+//! a null client — an empty `mydestination`, so the machine delivers nothing
+//! locally and forwards everything upstream — and against one of those a bare
+//! `MAILTO=uh_abc12345` is completed to `uh_abc12345@<this host>` and relayed to
+//! the operator's provider, where no such mailbox exists. That is a bounce into
+//! a queue nobody reads, which is the same nothing as before with a support
+//! cost attached.
+//!
+//! So [`CronMail`] resolves the address of the account that owns the
+//! subscription — the person who would act on a backup script that started
+//! failing — and that is what goes in the file. When there is no usable address
+//! the line is `MAILTO=""`, which is cron's own spelling of "mail nothing", and
+//! the task log says why. Both outcomes are "the tenant is not emailed"; only
+//! one of them also pours bounces into the operator's relay, and it is not this
+//! one.
+//!
 //! # Why not the config engine
 //!
 //! Everything else the panel owns goes through `unihelm_config::apply` and its
@@ -135,7 +160,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use unihelm_config::paths;
 use unihelm_core::{
-    ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantScope, UnihelmError,
+    Email, ErrorCode, LinuxUser, Permission, Result, SubscriptionId, TenantScope, UnihelmError,
 };
 use unihelm_db::cron::{CronJob, CronJobUpdate, NewCronJob};
 use unihelm_db::subscriptions::Subscription;
@@ -516,6 +541,87 @@ async fn resolve_placement(host: &dyn CronHost, user: &LinuxUser) -> Result<Slic
     })
 }
 
+// ---------------------------------------------------------------------------
+// Where the output is mailed
+// ---------------------------------------------------------------------------
+
+/// What goes after `MAILTO=` in the crontab.
+///
+/// Two states, and the type exists so the second one cannot be reached by
+/// accident. [`CronMail::Nobody`] renders `MAILTO=""` — cron reads an empty
+/// value as "do not mail this crontab's output anywhere" — and is only ever
+/// chosen deliberately, with a line in the task log saying so.
+///
+/// The address is held as a validated [`Email`], not a `String`, because this
+/// value is written verbatim into a file cron parses line by line: an address
+/// carrying a newline would be a second cron setting, or a job, appearing in a
+/// file the panel believes it wrote every line of. `Email::parse` already
+/// rejects control characters, spaces, commas and semicolons, which is exactly
+/// the set that matters here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronMail {
+    To(Email),
+    Nobody,
+}
+
+impl CronMail {
+    /// The `MAILTO=` value, quoted where cron needs it to be.
+    fn value(&self) -> String {
+        match self {
+            // Unquoted: cron implementations differ on whether the quotes are
+            // stripped from a value, and an address that arrived as
+            // `"me@example.com"` would be undeliverable. An `Email` cannot
+            // contain a space, so there is nothing here to protect.
+            CronMail::To(address) => address.as_str().to_string(),
+            // Quoted, because this one *is* the empty string and a bare
+            // `MAILTO=` is the spelling cronie's parser is least sure about.
+            CronMail::Nobody => "\"\"".to_string(),
+        }
+    }
+}
+
+/// The address a subscription's cron output should go to.
+///
+/// The owning account's, because a subscription is somebody's, and a failing
+/// job is theirs to see. Never fails the operation: an account that has gone
+/// missing, or an address the panel would not accept today, is a reason to mail
+/// nobody and say so — not a reason to refuse to schedule a job, or to write an
+/// address the panel has not checked into a file cron parses.
+async fn resolve_cron_mail(ctx: &OpContext, subscription: &Subscription) -> Result<CronMail> {
+    let owner = ctx
+        .db()
+        .users(&TenantScope::Global)
+        .by_id(subscription.customer_id)
+        .await
+        .map_err(UnihelmError::from)?;
+
+    let Some(owner) = owner else {
+        ctx.log(format!(
+            "subscription {} has no owning account, so its cron output is mailed nowhere \
+             (MAILTO=\"\"). Job failures will only be visible in the panel.",
+            subscription.id.get()
+        ));
+        return Ok(CronMail::Nobody);
+    };
+
+    // Re-parsed rather than trusted, for the same reason every row this module
+    // renders is re-validated: the database read is not the last place this
+    // string is checked before it becomes a line in a file cron executes.
+    match Email::parse(owner.email.as_str()) {
+        Ok(address) => Ok(CronMail::To(address)),
+        Err(e) => {
+            ctx.log(format!(
+                "the address on the account owning subscription {} is not one the panel \
+                 will write into a crontab ({}), so its cron output is mailed nowhere \
+                 (MAILTO=\"\").",
+                subscription.id.get(),
+                e.detail
+            ));
+            Ok(CronMail::Nobody)
+        }
+    }
+}
+
 /// Everything on a job line between the schedule and the tenant's own command.
 ///
 /// Assembled in one place because it is the security boundary: every character
@@ -586,11 +692,13 @@ fn job_line(schedule: &str, command: &str, placement: &SlicePlacement) -> Result
 /// The `placement` is not optional and not defaulted: a caller that has not
 /// resolved the tenant's slice cannot render a line, which is what keeps
 /// "the job runs inside the plan's ceiling" true of every line in the file
-/// rather than of the lines somebody remembered to wrap.
+/// rather than of the lines somebody remembered to wrap. `mail` is not
+/// defaulted either, and for the same shape of reason: see [`CronMail`].
 pub fn render_crontab(
     subscription_id: SubscriptionId,
     jobs: &[CronJob],
     placement: &SlicePlacement,
+    mail: &CronMail,
 ) -> Result<String> {
     // Deliberately pure ASCII, unlike the rest of this codebase's prose. The
     // file is read by the cron daemon, and there is no reason to find out on
@@ -620,7 +728,13 @@ pub fn render_crontab(
     // Output and exit status still belong to the tenant, not to root: `--pipe`
     // hands the job's output back to cron, and this is where cron sends it.
     // Without it every failing job would mail root instead of the customer.
-    out.push_str(&format!("MAILTO={}\n", placement.linux_user));
+    //
+    // The value used to be `placement.linux_user`. A local account name is not
+    // deliverable through a null-client MTA — it is completed to
+    // `<user>@<this host>` and relayed to a provider that has never heard of it
+    // — so this is the owning account's real address, or `""` for "mail
+    // nobody" when there isn't one. See the module docs.
+    out.push_str(&format!("MAILTO={}\n", mail.value()));
 
     for job in jobs {
         let schedule = validate_schedule(&job.schedule).map_err(|e| {
@@ -988,18 +1102,29 @@ async fn ensure_managed_file_is_ours(host: &dyn CronHost, user: &LinuxUser) -> R
 /// agreeing about what is scheduled.
 struct CronTarget {
     placement: SlicePlacement,
+    /// Where cron mails what the jobs print. Resolved here rather than in the
+    /// renderer because it is a database read, and the renderer is a pure
+    /// function of what it is handed.
+    mail: CronMail,
     /// The tenant still has the panel's pre-slice spool crontab. Removed after
     /// the `/etc/cron.d` file is in place, so the jobs move rather than run
     /// twice.
     legacy_spool_crontab: bool,
 }
 
-async fn prepare(host: &dyn CronHost, user: &LinuxUser) -> Result<CronTarget> {
-    let legacy_spool_crontab = ensure_crontab_is_ours(host, user).await?;
-    ensure_managed_file_is_ours(host, user).await?;
-    let placement = resolve_placement(host, user).await?;
+async fn prepare(
+    ctx: &OpContext,
+    host: &dyn CronHost,
+    subscription: &Subscription,
+) -> Result<CronTarget> {
+    let user = LinuxUser::parse(&subscription.linux_user)?;
+    let legacy_spool_crontab = ensure_crontab_is_ours(host, &user).await?;
+    ensure_managed_file_is_ours(host, &user).await?;
+    let placement = resolve_placement(host, &user).await?;
+    let mail = resolve_cron_mail(ctx, subscription).await?;
     Ok(CronTarget {
         placement,
+        mail,
         legacy_spool_crontab,
     })
 }
@@ -1024,7 +1149,7 @@ async fn install_from_db(
         .cron_jobs_for_render(subscription.id)
         .await
         .map_err(UnihelmError::from)?;
-    let content = render_crontab(subscription.id, &jobs, &target.placement)?;
+    let content = render_crontab(subscription.id, &jobs, &target.placement, &target.mail)?;
 
     match host.install(&user, &content).await {
         Ok(()) => {
@@ -1255,8 +1380,7 @@ impl TypedOperation for Set {
         // exactly as it found it. That now covers the tenant's slice as well as
         // their crontab — a job the panel cannot confine is refused rather than
         // stored and then scheduled with the whole machine underneath it.
-        let user = LinuxUser::parse(&subscription.linux_user)?;
-        let target = prepare(self.host.as_ref(), &user).await?;
+        let target = prepare(ctx, self.host.as_ref(), &subscription).await?;
 
         // The wrapper costs ~150 characters of cron's line budget, so a command
         // that fits `MAX_COMMAND_CHARS` may still not fit a line. Checked here,
@@ -1376,12 +1500,11 @@ impl TypedOperation for Delete {
         // subscription was suspended, must still be able to take their jobs
         // out — refusing would strand exactly the schedules an operator most
         // wants gone.
-        let user = LinuxUser::parse(&subscription.linux_user)?;
         // Resolved before the row goes, for the same reason as on the way in: if
         // the file cannot be rewritten, the job is still on the machine, and a
         // panel that had already forgotten the row would be showing a schedule
         // that is not the one running.
-        let target = prepare(self.host.as_ref(), &user).await?;
+        let target = prepare(ctx, self.host.as_ref(), &subscription).await?;
 
         ctx.db()
             .cron_jobs(ctx.scope())
@@ -1532,6 +1655,11 @@ mod tests {
         }
     }
 
+    /// The address of the account that owns the fixture subscription.
+    fn mail() -> CronMail {
+        CronMail::To(Email::parse("owner@example.com").unwrap())
+    }
+
     fn job_row(id: i64, schedule: &str, command: &str, enabled: bool) -> CronJob {
         CronJob {
             id,
@@ -1678,6 +1806,7 @@ mod tests {
             SubscriptionId(7),
             &[job_row(1, "* * * * *", "ok\n* * * * * /bin/sh -i", true)],
             &placement(),
+            &mail(),
         )
         .unwrap_err();
         assert!(err.detail.contains("cron job 1"), "{}", err.detail);
@@ -1742,6 +1871,7 @@ mod tests {
             SubscriptionId(7),
             &[job_row(1, "0 3 * * *", "/usr/bin/php cron.php", true)],
             &placement(),
+            &mail(),
         )
         .unwrap();
 
@@ -1771,6 +1901,7 @@ mod tests {
                 job_row(2, "0 4 * * *", "disabled.sh", false),
             ],
             &placement(),
+            &mail(),
         )
         .unwrap();
         assert!(body.contains("\n0 3 * * * root systemd-run "), "{body}");
@@ -1794,6 +1925,7 @@ mod tests {
             SubscriptionId(7),
             &[job_row(1, "0 3 * * *", "echo $(date +%Y-%m-%d) 50%", true)],
             &placement(),
+            &mail(),
         )
         .unwrap();
         let line = body
@@ -1820,20 +1952,52 @@ mod tests {
             job_row(1, "0 3 * * *", "a.sh", true),
             job_row(2, "0 4 * * *", "b.sh", false),
         ];
-        let once = render_crontab(SubscriptionId(7), &jobs, &placement()).unwrap();
-        let twice = render_crontab(SubscriptionId(7), &jobs, &placement()).unwrap();
+        let once = render_crontab(SubscriptionId(7), &jobs, &placement(), &mail()).unwrap();
+        let twice = render_crontab(SubscriptionId(7), &jobs, &placement(), &mail()).unwrap();
         assert_eq!(once, twice);
     }
 
     #[test]
     fn an_empty_job_list_renders_a_valid_but_empty_managed_crontab() {
-        let body = render_crontab(SubscriptionId(7), &[], &placement()).unwrap();
+        let body = render_crontab(SubscriptionId(7), &[], &placement(), &mail()).unwrap();
         assert!(is_unihelm_crontab(&body));
         assert!(
             body.lines()
                 .all(|l| l.starts_with('#') || l.starts_with("MAILTO=")),
             "no schedule lines: {body}"
         );
+    }
+
+    // -- where the output is mailed -----------------------------------------
+
+    #[test]
+    fn the_crontab_is_mailed_to_an_address_and_never_to_a_bare_local_account_name() {
+        // This line used to be `MAILTO=uh_abc12345`, which delivered nothing:
+        // the host MTA is a null client with an empty `mydestination`, so a
+        // bare local name is completed to `uh_abc12345@<this host>` and handed
+        // to the operator's relay, which has no such mailbox. Every failing
+        // job's output became a bounce.
+        let body = render_crontab(SubscriptionId(7), &[], &placement(), &mail()).unwrap();
+
+        assert!(body.contains("\nMAILTO=owner@example.com\n"), "{body}");
+        assert!(
+            !body.contains("MAILTO=uh_abc12345"),
+            "a Linux account name is not an address: {body}"
+        );
+        // Unquoted, because some cron implementations keep the quotes as part
+        // of the value and `"me@example.com"` is not deliverable.
+        assert!(!body.contains("MAILTO=\"owner"), "{body}");
+    }
+
+    #[test]
+    fn a_subscription_with_no_usable_address_mails_nobody_rather_than_somewhere_undeliverable() {
+        // `MAILTO=""` is cron's own "send nothing". It is the honest end of a
+        // choice between two kinds of nothing: this one does not also fill the
+        // operator's relay with bounces addressed to accounts nobody hosts.
+        let body = render_crontab(SubscriptionId(7), &[], &placement(), &CronMail::Nobody).unwrap();
+
+        assert!(body.contains("\nMAILTO=\"\"\n"), "{body}");
+        assert!(!body.contains("uh_abc12345@"), "{body}");
     }
 
     // -- slice placement ----------------------------------------------------
@@ -1847,6 +2011,7 @@ mod tests {
             SubscriptionId(7),
             &[job_row(1, "*/5 * * * *", "/usr/bin/php cron.php", true)],
             &placement(),
+            &mail(),
         )
         .unwrap();
         let line = body
@@ -1872,7 +2037,7 @@ mod tests {
         // it to them rather than to root.
         assert!(line.contains("--wait"), "{line}");
         assert!(line.contains("--pipe"), "{line}");
-        assert!(body.contains("\nMAILTO=uh_abc12345\n"), "{body}");
+        assert!(body.contains("\nMAILTO=owner@example.com\n"), "{body}");
     }
 
     #[test]
@@ -1891,6 +2056,7 @@ mod tests {
                 SubscriptionId(7),
                 &[job_row(1, "0 3 * * *", command, true)],
                 &placement(),
+                &mail(),
             )
             .unwrap();
             let line = body
@@ -1965,7 +2131,7 @@ mod tests {
         // prepends its own banner — the case that would otherwise make the
         // panel refuse the very file it had just installed.
         assert!(is_unihelm_crontab(
-            &render_crontab(SubscriptionId(1), &[], &placement()).unwrap()
+            &render_crontab(SubscriptionId(1), &[], &placement(), &mail()).unwrap()
         ));
         assert!(is_unihelm_crontab(
             "# DO NOT EDIT THIS FILE - edit the master and reinstall.\n\
@@ -2058,6 +2224,31 @@ mod tests {
             "{installed}"
         );
         assert_eq!(db.cron_jobs_for_render(sub.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_saved_job_mails_its_output_to_the_owning_accounts_address() {
+        // End to end, because the address is a database read and the renderer
+        // only writes what it is handed: the account that owns the
+        // subscription is the person who has to see a backup script start
+        // failing, and before this the file named their Linux account instead.
+        let (ctx, _db, sub) = ctx_with_tenant().await;
+        let host = Arc::new(FakeHost::default());
+
+        Set::with_host(host.clone())
+            .run(&ctx, set_input("0 3 * * *", "backup.sh", &sub))
+            .await
+            .unwrap();
+
+        let installed = host.installed_for(&sub.linux_user).expect("a crontab");
+        assert!(
+            installed.contains("\nMAILTO=c@example.com\n"),
+            "{installed}"
+        );
+        assert!(
+            !installed.contains(&format!("MAILTO={}", sub.linux_user)),
+            "{installed}"
+        );
     }
 
     #[tokio::test]

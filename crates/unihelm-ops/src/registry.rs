@@ -404,6 +404,8 @@ impl OpRegistry {
         registry.register(crate::mail::DnsPublish);
         registry.register(crate::mail::RelaySet::live());
         registry.register(crate::mail::RelayTest);
+        registry.register(crate::mail::MtaStatus::live());
+        registry.register(crate::mail::MtaInstall::live());
         registry.register(crate::branding::Get);
         registry.register(crate::branding::Set);
         registry.register(crate::terminal::keys::List);

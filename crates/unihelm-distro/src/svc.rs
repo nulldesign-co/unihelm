@@ -92,6 +92,9 @@ pub enum ManagedUnit {
     KvStore,
     Docker,
     Sshd,
+    /// The local MTA every runtime on the box hands outbound mail to
+    /// (spec §11.18).
+    Postfix,
     UnihelmWeb,
     UnihelmAgentd,
 }
@@ -142,6 +145,18 @@ impl ManagedUnit {
             (ManagedUnit::Sshd, Family::Debian) => "ssh.service".to_string(),
             (ManagedUnit::Sshd, Family::Rhel) => "sshd.service".to_string(),
 
+            // Checked on 2026-09-09 against both families' packaging, because
+            // "they're both called postfix" is exactly the assumption that made
+            // `apache2` / `httpd` a bug the first time. Debian's `postfix` ships
+            // `/lib/systemd/system/postfix.service` alongside a templated
+            // `postfix@.service` for multi-instance setups, and the plain name
+            // is the one that drives the default instance; EL's `postfix` ships
+            // `postfix.service` and nothing else. So one name really does cover
+            // both — but the panel must keep naming `postfix.service` and never
+            // `postfix@-.service`, which is the *instance* Debian's wrapper
+            // starts and is not a unit that exists on EL at all.
+            (ManagedUnit::Postfix, _) => "postfix.service".to_string(),
+
             (ManagedUnit::UnihelmWeb, _) => "unihelm-web.service".to_string(),
             (ManagedUnit::UnihelmAgentd, _) => "unihelm-agentd.service".to_string(),
         };
@@ -159,6 +174,7 @@ impl ManagedUnit {
             ManagedUnit::KvStore => "Redis".into(),
             ManagedUnit::Docker => "Docker".into(),
             ManagedUnit::Sshd => "OpenSSH".into(),
+            ManagedUnit::Postfix => "Postfix".into(),
             ManagedUnit::UnihelmWeb => "Unihelm panel".into(),
             ManagedUnit::UnihelmAgentd => "Unihelm agent".into(),
         }
@@ -609,6 +625,34 @@ mod tests {
     }
 
     #[test]
+    fn the_mta_is_one_unit_name_on_both_families_and_is_not_the_instance() {
+        // Both families really do call it `postfix.service` — verified rather
+        // than assumed, since this table already carries `apache2` / `httpd`
+        // for a service everyone calls Apache.
+        for family in [Family::Debian, Family::Rhel] {
+            assert_eq!(
+                ManagedUnit::Postfix.unit_name(family).as_str(),
+                "postfix.service",
+                "{family:?}"
+            );
+        }
+        // Debian additionally ships `postfix@.service`, whose `-` instance is
+        // what its wrapper starts. Naming that here would work on Debian and
+        // resolve to nothing on EL, so the panel would report a mail system
+        // that is `not-found` on half the servers it supports.
+        assert!(
+            !ManagedUnit::Postfix
+                .unit_name(Family::Debian)
+                .as_str()
+                .contains('@')
+        );
+        assert_eq!(ManagedUnit::Postfix.display_name(), "Postfix");
+        // Mail going down is bad; it is not the panel or the serving path going
+        // down, and an operator has to be able to stop it to work on it.
+        assert!(!ManagedUnit::Postfix.is_critical());
+    }
+
+    #[test]
     fn every_managed_unit_resolves_to_a_valid_unit_name_on_both_families() {
         let mut units = vec![
             ManagedUnit::Nginx,
@@ -617,6 +661,7 @@ mod tests {
             ManagedUnit::KvStore,
             ManagedUnit::Docker,
             ManagedUnit::Sshd,
+            ManagedUnit::Postfix,
             ManagedUnit::UnihelmWeb,
             ManagedUnit::UnihelmAgentd,
         ];

@@ -118,6 +118,9 @@ pub const COVERAGE: &[(&str, &[&str])] = &[
     ("import.list", &["unihelm", "import", "list"]),
     ("import.plan", &["unihelm", "import", "plan", "--source", "cpanel", "--path", "/srv/backups/cpmove-shop.tar.gz", "--subscription", "1"]),
     ("mail.dns.publish", &["unihelm", "mail", "dns-publish"]),
+
+    ("mail.mta.install", &["unihelm", "mail", "mta", "install"]),
+    ("mail.mta.status", &["unihelm", "mail", "mta", "status"]),
     ("mail.relay.get", &["unihelm", "mail", "relay", "get"]),
     ("mail.relay.set", &["unihelm", "mail", "relay", "set", "smtp.example.com", "--port", "587", "--tls", "starttls", "--from", "panel@example.com"]),
     ("mail.relay.test", &["unihelm", "mail", "relay", "test", "--to", "ops@example.com"]),
@@ -457,6 +460,9 @@ mod tests {
             "import.list" => importer::ListInput,
             "import.plan" => importer::PlanInput,
             "mail.dns.publish" => mail::DnsPublishInput,
+
+            "mail.mta.install" => mail::MtaInstallInput,
+            "mail.mta.status" => mail::MtaStatusInput,
             "mail.relay.get" => mail::RelayGetInput,
             "mail.relay.set" => mail::RelaySetInput,
             "mail.relay.test" => mail::RelayTestInput,

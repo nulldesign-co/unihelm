@@ -1,0 +1,30 @@
+# The upstream relay credential (spec §11.18).
+#
+# ONE FILE FOR THE MACHINE, AND ROOT IS THE ONLY ACCOUNT THAT READS IT. That is
+# the entire security argument for replacing msmtp with a local MTA. msmtp ran
+# as the tenant, so its configuration had to be tenant-readable, so every
+# customer on the box held the credential the server itself sends with — and
+# one customer reading their own copy could send as the operator and get the
+# machine blacklisted for everyone. Postfix's smtp(8) opens this map in its
+# pre-jail initialisation, while it is still root, and only then drops to the
+# unprivileged `postfix` user. Nothing else ever needs to open it, so nothing
+# else is allowed to: 0600, root-owned.
+#
+# There is no compiled copy. `main.cf` names this map `texthash:`, which Postfix
+# reads directly, so `postmap` is never run and the second file holding the same
+# password — the one people chmod the source and forget — is never created.
+#
+# The key has to be spelled exactly as `relayhost` in main.cf, brackets and port
+# included; both come from the same rendered value, so they cannot drift apart.
+# A key that merely looks right is not a syntax error, it is an authentication
+# that is silently never attempted.
+{% if mail.username %}
+{{ mail.relayhost }}	{{ mail.username }}:{{ mail.password }}
+{% else %}
+#
+# This relay authorises by source IP and needs no credential, so the table is
+# empty. The file still exists, and `main.cf` still does not reference it —
+# `smtp_sasl_auth_enable` is off — because an absent map that something later
+# starts pointing at is a fatal error at Postfix startup, and an empty one is
+# not.
+{% endif %}

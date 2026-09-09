@@ -96,19 +96,38 @@ php_admin_value[opcache.revalidate_freq] = 2
 php_admin_value[opcache.file_cache] = {{ pool.tmp_dir }}/opcache
 
 ; --- outbound mail --------------------------------------------------------
-{% if pool.sendmail_path %}
-; PHP's mail() with an external relay (spec §11.18). `php_admin_value` rather
-; than `php_value`: a script that could ini_set() its way to another
-; sendmail_path could run a program of its own choosing as this tenant.
+; There is no sendmail_path here, on purpose, and adding one back would be a
+; step backwards on both counts.
 ;
-; Rendered only while a relay is configured and enabled. There is no fallback
-; line: an empty sendmail_path makes mail() run nothing and return true, so
-; every message would be reported as sent.
-php_admin_value[sendmail_path] = {{ pool.sendmail_path }}
-{% else %}
-; No relay is configured, so nothing overrides PHP's own sendmail_path and
-; mail() fails the way an unconfigured server should.
-{% endif %}
+; This pool used to carry
+;   php_admin_value[sendmail_path] = msmtp --file=/etc/unihelm/mail/<domain>.msmtprc -t
+; which made mail a PHP feature delivered by a per-site relay client. msmtp ran
+; as the tenant, so its configuration file had to be readable by the tenant —
+; and since the panel has one upstream relay, every site's copy held the *same*
+; credential: the one this server authenticates to SendGrid, SES or Postmark
+; with. Any customer could read it and send as the operator.
+;
+; The host now runs a local MTA (a Postfix null client) that holds that
+; credential as root, mode 0600, and relays upstream. PHP's own compiled-in
+; default hands the message to /usr/sbin/sendmail, which is that MTA — so the
+; correct per-site configuration is no directive at all, and the tenant hands
+; over a message instead of holding a secret. It also means everything else on
+; the box can send: Node, Python, a shell script, cron.
+;
+; The one thing that must never be written here is an *empty* one:
+;
+;   php_admin_value[sendmail_path] =        ; <- never do this
+;
+; Leaving the directive out lets PHP use its default. Setting it to the empty
+; string is not the same thing and is the worst outcome available: mail()
+; executes nothing and returns true, so the application reports every message
+; as sent while every message is discarded. Absent is honest; empty is a lie.
+; If mail ever has to be turned off for a site, it has to fail visibly instead.
+;
+; php_admin_value, not php_value, is also why the panel's override allowlist
+; (`check_php_overrides` in unihelm-ops, site.rs) still refuses sendmail_path
+; outright: a tenant-set sendmail_path is a program of their choosing run by
+; PHP, whatever the MTA arrangement is.
 
 ; --- environment ----------------------------------------------------------
 ; FPM clears the environment by default; PATH is the one thing scripts that

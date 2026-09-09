@@ -438,6 +438,134 @@ pub fn mail_site_config(domain: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// The Postfix null client (spec §11.18)
+// ---------------------------------------------------------------------------
+//
+// What replaced the per-site msmtp files above, and why the layout is not the
+// same shape. msmtp ran *as the tenant*, so its configuration had to be
+// readable by the tenant, so the relay credential was in every site's hands —
+// one server-wide secret, copied once per customer. Postfix runs as root, reads
+// its maps before dropping privileges, and accepts a message from anything on
+// the box through `/usr/sbin/sendmail` or `localhost:25`. So there is one set of
+// files here instead of one per domain, and nothing but root ever opens them.
+
+/// Postfix's own configuration directory.
+///
+/// The one place the panel writes outside a `unihelm.d` of its own
+/// (spec §10.4 rule 1), and the exception is forced rather than chosen:
+/// `main.cf` has no `include` directive and no drop-in directory. There is no
+/// one line to add — every parameter that makes this a null client has to be in
+/// the file Postfix actually reads. The mitigation is that the file is a full
+/// managed file with a hash header, so an edit by a human or by the package's
+/// own `postconf -e` on upgrade is detected and reported rather than silently
+/// thrown away.
+pub fn postfix_dir() -> PathBuf {
+    under("/etc/postfix")
+}
+
+/// The null client's configuration.
+///
+/// Not a dpkg conffile on the Debian family — the package generates it in its
+/// postinst rather than shipping it — so `--force-confold` does not protect it
+/// and a postfix upgrade can rewrite parts of it. That is one more reason the
+/// install is preseeded `Local only`
+/// (`unihelm_distro::pkg::postfix_debconf_selections`): whatever the postinst
+/// re-derives, it re-derives as a loopback-only mailer.
+pub fn postfix_main_cf() -> PathBuf {
+    postfix_dir().join("main.cf")
+}
+
+/// The relay credential, as a Postfix lookup table.
+///
+/// Kept under `/etc/unihelm/mail` — the panel's own directory, already `0711`
+/// so it cannot be listed — rather than in `/etc/postfix` beside `main.cf`.
+/// Postfix reads a map from any absolute path, and the panel owning the file
+/// completely is worth more than the convention of keeping it next to the
+/// configuration: `/etc/postfix` is the package's directory, and a file the
+/// panel fully owns does not belong in it.
+///
+/// One file, not one per site. That is the whole point of the change: the
+/// tenant hands a message to `sendmail` and never sees this.
+pub fn mail_sasl_passwd() -> PathBuf {
+    mail_dir().join("sasl_passwd")
+}
+
+/// The sender-rewriting map: which envelope sender a message leaves as.
+///
+/// Beside the credential and held at the same mode, because it is the server's
+/// customer list — every domain hosted here, in one file. It holds no secret,
+/// and the msmtp design's `0711` directory note applies to it exactly: nothing
+/// but Postfix reads it, and Postfix reads it as root.
+pub fn mail_sender_canonical() -> PathBuf {
+    mail_dir().join("sender_canonical")
+}
+
+/// How `main.cf` must spell a reference to one of the two maps above.
+///
+/// **`texthash:`, and this is a verified decision rather than a preference.**
+/// A compiled map (`postmap`) has no portable spelling across the releases this
+/// panel supports, checked on 2026-09-09:
+///
+/// - Debian 13 sets `default_database_type = cdb` and makes `postfix-cdb` and
+///   `postfix-lmdb` hard dependencies; Debian 12, Ubuntu 22.04 and 24.04 still
+///   default to `hash`;
+/// - EL 10 has no Berkeley DB at all — RHEL removed `libdb` — so `hash:` is not
+///   a type its Postfix can open, while EL 9's still is;
+/// - `lmdb:` needs `postfix-lmdb`, which on Ubuntu 22.04 is in `universe`, a
+///   component that is not enabled on every image (the same trap the WAF
+///   connector work found).
+///
+/// So a compiled map would mean a per-release map type, a per-release file
+/// extension, and a `postmap` run that fails on the release nobody tested.
+/// `texthash:` is built into every Postfix — it needs no plugin package, no
+/// `postmap`, and no database library — and it reads exactly the same file
+/// format. It is documented as suitable for tables that are read once and do
+/// not change underneath, which is what a one-line credential is.
+///
+/// **And it removes a copy of the secret.** `postmap` writes a second file
+/// holding the same password, which is the copy people forget to `chmod`. There
+/// is nothing to forget when it is never created. See
+/// [`postfix_map_companions`] for the ones a hand-run `postmap` could still
+/// leave behind.
+///
+/// The cost is that Postfix caches a `texthash:` table when it opens it and
+/// never notices the file changing, so **the panel must reload Postfix after
+/// rewriting either map** — otherwise a rotated credential is accepted, stored
+/// and reported saved while the running daemons keep sending with the old one.
+pub const POSTFIX_MAP_TYPE: &str = "texthash";
+
+/// One map, spelled the way `main.cf` has to name it: `texthash:/absolute/path`.
+pub fn postfix_map_ref(map: &Path) -> String {
+    format!("{POSTFIX_MAP_TYPE}:{}", map.display())
+}
+
+/// Every compiled file a `postmap` run could have left beside `map`.
+///
+/// The panel never runs `postmap` (see [`POSTFIX_MAP_TYPE`]), but an operator
+/// following any relay tutorial on the internet will, and a machine adopted
+/// from an existing Postfix setup may already have one. Each of these holds the
+/// same relay password as its source in a file with its own permissions, so
+/// they are exactly the copy that gets left world-readable. Listed here so the
+/// layer that writes the maps can hold them at the source's mode, or remove
+/// them, rather than leaving a secret behind under a name nobody looked for.
+///
+/// All three extensions, because which one `postmap` produces depends on the
+/// release's `default_database_type`: `.db` for `hash`, `.lmdb` for `lmdb`,
+/// `.cdb` for `cdb`.
+pub fn postfix_map_companions(map: &Path) -> Vec<PathBuf> {
+    ["db", "lmdb", "cdb"]
+        .iter()
+        .map(|ext| {
+            let mut path = map.to_path_buf();
+            // Appended, not substituted: `postmap sasl_passwd` writes
+            // `sasl_passwd.db`, keeping the whole source name.
+            path.as_mut_os_string().push(format!(".{ext}"));
+            path
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Engine containers (spec §11.5; `unihelm_ops::engine`)
 // ---------------------------------------------------------------------------
 
@@ -600,6 +728,92 @@ mod tests {
         // The file mode is what the container needs to read it through the
         // mount, and nothing more is claimed for it.
         assert_eq!(ENGINE_CONFIG_FILE_MODE & 0o004, 0o004);
+    }
+
+    /// The relay credential moved out of one file per customer and into one
+    /// file for the server, and it must stay in the panel's own directory. The
+    /// old per-site files were readable by their tenant because msmtp ran as
+    /// the tenant; nothing about the replacement should put the credential
+    /// anywhere a tenant can reach, and `/etc/postfix` is a directory whose
+    /// mode belongs to the package.
+    #[test]
+    fn the_relay_credential_lives_in_the_panels_own_directory_not_postfixs() {
+        assert!(mail_sasl_passwd().starts_with(mail_dir()));
+        assert!(mail_sender_canonical().starts_with(mail_dir()));
+        assert!(mail_dir().starts_with(config_dir()));
+        assert!(!mail_sasl_passwd().starts_with(postfix_dir()));
+
+        assert_eq!(
+            mail_sasl_passwd().to_str().unwrap(),
+            "/etc/unihelm/mail/sasl_passwd"
+        );
+        // One file for the machine, where the design it replaces had one per
+        // domain — which is what put the same secret in every tenant's hands.
+        assert_ne!(mail_sasl_passwd(), mail_site_config("example.com"));
+    }
+
+    /// `main.cf` is the single file the panel writes outside a directory of its
+    /// own, and it is forced: Postfix's configuration has no `include` and no
+    /// drop-in directory, so there is no one line to add the way there is for
+    /// nginx, Apache and sshd. Spelled out here so a later reader meets the
+    /// exception deliberately rather than finding it.
+    #[test]
+    fn the_only_stock_file_the_mail_stack_owns_is_main_cf() {
+        assert_eq!(postfix_main_cf().to_str().unwrap(), "/etc/postfix/main.cf");
+        assert!(postfix_main_cf().starts_with(postfix_dir()));
+
+        for path in [mail_sasl_passwd(), mail_sender_canonical(), mail_dir()] {
+            assert!(
+                path.starts_with(config_dir()),
+                "{path:?} escaped the panel's own tree"
+            );
+        }
+    }
+
+    #[test]
+    fn a_map_reference_needs_no_postmap_and_names_an_absolute_path() {
+        // `texthash:` is what makes the map work identically on Debian 12 and
+        // 13, Ubuntu 22.04 and 24.04, and EL 9 and 10 — where `hash:`, `cdb:`
+        // and `lmdb:` each fail on at least one of them. It also means no
+        // compiled second copy of the relay password is ever created.
+        let reference = postfix_map_ref(&mail_sasl_passwd());
+        assert_eq!(reference, "texthash:/etc/unihelm/mail/sasl_passwd");
+        assert!(reference.starts_with("texthash:"), "{reference}");
+        for compiled in ["hash:", "lmdb:", "cdb:", "btree:"] {
+            assert!(
+                !reference.starts_with(compiled),
+                "{reference} would need a postmap run and a per-release map type"
+            );
+        }
+    }
+
+    #[test]
+    fn every_extension_postmap_could_have_written_is_accounted_for() {
+        // Which one exists depends on the release's `default_database_type`:
+        // `hash` on Debian 12 / Ubuntu, `cdb` on Debian 13, `lmdb` on EL 10.
+        // Missing one would leave a readable copy of the relay password behind
+        // under a name nothing looked for.
+        let companions = postfix_map_companions(Path::new("/etc/unihelm/mail/sasl_passwd"));
+        let names: Vec<&str> = companions
+            .iter()
+            .map(|p| p.to_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "/etc/unihelm/mail/sasl_passwd.db",
+                "/etc/unihelm/mail/sasl_passwd.lmdb",
+                "/etc/unihelm/mail/sasl_passwd.cdb",
+            ]
+        );
+        // Appended, not substituted: `postmap sasl_passwd` keeps the whole
+        // source name. `Path::set_extension` would have produced the same
+        // thing here and the wrong thing for any map name with a dot in it.
+        let dotted = postfix_map_companions(Path::new("/etc/unihelm/mail/relay.map"));
+        assert_eq!(
+            dotted[0].to_str().unwrap(),
+            "/etc/unihelm/mail/relay.map.db"
+        );
     }
 
     #[test]

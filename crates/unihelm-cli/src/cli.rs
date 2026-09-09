@@ -1919,6 +1919,30 @@ pub enum MailCommand {
     /// The outbound relay.
     #[command(subcommand)]
     Relay(MailRelayCommand),
+    /// The local mail transfer agent, which is what actually sends.
+    ///
+    /// Mail is a server capability rather than a PHP feature: every language on
+    /// the machine hands a message to this and it relays upstream, so the
+    /// relay's own credential is never readable by a tenant.
+    #[command(subcommand)]
+    Mta(MailMtaCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MailMtaCommand {
+    /// Whether the local MTA is installed, configured by the panel, and able to
+    /// reach the relay — and whether any per-site msmtp files are left over.
+    Status,
+    /// Install and configure the local MTA, then re-render the PHP pools that
+    /// used to name their own sendmail.
+    ///
+    /// Refuses to overwrite a `main.cf` the panel did not write. `--adopt`
+    /// takes it over, keeping the displaced file beside it.
+    Install {
+        /// Take over a Postfix configuration this panel did not write.
+        #[arg(long)]
+        adopt: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

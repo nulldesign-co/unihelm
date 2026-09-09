@@ -370,15 +370,15 @@ pub struct PoolContext {
 
     pub env: Vec<EnvEntry>,
     pub extra_ini: Option<String>,
-
-    /// What PHP's `mail()` runs, or `None` for "leave PHP's own default".
-    ///
-    /// `None` renders no `sendmail_path` line at all rather than an empty one:
-    /// an empty `sendmail_path` makes `mail()` execute nothing and return
-    /// *true*, so an application would report every message as sent. Absent,
-    /// PHP falls back to whatever the system has — usually nothing, which at
-    /// least fails honestly (spec §11.18).
-    pub sendmail_path: Option<String>,
+    // There is deliberately no `sendmail_path` here any more. It used to carry
+    // `msmtp --file=/etc/unihelm/mail/<domain>.msmtprc -t`, which made outbound
+    // mail a *PHP* feature and put the server's one upstream relay credential
+    // in a file every tenant could read. Mail is now a host service — a Postfix
+    // null client that holds the credential as root and accepts messages from
+    // `/usr/sbin/sendmail` and on the loopback — so PHP's own compiled-in
+    // default is the correct configuration and there is nothing per-site to
+    // render. See `templates/php/pool.conf.j2`, which says what must never be
+    // rendered here instead.
 }
 
 /// Functions disabled by default.
@@ -471,10 +471,6 @@ impl PoolContext {
 
             env: Vec::new(),
             extra_ini: None,
-            // Filled in by `unihelm_ops::mail` when a relay is configured. A
-            // pool rendered without one is a pool whose sites cannot send
-            // mail, which is the correct state for a panel with no relay.
-            sendmail_path: None,
         }
     }
 }
@@ -1253,101 +1249,53 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_without_a_relay_renders_no_sendmail_path_at_all() {
-        // Not an empty one: PHP's mail() with an empty sendmail_path executes
-        // nothing and returns true, so an application would report every
-        // message as delivered (spec §11.18).
+    fn no_pool_renders_a_sendmail_path_directive_now_that_the_host_runs_an_mta() {
+        // The pool used to carry `php_admin_value[sendmail_path] = msmtp
+        // --file=/etc/unihelm/mail/<domain>.msmtprc -t`, which is what made the
+        // relay credential tenant-readable: msmtp ran as the tenant, so its
+        // configuration had to be too. With a local MTA the message goes to
+        // PHP's own default `/usr/sbin/sendmail -t -i`, and the pool has
+        // nothing to say about mail at all.
         let set = TemplateSet::load().unwrap();
         let pool = PoolContext::new("example.com", "uh_a", PhpVersion::V83, 1024, "nginx");
         let out = set
             .render("php/pool.conf", &serde_json::json!({ "pool": pool }))
             .unwrap();
         assert!(
-            !out.lines()
-                .any(|l| l.trim_start().starts_with("php_admin_value[sendmail_path]")),
-            "an unconfigured relay must leave the directive out entirely"
+            !out.lines().any(|l| {
+                let l = l.trim_start();
+                !l.starts_with(';') && l.contains("sendmail_path")
+            }),
+            "no directive line may mention sendmail_path:\n{out}"
         );
     }
 
     #[test]
-    fn a_configured_relay_renders_sendmail_path_where_a_script_cannot_change_it() {
+    fn every_pool_carries_the_warning_that_an_empty_sendmail_path_is_the_worst_outcome() {
+        // This used to be rendered only in the branch that *set* the directive,
+        // so the pools an operator actually reads — the ones with no relay —
+        // did not carry it. It is the one fact somebody reaching for a
+        // "disable mail for this site" switch has to know first: PHP's mail()
+        // with `sendmail_path` set to the empty string runs nothing and returns
+        // *true*, so every message is silently discarded and reported as sent.
         let set = TemplateSet::load().unwrap();
-        let mut pool = PoolContext::new("example.com", "uh_a", PhpVersion::V83, 1024, "nginx");
-        pool.sendmail_path =
-            Some("/usr/bin/msmtp --file=/etc/unihelm/mail/example.com.msmtprc -t".into());
+        let pool = PoolContext::new("example.com", "uh_a", PhpVersion::V83, 1024, "nginx");
         let out = set
             .render("php/pool.conf", &serde_json::json!({ "pool": pool }))
             .unwrap();
-        assert!(out.contains(
-            "php_admin_value[sendmail_path] = /usr/bin/msmtp \
-             --file=/etc/unihelm/mail/example.com.msmtprc -t"
-        ));
-        // `php_value` would let a script ini_set() its way to running a
-        // program of its own choosing as this tenant.
-        assert!(!out.contains("php_value[sendmail_path]"));
-    }
-
-    #[test]
-    fn the_relay_config_keeps_certificate_checking_on_and_never_logs_to_a_tenant_file() {
-        let set = TemplateSet::load().unwrap();
-        let out = set
-            .render(
-                "mail/msmtprc",
-                &serde_json::json!({ "mail": {
-                    "site_domain": "example.com",
-                    "group": "uh_a",
-                    "host": "smtp.example.net",
-                    "port": 587,
-                    "tls_mode": "starttls",
-                    "tls_trust_file": "/etc/ssl/certs/ca-certificates.crt",
-                    "username": "panel@example.com",
-                    "password": "s3cret",
-                    "from_address": "noreply@example.com",
-                    "timeout_seconds": 20,
-                }}),
-            )
-            .unwrap();
-        assert!(out.contains("tls             on"));
-        assert!(out.contains("tls_starttls    on"));
         assert!(
-            out.contains("tls_certcheck   on"),
-            "verification must stay on"
-        );
-        assert!(out.contains("auth            on"));
-        assert!(out.contains("from            noreply@example.com"));
-        // The tenant runs this; a log file they could write is a log file they
-        // could forge or fill.
-        assert!(out.contains("syslog          on"));
-        assert!(!out.contains("logfile"));
-    }
-
-    #[test]
-    fn a_plaintext_relay_renders_tls_off_and_no_credential() {
-        let set = TemplateSet::load().unwrap();
-        let out = set
-            .render(
-                "mail/msmtprc",
-                &serde_json::json!({ "mail": {
-                    "site_domain": "example.com",
-                    "group": "uh_a",
-                    "host": "127.0.0.1",
-                    "port": 25,
-                    "tls_mode": "none",
-                    "tls_trust_file": "",
-                    "username": serde_json::Value::Null,
-                    "password": serde_json::Value::Null,
-                    "from_address": "noreply@example.com",
-                    "timeout_seconds": 20,
-                }}),
-            )
-            .unwrap();
-        assert!(out.contains("tls             off"));
-        assert!(out.contains("auth            off"));
-        assert!(
-            !out.contains("password  "),
-            "no credential may be rendered here"
+            out.contains("returns true"),
+            "the pool must say why an empty sendmail_path is worse than none:\n{out}"
         );
     }
+
+    // The two tests that rendered `mail/msmtprc` here are gone with the
+    // template's only caller. That file was the per-site msmtp configuration
+    // PHP's `sendmail_path` pointed at, and it had to be readable by the
+    // tenant, so it handed every hosting customer the credential the server
+    // itself relays with. The relay's TLS settings and its credential now live
+    // in the host MTA's own configuration, which no tenant can read, and are
+    // covered where that is rendered.
 
     #[test]
     fn pool_execution_limits_are_bounded() {

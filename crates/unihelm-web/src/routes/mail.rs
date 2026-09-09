@@ -2,9 +2,17 @@
 //!
 //! Thin, like every route module: permission check, an audit row for the
 //! mutations, then the operation. The interesting decisions — what a relay may
-//! be configured as, how the shim is rendered, what the SMTP conversation says
-//! — live in `unihelm_ops::mail`, and the agent re-checks every permission
+//! be configured as, how the local MTA is rendered, what the SMTP conversation
+//! says — live in `unihelm_ops::mail`, and the agent re-checks every permission
 //! against the same tables (spec §12 rule 4).
+//!
+//! **Mail is a host service here, not a PHP setting.** It used to be delivered
+//! by writing a per-site msmtp configuration and pointing each FPM pool's
+//! `sendmail_path` at it, which put the server's one relay credential in every
+//! tenant's reach and meant nothing but PHP could send at all. The server now
+//! runs a Postfix null client that holds the credential as root; `GET
+//! /api/mail/mta` is the state of it, and `POST /api/mail/mta/install` is the
+//! migration.
 //!
 //! What this layer *is* responsible for is the direction the relay password
 //! travels. It goes in through `PUT /api/mail/relay` and is sealed with the
@@ -49,7 +57,7 @@ use crate::state::SharedState;
     tag = "mail",
     security(("session_cookie" = [])),
     responses(
-        (status = 200, description = "Host, port, TLS mode, username, whether a password is stored (never which one), whether the sendmail agent is installed, and the advisory DNS records", body = serde_json::Value),
+        (status = 200, description = "Host, port, TLS mode, username, whether a password is stored (never which one), the state of the local MTA, and the advisory DNS records", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
         (status = 403, description = "`permission_denied`: needs `server_manage`", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
@@ -94,21 +102,29 @@ pub struct RelayRequest {
     pub from_address: String,
     #[serde(default)]
     pub from_name: Option<String>,
-    /// Switching this off re-renders every pool *without* `sendmail_path`, so
-    /// PHP stops handing messages to a relay the operator turned off. The
-    /// credential is kept.
+    /// Switching this off re-renders the local MTA to refuse every message as
+    /// it is submitted, rather than queueing mail against a relay the operator
+    /// turned off. The credential is kept.
     #[serde(default)]
     pub enabled: Option<bool>,
 }
 
-/// Store the relay and point every PHP site at it.
+/// Store the relay and point the local MTA at it.
 ///
 /// `PUT` because there is exactly one relay and this is an upsert of it.
 ///
-/// 202 and a task id: this rewrites one configuration file per site and
-/// reloads PHP-FPM once per PHP version, which on a busy server is well past
-/// the ~300 ms an immediate operation is allowed. The task log names each site
-/// as it is wired, which is the only way to see which one did not take.
+/// 202 and a task id: it rewrites the MTA's configuration and reloads it, and
+/// on a server still carrying the pre-MTA per-site wiring it re-renders one FPM
+/// pool per site. That is well past the ~300 ms an immediate operation is
+/// allowed, and the task log names each site as it goes, which is the only way
+/// to see which one did not take.
+///
+/// On a server that has no local MTA configured yet this **stores the relay and
+/// changes nothing else**, and says so in the task log: re-rendering a pool
+/// there would take away the `sendmail_path` those sites are still sending
+/// through and leave nothing behind it. `POST /api/mail/mta/install` is the
+/// operation that moves a server across, in an order that keeps it delivering
+/// the whole way.
 #[utoipa::path(
     put,
     path = "/api/mail/relay",
@@ -324,6 +340,128 @@ pub async fn dns_publish(
     Ok(Json(data))
 }
 
+/// What this server actually does with a message today.
+///
+/// Separate from `GET /api/mail/relay` because it is a question about the
+/// machine rather than about the stored relay, and because the states worth
+/// naming are the ones where the two disagree: a relay configured with no MTA
+/// to use it, an MTA with no relay behind it, a migration that stopped half
+/// way. `summary` is that in one sentence, and no branch of it rounds a
+/// half-configured server up to "mail works".
+///
+/// `legacy_files` is the count of per-site msmtp credential files still on
+/// disk. Anything above zero is a copy of the relay password a tenant can still
+/// read, and the migration has not finished.
+#[utoipa::path(
+    get,
+    path = "/api/mail/mta",
+    tag = "mail",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Whether the MTA is installed, configured, running and relaying; how many messages are queued; how many per-site credential files are left; and the sentence that says which of those is true", body = serde_json::Value),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server_manage`", body = ApiErrorBody),
+        (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
+    ),
+)]
+pub async fn mta_status(
+    State(state): State<SharedState>,
+    current: CurrentUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+    let data = ops::invoke_now(&state, &current.auth, "mail.mta.status", json!({})).await?;
+    Ok(Json(data))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MtaInstallRequest {
+    /// Take over a `main.cf` the panel did not write.
+    ///
+    /// Off by default and deliberately a decision the operator makes. Postfix's
+    /// own package always leaves a `main.cf` behind, so "not ours" is the
+    /// ordinary state of a first install — and it is also exactly what a machine
+    /// already running somebody's mail server looks like. Without this the
+    /// operation refuses and changes nothing; with it the displaced file is kept
+    /// beside the new one.
+    #[serde(default)]
+    pub adopt: bool,
+}
+
+/// Install the local MTA, point it at the relay, and retire the per-site msmtp
+/// files.
+///
+/// The whole migration, in the one order that keeps a server delivering the
+/// whole way through it: verify the relay accepts a real message *before*
+/// anything is touched, install and configure the MTA, prove it is running, then
+/// re-render each site's pool and delete that site's credential file only after
+/// its own pool has stopped naming it. A run that stops anywhere leaves a
+/// machine that still sends mail, and the task log says which state it reached.
+///
+/// **Refused when no relay is configured or the relay is switched off.** A local
+/// MTA with nowhere to send is a queue nobody drains: `sendmail` would exit 0,
+/// PHP's `mail()` would return `true`, and every message would sit in the spool
+/// until it was bounced days later — reported to the application as sent.
+///
+/// Idempotent: running it again installs nothing and writes nothing. It does
+/// re-check the relay, because a configuration that has not changed can still
+/// have stopped working when somebody rotated a credential upstream.
+#[utoipa::path(
+    post,
+    path = "/api/mail/mta/install",
+    tag = "mail",
+    security(("session_cookie" = [], "csrf_header" = [])),
+    request_body = MtaInstallRequest,
+    responses(
+        (status = 202, description = "The migration runs as a task; its log names each site and the state it reached", body = ops::TaskAccepted),
+        (status = 401, description = "`session_invalid`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`", body = ApiErrorBody),
+        (status = 409, description = "`conflict`: no live relay to hand mail to, or the relay rejected the panel's verification message — nothing was changed either way", body = ApiErrorBody),
+        (status = 503, description = "`service_unavailable`: the MTA was configured but would not start, so the old wiring was left in place", body = ApiErrorBody),
+    ),
+)]
+pub async fn mta_install(
+    State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    current: CurrentUser,
+    Json(body): Json<MtaInstallRequest>,
+) -> ApiResult<Response> {
+    current
+        .auth
+        .require(Permission::ServerManage)
+        .map_err(ApiError::from)?;
+
+    // Audited: it installs a package, takes over `/etc/postfix/main.cf`, and
+    // deletes files. `adopt` is recorded because it is the difference between
+    // "wrote a new configuration" and "replaced one somebody else was running".
+    state
+        .db
+        .record_audit(NewAuditEntry {
+            actor_user_id: Some(current.user.id),
+            actor_username: current.user.username.as_str().to_string(),
+            impersonator_id: current.session.impersonator_id,
+            ip: Some(client_ip(Some(&peer), &headers)),
+            action: "mail.mta.install".into(),
+            target: None,
+            detail: json!({ "adopt": body.adopt }),
+            request_id: Some(current.auth.request_id.clone()),
+            subscription_id: current.auth.tenant_scope.subscription_id(),
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    ops::invoke(
+        &state,
+        &current.auth,
+        "mail.mta.install",
+        json!({ "adopt": body.adopt }),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +530,19 @@ mod tests {
         let mut body = base();
         body["tls_mode"] = json!("ssl");
         assert_eq!(relay_input(&request(body))["tls_mode"], json!("ssl"));
+    }
+
+    #[test]
+    fn adopting_someone_elses_postfix_configuration_is_never_the_default() {
+        // The package's own postinst always leaves a main.cf behind, so a
+        // "foreign" file is the ordinary first-install state — and it is also
+        // what a machine already running somebody's mail server looks like.
+        // A client that omits the field must not be taken as consent to
+        // replace one.
+        let body: MtaInstallRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(!body.adopt);
+        let explicit: MtaInstallRequest = serde_json::from_value(json!({ "adopt": true })).unwrap();
+        assert!(explicit.adopt);
     }
 
     #[test]

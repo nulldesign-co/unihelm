@@ -1,0 +1,29 @@
+# Envelope sender rewriting (spec §11.18).
+#
+# Every message this machine sends leaves as `<local user>@{{ mail.myhostname }}`
+# unless something says otherwise, and no relay is authorised for that domain —
+# so SPF fails, the relay rejects, and a site's mail silently does not arrive.
+# This map is what makes a site send as its own domain instead.
+#
+# Applied to the envelope only (`sender_canonical_classes = envelope_sender`).
+# SPF is evaluated against the envelope, so that is the address that has to be
+# authorised; the From: the recipient sees stays whatever the application wrote.
+#
+# Postfix tries the most specific key first — `user@domain`, then `user`, then
+# `@domain` — so the per-site entries below win over the catch-all, whatever
+# order they appear in.
+#
+# Held at the same 0600 as the credential beside it. It carries no secret, but
+# it is every domain hosted on this machine in one file: the customer list.
+# Nothing but Postfix reads it, and Postfix reads it as root.
+{% for sender in mail.senders %}
+
+# {{ sender.site }}
+{{ sender.local_user }}	{{ sender.address }}
+{{ sender.local_user }}@{{ mail.myhostname }}	{{ sender.address }}
+{% endfor %}
+
+# Everything else this machine emits — cron's MAILTO, a script that set no
+# sender, root's own mail — leaves as the relay's configured address rather
+# than as a local account name the relay has never heard of.
+@{{ mail.myhostname }}	{{ mail.default_sender }}

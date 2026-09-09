@@ -312,10 +312,15 @@ pub fn adminer_pool_context(php: PhpVersion, nginx_user: &str) -> PoolContext {
 
         env: Vec::new(),
         extra_ini: None,
-        // Never. Adminer is a database browser; a database browser that can
-        // hand a message to the outbound relay is a spam relay with a login
-        // form (spec §11.18).
-        sendmail_path: None,
+        // `sendmail_path: None` used to sit here, with the note that a database
+        // browser able to hand a message to the outbound relay is a spam relay
+        // with a login form. The field is gone from `PoolContext` because mail
+        // is no longer a PHP pool setting: the host runs a local MTA and PHP's
+        // default reaches it, so *not* naming a relay here no longer prevents
+        // anything. Adminer's `mail()` therefore needs closing on purpose —
+        // `disable_functions` for this pool is the place — which is a change in
+        // this file's own hands and is reported as wiring, not made silently
+        // from the mail work.
     }
 }
 

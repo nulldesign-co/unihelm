@@ -345,6 +345,8 @@ fn protected() -> Router<SharedState> {
         .route("/api/plugins/{slug}/disable", post(plugins::disable))
         .route("/api/mail/relay", get(mail::relay_get).put(mail::relay_set))
         .route("/api/mail/relay/test", post(mail::relay_test))
+        .route("/api/mail/mta", get(mail::mta_status))
+        .route("/api/mail/mta/install", post(mail::mta_install))
         .route("/api/mail/dns/publish", post(mail::dns_publish))
         // The *authenticated* half of branding. `GET /api/branding` and the
         // asset route are in `public()`: the login page renders before there

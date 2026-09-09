@@ -72,6 +72,41 @@
 //! tenant's own directory on this host — the same directory a build writes
 //! into — but it says out loud that it ran here rather than inside the image.
 //!
+//! # Sending mail
+//!
+//! An application had no way to send mail at all until the panel grew a host
+//! MTA. Outbound mail was `php_admin_value[sendmail_path]` in an FPM pool —
+//! a *PHP* setting — so a Node application had nothing local to hand a message
+//! to, and the relay credential was something only a PHP site's Linux user
+//! could read. A tenant's answer was to put their own SMTP credentials in an
+//! `Environment=` line, which is why that file is 0600.
+//!
+//! With the null client on the host the path is **SMTP on `127.0.0.1:25`, no
+//! authentication and no TLS**: the MTA accepts from the loopback, holds the
+//! upstream credential itself as root, and relays. The application hands over a
+//! message and never sees a secret. `nodemailer` with
+//! `{ host: "127.0.0.1", port: 25, secure: false }` is the whole configuration.
+//!
+//! Two specifics, because "it just works" is the claim that becomes a support
+//! ticket:
+//!
+//! * **SMTP, not the `sendmail` transport.** The unit sets
+//!   `NoNewPrivileges=yes`, and that cancels the set-gid bit on Postfix's
+//!   `postdrop` — the helper `/usr/sbin/sendmail` runs to place a message in
+//!   `/var/spool/postfix/maildrop`, a directory only the `postdrop` group may
+//!   write. So `sendmail` from inside an app cannot queue anything. It fails
+//!   loudly rather than silently, which is the right way round, but it is a
+//!   dead end and the hardening is worth more than the convenience.
+//! * **A container is not on the host's loopback.** [`AppMode::Container`] is
+//!   what a new application gets, and `127.0.0.1` inside a container is the
+//!   container. [`crate::appcontainer`] maps `host.docker.internal` to the
+//!   bridge gateway, so the host is *addressable* — but a null client set up
+//!   the hardened way (`inet_interfaces = loopback-only`) is not listening on
+//!   that address, and would not treat the bridge as a network it relays for
+//!   even if it were. **Until the MTA is configured to accept the bridge, a
+//!   containerised application cannot send mail**, and nothing here may tell a
+//!   tenant otherwise. A host-mode application can, today.
+//!
 //! # What this module deliberately does not do
 //!
 //! - **It does not install Node.** `app.create` refuses, naming what to
@@ -3125,6 +3160,31 @@ mod tests {
             !body.contains("ProtectHome"),
             "the app lives in /home; hiding it would leave nothing to run — {body}"
         );
+    }
+
+    /// The module docs now tell tenants that a host-mode application sends mail
+    /// by talking to `127.0.0.1:25`. That is only true while the unit leaves
+    /// the host's network alone, so the claim is pinned here rather than left
+    /// to be quietly falsified by a future line of hardening: `PrivateNetwork=`
+    /// would put the app in an empty namespace where nothing answers on the
+    /// loopback, and the `IPAddress*` and `RestrictAddressFamilies=` options
+    /// would filter or forbid the connection. Any of them is fine to add — with
+    /// the MTA's address allowed for, and the documentation changed in the same
+    /// commit.
+    #[test]
+    fn a_host_mode_app_can_still_reach_the_local_mta_on_the_loopback() {
+        let body = render(&app_row(20_000, "apps/blog/server.js"), vec![], None);
+        for forbidden in [
+            "PrivateNetwork",
+            "IPAddressDeny",
+            "IPAddressAllow",
+            "RestrictAddressFamilies",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "`{forbidden}` would break the documented `127.0.0.1:25` mail path — {body}"
+            );
+        }
     }
 
     #[test]

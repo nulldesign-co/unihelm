@@ -399,6 +399,45 @@ pub enum DiffKind {
     Removed,
 }
 
+/// The mode a Postfix lookup table is held at, source and compiled copy alike.
+///
+/// A named constant rather than a literal inside the constructor because
+/// [`enforce_map_companion_modes`] has to use the *same* number: a `0600`
+/// `sasl_passwd` beside a `0644` `sasl_passwd.db` is a protected file next to
+/// an unprotected copy of the same password, and the whole point of naming it
+/// once is that the two cannot drift apart.
+pub const POSTFIX_MAP_MODE: u32 = 0o600;
+
+/// The mode Postfix's `main.cf` is held at. See [`ManagedFile::postfix_main_cf`]
+/// for why this one is world-readable on purpose.
+pub const POSTFIX_MAIN_CF_MODE: u32 = 0o644;
+
+/// Hold every compiled copy of a Postfix map at the map's own mode.
+///
+/// The panel never runs `postmap` — `main.cf` names its maps `texthash:`, so
+/// there is no compiled copy to make (see [`crate::paths::POSTFIX_MAP_TYPE`]).
+/// This exists for the copies that are there anyway: a machine adopted from an
+/// existing Postfix setup, or an operator who followed a relay tutorial and ran
+/// `postmap /etc/unihelm/mail/sasl_passwd` by hand. Every one of those files
+/// holds the same relay password as its source, with permissions of its own —
+/// `postmap` creates the output with the *source's* mode on modern Postfix, but
+/// a file created by an older one, or by a `postmap` run under a loose umask,
+/// keeps whatever it was born with, and it is the copy nobody thinks to check.
+///
+/// Returns the files it actually moved and the mode each one had, so a caller
+/// can say so somewhere an operator will read; a companion that is absent, or
+/// already correct, is not reported. Ignoring the return value is fine — the
+/// tightening has already happened.
+pub fn enforce_map_companion_modes(map: &Path, mode: u32) -> Result<Vec<(PathBuf, u32)>> {
+    let mut moved = Vec::new();
+    for companion in crate::paths::postfix_map_companions(map) {
+        if let Some(previous) = enforce_mode(&companion, mode)? {
+            moved.push((companion, previous));
+        }
+    }
+    Ok(moved)
+}
+
 /// A file the panel owns, and where it lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedFile {
@@ -476,6 +515,52 @@ impl ManagedFile {
         Self {
             path: path.into(),
             mode: 0o640,
+            comment_style: CommentStyle::Hash,
+        }
+    }
+
+    /// Postfix's `main.cf` — the null client's whole configuration.
+    ///
+    /// `0644`, and unlike every other mode in this file that is not a choice.
+    /// Postfix is not one process: `master` starts a dozen daemons which each
+    /// re-read `main.cf` *after* dropping to the unprivileged `postfix` user,
+    /// and `postconf`, which an operator and the panel's own preflight run as
+    /// anybody, reads it too. A narrower mode does not hide anything worth
+    /// hiding — the file names the relay host and the *path* of the credential,
+    /// never the credential — and it does stop the MTA starting.
+    ///
+    /// The one file the panel writes outside a directory of its own: `main.cf`
+    /// has no `include` and no drop-in directory, so there is no single line to
+    /// add. See [`crate::paths::postfix_dir`].
+    pub fn postfix_main_cf(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: POSTFIX_MAIN_CF_MODE,
+            comment_style: CommentStyle::Hash,
+        }
+    }
+
+    /// A Postfix lookup table: the relay credential, or the sender-rewriting
+    /// map (`unihelm_ops::mail`).
+    ///
+    /// [`POSTFIX_MAP_MODE`] — `0600`, root-owned, and **this is the whole
+    /// difference between this design and the one it replaces**. The msmtp
+    /// files these supersede were `0640 root:<tenant>` because msmtp ran as the
+    /// tenant, so the account that had to send was the account that had to read
+    /// the relay password; one relay for the server meant every tenant held the
+    /// credential the operator sends with, and a single customer reading their
+    /// own copy could get the machine blacklisted for everyone. Postfix's
+    /// `smtp(8)` opens this map in its pre-jail initialisation, while it is
+    /// still root, and only then drops to the `postfix` user — so no account
+    /// but root ever needs to read it, and none is given the chance.
+    ///
+    /// Both maps get the same mode. The credential is obvious; the sender map
+    /// is every domain hosted on the machine in one file, which is the customer
+    /// list, and nothing but Postfix reads that either.
+    pub fn postfix_map(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: POSTFIX_MAP_MODE,
             comment_style: CommentStyle::Hash,
         }
     }
@@ -752,6 +837,370 @@ mod tests {
         assert_eq!(relay.mode, 0o640);
         assert_eq!(relay.mode & 0o007, 0, "world-readable relay credential");
         assert_eq!(relay.comment_style, CommentStyle::Hash);
+    }
+
+    #[test]
+    fn a_postfix_map_is_readable_by_root_and_by_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The msmtp design this replaces had to be group-readable: msmtp ran as
+        // the tenant, so the tenant held the operator's relay password. Postfix
+        // opens this map as root before it drops privileges, so the group bit
+        // buys nothing and costs the entire security argument for the change.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sasl_passwd");
+        let map = ManagedFile::postfix_map(&path);
+        assert_eq!(map.mode, 0o600);
+        assert_eq!(
+            map.mode & 0o077,
+            0,
+            "group or world can read: {:o}",
+            map.mode
+        );
+        assert_eq!(map.comment_style, CommentStyle::Hash);
+
+        // The file it replaces, kept alongside so the contrast is a fact in the
+        // test suite rather than a claim in a comment.
+        assert_eq!(
+            ManagedFile::mail_relay("/etc/unihelm/mail/example.com.msmtprc").mode,
+            0o640,
+            "the per-site msmtp file was group-readable by design"
+        );
+
+        write_atomic(
+            &path,
+            &with_header("relay user:pw\n", map.comment_style),
+            map.mode,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "on disk: {mode:o}");
+    }
+
+    #[test]
+    fn postfix_main_cf_stays_readable_because_every_postfix_daemon_reads_it() {
+        // Tempting to lock this down beside the maps, and it would stop the MTA
+        // starting: `master` forks a dozen daemons that re-read main.cf after
+        // dropping to the unprivileged `postfix` user. It carries the relay
+        // host and the *path* of the credential, never the credential.
+        let main_cf = ManagedFile::postfix_main_cf("/etc/postfix/main.cf");
+        assert_eq!(main_cf.mode, 0o644);
+        assert_eq!(main_cf.mode & 0o044, 0o044, "postfix could not read it");
+        assert_eq!(main_cf.comment_style, CommentStyle::Hash);
+    }
+
+    #[test]
+    fn a_compiled_copy_of_a_map_is_held_at_the_same_mode_as_its_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `postmap` writes a second file holding the same relay password, and
+        // that is the copy people forget: the source gets chmodded because
+        // every tutorial says to, the `.db` beside it does not. The panel does
+        // not create these — main.cf names its maps `texthash:` — but an
+        // adopted machine, or an operator who ran `postmap` by hand, has them.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sasl_passwd");
+        let map = ManagedFile::postfix_map(&source);
+        write_atomic(
+            &source,
+            &with_header("relay user:pw\n", map.comment_style),
+            map.mode,
+        )
+        .unwrap();
+
+        // One of each extension postmap can produce, all left wide open.
+        let companions = crate::paths::postfix_map_companions(&source);
+        assert_eq!(companions.len(), 3, "{companions:?}");
+        for companion in &companions {
+            std::fs::write(companion, "compiled copy of the same password\n").unwrap();
+            std::fs::set_permissions(companion, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let moved = enforce_map_companion_modes(&source, map.mode).unwrap();
+        assert_eq!(moved.len(), 3, "every compiled copy has to be reported");
+
+        for companion in &companions {
+            let mode = std::fs::metadata(companion).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                map.mode,
+                "{} is a readable copy of the relay password: {mode:o}",
+                companion.display()
+            );
+            assert_eq!(mode & 0o077, 0, "{}: {mode:o}", companion.display());
+        }
+
+        // Idempotent, and silent when there is nothing to say — an apply that
+        // tightens nothing must not log a tightening.
+        assert!(
+            enforce_map_companion_modes(&source, map.mode)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A map with no compiled copies at all — the normal case — is not an
+        // error and reports nothing.
+        let untouched = dir.path().join("sender_canonical");
+        std::fs::write(&untouched, "uh_abc noreply@example.com\n").unwrap();
+        assert!(
+            enforce_map_companion_modes(&untouched, POSTFIX_MAP_MODE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // -- the null client's three files ---------------------------------------
+    //
+    // Rendered here rather than in `templates.rs` because these three are not
+    // in the embedded `TEMPLATES` table yet — registering them is orchestrator
+    // wiring — and a template nothing renders is a template nothing checks.
+    // `add_template` is the supported way to put a source into the environment
+    // at runtime, so the checks are the real ones: strict undefined, no
+    // escaping, the same trim rules.
+
+    const MAIN_CF: &str = include_str!("../templates/mail/main.cf.j2");
+    const SASL_PASSWD: &str = include_str!("../templates/mail/sasl_passwd.j2");
+    const SENDER_CANONICAL: &str = include_str!("../templates/mail/sender_canonical.j2");
+
+    fn mail_templates() -> crate::TemplateSet {
+        let mut set = crate::TemplateSet::load().expect("the embedded set must load");
+        for (name, source) in [
+            ("mail/main.cf", MAIN_CF),
+            ("mail/sasl_passwd", SASL_PASSWD),
+            ("mail/sender_canonical", SENDER_CANONICAL),
+        ] {
+            set.add_template(name, source)
+                .unwrap_or_else(|e| panic!("{name} does not parse: {e:?}"));
+        }
+        set
+    }
+
+    /// A relay the panel would plausibly be pointed at, with the knobs the
+    /// tests move named as arguments.
+    fn mail_context(tls_mode: &str, username: Option<&str>) -> serde_json::Value {
+        serde_json::json!({ "mail": {
+            "myhostname": "srv1.hosting.example",
+            // One rendered value, used as `relayhost` in main.cf and as the
+            // lookup key in sasl_passwd, so the two cannot disagree.
+            "relayhost": "[smtp.sendgrid.net]:587",
+            "tls_mode": tls_mode,
+            "tls_trust_file": "/etc/ssl/certs/ca-certificates.crt",
+            "username": username,
+            "password": "SG.hunter2",
+            "sasl_password_map": "texthash:/etc/unihelm/mail/sasl_passwd",
+            "sender_canonical_map": "texthash:/etc/unihelm/mail/sender_canonical",
+            "default_sender": "noreply@hosting.example",
+            "senders": [{
+                "site": "shop.example.com",
+                "local_user": "uh_abc123",
+                "address": "noreply@shop.example.com",
+            }],
+        }})
+    }
+
+    /// The directives, with the file's own prose stripped. Every one of these
+    /// templates explains itself at length, and a comment is not a setting —
+    /// which is exactly the distinction Postfix makes too.
+    fn directives(rendered: &str) -> String {
+        rendered
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_null_client_delivers_nothing_locally_and_hears_nothing_from_the_network() {
+        // The two properties that make this an MTA it is safe to run on every
+        // customer-facing box. Losing either turns a mail client into a mail
+        // server: `inet_interfaces` into an open SMTP port, `mydestination`
+        // into local mailboxes on a machine with no mailbox management at all.
+        let rendered = mail_templates()
+            .render("mail/main.cf", &mail_context("starttls", Some("apikey")))
+            .unwrap();
+        let set = directives(&rendered);
+
+        assert!(set.contains("inet_interfaces = loopback-only"), "{set}");
+        assert!(
+            !set.contains("inet_interfaces = all"),
+            "this MTA would accept mail from the internet:\n{set}"
+        );
+        assert!(
+            set.lines().any(|l| l == "mydestination ="),
+            "an empty mydestination is what makes it a null client:\n{set}"
+        );
+        assert!(set.contains("local_transport = error:"), "{set}");
+        assert!(set.contains("local_recipient_maps ="), "{set}");
+
+        // Loopback is not "trusted" enough on a shared host: every tenant
+        // process can reach 127.0.0.1:25, and without this it could relay to
+        // anywhere through the operator's credential — the same exposure this
+        // change exists to close, on a different port.
+        assert!(
+            set.contains("smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination"),
+            "{set}"
+        );
+    }
+
+    #[test]
+    fn the_relay_credential_is_never_offered_over_an_unverified_session() {
+        let templates = mail_templates();
+
+        for mode in ["starttls", "implicit"] {
+            let rendered = templates
+                .render("mail/main.cf", &mail_context(mode, Some("apikey")))
+                .unwrap();
+            let set = directives(&rendered);
+
+            // `encrypt` requires TLS and verifies nothing — it is satisfied by
+            // whoever answers on that address. The msmtp configuration this
+            // replaces verified the certificate and the host name, so anything
+            // weaker here is a downgrade shipped as an upgrade.
+            assert!(
+                set.contains("smtp_tls_security_level = secure"),
+                "{mode}:\n{set}"
+            );
+            assert!(
+                !set.contains("smtp_tls_security_level = encrypt")
+                    && !set.contains("smtp_tls_security_level = may"),
+                "{mode} would accept an unverified relay:\n{set}"
+            );
+            assert!(set.contains("smtp_tls_CAfile = /etc/ssl/certs/"), "{set}");
+            assert!(
+                set.contains("smtp_tls_mandatory_protocols = >=TLSv1.2"),
+                "{set}"
+            );
+            assert!(set.contains("smtp_sasl_auth_enable = yes"), "{set}");
+            // Postfix's default forbids the plaintext mechanisms every
+            // submission service actually offers, and leaving it in place
+            // produces `no mechanism available` — which reads as a wrong
+            // password and costs an afternoon.
+            assert!(
+                set.contains("smtp_sasl_security_options = noanonymous"),
+                "{set}"
+            );
+        }
+
+        // SMTPS is TLS from the first byte; without wrappermode Postfix speaks
+        // plain SMTP into a TLS listener and hangs until the timeout.
+        let implicit = templates
+            .render("mail/main.cf", &mail_context("implicit", Some("apikey")))
+            .unwrap();
+        assert!(directives(&implicit).contains("smtp_tls_wrappermode = yes"));
+        let starttls = templates
+            .render("mail/main.cf", &mail_context("starttls", Some("apikey")))
+            .unwrap();
+        assert!(!directives(&starttls).contains("smtp_tls_wrappermode = yes"));
+    }
+
+    #[test]
+    fn a_plaintext_relay_cannot_be_talked_into_sending_the_password_in_the_clear() {
+        // The panel refuses to store a password against a plaintext relay, so
+        // this combination should not reach the template at all. It renders
+        // fail-closed anyway: `noplaintext` means authentication fails rather
+        // than the operator's relay password crossing the wire unencrypted.
+        let rendered = mail_templates()
+            .render("mail/main.cf", &mail_context("none", Some("apikey")))
+            .unwrap();
+        let set = directives(&rendered);
+        assert!(set.contains("smtp_tls_security_level = none"), "{set}");
+        assert!(
+            set.contains("smtp_sasl_security_options = noanonymous, noplaintext"),
+            "a credential could leave this machine in the clear:\n{set}"
+        );
+
+        // No credential at all is the ordinary in-datacentre case, and must not
+        // render an authentication that cannot happen.
+        let anonymous = mail_templates()
+            .render("mail/main.cf", &mail_context("starttls", None))
+            .unwrap();
+        let set = directives(&anonymous);
+        assert!(set.contains("smtp_sasl_auth_enable = no"), "{set}");
+        assert!(!set.contains("smtp_sasl_password_maps"), "{set}");
+    }
+
+    #[test]
+    fn the_credential_map_is_keyed_by_the_exact_string_relayhost_uses() {
+        // A key that merely looks right — the host without its brackets, or
+        // without the port — is not a syntax error. Postfix simply never finds
+        // a credential and never attempts authentication, and the relay's
+        // rejection reads like a bad password. Both files take the value from
+        // one context key so they cannot drift.
+        let templates = mail_templates();
+        let ctx = mail_context("starttls", Some("apikey"));
+
+        let main_cf = templates.render("mail/main.cf", &ctx).unwrap();
+        let map = templates.render("mail/sasl_passwd", &ctx).unwrap();
+
+        assert!(
+            directives(&main_cf).contains("relayhost = [smtp.sendgrid.net]:587"),
+            "{main_cf}"
+        );
+        let credential = directives(&map);
+        assert_eq!(
+            credential, "[smtp.sendgrid.net]:587\tapikey:SG.hunter2",
+            "the map key must match relayhost byte for byte"
+        );
+
+        // Without a username the table is comments only — a file that exists
+        // and holds nothing, rather than a missing map for something to point
+        // at later and fail to start on.
+        let anonymous = templates
+            .render("mail/sasl_passwd", &mail_context("starttls", None))
+            .unwrap();
+        assert_eq!(directives(&anonymous), "", "{anonymous}");
+        assert!(!anonymous.contains("hunter2"), "{anonymous}");
+    }
+
+    #[test]
+    fn a_relay_context_missing_a_value_fails_to_render_rather_than_sending_as_nothing() {
+        // Strict undefined, and it matters more here than in an nginx include:
+        // `relayhost = ` is not a syntax error to Postfix, it is a machine that
+        // tries to deliver every message itself and queues them all.
+        let templates = mail_templates();
+        for missing in ["relayhost", "myhostname", "username", "sasl_password_map"] {
+            let mut ctx = mail_context("starttls", Some("apikey"));
+            ctx["mail"]
+                .as_object_mut()
+                .expect("the context is an object")
+                .remove(missing);
+            assert!(
+                templates.render("mail/main.cf", &ctx).is_err(),
+                "a context with no `{missing}` rendered anyway"
+            );
+        }
+    }
+
+    #[test]
+    fn a_site_sends_as_its_own_domain_and_everything_else_as_the_relays_address() {
+        // Without this map every message leaves as `uh_abc123@srv1.hosting.
+        // example`, which no relay is authorised for: SPF fails and the mail
+        // is rejected or filed as spam.
+        let rendered = mail_templates()
+            .render(
+                "mail/sender_canonical",
+                &mail_context("starttls", Some("apikey")),
+            )
+            .unwrap();
+        let map = directives(&rendered);
+
+        assert!(
+            map.contains("uh_abc123\tnoreply@shop.example.com"),
+            "the bare local user is what cron and CLI mail send as:\n{map}"
+        );
+        assert!(
+            map.contains("uh_abc123@srv1.hosting.example\tnoreply@shop.example.com"),
+            "the qualified form is what PHP and a local MTA hand over:\n{map}"
+        );
+        // The catch-all covers root's own mail and any script that set no
+        // sender, and must not shadow the per-site entries — Postfix tries
+        // `user@domain`, then `user`, then `@domain`, so specificity wins
+        // whatever the order in the file.
+        assert!(
+            map.contains("@srv1.hosting.example\tnoreply@hosting.example"),
+            "{map}"
+        );
     }
 
     #[test]

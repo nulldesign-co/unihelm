@@ -4332,6 +4332,66 @@ still sending as the operator's domain); and `mail.relay.get` returns the
 exposure as a `credential_note` field so an operator chooses a send-only
 credential scoped to this server on purpose rather than discovering it later.
 
+### `mail.mta.status`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | immediate |
+| Input | — |
+
+Whether this machine can send mail at all, and how.
+
+Reports the local MTA: installed or not, whether `main.cf` is the panel's
+rendering or somebody else's, whether the relay answers, and whether any
+per-site msmtp files are left over from before 0.8.0.
+
+That last field is the migration's own progress bar. Until this release, mail
+was a **PHP feature**: each site got `/etc/unihelm/mail/<domain>.msmtprc` and its
+pool named it in `sendmail_path`. Two things were wrong with that. Every tenant
+could read the credential the server itself sends with — msmtp runs as the site's
+own user, so the file had to be readable by it — and nothing but PHP could send
+at all: a Node application had no mail path, and a server with no PHP installed
+had no mail whatsoever, while `cron` had been writing `MAILTO=` into every tenant
+crontab for a mail system that did not exist.
+
+`server_manage`, not `server_read`: the answer names the relay and its host.
+
+### `mail.mta.install`
+
+| | |
+|---|---|
+| Permission | `server_manage` |
+| Execution | task — not cancellable, idempotent |
+| Input | `adopt` *(optional, default false)* |
+
+Installs and configures the local MTA, then re-renders the PHP pools that used
+to carry their own `sendmail_path`.
+
+After this, mail is a property of the **machine** rather than of PHP. Every
+language on the box reaches it the same way — PHP's `mail()` through
+`/usr/sbin/sendmail`, anything else through `127.0.0.1:25`, cron through its
+`MAILTO=` — and none of them ever sees the relay credential, which Postfix reads
+as root before dropping privileges.
+
+**It verifies the relay before it configures anything.** A configuration written
+for a credential the relay rejects is the panel reporting success for mail that
+will silently fail, so the check comes first and a refusal leaves the machine as
+it was.
+
+**`adopt` is the difference between writing a configuration and replacing one.**
+`/etc/postfix/main.cf` always exists before the panel first writes it — the
+package's own postinst generates one — so a foreign file is the normal
+first-install state and cannot simply be refused. But it may equally be a real
+Postfix somebody is running. Without `adopt` the operation refuses and changes
+nothing; with it, the displaced file is kept beside the new one rather than
+deleted.
+
+`reached` says how far it got — `sites-migrated`, or `mta-configured` when some
+pools could not be re-rendered. A half-migrated machine still delivers mail: the
+MTA is configured and verified before any pool is touched, and a pool still
+naming its old msmtp keeps working until it is re-rendered.
+
 ### `mail.relay.get`
 
 | | |

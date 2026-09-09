@@ -1,0 +1,132 @@
+# Postfix null client for {{ mail.myhostname }} (spec §11.18).
+#
+# A null client is an MTA that accepts mail from this machine and from nowhere
+# else, delivers nothing locally, and hands everything to one upstream relay.
+# It exists so that mail is a *server* capability rather than a PHP one: PHP's
+# mail() reaches it through /usr/sbin/sendmail, Node and Python through
+# localhost:25, cron through its own MAILTO, and none of them ever sees the
+# relay credential — Postfix opens that as root, before it drops privileges.
+#
+# What this replaced: one msmtp configuration per site, run *as the tenant*, so
+# every customer on the box could read the one credential the server sends with
+# and could send as the operator. Nothing outside PHP could send at all.
+#
+# THIS FILE IS THE PANEL'S. Postfix has no `include` directive and no drop-in
+# directory, so unlike nginx, Apache and sshd there is no one line to add — the
+# whole configuration has to be here. The header above is what makes an edit
+# (by a human, or by the package's own postconf on upgrade) visible instead of
+# silently discarded.
+#
+# `compatibility_level` is deliberately absent: its syntax changed at Postfix
+# 3.6 (an integer before, a version number after), and this panel supports
+# releases on both sides of that change — EL 9 ships 3.5, Debian 13 ships 3.10 —
+# so any fixed value here would be a parse error on one of them.
+
+# -- identity ---------------------------------------------------------------
+
+myhostname = {{ mail.myhostname }}
+myorigin = $myhostname
+
+# Deliver nothing locally. `mydestination` empty is what makes this a null
+# client rather than a mail server: no domain is "ours", so nothing is ever
+# written to a mailbox on this machine and there is no local spool for a tenant
+# to read. The other two lines close the same door from the other side —
+# `local_transport` makes any attempt an immediate error rather than a message
+# that sits in a queue nobody drains.
+mydestination =
+local_recipient_maps =
+local_transport = error:local mail delivery is disabled on this server
+
+# -- who may hand us a message ----------------------------------------------
+
+# Loopback only. This MTA must never accept mail from the network: it has no
+# spam filtering, no rate limiting and no reason to be reachable. The install is
+# also preseeded so the package's own generated configuration is loopback-only
+# from the moment it is unpacked (see unihelm_distro::pkg), because otherwise
+# there is a window between `apt-get install` finishing and this file landing
+# in which Debian's default `Internet Site` answer has port 25 open on every
+# address of the machine.
+inet_interfaces = loopback-only
+mynetworks = 127.0.0.0/8 [::1]/128
+
+# Belt and braces: even on the loopback, relay only for ourselves. Without
+# `reject_unauth_destination` anything that could reach 127.0.0.1:25 — every
+# tenant process on the box — could relay to arbitrary recipients through the
+# operator's credential, which is the exposure this whole change exists to
+# close, reopened on a different port.
+smtpd_relay_restrictions = permit_mynetworks, reject_unauth_destination
+smtpd_recipient_restrictions = permit_mynetworks, reject_unauth_destination
+
+biff = no
+append_dot_mydomain = no
+
+# -- the relay --------------------------------------------------------------
+
+# Square brackets suppress the MX lookup: a submission service is named by its
+# A record, and asking for its MX either finds nothing or finds somebody else's
+# inbound mail server.
+relayhost = {{ mail.relayhost }}
+
+{% if mail.tls_mode == "none" %}
+# Plaintext. Only ever defensible to a relay on localhost or a private LAN, and
+# the panel refuses to store a password alongside it.
+smtp_tls_security_level = none
+{% else %}
+# `secure`, not `encrypt`. `encrypt` requires TLS but verifies nothing, so it
+# is satisfied by whoever answers on that address; `secure` requires the
+# certificate to chain to a trusted CA *and* to match the relay host named
+# above. That is exactly what the msmtp configuration this replaces did
+# (`tls_certcheck on` plus a trust file), and a replacement that quietly
+# verified less would be a downgrade nobody asked for.
+smtp_tls_security_level = secure
+smtp_tls_CAfile = {{ mail.tls_trust_file }}
+smtp_tls_mandatory_protocols = >=TLSv1.2
+smtp_tls_protocols = >=TLSv1.2
+{% if mail.tls_mode == "implicit" %}
+# Implicit TLS (SMTPS): encrypted from the first byte, conventionally port 465.
+# Without wrappermode Postfix would speak plain SMTP into a TLS listener and
+# hang until the timeout.
+smtp_tls_wrappermode = yes
+{% endif %}
+{% endif %}
+
+{% if mail.username %}
+smtp_sasl_auth_enable = yes
+# `texthash:` — no `postmap`, and therefore no compiled second copy of the
+# credential to leave world-readable. It is also the one map type that works
+# unchanged on every release this panel supports; `hash:` is gone on EL 10,
+# `cdb:` is the Debian 13 default, and `lmdb:` needs a package from Ubuntu's
+# universe component. Postfix caches this table when it opens it and never
+# re-reads it, so the panel reloads Postfix whenever it rewrites the map.
+smtp_sasl_password_maps = {{ mail.sasl_password_map }}
+{% if mail.tls_mode == "none" %}
+# Fail closed. Postfix's default already forbids plaintext mechanisms; on an
+# unencrypted session that default is the only thing standing between the
+# operator's relay password and anyone on the wire, so it is spelled out rather
+# than inherited. Authentication will simply fail here, which is the correct
+# outcome: the panel is not permitted to store a password against a plaintext
+# relay in the first place.
+smtp_sasl_security_options = noanonymous, noplaintext
+{% else %}
+# Dropping `noplaintext` from Postfix's default is required, not optional:
+# PLAIN and LOGIN are what every submission service offers, and leaving the
+# default in place produces `SASL authentication failed; no mechanism
+# available` — which reads exactly like a wrong password. The session is
+# verified TLS by the block above before any credential is offered.
+smtp_sasl_security_options = noanonymous
+{% endif %}
+{% else %}
+# No credential: this relay authorises by source IP, which is how most
+# in-datacentre relays work.
+smtp_sasl_auth_enable = no
+{% endif %}
+
+# -- who the mail is from ---------------------------------------------------
+
+# Rewrite the envelope sender so a site's mail leaves as its own domain rather
+# than as `uh_abc@{{ mail.myhostname }}`, which no relay is authorised for and
+# which SPF would fail. Envelope only, deliberately: SPF is evaluated against
+# the envelope, and the From: the recipient sees stays the one the application
+# wrote.
+sender_canonical_maps = {{ mail.sender_canonical_map }}
+sender_canonical_classes = envelope_sender

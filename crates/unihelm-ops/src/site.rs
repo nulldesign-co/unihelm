@@ -406,45 +406,26 @@ fn document_root_is_empty(root: &Path) -> bool {
 
 /// Render and activate a site's PHP-FPM pool.
 ///
-/// Picks up the configured mail relay on the way, so a site created after the
-/// relay was set gets `sendmail_path` without anybody re-running
-/// `mail.relay.set` (spec §11.18). A relay that is absent, switched off, or
-/// missing its sendmail agent renders no directive at all — see
-/// `mail::write_site_relay`.
+/// **Nothing about mail happens here any more, and that is the point.** This
+/// function used to read the `mail_relay` row and call
+/// `mail::write_site_relay`, which wrote `/etc/unihelm/mail/<domain>.msmtprc`
+/// and returned the `sendmail_path` the pool then pointed PHP at. Creating a
+/// site was therefore also an act of copying the server's single upstream relay
+/// credential into a file that site's tenant could read — and mail worked only
+/// for sites that had a PHP pool, because `sendmail_path` is an FPM directive
+/// and nothing else on the box ever saw it.
+///
+/// Outbound mail is now a host service (a Postfix null client) rather than a
+/// per-site PHP setting: it holds the credential as root, and PHP's own default
+/// hands messages to `/usr/sbin/sendmail`, which is that MTA. So a pool has no
+/// mail configuration to render, a site has no mail file to write, and this
+/// function is back to being about FPM. There is deliberately no
+/// `render_pool_with_mail` variant left for a caller to reach for.
 pub async fn render_pool(
     ctx: &OpContext,
     site: &Site,
     linux_user: &unihelm_core::LinuxUser,
     version: PhpVersion,
-) -> Result<()> {
-    let relay = ctx.db().mail_relay().await.map_err(UnihelmError::from)?;
-    let sendmail = crate::mail::write_site_relay(ctx, &site.domain, linux_user, relay.as_ref())
-        .await
-        // Mail is not worth failing a site creation over: a site that serves
-        // but cannot send is a support ticket, a site that does not exist is
-        // an outage.
-        .unwrap_or_else(|e| {
-            ctx.log(format!(
-                "could not write the mail relay configuration for {}: {e}. The site is fine; \
-                 its PHP mail() will not work until this is fixed.",
-                site.domain
-            ));
-            None
-        });
-    render_pool_with_mail(ctx, site, linux_user, version, sendmail).await
-}
-
-/// [`render_pool`], with the mail wiring already decided by the caller.
-///
-/// Split out for `mail.relay.set`, which writes every site's relay
-/// configuration itself and must not have each pool re-read the relay row it
-/// just wrote.
-pub async fn render_pool_with_mail(
-    ctx: &OpContext,
-    site: &Site,
-    linux_user: &unihelm_core::LinuxUser,
-    version: PhpVersion,
-    sendmail_path: Option<String>,
 ) -> Result<()> {
     let distro = ctx.distro();
     let family = distro.info.family;
@@ -465,7 +446,6 @@ pub async fn render_pool_with_mail(
         provision::nginx_user(distro),
     );
     pool.extra_ini = site.php_ini_overrides.clone();
-    pool.sendmail_path = sendmail_path;
 
     ctx.config()
         .apply(ApplyRequest {
@@ -488,7 +468,43 @@ pub async fn render_pool_with_mail(
         version.as_str(),
         site.domain
     ));
+    if let Some(note) = missing_mta_note(
+        &site.domain,
+        unihelm_distro::exec::program_available(SENDMAIL_PROGRAM),
+    ) {
+        ctx.log(note);
+    }
     Ok(())
+}
+
+/// The `sendmail`-compatible program PHP hands a message to.
+///
+/// Resolved through `unihelm_distro`'s trusted directories rather than `PATH`,
+/// like every other program name in this codebase. On a machine that has the
+/// panel's mail service this is the MTA's own drop-in for it.
+const SENDMAIL_PROGRAM: &str = "sendmail";
+
+/// What to tell the operator when a PHP pool lands on a machine with no local
+/// mail agent.
+///
+/// Not a refusal. A site that serves but cannot send mail is a support ticket
+/// and a site that does not exist is an outage, which is the trade the old
+/// per-site relay write made too. What it must not do is stay quiet: with
+/// `sendmail_path` out of the pool, PHP hands messages to the system's
+/// `sendmail`, and when there is none `mail()` returns false with nothing in
+/// any log the operator reads to say why. It is not "mail is broken on this
+/// site", it is "this machine has no mail service yet" — a different fix, in a
+/// different place, and worth naming as such.
+fn missing_mta_note(domain: &str, sendmail_present: bool) -> Option<String> {
+    if sendmail_present {
+        return None;
+    }
+    Some(format!(
+        "there is no local mail agent on this machine, so PHP's mail() from {domain} has \
+         nothing to hand a message to and will return false. This is a server-wide gap, not \
+         a setting on this site: install the panel's mail service and every site, app and \
+         cron job on the box can send. Nothing here needs re-rendering afterwards."
+    ))
 }
 
 /// Is this create request a retry of a failed site we already own?
@@ -2261,6 +2277,27 @@ mod tests {
         );
         assert!(check_php_overrides("php_value[memory_limit] = 256M\x1b[2J").is_err());
         assert!(check_php_overrides("php_value[memory_limit] =").is_err());
+    }
+
+    /// The pool no longer names a mail program, so "can this site send mail?"
+    /// stopped being a question about the site. It is now a question about the
+    /// machine, and the answer has to reach the operator somewhere.
+    #[test]
+    fn a_pool_on_a_machine_with_no_mail_agent_says_the_gap_is_the_server_not_the_site() {
+        let note = missing_mta_note("example.com", false).expect("a note");
+        assert!(note.contains("example.com"), "{note}");
+        assert!(
+            note.contains("mail()") && note.contains("false"),
+            "say what PHP actually does, which is fail rather than pretend: {note}"
+        );
+        assert!(
+            note.contains("cron"),
+            "one install fixes every sender on the box, not just this site: {note}"
+        );
+        assert!(
+            missing_mta_note("example.com", true).is_none(),
+            "a machine with a mail agent has nothing to report"
+        );
     }
 
     /// Defence in depth for rows written before the allowlist existed: they
