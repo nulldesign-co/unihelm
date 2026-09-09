@@ -221,9 +221,15 @@ pub async fn provider_get(
 
 /// Every zone the stored credentials can edit.
 ///
-/// `DnsManage`, not `ServerManage`: storing the credential is an admin act,
-/// using it to edit a zone is what the reseller-held DNS permission is for —
-/// the same split `cert.issue_wildcard` already makes.
+/// `dns.manage` gets you past this handler; being the operator of the machine is
+/// what gets you an answer. The stored Cloudflare token is server-wide and the
+/// panel records no owner for it, so `unihelm_ops::dns` refuses every caller
+/// whose tenant scope is narrower than the whole machine — `dns.manage` is a
+/// `Role::Reseller` default, and before 0.8.0 shipped that meant any reseller
+/// could list, repoint and delete records in every zone the operator's token
+/// reaches. The judgement lives in the operation and not here for the reason
+/// this module gives everywhere else: one place decides, and it is the place
+/// that holds the credential.
 #[utoipa::path(
     get,
     path = "/api/dns/zones",
@@ -232,7 +238,7 @@ pub async fn provider_get(
     responses(
         (status = 200, description = "The zones, each with the credential that administers it, and the credentials that could not be asked", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied`: needs `dns.manage`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `dns.manage`; or `tenant_scope_violation`: the stored credential is the machine operator's, so only an account scoped to the whole machine may spend it", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
     ),
 )]
@@ -270,7 +276,7 @@ pub struct ZoneQuery {
         (status = 200, description = "The zone's records, each with what changing it would cost, plus this server's own addresses", body = serde_json::Value),
         (status = 400, description = "`invalid_input`: not a zone name", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied`: needs `dns.manage`, or the token cannot read this zone", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `dns.manage`; `tenant_scope_violation`: the zone is administered by the machine operator's credential, not by your tenancy; or the token itself cannot read this zone", body = ApiErrorBody),
         (status = 404, description = "`not_found`: no stored credential administers this zone", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`, or the Cloudflare API is unreachable", body = ApiErrorBody),
     ),
@@ -330,7 +336,7 @@ pub struct RecordRequest {
         (status = 200, description = "The record as Cloudflare stored it, with what changing it would cost", body = serde_json::Value),
         (status = 400, description = "`invalid_input`: a field the panel can check before Cloudflare is asked", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied` / `csrf_invalid`, or the token cannot edit DNS in this zone", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`; `tenant_scope_violation`: the zone is administered by the machine operator's credential, not by your tenancy; or the token itself cannot edit DNS in this zone", body = ApiErrorBody),
         (status = 404, description = "`not_found`: no stored credential administers this zone", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`, or the Cloudflare API is unreachable", body = ApiErrorBody),
     ),
@@ -386,7 +392,7 @@ pub async fn record_create(
         (status = 200, description = "The record as Cloudflare stored it, and what it replaced", body = serde_json::Value),
         (status = 400, description = "`invalid_input`: a field the panel can check before Cloudflare is asked", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied` / `csrf_invalid`, or the token cannot edit DNS in this zone", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`; `tenant_scope_violation`: the zone is administered by the machine operator's credential, not by your tenancy; or the token itself cannot edit DNS in this zone", body = ApiErrorBody),
         (status = 404, description = "`not_found`: the record is already gone", body = ApiErrorBody),
         (status = 409, description = "`conflict`: the record changed since it was shown", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`, or the Cloudflare API is unreachable", body = ApiErrorBody),
@@ -458,7 +464,7 @@ pub struct RecordDeleteQuery {
     responses(
         (status = 200, description = "What was removed, with the impact it had while it existed", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied` / `csrf_invalid`, or the token cannot edit DNS in this zone", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`; `tenant_scope_violation`: the zone is administered by the machine operator's credential, not by your tenancy; or the token itself cannot edit DNS in this zone", body = ApiErrorBody),
         (status = 404, description = "`not_found`: the record is already gone", body = ApiErrorBody),
         (status = 409, description = "`conflict`: the record changed since it was shown", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`, or the Cloudflare API is unreachable", body = ApiErrorBody),

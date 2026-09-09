@@ -264,6 +264,39 @@ impl Db {
         Ok(row.0)
     }
 
+    /// Has this address ever signed in successfully under this identifier?
+    ///
+    /// The one thing an attacker cannot manufacture: it takes the correct
+    /// password to leave a `success = 1` row behind. That is what lets
+    /// `unihelm_web::auth::check_rate_limits` put a hard bound on an account's
+    /// failures from *everywhere* — the bound it removed when it discovered that
+    /// an account-wide refusal is a lockout anybody can impose on anybody —
+    /// without that bound reaching the operator: the addresses it refuses are
+    /// the ones that have never got in, and the operator's has.
+    ///
+    /// "Ever" means as far back as the history goes, which the scheduler's
+    /// `purge_login_attempts` sets — 14 days today. Shortening that retention
+    /// shortens how long a known address stays known, so it is not the knob it
+    /// looks like.
+    ///
+    /// The label is the caller-supplied one, stripped the same way every other
+    /// counter here strips it: the row a successful sign-in leaves is filed
+    /// under what was typed, so an operator who signs in as `admin` is known
+    /// under `admin`.
+    pub async fn address_has_signed_in(&self, ip: &str, username: &str) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM login_attempts
+                  WHERE ip = ?1 AND username = ?2 AND success = 1
+             )",
+        )
+        .bind(ip)
+        .bind(account_label(username))
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.0 != 0)
+    }
+
     /// Failed attempts against one account *from one address* inside `window`.
     ///
     /// This pair, rather than the account alone, is what may earn a refusal.
@@ -292,6 +325,30 @@ impl Db {
         Ok(row.0)
     }
 
+    /// Every spelling an account's failures can be filed under.
+    ///
+    /// The throttle files a row under *what the caller typed*, and
+    /// [`Db::find_user_for_login`] answers to a username **or** an email
+    /// address, so one account has two buckets and a locked-out operator is
+    /// usually in the one nobody thinks to name.
+    async fn login_labels_for(&self, identifier: &str) -> Result<Vec<String>> {
+        // Lower-cased because that is what the login route records: it
+        // lower-cases the typed identifier before the attempt is filed.
+        let typed = account_label(identifier).to_ascii_lowercase();
+        let mut labels = vec![typed.clone()];
+        if let Some(user) = self.find_user_for_login(&typed).await? {
+            for spelling in [
+                user.username.as_str().to_ascii_lowercase(),
+                user.email.as_str().to_ascii_lowercase(),
+            ] {
+                if !labels.contains(&spelling) {
+                    labels.push(spelling);
+                }
+            }
+        }
+        Ok(labels)
+    }
+
     /// Forget an account's failed logins, and the failures from the addresses
     /// they came from.
     ///
@@ -301,25 +358,54 @@ impl Db {
     /// on the credential. Fifteen minutes of waiting was the only cure, and the
     /// message did not say fifteen.
     ///
+    /// **Every spelling of the account, not just its username.** The throttle
+    /// files rows under the string that was typed, and typing the address the
+    /// installer printed into a field labelled "Username" is the documented
+    /// first mistake (see [`Db::find_user_for_login`]) — so the five rows that
+    /// are refusing the operator say `admin@example.com` while the command they
+    /// were told to run said `admin`. It cleared nothing, deleted nothing,
+    /// reported success, and left the person it was written for locked out for
+    /// the full fifteen minutes. [`Db::login_labels_for`] is what makes the two
+    /// spellings one account again.
+    ///
     /// The IP rows go too: whoever is locked out has usually spent some of that
     /// budget as well, and clearing only half leaves them still refused for a
     /// reason the command said it had fixed. That second pass is also what
     /// takes the throttled rows those addresses left behind, which the first
     /// pass cannot see because they are filed under a different label.
-    pub async fn clear_login_failures(&self, username: &str) -> Result<u64> {
-        let account = account_label(username);
-        let ips = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT ip FROM login_attempts WHERE username = ?1 AND success = 0",
-        )
-        .bind(account)
-        .fetch_all(self.pool())
-        .await?;
+    ///
+    /// **Failures only.** A successful sign-in is not a lock, and deleting one
+    /// would cost the operator something they cannot get back cheaply: their
+    /// address's standing with [`Db::address_has_signed_in`], which is what
+    /// exempts them from the account-wide bound while an attack is running.
+    /// Unlocking an account must not be the thing that makes it lockable.
+    pub async fn clear_login_failures(&self, identifier: &str) -> Result<u64> {
+        let labels = self.login_labels_for(identifier).await?;
 
-        let mut cleared = sqlx::query("DELETE FROM login_attempts WHERE username = ?1")
-            .bind(account)
-            .execute(self.pool())
-            .await?
-            .rows_affected();
+        let mut ips: Vec<String> = Vec::new();
+        for label in &labels {
+            let found = sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT ip FROM login_attempts WHERE username = ?1 AND success = 0",
+            )
+            .bind(label)
+            .fetch_all(self.pool())
+            .await?;
+            for ip in found {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+        }
+
+        let mut cleared = 0u64;
+        for label in &labels {
+            cleared +=
+                sqlx::query("DELETE FROM login_attempts WHERE username = ?1 AND success = 0")
+                    .bind(label)
+                    .execute(self.pool())
+                    .await?
+                    .rows_affected();
+        }
 
         for ip in ips {
             cleared += sqlx::query("DELETE FROM login_attempts WHERE ip = ?1 AND success = 0")
@@ -334,8 +420,12 @@ impl Db {
     /// Failed attempts against one account, from anywhere, inside `window`.
     ///
     /// A signal about the account rather than about a caller: anyone on the
-    /// internet can raise it for any account, so what the panel does with it
-    /// must never be a refusal (see `unihelm_web::auth::check_rate_limits`).
+    /// internet can raise it for any account. So what the panel does with it may
+    /// never be a refusal the operator can be caught by — refusing everyone on
+    /// this number alone is a lockout anybody can impose on anybody, and was.
+    /// It may still refuse callers this account has never seen succeed, which is
+    /// the one group the operator is not in; see
+    /// `unihelm_web::auth::check_rate_limits` and [`Db::address_has_signed_in`].
     pub async fn recent_failures_for_username(
         &self,
         username: &str,
@@ -754,6 +844,122 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unlocking_an_account_finds_the_attempts_typed_as_its_email_address() {
+        // The case the command exists for and could not do: the installer
+        // prints the address, so the address is what gets typed into the
+        // Username field, so the five rows holding the operator out say
+        // `admin@example.com` — and `unihelm user unlock admin` deleted nothing,
+        // returned 0, and printed "it can sign in again now".
+        let (db, _) = seed().await;
+        for _ in 0..5 {
+            db.record_login_attempt("10.0.0.9", "admin@example.com", false)
+                .await
+                .unwrap();
+        }
+
+        let window = Duration::minutes(15);
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "admin@example.com", window)
+                .await
+                .unwrap(),
+            5,
+            "the bucket that is doing the refusing"
+        );
+
+        assert_eq!(
+            db.clear_login_failures("admin").await.unwrap(),
+            5,
+            "the canonical username must reach the rows filed under the address"
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "admin@example.com", window)
+                .await
+                .unwrap(),
+            0,
+            "and the refusing bucket must actually be empty afterwards"
+        );
+
+        // The other direction too: an operator who unlocks by the address they
+        // typed must reach the rows filed under the username.
+        db.record_login_attempt("10.0.0.9", "admin", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.clear_login_failures("admin@example.com").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            db.recent_failures_for_ip_and_username("10.0.0.9", "admin", window)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unlocking_an_account_does_not_cost_it_its_known_addresses() {
+        // `address_has_signed_in` is what keeps the account-wide bound off the
+        // operator. If unlock deleted successes along with failures, running the
+        // documented cure would strip the operator of the standing that exempts
+        // them — and hand the attack the lockout it was denied.
+        let (db, _) = seed().await;
+        db.record_login_attempt("10.0.0.9", "admin", true)
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            db.record_login_attempt("10.0.0.9", "admin", false)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(db.clear_login_failures("admin").await.unwrap(), 5);
+        assert!(
+            db.address_has_signed_in("10.0.0.9", "admin").await.unwrap(),
+            "the successful sign-in must survive an unlock"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_correct_password_makes_an_address_known() {
+        let (db, _) = seed().await;
+        for _ in 0..20 {
+            db.record_login_attempt("203.0.113.9", "admin", false)
+                .await
+                .unwrap();
+        }
+        db.record_throttled_login_attempt("203.0.113.9", "admin")
+            .await
+            .unwrap();
+        assert!(
+            !db.address_has_signed_in("203.0.113.9", "admin")
+                .await
+                .unwrap(),
+            "no number of failures may earn what only the password earns"
+        );
+
+        db.record_login_attempt("198.51.100.4", "admin", true)
+            .await
+            .unwrap();
+        assert!(
+            db.address_has_signed_in("198.51.100.4", "admin")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.address_has_signed_in("198.51.100.5", "admin")
+                .await
+                .unwrap(),
+            "and only for the address that did it"
+        );
+        assert!(
+            !db.address_has_signed_in("198.51.100.4", "someone-else")
+                .await
+                .unwrap(),
+            "and only for the account it signed in to"
         );
     }
 

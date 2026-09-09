@@ -609,11 +609,20 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
                 db.close().await;
                 anyhow::bail!("no account named `{username}` — `unihelm user list` shows them all");
             };
+            // The account, not one spelling of it: the throttle files a row
+            // under whatever string was typed at the login form, and
+            // `find_user_for_login` answers to the username *or* the email
+            // address. Passing only `user.username` meant the operator who
+            // typed the installer-printed address — the documented first
+            // mistake, and so the person most likely to be locked out — ran
+            // this command against an empty bucket, deleted nothing, and was
+            // told it had worked. `clear_login_failures` now takes every
+            // spelling the account answers to.
             let cleared = db.clear_login_failures(user.username.as_str()).await?;
             db.close().await;
             println!(
-                "cleared {cleared} failed login attempt(s) for `{}`; it can sign in again now",
-                user.username.as_str()
+                "{}",
+                unlock_report(cleared, user.username.as_str(), user.email.as_str())
             );
             return Ok(());
         }
@@ -697,6 +706,35 @@ async fn user(config: &UnihelmConfig, cmd: &UserCommand) -> Result<()> {
     Ok(())
 }
 
+/// What `unihelm user unlock` says it did.
+///
+/// The line used to end "it can sign in again now" whichever number came back,
+/// and zero was the ordinary case: the rows holding the operator out were filed
+/// under the address they had typed into the Username field, and the command
+/// only looked under the username. So the one person the command exists for was
+/// told their lock had been lifted while it sat there for the full fifteen
+/// minutes. Nothing cleared now says nothing cleared.
+///
+/// Both spellings are named because the operator cannot tell from the panel
+/// which one the throttle counted, and the last line is there because clearing
+/// an account's failures does not clear a block earned from the same address
+/// against some other name — claiming otherwise would be the same lie in a new
+/// place.
+fn unlock_report(cleared: u64, username: &str, email: &str) -> String {
+    let outcome = if cleared == 0 {
+        format!("nothing to clear: no failed sign-in is on record for `{username}` or `{email}`")
+    } else {
+        format!(
+            "cleared {cleared} recorded failed sign-in(s) for `{username}` / `{email}`, \
+             and the failures from the addresses they came from"
+        )
+    };
+    format!(
+        "{outcome}\nif a sign-in is still refused, the block is on the calling address rather \
+         than on this account — the refusal names both the address and the identifier it counted"
+    )
+}
+
 /// A generated first password: long, random, and printed once.
 ///
 /// Words would be friendlier, but shipping a wordlist to save an operator one
@@ -727,6 +765,29 @@ mod tests {
         }
         // And it must satisfy the panel's own policy.
         assert!(unihelm_db::password::check_strength(&a).is_ok());
+    }
+
+    #[test]
+    fn unlock_does_not_claim_to_have_lifted_a_lock_it_did_not_find() {
+        // The state this command was written for and used to get wrong: the
+        // attempts are filed under the address the operator typed, the command
+        // looked under the username, and it printed success over a no-op.
+        let nothing = unlock_report(0, "admin", "admin@example.com");
+        assert!(
+            !nothing.contains("can sign in again"),
+            "a no-op must not read as a cure: {nothing}"
+        );
+        assert!(nothing.contains("nothing to clear"), "{nothing}");
+
+        let did = unlock_report(6, "admin", "admin@example.com");
+        assert!(did.contains("cleared 6"), "{did}");
+
+        // Both spellings, either way: the operator cannot tell from the panel
+        // which one the throttle counted.
+        for line in [&nothing, &did] {
+            assert!(line.contains("`admin`"), "{line}");
+            assert!(line.contains("`admin@example.com`"), "{line}");
+        }
     }
 
     #[test]

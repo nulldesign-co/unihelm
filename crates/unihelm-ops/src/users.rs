@@ -154,20 +154,127 @@ async fn ensure_not_the_last_admin(ctx: &OpContext, user: &User, what: &str) -> 
     if active_admins(ctx.db()).await? > 1 {
         return Ok(());
     }
-    let advice = if ctx.auth().actor_user_id == user.id {
+    Err(last_admin_refusal(
+        ctx,
+        user.id,
+        user.username.as_str(),
+        what,
+    ))
+}
+
+/// The refusal itself, in one place because two callers raise it: the
+/// pre-flight [`ensure_not_the_last_admin`], and [`guard_refusal`] when the
+/// write's own condition catches what the pre-flight could not. From the
+/// operator's side those are the same refusal and must read the same.
+fn last_admin_refusal(ctx: &OpContext, id: UserId, username: &str, what: &str) -> UnihelmError {
+    let advice = if ctx.auth().actor_user_id == id {
         "Create a second administrator first; it is that account that can then do this, \
          because nobody may act on the account they are signed in as."
     } else {
         "Create a second administrator first, then repeat this."
     };
-    Err(UnihelmError::new(
+    UnihelmError::new(
         ErrorCode::DependentsExist,
         format!(
-            "`{}` is the only administrator who can sign in, so it cannot be {what} — the \
-             panel would have nobody left to administer it. {advice}",
-            user.username.as_str()
+            "`{username}` is the only administrator who can sign in, so it cannot be {what} — \
+             the panel would have nobody left to administer it. {advice}"
         ),
-    ))
+    )
+}
+
+/// The `WHERE` fragment that makes the last-administrator refusal true.
+///
+/// [`ensure_not_the_last_admin`] counts and returns; the write that followed it
+/// was a separate statement on a separate pool connection, and the IPC server
+/// runs one task per request. So with exactly two active administrators, A
+/// demoting B while B demotes A — two sessions, or the panel and a script —
+/// both counted 2, both wrote, and the panel was left with no account that
+/// could sign in and undo it: `unihelm user create-admin` refuses once any
+/// account exists, and every other ops-backed CLI verb authenticates as an
+/// active administrator first. The way back was sqlite3 as root.
+///
+/// Appended to the write, the count and the write are one statement evaluated
+/// under one write lock, so the second of the two matches no row and is
+/// refused. This is spelled out at the call sites rather than in the
+/// repository because the repository cannot express it: `UserRepo::set_status`
+/// is an unconditional UPDATE that reports nothing about what it touched.
+///
+/// The second half of the condition is what keeps a panel that has exactly one
+/// administrator working normally — a write to a row that is not an active
+/// admin cannot reduce the number of admins, so the count of them must not
+/// block it. `?1` is the id of the row being written, bound once for both
+/// places it appears; the unqualified `role` and `status` are that row's, as it
+/// stands before the SET applies.
+const LAST_ADMIN_GUARD: &str = " AND ((SELECT COUNT(*) FROM users WHERE role = 'admin' AND \
+                                 status = 'active' AND id <> ?1) > 0 OR role <> 'admin' OR \
+                                 status <> 'active')";
+
+/// Why a guarded write matched no row.
+///
+/// Two things can leave `rows_affected` at zero: the guard fired, or the row is
+/// gone because somebody else deleted it in the meantime. Which one it was is
+/// asked, not assumed — a refusal that names the wrong reason sends the
+/// operator to fix the wrong thing. If the row is still there, the guard is the
+/// only other condition the statement had.
+async fn guard_refusal(ctx: &OpContext, id: UserId, username: &str, what: &str) -> UnihelmError {
+    match ctx.db().users(&TenantScope::Global).by_id(id).await {
+        Ok(Some(_)) => last_admin_refusal(ctx, id, username, what),
+        Ok(None) => UnihelmError::not_found("user"),
+        Err(e) => UnihelmError::from(e),
+    }
+}
+
+/// `updated_at`, in the spelling the schema stores.
+fn now_sql() -> Result<String> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| UnihelmError::internal(format!("could not format a timestamp: {e}")))
+}
+
+// The three writes that can take an administrator away, each carrying
+// [`LAST_ADMIN_GUARD`] in its own statement. They are functions rather than
+// inline SQL so a test can exercise the guard directly: the race itself cannot
+// be reproduced deterministically through `dispatch`, but the statement's
+// behaviour once the last *other* administrator has gone is the same thing the
+// losing request meets, and that is exactly reproducible.
+//
+// Each returns the rows it changed. Zero is the refusal — hand it to
+// [`guard_refusal`], which says which of the two reasons it was.
+
+async fn demote_guarded(db: &Db, id: UserId, role: Role) -> Result<u64> {
+    let sql =
+        format!("UPDATE users SET role = ?2, updated_at = ?3 WHERE id = ?1{LAST_ADMIN_GUARD}");
+    Ok(sqlx::query(&sql)
+        .bind(id.get())
+        .bind(role.as_str())
+        .bind(now_sql()?)
+        .execute(db.pool())
+        .await
+        .map_err(db_error)?
+        .rows_affected())
+}
+
+async fn suspend_guarded(db: &Db, id: UserId) -> Result<u64> {
+    let sql =
+        format!("UPDATE users SET status = ?2, updated_at = ?3 WHERE id = ?1{LAST_ADMIN_GUARD}");
+    Ok(sqlx::query(&sql)
+        .bind(id.get())
+        .bind(UserStatus::Suspended.as_str())
+        .bind(now_sql()?)
+        .execute(db.pool())
+        .await
+        .map_err(db_error)?
+        .rows_affected())
+}
+
+async fn delete_guarded(db: &Db, id: UserId) -> Result<u64> {
+    let sql = format!("DELETE FROM users WHERE id = ?1{LAST_ADMIN_GUARD}");
+    Ok(sqlx::query(&sql)
+        .bind(id.get())
+        .execute(db.pool())
+        .await
+        .map_err(db_error)?
+        .rows_affected())
 }
 
 /// The reseller a caller's new accounts belong to, and the roles they may hand
@@ -471,19 +578,23 @@ impl TypedOperation for RoleSet {
         ensure_not_self(ctx, &user, "change the role of")?;
 
         let db = ctx.db();
-        sqlx::query("UPDATE users SET role = ?2, updated_at = ?3 WHERE id = ?1")
-            .bind(user.id.get())
-            .bind(input.role.as_str())
-            .bind(
-                time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .map_err(|e| {
-                        UnihelmError::internal(format!("could not format a timestamp: {e}"))
-                    })?,
-            )
-            .execute(db.pool())
-            .await
-            .map_err(db_error)?;
+        // Guarded only when this write takes an administrator away. Promoting
+        // somebody *to* admin must not be refused for want of an admin: on a
+        // one-admin panel the guard would refuse exactly the write that fixes
+        // that.
+        if input.role == Role::Admin {
+            sqlx::query("UPDATE users SET role = ?2, updated_at = ?3 WHERE id = ?1")
+                .bind(user.id.get())
+                .bind(input.role.as_str())
+                .bind(now_sql()?)
+                .execute(db.pool())
+                .await
+                .map_err(db_error)?;
+        } else if demote_guarded(db, user.id, input.role).await? == 0 {
+            return Err(
+                guard_refusal(ctx, user.id, user.username.as_str(), "given another role").await,
+            );
+        }
 
         // A role decides what the panel draws as much as what the agent
         // permits. The agent re-derives rights per request, so a demoted admin
@@ -576,10 +687,22 @@ impl TypedOperation for StatusSet {
         }
 
         let db = ctx.db();
-        db.users(ctx.scope())
-            .set_status(user.id, input.status.stored())
-            .await
-            .map_err(UnihelmError::from)?;
+        if input.status == AccountStatus::Suspended {
+            // Not `UserRepo::set_status`, whose UPDATE is unconditional and
+            // reports nothing about what it touched: the last-administrator
+            // condition has to travel in the statement to hold against a
+            // concurrent one. The scope check the repository would have done
+            // has already run — `target` resolved this id through the caller's
+            // own scope, and every refusal since has been about this row.
+            if suspend_guarded(db, user.id).await? == 0 {
+                return Err(guard_refusal(ctx, user.id, user.username.as_str(), "suspended").await);
+            }
+        } else {
+            db.users(ctx.scope())
+                .set_status(user.id, input.status.stored())
+                .await
+                .map_err(UnihelmError::from)?;
+        }
 
         // `lookup_session` already refuses a session whose account cannot log
         // in, so a suspension takes effect on the next request either way.
@@ -736,14 +859,13 @@ impl TypedOperation for Delete {
         // been its job has already run above — `target` resolved this id
         // through the caller's own scope, and every refusal since has been
         // about this row.
-        let removed = sqlx::query("DELETE FROM users WHERE id = ?1")
-            .bind(id)
-            .execute(db.pool())
-            .await
-            .map_err(db_error)?
-            .rows_affected();
-        if removed == 0 {
-            return Err(UnihelmError::not_found("user"));
+        //
+        // The guard is the seven awaited round trips above made safe: between
+        // the last-administrator count and this line the counts and the
+        // dependants load all go to the database, which is a wide window for
+        // another administrator's delete to land in.
+        if delete_guarded(db, UserId(id)).await? == 0 {
+            return Err(guard_refusal(ctx, UserId(id), &username, "deleted").await);
         }
 
         ctx.log(format!("deleted account `{username}`"));
@@ -1022,6 +1144,82 @@ mod tests {
             .unwrap();
         assert_eq!(still.role, Role::Admin);
         assert_eq!(still.status, UserStatus::Active);
+    }
+
+    /// The refusal above is a count followed, some round trips later, by an
+    /// unrelated write. Two administrators acting on each other at the same
+    /// moment both counted two, both wrote, and the panel was left with none —
+    /// which no CLI verb can undo, because they all authenticate as an active
+    /// administrator first.
+    ///
+    /// The interleaving cannot be forced through `dispatch`, so this tests the
+    /// thing that closes it: each of the three writes carries the count in its
+    /// own statement, so a write whose pre-flight was true and is no longer
+    /// matches nothing instead of landing. `demote` is the other request having
+    /// already committed; the guarded write is the losing one arriving after
+    /// it. Before the guard every one of these changed a row and left
+    /// `active_admins` at zero.
+    #[tokio::test]
+    async fn a_write_that_would_take_the_last_administrator_matches_no_row() {
+        for what in ["demote", "suspend", "delete"] {
+            let (reg, admin, _) = registry().await;
+            let db = reg.services().db.clone();
+            let deputy = seed(&db, "deputy", Role::Admin, None).await;
+            assert_eq!(active_admins(&db).await.unwrap(), 2, "{what}");
+
+            // The other request, already committed: `deputy` is no longer an
+            // administrator who can sign in. `admin` is now the last one, and
+            // its own pre-flight check ran while there were still two.
+            db.users(&TenantScope::Global)
+                .set_status(deputy.id, UserStatus::Suspended)
+                .await
+                .unwrap();
+
+            let changed = match what {
+                "demote" => demote_guarded(&db, admin, Role::Customer).await.unwrap(),
+                "suspend" => suspend_guarded(&db, admin).await.unwrap(),
+                _ => delete_guarded(&db, admin).await.unwrap(),
+            };
+            assert_eq!(changed, 0, "{what} took the last administrator");
+            assert_eq!(
+                active_admins(&db).await.unwrap(),
+                1,
+                "{what} left the panel with nobody who can sign in"
+            );
+        }
+    }
+
+    /// The other half of the same condition: it must only ever stop the write
+    /// that would leave the panel unadministered. A panel with one
+    /// administrator is the ordinary case, and every write to every other
+    /// account has to go through unblocked.
+    #[tokio::test]
+    async fn the_guard_stops_nothing_else_on_a_panel_with_one_administrator() {
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        assert_eq!(active_admins(&db).await.unwrap(), 1);
+
+        // Suspending, demoting and deleting an ordinary account cannot reduce
+        // the number of administrators, so the count of them says nothing here.
+        assert_eq!(suspend_guarded(&db, customer).await.unwrap(), 1);
+        assert_eq!(
+            demote_guarded(&db, customer, Role::Reseller).await.unwrap(),
+            1
+        );
+        assert_eq!(delete_guarded(&db, customer).await.unwrap(), 1);
+
+        // And a second administrator can still be made, which is the write the
+        // refusal above tells the operator to make.
+        let deputy = seed(&db, "deputy", Role::Customer, None).await;
+        call(
+            &reg,
+            &RoleSet,
+            &auth_for(admin, Role::Admin),
+            serde_json::json!({ "user_id": deputy.id.get(), "role": "admin" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(active_admins(&db).await.unwrap(), 2);
     }
 
     #[tokio::test]

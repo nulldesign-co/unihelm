@@ -110,6 +110,22 @@ impl Db {
     /// Oldest first is the issuance order, and it is stable: a wildcard that
     /// issued through one token last month must not silently start using a
     /// different one because a row was added.
+    ///
+    /// **There is no tenant scope here, and that is not an oversight to fix by
+    /// adding a `TenantScope` argument.** `dns_providers` has no owner column
+    /// (migration 0008): a stored token is the *machine's*, entered by its
+    /// operator, and every tenant's wildcard issuance runs through whichever one
+    /// covers their zone. Adding a scope parameter that had nothing to filter on
+    /// would be a signature that claims a boundary the table cannot keep.
+    ///
+    /// What the boundary actually costs the caller: an operation that reaches
+    /// this method is spending a credential no tenant owns, so it must first
+    /// refuse any caller whose scope is narrower than the whole machine. 0.8.0
+    /// shipped a candidate where five of them did not, and a reseller could
+    /// enumerate and rewrite every zone the operator's Cloudflare token
+    /// administered — see `unihelm_ops::dns::require_operator_scope`. The one
+    /// exception is `cert.issue_wildcard`, which lends the token to a tenant
+    /// only after loading their `site_id` through `db.sites(ctx.scope())`.
     pub async fn dns_providers(&self, kind: DnsProviderKind) -> Result<Vec<DnsProvider>> {
         let rows = sqlx::query_as::<_, DnsProviderRow>(
             "SELECT id, kind, label, credentials_sealed FROM dns_providers

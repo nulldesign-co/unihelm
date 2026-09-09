@@ -7,8 +7,9 @@
 //! obtains a Let's Encrypt certificate over HTTP-01, renders the panel vhost
 //! through the config engine and reloads whichever web server is serving —
 //! `panel.conf` in whichever of `templates/nginx/` and `templates/apache/` that
-//! is — and then narrows `panel.listen` to loopback, so the vhost it just put
-//! live is the only way in (see [`narrow_listener_to_loopback`]). The renewal
+//! is — and then, once it has asked that vhost for the panel's own health check
+//! and got it, narrows `panel.listen` to loopback so the vhost is the only way
+//! in (see [`vhost_proof`] and [`narrow_listener_to_loopback`]). The renewal
 //! scheduler keeps the certificate alive through the same path (spec §10.2).
 //!
 //! This doc comment used to open "`unihelm-web` listens on loopback and never
@@ -75,6 +76,23 @@ pub fn panel_upstream() -> Upstream {
 /// The port the panel falls back to when its configuration cannot say.
 const DEFAULT_PANEL_PORT: u16 = 8088;
 
+/// The file the panel's own port questions are answered from.
+///
+/// A constant in production, and a path a test can point at its own file. Until
+/// it was one, none of these questions could be asked in a test at all — both
+/// port functions read the fixed `/etc/unihelm/config.toml`, which no test may
+/// write — and that is exactly how [`panel_port_reachable_from_network`] shipped
+/// documented, unit-tested and called by nothing: neither firewall decision
+/// could be exercised against a panel that had been narrowed to loopback, so
+/// nothing failed when both of them went on asking the wrong question.
+fn config_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(path) = testing::config_override() {
+        return path;
+    }
+    std::path::PathBuf::from(unihelm_core::config::paths::CONFIG)
+}
+
 /// `panel.listen`, as the file says, or the default the panel would itself have
 /// bound to if it could not read that file either.
 fn configured_listen(path: &Path) -> String {
@@ -92,7 +110,7 @@ fn configured_listen(path: &Path) -> String {
 /// default is used when the file cannot be read, which is the same port the
 /// panel would itself have bound to in that case.
 pub fn panel_listen_port() -> u16 {
-    configured_listen(Path::new(unihelm_core::config::paths::CONFIG))
+    configured_listen(&config_path())
         .parse::<std::net::SocketAddr>()
         .map(|a| a.port())
         .unwrap_or(DEFAULT_PANEL_PORT)
@@ -113,10 +131,14 @@ pub fn panel_listen_port() -> u16 {
 /// A listen value that cannot be read or cannot be parsed counts as reachable.
 /// Being unsure that the operator has another way in is not a reason to take
 /// this one away.
+///
+/// Both callers named above are wired to this function. They used to call
+/// `panel_listen_port`, which answers the other question — and on every server
+/// that had run `panel.tls.issue` that cost the operator a firewall hole
+/// re-punched to a port nothing external could reach, and a refusal ("closing it
+/// would lock you out of the panel") that was false and had no way around it.
 pub fn panel_port_reachable_from_network() -> Option<u16> {
-    reachable_port(&configured_listen(Path::new(
-        unihelm_core::config::paths::CONFIG,
-    )))
+    reachable_port(&configured_listen(&config_path()))
 }
 
 fn reachable_port(listen: &str) -> Option<u16> {
@@ -395,16 +417,36 @@ impl TypedOperation for Issue {
             .await
             .map_err(UnihelmError::from)?;
 
-        ctx.log(format!(
-            "the panel is now served at https://{}",
-            domain.as_str()
-        ));
-
         // Last, and only here: the vhost is live, reloaded and certificated, so
         // the wide listener the installer left behind is now a second front
-        // door rather than the only one. See `narrow_listener_to_loopback`.
-        narrow_listener_to_loopback(ctx, Path::new(unihelm_core::config::paths::CONFIG), &domain)
-            .await;
+        // door rather than the only one — *if* it is a front door at all, which
+        // is what this asks before anything is taken away. See
+        // `narrow_listener_to_loopback` and `vhost_proof`.
+        let proof = vhost_proof(&domain, vhost_probe_addr()).await;
+
+        // The line under this used to read "the panel is now served at
+        // https://…" unconditionally, which is the same class of claim as the
+        // narrowing it preceded: true of the configuration, not checked against
+        // the server. Said while nothing answers on 443, it is the panel telling
+        // an operator their panel has moved somewhere they cannot reach —
+        // so it is said only when the vhost has answered.
+        match &proof {
+            VhostProof::Answering => ctx.log(format!(
+                "the panel answered on its own vhost: it is served at https://{}",
+                domain.as_str()
+            )),
+            // Said here rather than left to the narrowing, because a renewal on
+            // a panel that is *already* behind its vhost narrows nothing and
+            // would otherwise say nothing — and a vhost that has stopped
+            // answering is exactly what that operator needs to hear.
+            VhostProof::Unproven(why) => ctx.log(format!(
+                "the panel's own vhost did not answer on this machine — {why}. The certificate \
+                 is installed and the vhost is rendered; what this could not confirm is that \
+                 port {VHOST_PORT} serves the panel."
+            )),
+        }
+
+        narrow_listener_to_loopback(ctx, &config_path(), &domain, &proof).await;
 
         Ok(IssueOutput {
             certificate_id: record.id,
@@ -413,6 +455,144 @@ impl TypedOperation for Issue {
             not_after: issued.not_after,
             days_valid,
         })
+    }
+}
+
+/// Where the panel goes when it goes behind its vhost: this machine only, on
+/// the port it already holds.
+///
+/// The same port, deliberately — the vhost proxies to it (`panel_upstream`
+/// resolves the very same address), and moving the port as well would break the
+/// vhost that was just put live. Named once because the refusal above and the
+/// rewrite below have to agree: an operator told to write one value by hand and
+/// a panel that would have written another is the sort of disagreement this
+/// module cannot afford.
+fn loopback_of(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    let ip = if addr.is_ipv6() {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    std::net::SocketAddr::new(ip, addr.port())
+}
+
+/// The port the panel's vhost is served on.
+///
+/// Not read from anywhere, because it is not configurable: both templates say
+/// `listen 443 ssl` / `<VirtualHost *:443>`, and a renewal that probed some
+/// other port would be asking about a door the panel never opened.
+const VHOST_PORT: u16 = 443;
+
+/// Where to knock: this machine, on the vhost's port.
+///
+/// Loopback rather than the public address deliberately. The question is
+/// whether *this* server answers on 443 — a public address could be answered by
+/// a load balancer, a stale DNS record, or another host entirely, and none of
+/// those keeps the panel reachable once its own listener is gone.
+fn vhost_probe_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        VHOST_PORT,
+    )
+}
+
+/// What the panel could prove about its own vhost before taking the other way
+/// in away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VhostProof {
+    /// The panel itself answered through the vhost, on this machine, on 443.
+    Answering,
+    /// It did not, and this is what happened — phrased for the task log,
+    /// because the operator is who has to act on it.
+    Unproven(String),
+}
+
+/// Ask the vhost, over TLS, for the panel's own health check.
+///
+/// **Why this exists at all.** Reaching the narrowing used to be treated as
+/// proof enough that the vhost was serving: a CA had fetched an HTTP-01
+/// challenge, the validator had accepted the file and the server had reloaded.
+/// None of that is evidence about port 443. HTTP-01 is fetched over **port 80**
+/// (`acme.rs` writes into the shared webroot; there is no standalone listener),
+/// `nginx -t` only says the file parses, and `UnitReloader::reload` returns
+/// `Ok(())` for a unit that is not running at all — so a machine where Apache
+/// held 80 while the nginx vhost was written and "reloaded", or one whose 443 is
+/// shut, passed every one of those checks and then had its only working address
+/// deleted. Recovery was ssh or the provider's console, on a server being
+/// administered through a browser.
+///
+/// So the panel asks the vhost the question directly, and only a 200 from
+/// `/healthz` with the panel's own body in it counts: a TCP connect would be
+/// satisfied by Apache's catch-all `*:443`, which answers an empty 403 and
+/// serves no panel. The certificate is verified as a browser would verify it,
+/// because "the operator can reach this" is the claim being made — and the
+/// certificate for this name was issued seconds ago, so a failure here is a real
+/// one.
+///
+/// What it still cannot prove is the path from wherever the operator is: a cloud
+/// security group in front of the machine is not visible from inside it. That
+/// half is `fw.enable`'s, which now opens 80 and 443 on a host that serves the
+/// web.
+async fn vhost_proof(domain: &Domain, addr: std::net::SocketAddr) -> VhostProof {
+    // Three shots, half a second apart. `systemctl reload` returns when the
+    // master process has taken the signal, not when the worker holding 443 has
+    // swapped onto the new configuration, so a single miss half a second after a
+    // reload is not evidence that the vhost is broken — and treating it as such
+    // costs the operator a panel that stays double-doored until the next
+    // renewal.
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        match probe_vhost(domain, addr).await {
+            VhostProof::Answering => return VhostProof::Answering,
+            VhostProof::Unproven(why) => last = why,
+        }
+    }
+    VhostProof::Unproven(last)
+}
+
+async fn probe_vhost(domain: &Domain, addr: std::net::SocketAddr) -> VhostProof {
+    let url = format!("https://{}/healthz", domain.as_str());
+    let unproven = |what: String| VhostProof::Unproven(format!("{url} (asked of {addr}) {what}"));
+
+    let client = match reqwest::Client::builder()
+        // The name resolves to this machine, and to nothing else: DNS is not
+        // consulted, so the answer cannot come from somewhere the panel is not.
+        .resolve(domain.as_str(), addr)
+        // A proxy from the environment would answer a different server's 443.
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("unihelm/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => return unproven(format!("could not be asked: no HTTP client ({e})")),
+    };
+
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(e) => return unproven(format!("did not answer ({e})")),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return unproven(format!(
+            "answered {status}, so something other than this panel is serving that name on \
+             {VHOST_PORT}"
+        ));
+    }
+    match response.json::<serde_json::Value>().await {
+        Ok(body) if body.get("status").and_then(|s| s.as_str()) == Some("ok") => {
+            VhostProof::Answering
+        }
+        Ok(_) => unproven(format!(
+            "answered {status}, but not with this panel's health check — something else is \
+             serving that name on {VHOST_PORT}"
+        )),
+        Err(e) => unproven(format!(
+            "answered {status} and then would not be read ({e})"
+        )),
     }
 }
 
@@ -429,19 +609,28 @@ impl TypedOperation for Issue {
 /// attempting. So the listener follows the vhost down, and the hole the panel
 /// opened for itself is closed behind it.
 ///
-/// **Only once the vhost is actually serving.** Reaching this line means a CA
-/// fetched an HTTP-01 challenge from this machine on this name, the web server's
-/// own validator accepted the vhost, and the server reloaded onto it. A failed
-/// apply or a failed reload returns long before here and leaves the listener
-/// exactly as it was, because a panel that narrows its address on the strength
-/// of a vhost that did not come up is a panel nobody can reach.
+/// **Only once the vhost is actually answering**, which is what `proof` carries.
+/// This doc used to say that reaching this line was proof enough — a CA had
+/// fetched an HTTP-01 challenge, the validator had accepted the vhost, the
+/// server had reloaded onto it. Every word of that is true and none of it is
+/// about port 443: **HTTP-01 proves port 80**, `nginx -t` proves the file
+/// parses, and `UnitReloader::reload` returns `Ok(())` for a unit that is not
+/// running. So a machine whose 443 was shut, or whose nginx was installed and
+/// stopped while Apache answered 80, passed all three and then had its only
+/// working address deleted, with no revert and nothing but ssh or a provider
+/// console to get back in. See [`vhost_proof`], which asks the vhost itself.
 ///
 /// **Nothing here can fail the operation.** The certificate is issued and the
 /// vhost is live by the time it runs; turning a firewall hiccup into a failed
 /// `panel.tls.issue` would report that none of that happened. Every way this
 /// can stop early says so in the task log instead, and names the file, the key
 /// and the value that put things back.
-async fn narrow_listener_to_loopback(ctx: &OpContext, config_path: &Path, domain: &Domain) {
+async fn narrow_listener_to_loopback(
+    ctx: &OpContext,
+    config_path: &Path,
+    domain: &Domain,
+    proof: &VhostProof,
+) {
     let path = config_path.display();
 
     // The address the vhost is proxying to, for the messages below that hand the
@@ -497,15 +686,25 @@ async fn narrow_listener_to_loopback(ctx: &OpContext, config_path: &Path, domain
         return;
     }
 
-    let loopback = if addr.is_ipv6() {
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-    } else {
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-    };
-    // The same port, deliberately: the vhost proxies to it (`panel_upstream`
-    // resolves the very same address), and moving the port as well would break
-    // the vhost that was just put live.
-    let narrowed = std::net::SocketAddr::new(loopback, addr.port()).to_string();
+    // Here, and only here, is where something is taken away — so this is where
+    // it has to be earned. A renewal on an already-narrowed panel returned
+    // above without needing any proof, because it removes nothing.
+    if let VhostProof::Unproven(why) = proof {
+        ctx.log(format!(
+            "`panel.listen` is still `{current}`, so the direct port stays open: nothing \
+             confirmed that this machine serves the panel on port {VHOST_PORT} — {why}. The \
+             challenge that earned the certificate is fetched over port 80 and proves nothing \
+             about 443, and closing the way in you are reading this through on that evidence \
+             is how an operator ends up with no address that works at all. Once \
+             https://{}/ answers, set `panel.listen = \"{}\"` in {path} and run \
+             `systemctl restart unihelm-web` to close it.",
+            domain.as_str(),
+            loopback_of(addr),
+        ));
+        return;
+    }
+
+    let narrowed = loopback_of(addr).to_string();
 
     let rewritten = match UnihelmConfig::rewrite_panel_listen(&text, &narrowed) {
         Ok(text) => text,
@@ -759,6 +958,49 @@ async fn obtain(
 
     let log = |line: &str| ctx.log(line);
     acme::issue_http01(&account, &webroot, names, &log).await
+}
+
+// ---------------------------------------------------------------------------
+// Test plumbing: answer this module's port questions from a file a test wrote
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        // Thread-local for `db::testing`'s reason: `#[tokio::test]` runs each
+        // test's future on its own thread, so one test's panel config cannot
+        // bleed into another's while they run side by side.
+        static CONFIG: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Answer [`super::panel_listen_port`] and
+    /// [`super::panel_port_reachable_from_network`] from `path` until the
+    /// returned guard drops.
+    ///
+    /// The firewall's two panel decisions read the panel's configuration
+    /// through those functions and nothing else, so this is the whole seam:
+    /// with it, "the panel is behind its vhost now" is a state a test can put
+    /// the code in, which is what nothing could do when both decisions were
+    /// wired to the wrong one.
+    pub(crate) fn panel_config_at(path: &Path) -> Guard {
+        CONFIG.with(|c| *c.borrow_mut() = Some(path.to_path_buf()));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CONFIG.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn config_override() -> Option<PathBuf> {
+        CONFIG.with(|c| c.borrow().clone())
+    }
 }
 
 #[cfg(test)]
@@ -1158,7 +1400,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = config_with_listen(dir.path(), "0.0.0.0:8088");
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         let after = std::fs::read_to_string(&path).unwrap();
         let parsed = UnihelmConfig::from_toml(&after).unwrap();
@@ -1187,7 +1429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = config_with_listen(dir.path(), "[::]:9443");
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         let parsed = UnihelmConfig::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed.panel.listen, "[::1]:9443");
@@ -1204,7 +1446,7 @@ mod tests {
         let path = config_with_listen(dir.path(), "127.0.0.1:8088");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         assert!(restarted_units(&rec).is_empty());
@@ -1220,7 +1462,13 @@ mod tests {
         let (ctx, rec) = narrowing_ctx().await;
         let dir = tempfile::tempdir().unwrap();
 
-        narrow_listener_to_loopback(&ctx, &dir.path().join("absent.toml"), &panel_domain()).await;
+        narrow_listener_to_loopback(
+            &ctx,
+            &dir.path().join("absent.toml"),
+            &panel_domain(),
+            &VhostProof::Answering,
+        )
+        .await;
         assert!(restarted_units(&rec).is_empty());
         // Handing the job back is only useful with the value to hand back: the
         // address the vhost proxies to, not "a loopback address".
@@ -1232,7 +1480,7 @@ mod tests {
         let path = dir.path().join("broken.toml");
         let broken = "[panel]\nlisten = \"0.0.0.0:8088\"\nno_such_key = 1\n";
         std::fs::write(&path, broken).unwrap();
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
         assert!(restarted_units(&rec).is_empty());
@@ -1254,7 +1502,7 @@ mod tests {
         let path = dir.path().join("nonsense-listen.toml");
         std::fs::write(&path, "[panel]\nlisten = = =\n").unwrap();
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1285,7 +1533,7 @@ mod tests {
             .await
             .unwrap();
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         assert_eq!(
             rec.lock().expect("recorder").closed_ports,
@@ -1316,7 +1564,7 @@ mod tests {
             .await
             .unwrap();
 
-        narrow_listener_to_loopback(&ctx, &path, &panel_domain()).await;
+        narrow_listener_to_loopback(&ctx, &path, &panel_domain(), &VhostProof::Answering).await;
 
         assert!(
             rec.lock().expect("recorder").closed_ports.is_empty(),
@@ -1328,6 +1576,127 @@ mod tests {
             log.contains("left the firewall rule for 8088/tcp alone"),
             "{log}"
         );
+    }
+
+    /// The defect this release fixed: the narrowing treated "the certificate
+    /// was issued and the server reloaded" as proof that the vhost answers.
+    /// HTTP-01 is fetched over port **80** and `UnitReloader::reload` succeeds
+    /// on a unit that is not running, so a host whose 443 was shut passed every
+    /// check on the way here and then had its only working address deleted —
+    /// with no revert, and nothing but ssh or a provider console to get back in.
+    #[tokio::test]
+    async fn a_vhost_that_did_not_answer_leaves_the_direct_port_exactly_as_it_was() {
+        let (ctx, rec) = narrowing_ctx().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_with_listen(dir.path(), "0.0.0.0:8088");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // The panel's own rule is in place, as `fw.enable` would have left it.
+        let rule = PortRule::anywhere(8088, Proto::Tcp, crate::fwops::PANEL_RULE_COMMENT);
+        ctx.distro().fw.open_port(&rule).await.unwrap();
+        ctx.db()
+            .record_fw_rule(8088, "tcp", None, crate::fwops::PANEL_RULE_COMMENT)
+            .await
+            .unwrap();
+
+        narrow_listener_to_loopback(
+            &ctx,
+            &path,
+            &panel_domain(),
+            &VhostProof::Unproven("did not answer (connection refused)".into()),
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "`panel.listen` must still be the address that works"
+        );
+        assert!(
+            restarted_units(&rec).is_empty(),
+            "and the panel must not be restarted onto an address nothing can reach"
+        );
+        assert!(
+            rec.lock().expect("recorder").closed_ports.is_empty(),
+            "nor may the hole in front of it be closed"
+        );
+        assert_eq!(ctx.db().fw_rules().await.unwrap().len(), 1);
+
+        // And the operator is told what was not proven, in what the probe saw,
+        // and why the evidence that did arrive is not about port 443.
+        let log = log_text(&rec);
+        assert!(log.contains("nothing confirmed"), "{log}");
+        assert!(log.contains("connection refused"), "{log}");
+        assert!(log.contains("port 80"), "{log}");
+        assert!(log.contains("panel.listen = \"127.0.0.1:8088\""), "{log}");
+        assert!(log.contains("systemctl restart unihelm-web"), "{log}");
+    }
+
+    /// What "answering" has to mean, and why a TCP connect is not it.
+    ///
+    /// Apache's catch-all holds `*:443` on a machine whose nginx is installed
+    /// and stopped: a connect succeeds there and serves an empty 403, which is
+    /// the shape this probe exists to tell apart from a working panel.
+    #[tokio::test]
+    async fn a_socket_that_accepts_and_serves_nothing_is_not_a_working_vhost() {
+        let domain = panel_domain();
+
+        // Nothing listening at all: the plainest failure, and the one a host
+        // with 443 shut produces.
+        let closed = {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            addr
+        };
+        match vhost_proof(&domain, closed).await {
+            VhostProof::Unproven(why) => {
+                assert!(why.contains("panel.example.com/healthz"), "{why}");
+                assert!(why.contains(&closed.to_string()), "{why}");
+            }
+            VhostProof::Answering => panic!("nothing is listening on {closed}"),
+        }
+
+        // Something answers the connection and is not a TLS server serving this
+        // panel. A probe that stopped at `TcpStream::connect` would call this
+        // proof and narrow the listener onto it.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepting = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        assert!(
+            matches!(vhost_proof(&domain, addr).await, VhostProof::Unproven(_)),
+            "a socket that hangs up is not a vhost serving the panel"
+        );
+        accepting.abort();
+    }
+
+    /// The seam the firewall's two panel decisions hang on, exercised the way
+    /// they exercise it: through the public function, against a config file.
+    #[test]
+    fn the_reachable_port_follows_the_configuration_the_panel_actually_reads() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let wide = config_with_listen(dir.path(), "0.0.0.0:8088");
+        {
+            let _at = testing::panel_config_at(&wide);
+            assert_eq!(panel_listen_port(), 8088);
+            assert_eq!(panel_port_reachable_from_network(), Some(8088));
+        }
+
+        let narrowed = dir.path().join("narrowed");
+        std::fs::create_dir_all(&narrowed).unwrap();
+        let narrowed = config_with_listen(&narrowed, "127.0.0.1:8088");
+        let _at = testing::panel_config_at(&narrowed);
+        // Still bound to 8088, and no longer reachable on it. Both firewall
+        // decisions ask the second question now.
+        assert_eq!(panel_listen_port(), 8088);
+        assert_eq!(panel_port_reachable_from_network(), None);
     }
 
     #[tokio::test]

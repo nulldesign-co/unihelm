@@ -285,7 +285,7 @@ fn csp_header() -> HeaderValue {
 /// request reached a server that does not answer for that authority — and a 404
 /// would tell an operator debugging a proxy that their *path* was wrong.
 ///
-/// # The gap this deliberately leaves
+/// # The gaps this deliberately leaves
 ///
 /// **Every IP-literal `Host` is accepted**, not only the addresses this process
 /// can see on itself. A fresh install is reached at `https://<address>:8088`
@@ -297,6 +297,22 @@ fn csp_header() -> HeaderValue {
 /// more likely failure than the header forgery this narrows. So an attacker can
 /// still forge an IP-shaped `Host`; they cannot forge a *domain*, which is what
 /// a poisoned cache key and a phishing link both need.
+///
+/// **Every `Host` is accepted until this panel has a name of its own**, which is
+/// 0.7's behaviour, kept for exactly as long as the allowlist would have nothing
+/// to say. The first cut of this shipped without that: it refused any DNS name
+/// that was not the recorded `panel.domain`, and the refusal is a JSON body on
+/// *every* path — the layer sits outside `ui::serve` too — so the login page
+/// itself became raw JSON. Two ordinary operators got that. One had pointed DNS
+/// at the box and browsed to it before running `unihelm cert panel`, which is
+/// the documented order. The other fronts the panel with their own TLS
+/// terminator under `tls = "off"` (a supported deployment; Caddy, Traefik and
+/// Cloudflare Tunnel all preserve the original `Host`) and so never records a
+/// domain at all — for them every page of the panel 421'd on upgrade, and the
+/// remedy the message names would have rendered a managed vhost they do not
+/// want. A panel with no domain of its own has no domain to poison a cache key
+/// or a reset link *for*, so there is nothing to defend yet; the moment
+/// `panel.domain` is recorded the allowlist takes effect in full.
 async fn host_is_served(
     axum::extract::State(state): axum::extract::State<state::SharedState>,
     request: axum::extract::Request,
@@ -333,8 +349,11 @@ async fn host_is_served(
             message: format!(
                 "this panel does not answer for `{claimed}`. It serves its own domain, any \
                  white-label login host, localhost, and this server's addresses — point the \
-                 client (or the proxy in front of it) at one of those, or set the panel's \
-                 domain with `unihelm cert panel <domain>`."
+                 client (or the proxy in front of it) at one of those. To have it answer for \
+                 this name as well, either give the panel the domain with `unihelm cert panel \
+                 <domain>`, which also gets it a certificate, or add the name on its own with \
+                 `unihelm branding set --login-host <host>`. Both run over the agent socket, \
+                 so they work from a shell while this is refusing."
             ),
             field: Some("Host".into()),
             request_id: None,
@@ -380,7 +399,17 @@ async fn host_is_ours(state: &state::AppState, claimed: &str) -> bool {
         Ok(Some(domain)) if unihelm_db::branding::normalize_login_host(&domain) == host => {
             return true;
         }
-        Ok(_) => {}
+        Ok(Some(_)) => {}
+        // No domain of record: this panel has no name of its own to be
+        // impersonated for, and the name in front of us may well be the only
+        // one the operator has. See "the gaps this deliberately leaves" — a
+        // refusal here is a login page that renders as JSON, and the remedy it
+        // names is reachable only over ssh.
+        Ok(None) => {
+            tracing::debug!(host = %host,
+                "no panel domain is recorded, so this Host is served; `unihelm cert panel <domain>` starts refusing the others");
+            return true;
+        }
         Err(e) => {
             // Fail open, and say so. A database hiccup must not turn into "the
             // panel serves nothing": the header is not a credential, and the
@@ -549,8 +578,14 @@ mod tests {
 
     /// One request through the whole router, claiming `host`.
     async fn with_host(state: &state::SharedState, host: &str) -> StatusCode {
+        with_host_at(state, host, "/api/branding").await
+    }
+
+    /// The same, for a path that is not the API — the UI fallback is behind
+    /// this layer too, which is what makes a refusal a login page made of JSON.
+    async fn with_host_at(state: &state::SharedState, host: &str, path: &str) -> StatusCode {
         let request = Request::builder()
-            .uri("/api/branding")
+            .uri(path)
             .header(header::HOST, host)
             .body(Body::empty())
             .expect("a valid test request");
@@ -561,6 +596,15 @@ mod tests {
             .status()
     }
 
+    /// Give the panel a name of its own, which is what arms the allowlist.
+    async fn with_panel_domain(state: &state::SharedState, domain: &str) {
+        state
+            .db
+            .set_setting(unihelm_db::panel::DOMAIN_KEY, &domain.to_string())
+            .await
+            .expect("the setting stores");
+    }
+
     /// Issue 58: every `Host` was served. Only branding read the header, so
     /// nothing was directly exploitable yet — but a cache keyed on a forged
     /// host, or the first absolute URL built from it (a password-reset link is
@@ -569,6 +613,10 @@ mod tests {
     #[tokio::test]
     async fn a_host_this_panel_does_not_serve_is_refused_with_421() {
         let state = state().await;
+        // Once the panel has a domain: that is the name a forgery would be
+        // aimed at, and the point from which the allowlist has something to
+        // defend.
+        with_panel_domain(&state, "panel.example.com").await;
         let status = with_host(&state, "attacker.example").await;
         assert_eq!(
             status,
@@ -578,9 +626,42 @@ mod tests {
         );
     }
 
+    /// The regression this release shipped and then fixed: a DNS name the panel
+    /// has not been told about was refused on *every* path, the UI fallback
+    /// included, so the login page rendered as a JSON error. Two ordinary
+    /// operators are in that state — one who pointed DNS before running
+    /// `unihelm cert panel`, which is the documented order, and one fronting the
+    /// panel with their own terminator under `tls = "off"`, who never runs it at
+    /// all. A panel with no domain of its own has nothing to be impersonated
+    /// for, so until it has one it answers, exactly as 0.7 did.
+    #[tokio::test]
+    async fn a_dns_name_still_serves_the_panel_while_it_has_no_domain_of_its_own() {
+        let state = state().await;
+        for reached_by in ["box.example.com", "box.example.com:8088", "panel.acme.test"] {
+            assert_ne!(
+                with_host_at(&state, reached_by, "/").await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "`{reached_by}` must still render the login page"
+            );
+            assert_ne!(
+                with_host(&state, reached_by).await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "`{reached_by}` must still reach the API the page calls"
+            );
+        }
+
+        // And the moment the panel has a name, the allowlist means what it says.
+        with_panel_domain(&state, "panel.example.com").await;
+        assert_eq!(
+            with_host_at(&state, "box.example.com", "/").await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn the_refusal_names_the_host_that_was_sent() {
         let state = state().await;
+        with_panel_domain(&state, "panel.example.com").await;
         let response = build_router(state.clone())
             .oneshot(
                 Request::builder()
@@ -611,6 +692,9 @@ mod tests {
     #[tokio::test]
     async fn an_address_host_always_works_because_that_is_how_a_new_server_is_reached() {
         let state = state().await;
+        // With a domain recorded, so this is the address rule doing the work
+        // and not the "no name of its own yet" one.
+        with_panel_domain(&state, "panel.example.com").await;
         for reachable in [
             "127.0.0.1:8088",
             "localhost:8088",
@@ -634,6 +718,9 @@ mod tests {
     #[tokio::test]
     async fn the_panel_domain_and_a_branding_login_host_are_both_served() {
         let state = state().await;
+        // An unrelated name, refused only because this panel already answers
+        // for one of its own — before that it would be served, and must be.
+        with_panel_domain(&state, "first.example.com").await;
         assert_eq!(
             with_host(&state, "panel.example.com").await,
             StatusCode::MISDIRECTED_REQUEST

@@ -1514,6 +1514,16 @@ async fn install_component(
     // 3. Anything the component needs before it can usefully start.
     match component.entry.slug {
         "nginx" => bootstrap_nginx(ctx).await?,
+        // Apache had no arm here at all, and the packages alone are not a web
+        // server this panel can serve with: the include that makes Apache read
+        // `/etc/apache2/unihelm.d` was written by `webserver.switch` and by
+        // nothing else. So `stack install apache` on a machine with no nginx —
+        // the state a fresh install with no panel domain is in — enabled and
+        // started Apache, wrote no include and no default vhost, and every
+        // site created afterwards passed `apachectl configtest` (which never
+        // saw the file), reloaded cleanly and was reported live while Apache
+        // answered with the distribution's default page.
+        "apache" => bootstrap_apache(ctx).await?,
         // A database the panel installed is a database the panel is answerable
         // for.
         "mariadb" => {
@@ -1685,15 +1695,15 @@ pub async fn write_catchall_for(
 /// a name anyone else serves. `.invalid` is reserved for exactly this.
 const CATCHALL_NAME: &str = "unihelm-catchall.invalid";
 
-/// Everything nginx needs before it is worth starting.
+/// The parts of a web server's bootstrap that have nothing to do with which one
+/// it is.
 ///
-/// The include hook, a default server, and a certificate for it — an nginx with
-/// no `default_server` serves whichever vhost it parsed first to a request for
-/// an unknown host, which is how one customer's site answers for another's
-/// domain.
-pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
-    let engine = ctx.config();
-
+/// Split out when Apache grew a bootstrap of its own, rather than copied into
+/// it: every line here is a *worker* reaching a file — the ACME challenge, the
+/// maintenance page, the log directory — and a second copy is how one of the
+/// two web servers ends up with a 404 on every challenge that nobody notices
+/// until a certificate fails to renew.
+fn prepare_the_tree_a_web_server_reads(ctx: &OpContext) -> Result<()> {
     // A self-signed certificate for the catch-all. It is not meant to be
     // trusted; it exists so TLS on the default server is *something*.
     let default_certs = paths::default_cert_dir();
@@ -1702,14 +1712,15 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
         ctx.log("generated a self-signed certificate for the default server");
     }
 
-    // The ACME webroot has to exist before the first challenge, and nginx's
-    // *workers* have to be able to reach it at request time.
+    // The ACME webroot has to exist before the first challenge, and the web
+    // server's *workers* have to be able to reach it at request time.
     //
     // This is not the same as reading a certificate: nginx opens those as root
     // during a reload, before dropping privileges. A challenge file is fetched
-    // by a worker running as `nginx`, and `/var/lib/unihelm` is 0750 unihelm:unihelm
-    // — so without this the CA gets a 404 and nginx logs
-    // `stat() failed (13: Permission denied)` where nobody looks.
+    // by a worker running as `nginx` (or `www-data` under Apache), and
+    // `/var/lib/unihelm` is 0750 unihelm:unihelm — so without this the CA gets a
+    // 404 and nginx logs `stat() failed (13: Permission denied)` where nobody
+    // looks.
     //
     // `o+x` grants traversal, not listing. `panel.db` (0640) and private keys
     // (0600) stay unreadable to everyone else either way.
@@ -1728,6 +1739,57 @@ pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
 
     std::fs::create_dir_all(paths::site_log_root())
         .map_err(|e| UnihelmError::internal(format!("could not create the log directory: {e}")))?;
+    Ok(())
+}
+
+/// Everything Apache needs before it is worth starting.
+///
+/// **This arm did not exist**, and its absence is the release blocker. The
+/// panel's Apache footprint is one include — `/etc/apache2/conf-enabled/unihelm.conf`,
+/// the single `IncludeOptional` that makes `/etc/apache2/unihelm.d` a directory
+/// Apache parses — and it was written only at the end of a successful
+/// `webserver.switch`. An operator who installed Apache from the Stack page on
+/// a machine with no nginx had nothing to switch *from*, so the include was
+/// never written: Apache started, the panel rendered vhosts into a directory
+/// nothing includes, `apachectl configtest` passed over a configuration that
+/// did not contain them, and every site came back Active while Apache served
+/// the distribution's default page.
+///
+/// The modules and the group membership are here for the same reason they are
+/// in the switch and not as a refinement: without `proxy_fcgi` a PHP site is a
+/// 500, and without `www-data` in the web group every site directory (0710) and
+/// every FPM socket (0660) is unreachable — 403 for static files, 503 for PHP,
+/// over a configuration that is otherwise perfect.
+async fn bootstrap_apache(ctx: &OpContext) -> Result<()> {
+    prepare_the_tree_a_web_server_reads(ctx)?;
+
+    // Before anything is written, as in the switch: a machine that cannot serve
+    // with Apache should find that out from a refusal, not from a tree of files
+    // it half wrote.
+    crate::webserver::ensure_apache_modules(ctx).await?;
+    crate::webserver::admit_to_the_web_group(ctx, crate::webserver::WebServer::Apache).await?;
+
+    // The include, then the default vhost — the same two files and the same
+    // order the switch writes them in, through the same functions, so the two
+    // roads to a serving Apache cannot disagree about what one looks like.
+    crate::webserver::write_hook(ctx, crate::webserver::WebServer::Apache).await?;
+    write_catchall_for(ctx, crate::webserver::WebServer::Apache).await?;
+    ctx.log("default server configured");
+
+    open_web_ports(ctx).await;
+    Ok(())
+}
+
+/// Everything nginx needs before it is worth starting.
+///
+/// The include hook, a default server, and a certificate for it — an nginx with
+/// no `default_server` serves whichever vhost it parsed first to a request for
+/// an unknown host, which is how one customer's site answers for another's
+/// domain.
+pub async fn bootstrap_nginx(ctx: &OpContext) -> Result<()> {
+    let engine = ctx.config();
+
+    prepare_the_tree_a_web_server_reads(ctx)?;
 
     // The include hook. Written with no validator: nginx may not be running yet,
     // and `nginx -t` on a tree that does not include this file cannot test it.
@@ -2057,14 +2119,35 @@ impl TypedOperation for Remove {
         let serving = crate::webserver::active(ctx).await?;
         if component.entry.slug == serving.as_str() {
             let site_count = db.all_sites().await.map_err(UnihelmError::from)?.len();
-            if site_count > 0 {
+            // The panel counts as a dependent here for the same reason it does
+            // in the stop guard, and it is worse on this path: a removal takes
+            // the packages as well, so an operator locked out of a stopped
+            // nginx can at least start it from the console, while one who
+            // removed it has to install a web server over ssh before the panel
+            // answers again.
+            let panel = the_panel_behind_this_web_server(ctx).await?;
+            if site_count > 0 || panel.is_some() {
                 return Err(UnihelmError::new(
                     ErrorCode::DependentsExist,
                     format!(
-                        "{site_count} sites are still configured; removing {} would take \
-                         them all offline. It is what serves this machine — switch to \
-                         another web server first, and this becomes a safe removal.",
-                        serving.display_name()
+                        "{} is what serves this machine{}{}. Switch to another web server \
+                         first — that moves everything behind it across — and this becomes \
+                         a safe removal.",
+                        serving.display_name(),
+                        match &panel {
+                            // A removal takes the packages too, so even the
+                            // half-reachable case is worse here than it is for
+                            // a stop: nothing is left to start again.
+                            Some(route) => format!(", and {}", route.what_removal_costs()),
+                            None => String::new(),
+                        },
+                        match site_count {
+                            0 => String::new(),
+                            n => format!(
+                                "; {n} sites are still configured and removing it takes \
+                                 them all offline"
+                            ),
+                        },
                     ),
                 ));
             }
@@ -2185,6 +2268,22 @@ async fn refuse_to_remove_a_version_that_is_not_the_one_here(
 pub struct ServiceInput {
     #[serde(flatten)]
     pub component: StackComponent,
+    /// The component's own catalogue slug, said back by whoever is asking, for
+    /// a stop that takes something else down with it.
+    ///
+    /// Ignored by `stack.start`, which takes nothing down, and unnecessary for
+    /// a stop with nothing behind it — the refusal that asks for it names the
+    /// string, so it is never a guess. `user.delete` and `db.drop` take the
+    /// same kind of confirmation for the same reason: a click is not a decision
+    /// when what it costs is not on the button.
+    ///
+    /// The slug rather than the unit name, so that every client already holds
+    /// it: a page that had to derive `docker.service` in order to confirm
+    /// stopping Docker would be keeping a second copy of the slug-to-unit table
+    /// this file owns, and that table drifting is how a control acts on the
+    /// wrong unit.
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2201,8 +2300,14 @@ pub struct ServiceOutput {
 /// `stack.start` — start the service a catalogue entry installed.
 pub struct Start;
 
-/// `stack.stop` — stop it, unless stopping it takes this machine's sites off
-/// the internet.
+/// `stack.stop` — stop it, unless stopping it takes something else down.
+///
+/// Two guards and they answer differently on purpose. The web server that is
+/// serving is a flat refusal: there is a way through that leaves the machine
+/// serving, so the panel takes it rather than asking. Everything else is a
+/// refusal that names what goes with it and can be confirmed, because there is
+/// no other way to stop Docker and a control panel with something it cannot
+/// stop is what this pair was added to fix.
 pub struct Stop;
 
 #[async_trait]
@@ -2236,6 +2341,14 @@ impl TypedOperation for Stop {
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         refuse_to_stop_what_is_serving(ctx, input.component).await?;
+        // The web server was the only stop this operation knew the cost of, and
+        // four of the six controllable slugs went straight through. Docker is
+        // the widest: on a default install every database and cache is a
+        // container, so one unconfirmed click on the Stop beside Docker takes
+        // the lot down while nginx and PHP-FPM keep serving database-connection
+        // errors.
+        refuse_to_stop_what_others_are_riding_on(ctx, input.component, input.confirm.as_deref())
+            .await?;
         act_on_the_service(ctx, input.component, SvcAction::Stop).await
     }
 }
@@ -2282,7 +2395,8 @@ async fn act_on_the_service(
     })
 }
 
-/// Refuse to stop the web server this machine serves with while sites are up.
+/// Refuse to stop the web server this machine serves with while anything is
+/// riding on it — its sites, or the panel itself.
 ///
 /// There was no way to stop a web server from the panel at all until this pair
 /// existed, which is how a machine that came up serving with Apache had nothing
@@ -2291,13 +2405,18 @@ async fn act_on_the_service(
 /// on the server going dark, and "taking a machine offline" is not a thing a
 /// panel should do without saying so first.
 ///
-/// Judged on the same two facts `stack.remove` uses — which server actually
-/// serves (never nginx by name; a machine switched to Apache had that guard
-/// pointing at the wrong one for a release) and how many sites are still up. A
-/// site that is suspended or failed is already not being served, so it is not a
-/// reason to refuse: "every site is already down" is the state in which stopping
-/// costs nothing, and it has to stay reachable or the incumbent could never be
-/// stopped at all.
+/// Judged on which server actually serves (never nginx by name; a machine
+/// switched to Apache had that guard pointing at the wrong one for a release)
+/// and on what is behind it. A site that is suspended or failed is already not
+/// being served, so it is not a reason to refuse: "every site is already down"
+/// is the state in which stopping costs nothing, and it has to stay reachable or
+/// the incumbent could never be stopped at all.
+///
+/// **The panel is behind it too**, and it was not counted. That is new in this
+/// release rather than an oversight from an old one — `panel.tls.issue` narrows
+/// `panel.listen` to loopback once its own vhost is serving — but the guard was
+/// written to prevent exactly this class of damage and did not see the one
+/// dependent whose loss cannot be undone from the panel.
 async fn refuse_to_stop_what_is_serving(ctx: &OpContext, component: StackComponent) -> Result<()> {
     let Some(server) = crate::webserver::WebServer::from_slug(component.entry.slug) else {
         return Ok(());
@@ -2315,22 +2434,368 @@ async fn refuse_to_stop_what_is_serving(ctx: &OpContext, component: StackCompone
         .filter(|s| s.status == unihelm_db::SiteStatus::Active)
         .map(|s| s.domain)
         .collect();
-    if live.is_empty() {
+    let panel = the_panel_behind_this_web_server(ctx).await?;
+
+    if live.is_empty() && panel.is_none() {
+        return Ok(());
+    }
+
+    // The panel's own vhost, which this guard did not look at and which this
+    // release is the one that made load-bearing. `panel.tls.issue` now narrows
+    // `panel.listen` to loopback once the vhost is live and closes the direct
+    // port behind it, so from then on `01-panel.conf` in *this* web server's
+    // tree is the only way in. On the recommended first move — point a domain
+    // at the box and issue the panel certificate before creating any sites —
+    // `live` is empty, and this used to return `Ok(())`: one click stopped
+    // nginx and left the operator with no panel and no route back but the
+    // console. The old sentence made it worse by telling them to suspend their
+    // sites first, which is the state that reaches the lockout fastest.
+    let mut because = Vec::new();
+    if let Some(route) = &panel {
+        because.push(route.what_stopping_costs());
+    }
+    if !live.is_empty() {
+        because.push(format!(
+            "{} sites are still up on it: {}",
+            live.len(),
+            live.join(", ")
+        ));
+    }
+
+    // The way through, and only the ones that are actually open. The old
+    // sentence offered "suspend those sites" unconditionally, which on a
+    // machine whose panel is behind this vhost is an instruction that walks the
+    // operator into the lockout: every site can be suspended and the panel is
+    // still gone.
+    let way_through = match (&panel, live.is_empty()) {
+        (Some(_), _) => "Switch to another web server first — that moves the panel's vhost \
+                         across with the sites, and this becomes a stop with nothing \
+                         behind it."
+            .to_string(),
+        (None, false) => "Switch to another web server first, or suspend those sites, and \
+                          this becomes a stop with nothing behind it."
+            .to_string(),
+        // Unreachable: with no panel and no live site the guard returned above.
+        (None, true) => String::new(),
+    };
+
+    Err(UnihelmError::new(
+        ErrorCode::DependentsExist,
+        format!(
+            "{} is what serves this machine, and {}. {way_through}{}",
+            server.display_name(),
+            because.join("; and "),
+            match &panel {
+                // Named only where it is not a lockout. `svc.action` stops the
+                // same unit without this guard, and pointing an operator at it
+                // while the vhost is their only way in would be handing them
+                // the rope — which is what the old sentence did by suggesting
+                // they suspend their sites.
+                Some(PanelRoute::AndADirectPort { port, .. }) => format!(
+                    " If losing the panel's own name is acceptable, `svc.action` stops the \
+                     same unit without this guard and the panel keeps answering on port \
+                     {port}."
+                ),
+                _ => String::new(),
+            },
+        ),
+    ))
+}
+
+/// How the panel is reached, when it is reached through this web server at all.
+///
+/// Two facts and not one, because the cost of the stop is different. Once
+/// `panel.rs`'s `narrow_listener_to_loopback` has run — which is what
+/// `panel.tls.issue` does on success — the vhost is the whole route in and
+/// stopping the web server is a lockout. Before that, `panel.listen` is still a
+/// network address and the panel keeps answering there: the operator loses the
+/// name they use and nothing else, which is worth refusing over and not worth
+/// refusing *silently*, so that case names the way through instead.
+///
+/// The reachability question is asked through the same function the firewall
+/// rules use, so a stop and a `fw.port.close` cannot disagree about whether
+/// there is another way in.
+enum PanelRoute {
+    /// The vhost, and nothing else.
+    OnlyTheVhost { domain: String },
+    /// The vhost, plus a `panel.listen` the network can still dial.
+    AndADirectPort { domain: String, port: u16 },
+}
+
+impl PanelRoute {
+    fn what_stopping_costs(&self) -> String {
+        match self {
+            PanelRoute::OnlyTheVhost { domain } => format!(
+                "this panel is served through it at {domain} and `panel.listen` is on \
+                 loopback, so stopping it leaves no way back in except the console"
+            ),
+            PanelRoute::AndADirectPort { domain, port } => format!(
+                "this panel is served through it at {domain}, so stopping it takes the \
+                 panel off its own address (it would still answer on port {port})"
+            ),
+        }
+    }
+
+    fn what_removal_costs(&self) -> String {
+        match self {
+            PanelRoute::OnlyTheVhost { domain } => format!(
+                "this panel is served through it at {domain} with `panel.listen` on \
+                 loopback, so removing it leaves no way back in except the console — and \
+                 nothing left to start again once you are there"
+            ),
+            PanelRoute::AndADirectPort { domain, port } => format!(
+                "this panel is served through it at {domain}, so removing it takes the \
+                 panel off its own address for good (it would still answer on port {port})"
+            ),
+        }
+    }
+}
+
+async fn the_panel_behind_this_web_server(ctx: &OpContext) -> Result<Option<PanelRoute>> {
+    let domain: Option<unihelm_core::Domain> = ctx
+        .db()
+        .get_setting(unihelm_db::panel::DOMAIN_KEY)
+        .await
+        .map_err(UnihelmError::from)?;
+    let Some(domain) = domain else {
+        return Ok(None);
+    };
+    let domain = domain.as_str().to_string();
+    Ok(Some(
+        match crate::panel::panel_port_reachable_from_network() {
+            Some(port) => PanelRoute::AndADirectPort { domain, port },
+            None => PanelRoute::OnlyTheVhost { domain },
+        },
+    ))
+}
+
+/// Refuse a stop that takes something else down, and say what.
+///
+/// The gap this closes: `stack.stop` ran one check, and it looked only at the
+/// web server. Four of the six controllable slugs — php, mariadb, redis,
+/// docker — went straight through to `svc.action` with no guard, no
+/// confirmation and no count, while `stack.remove` on the *same* components
+/// refuses and names the dependents. Docker is the widest of them: on a default
+/// install `mariadb`, `postgres` and `redis` are `Install::Either { default:
+/// Container }`, so the engines are containers and one click on the Stop beside
+/// the Docker row takes every database on the machine down at once — with nginx
+/// and PHP-FPM still up, so every site serves connection errors rather than
+/// going cleanly offline.
+///
+/// Confirmable rather than flatly refused, and that is the difference from
+/// [`refuse_to_stop_what_is_serving`]. Stopping the web server has a way
+/// through that leaves the machine serving (switch, or suspend); stopping
+/// Docker to work on it does not, and a refusal with no way through would put
+/// back the thing this control was added to fix — a machine with something the
+/// panel cannot stop. So the operator is told exactly what goes with it and
+/// asked to say the component's name back.
+///
+/// The catalogue slug rather than the unit, because that is the string the
+/// caller already sent and can check by eye: an operator reading
+/// `docker.service` in a refusal cannot tell whether it is the row they pressed,
+/// and a client that had to derive a unit name to confirm a stop would be
+/// keeping a second copy of the slug-to-unit table this file owns. The unit is
+/// still named in the sentence — it is what systemd is told about — but it is
+/// not what has to be typed.
+async fn refuse_to_stop_what_others_are_riding_on(
+    ctx: &OpContext,
+    component: StackComponent,
+    confirm: Option<&str>,
+) -> Result<()> {
+    let unit = component
+        .managed_unit()?
+        .unit_name(ctx.distro().info.family);
+    let riders = what_is_riding_on(ctx, component).await?;
+    if riders.is_empty() {
+        return Ok(());
+    }
+
+    if confirm.map(str::trim) == Some(component.entry.slug) {
         return Ok(());
     }
 
     Err(UnihelmError::new(
         ErrorCode::DependentsExist,
         format!(
-            "{} is what serves this machine, and {} sites are still up on it: {}. \
-             Stopping it now takes every one of them offline. Switch to another web \
-             server first, or suspend those sites, and this becomes a stop with \
-             nothing behind it.",
-            server.display_name(),
-            live.len(),
-            live.join(", ")
+            "stopping {} ({unit}) stops {}:\n\n{}\n\nNothing is deleted and the Start \
+             beside it brings them back, but they go down now and stay down until it \
+             does. Confirm with `{slug}` to go ahead.",
+            component.display_name(),
+            a_list_of(&riders.iter().map(|r| r.what.clone()).collect::<Vec<_>>()),
+            riders
+                .iter()
+                .map(|r| format!("  - {}", r.detail))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            unit = unit.as_str(),
+            slug = component.entry.slug,
         ),
-    ))
+    )
+    .with_field("confirm"))
+}
+
+/// One kind of thing that goes down with a unit.
+struct Rider {
+    /// Counted and named for the summary line: "3 databases".
+    what: String,
+    /// The sentence under it, which names them.
+    detail: String,
+}
+
+/// What the panel's own records say depends on this unit.
+///
+/// **Records, never a probe.** `docker ps` would answer more completely and
+/// would also make this refusal disagree with itself on a machine whose daemon
+/// is slow: a stop that is refused or allowed depending on whether a shell-out
+/// timed out is worse than one that is consistently narrow. So every count here
+/// is a row this panel wrote, and the refusal says as much.
+async fn what_is_riding_on(ctx: &OpContext, component: StackComponent) -> Result<Vec<Rider>> {
+    let db = ctx.db();
+    let mut found = Vec::new();
+
+    match component.entry.slug {
+        "docker" => {
+            // Every containerised engine on the machine. `engine::registry` is
+            // the panel's own record that it built these containers and holds
+            // their credentials, so this is exact — and on a default install it
+            // is every database and cache the machine has.
+            let registry = crate::engine::registry(db).await?;
+            let mut engines: Vec<String> = registry.values().map(|r| r.container.clone()).collect();
+            engines.sort();
+            if !engines.is_empty() {
+                found.push(Rider {
+                    what: format!(
+                        "{} containerised {}",
+                        engines.len(),
+                        plural(engines.len(), "engine", "engines")
+                    ),
+                    detail: format!(
+                        "{}: every database and cache in them stops accepting connections, \
+                         so sites that use them serve connection errors rather than going \
+                         offline",
+                        engines.join(", ")
+                    ),
+                });
+            }
+
+            let mut apps: Vec<String> = db
+                .node_apps(&unihelm_core::TenantScope::Global)
+                .list(APP_SCAN_LIMIT, 0)
+                .await
+                .map_err(UnihelmError::from)?
+                .into_iter()
+                .filter(|a| a.mode == unihelm_db::node_apps::AppMode::Container)
+                .map(|a| a.name)
+                .collect();
+            apps.sort();
+            if !apps.is_empty() {
+                found.push(Rider {
+                    what: format!(
+                        "{} containerised {}",
+                        apps.len(),
+                        plural(apps.len(), "application", "applications")
+                    ),
+                    detail: format!(
+                        "{}: each one is a container, so the site in front of it starts \
+                         answering 502",
+                        apps.join(", ")
+                    ),
+                });
+            }
+        }
+        // The same list `stack.remove` refuses on, for the same reason: a stop
+        // and a removal cost these sites the same thing. `remove` will not do
+        // it at all; `stop` is reversible by the button beside it, so it asks.
+        "php" => {
+            let version = component.php_version()?;
+            let mut sites: Vec<String> = db
+                .all_sites()
+                .await
+                .map_err(UnihelmError::from)?
+                .into_iter()
+                .filter(|s| {
+                    s.php_version == Some(version) && s.status == unihelm_db::SiteStatus::Active
+                })
+                .map(|s| s.domain)
+                .collect();
+            sites.sort();
+            if !sites.is_empty() {
+                found.push(Rider {
+                    what: format!("{} {}", sites.len(), plural(sites.len(), "site", "sites")),
+                    detail: format!(
+                        "{}: every PHP request on them answers 502 until the pool is \
+                         running again",
+                        sites.join(", ")
+                    ),
+                });
+            }
+        }
+        // Only where the answer is not a guess. `dbs` rows record the engine
+        // family (`mysql`) and not *which* server holds them, so on a machine
+        // running both a host MariaDB and a containerised one the panel cannot
+        // say which of the two a database lives in — and a refusal that names
+        // databases the stop would not touch is the panel stating something it
+        // has not checked. Where there is no containerised MySQL-family engine,
+        // the host install is the only place they can be.
+        "mariadb" => {
+            let containerised = crate::engine::registry(db)
+                .await?
+                .values()
+                .any(|r| matches!(r.slug.as_str(), "mariadb" | "mysql"));
+            if !containerised {
+                let count = db
+                    .databases(&unihelm_core::TenantScope::Global)
+                    .list(APP_SCAN_LIMIT, 0)
+                    .await
+                    .map_err(UnihelmError::from)?
+                    .into_iter()
+                    .filter(|d| d.engine == unihelm_db::DbEngine::Mysql)
+                    .count();
+                if count > 0 {
+                    found.push(Rider {
+                        what: format!(
+                            "{count} {}",
+                            plural(count, "MySQL database", "MySQL databases")
+                        ),
+                        detail: format!(
+                            "{count} {} on this server, and every site and application \
+                             that connects to one starts failing at the connection",
+                            plural(count, "database is recorded", "databases are recorded")
+                        ),
+                    });
+                }
+            }
+        }
+        // Redis and the web servers are deliberately absent. Nothing in the
+        // panel's records says which sites use a cache, so a count here would
+        // be invented; the web servers have their own guard above, which is a
+        // refusal rather than a question.
+        _ => {}
+    }
+
+    Ok(found)
+}
+
+/// How many rows a dependent scan reads before it stops counting.
+///
+/// The repositories cap a page at 500 of their own accord. A machine with more
+/// applications than this has a refusal that under-counts rather than one that
+/// pages through the whole table to build a sentence — and under-counting still
+/// refuses, which is the part that matters.
+const APP_SCAN_LIMIT: i64 = 500;
+
+fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 { one } else { many }
+}
+
+/// "3 databases, 2 applications and 1 cache" — the summary an operator reads
+/// before they read the list.
+fn a_list_of(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Add the execute bit for "other" so a service running as another account can
@@ -3982,6 +4447,274 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn installing_apache_never_reports_a_web_server_that_reads_none_of_the_panels_tree() {
+        // There was no `"apache"` arm in the bootstrap match at all, so the
+        // install put the packages on, started the unit and stopped — leaving
+        // Apache with no `IncludeOptional` for /etc/apache2/unihelm.d and no
+        // default vhost. Every site created afterwards rendered into a directory
+        // nothing parses, passed `apachectl configtest` because it was never
+        // parsed, reloaded cleanly and was reported live while Apache answered
+        // with the distribution's default page.
+        //
+        // The invariant, not the mechanism: this install either leaves the
+        // include in place or fails saying why. A machine with no writable
+        // /etc/apache2 — which is every machine these tests run on — gets the
+        // second, and that is the honest half of the same rule.
+        let (ctx, _, _) = op_ctx(Family::Debian).await;
+        let hook = crate::webserver::WebServer::Apache.hook().unwrap();
+        let before = hook.path().exists();
+
+        match Install
+            .run(
+                &ctx,
+                InstallInput {
+                    component: c("apache"),
+                    extensions: Vec::new(),
+                    runtime: None,
+                },
+            )
+            .await
+        {
+            Ok(out) => assert!(
+                hook.path().exists(),
+                "reported {out:?} over an Apache with no include for the panel's tree"
+            ),
+            Err(e) => assert!(
+                !before || hook.path().exists(),
+                "the install failed and took the include with it: {}",
+                e.detail
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_the_web_server_the_panel_is_served_through_is_refused() {
+        // The lockout this release created and this guard did not see. On the
+        // recommended first move — point a domain at the box, issue the panel
+        // certificate, create sites afterwards — `panel.tls.issue` writes
+        // `panel.domain`, renders `01-panel.conf` into the web server's tree and
+        // narrows `panel.listen` to loopback. With no sites yet, the guard's
+        // only question ("are any sites up?") answered no and one click on Stop
+        // took the panel off the air with no route back but the console.
+        let (reg, admin, _) = registry().await;
+        reg.services()
+            .db
+            .set_setting(
+                unihelm_db::panel::DOMAIN_KEY,
+                &unihelm_core::Domain::parse("panel.example.com").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let err = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "nginx" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+        assert!(
+            err.detail.contains("panel.example.com"),
+            "the refusal has to name what is behind it: {}",
+            err.detail
+        );
+        // And it must not repeat the old instruction, which walked the operator
+        // into the lockout: suspending every site does not move the panel.
+        assert!(
+            !err.detail.contains("suspend those sites"),
+            "{}",
+            err.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_web_server_the_panel_is_served_through_is_refused() {
+        // The same hole with the packages taken as well, so there is nothing
+        // left to start again from the console.
+        let (reg, admin, _) = registry().await;
+        reg.services()
+            .db
+            .set_setting(
+                unihelm_db::panel::DOMAIN_KEY,
+                &unihelm_core::Domain::parse("panel.example.com").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let err = Remove
+            .run(
+                &crate::registry::OpContext::new(
+                    reg.services().clone(),
+                    auth_for(admin, Role::Admin),
+                ),
+                RemoveInput {
+                    component: c("nginx"),
+                    runtime: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+        assert!(err.detail.contains("panel.example.com"), "{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn stopping_docker_names_every_database_it_takes_with_it() {
+        // The widest unguarded stop on the page. `refuse_to_stop_what_is_serving`
+        // returns `Ok(())` for anything that is not a web-server slug, so Stop
+        // beside Docker went straight to `docker.service` — and on a default
+        // install every engine is `Install::Either { default: Container }`, so
+        // that is every database and cache on the machine, with nginx and
+        // PHP-FPM still up serving connection errors.
+        let (reg, admin, _) = registry().await;
+        let db = reg.services().db.clone();
+        seed_containerised_engines(&db, &["unihelm-mariadb-11.8", "unihelm-redis-7"]).await;
+
+        let err = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "docker" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+        // Counted and named. "Are you sure?" is a question an operator cannot
+        // answer; "2 containerised engines: unihelm-mariadb-11.8, unihelm-redis-7"
+        // is one they can.
+        assert!(err.detail.contains('2'), "{}", err.detail);
+        assert!(
+            err.detail.contains("unihelm-mariadb-11.8"),
+            "{}",
+            err.detail
+        );
+        assert!(err.detail.contains("unihelm-redis-7"), "{}", err.detail);
+        assert_eq!(err.field.as_deref(), Some("confirm"));
+
+        // And it is a question, not a wall: there is no other way to stop
+        // Docker, so a refusal with no way through would put back the thing
+        // this control was added to fix.
+        let out = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "docker", "confirm": "docker" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["unit"], "docker.service");
+        assert_eq!(out["unit_active"], false);
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_for_another_component_does_not_stop_this_one() {
+        // The confirmation names the component, so it cannot be satisfied by a
+        // click that was meant for a different row.
+        let (reg, admin, _) = registry().await;
+        seed_containerised_engines(&reg.services().db.clone(), &["unihelm-mariadb-11.8"]).await;
+
+        let err = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "docker", "confirm": "nginx" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+    }
+
+    #[tokio::test]
+    async fn stopping_docker_on_a_machine_running_nothing_asks_nothing() {
+        // The refusal is made of the panel's own records, so a machine with no
+        // containers has nothing to be asked about. A confirmation demanded
+        // where there is no cost is one an operator learns to click through.
+        let (reg, admin, _) = registry().await;
+        reg.dispatch(
+            "stack.stop",
+            &auth_for(admin, Role::Admin),
+            serde_json::json!({ "component": "docker" }),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_a_php_pool_names_the_sites_that_go_to_502() {
+        // `stack.remove php 8.3` refuses and names these sites; `stack.stop` on
+        // the identical component refused nothing, with the identical
+        // user-visible impact.
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        seed_active_php_site(db, customer, "shop.example.com").await;
+
+        let err = reg
+            .dispatch(
+                "stack.stop",
+                &auth_for(admin, Role::Admin),
+                serde_json::json!({ "component": "php", "version": "8.3" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::DependentsExist);
+        assert!(err.detail.contains("shop.example.com"), "{}", err.detail);
+        assert!(err.detail.contains("php8.3-fpm.service"), "{}", err.detail);
+    }
+
+    /// One active site on PHP 8.3, which is what a pool stop costs.
+    async fn seed_active_php_site(db: Db, owner: UserId, domain: &str) {
+        let sub = db.create_subscription(owner).await.unwrap();
+        let site = db
+            .create_site(unihelm_db::NewSite {
+                subscription_id: sub.id,
+                domain: unihelm_core::Domain::parse(domain).unwrap(),
+                site_type: unihelm_db::SiteType::Php,
+                php_version: Some(unihelm_core::PhpVersion::V83),
+                root_dir: format!("/home/{}/sites/{domain}/public", sub.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+        db.set_site_status(site.id, unihelm_db::SiteStatus::Active)
+            .await
+            .unwrap();
+    }
+
+    /// Engine records as `engine.install` writes them, so the stop guard reads
+    /// the same registry the Stack page builds its container rows from.
+    async fn seed_containerised_engines(db: &Db, containers: &[&str]) {
+        let mut registry = crate::engine::EngineRegistry::new();
+        for container in containers {
+            registry.insert(
+                (*container).to_string(),
+                crate::engine::EngineRecord {
+                    slug: "mariadb".into(),
+                    version: "11.8".into(),
+                    image: "mariadb:11.8".into(),
+                    container: (*container).to_string(),
+                    volume: None,
+                    host_port: 3306,
+                    container_port: 3306,
+                    root_user: Some("root".into()),
+                    root_password_sealed: None,
+                },
+            );
+        }
+        db.set_setting(crate::engine::ENGINES_SETTING, &registry)
+            .await
+            .unwrap();
     }
 
     /// One active site under a fresh subscription, for the stop guard.

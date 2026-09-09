@@ -565,6 +565,15 @@ pub(crate) mod testing {
         };
         AuthContext::from_role(id, role, scope, "req-test")
     }
+
+    /// A caller whose role and scope disagree — an admin *impersonating* a
+    /// tenant, which is the one real way to hold a permission without holding
+    /// the machine. Tests of a scope guard need it: with [`auth_for`] alone a
+    /// caller that lacks the scope usually lacks the permission too, so the
+    /// permission check refuses first and the guard under test never runs.
+    pub fn auth_for_scope(id: UserId, role: Role, scope: TenantScope) -> AuthContext {
+        AuthContext::from_role(id, role, scope, "req-test")
+    }
 }
 
 #[cfg(test)]

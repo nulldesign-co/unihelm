@@ -7,13 +7,17 @@
 //! for. `docs/design/web-servers.md` sets out the order this is fixed in; this
 //! module is its first step and deliberately its dullest.
 //!
-//! **Nothing here changes behaviour.** [`active`] can only answer `Nginx`,
-//! because nothing writes the setting it reads. What moves is where the answer
-//! comes from: the two call sites in `site.rs` now ask this module for the
-//! template, the path, the validator and the reloader instead of naming nginx's
-//! literally. That seam is the part worth getting wrong on its own, with the
-//! whole test suite still describing a machine that runs nginx — rather than
-//! discovering it is in the wrong place while also writing an Apache template.
+//! That first step said "nothing here changes behaviour: [`active`] can only
+//! answer `Nginx`, because nothing writes the setting it reads". It no longer
+//! can — the switch writes the setting, and [`active`] probes the machine when
+//! there is no row — and the sentence is kept here because forgetting it is how
+//! the seam went wrong twice. What moved first was only where the answer comes
+//! from: the two call sites in `site.rs` ask this module for the template, the
+//! path, the validator and the reloader instead of naming nginx's literally.
+//! Everything that answers *which* server is a later, riskier layer on top, and
+//! two of its failures were release blockers — see [`active`] on what is worth
+//! recording, and `Switch::run` on why "already serving" is not "already set
+//! up".
 //!
 //! The three arms are spelled out rather than left as a `TODO`, and the two that
 //! are not built yet refuse with the release they land in. A panel that offers
@@ -528,6 +532,11 @@ async fn probe_active(ctx: &OpContext) -> Option<WebServer> {
 /// panel has ever been able to render a vhost for, so every existing server is
 /// on it, and reading a missing row as "unknown" would break every one of them
 /// at once.
+///
+/// **Only a measurement is written down.** The probe can answer "nothing is
+/// running", which is not the same as "nginx runs here", and recording the
+/// fallback as though it were an observation is how a single poll during a
+/// reboot pinned a machine to the wrong web server for good.
 pub async fn active(ctx: &OpContext) -> Result<WebServer> {
     match ctx.db().get_setting::<WebServer>(WEB_SERVER_SETTING).await {
         Ok(Some(server)) => Ok(server),
@@ -543,19 +552,37 @@ pub async fn active(ctx: &OpContext) -> Result<WebServer> {
         // reported success. On a machine that never had nginx the switch could
         // not even be used to correct it, because it begins by disabling the
         // incumbent — which was not there.
-        Ok(None) => {
-            let found = probe_active(ctx).await;
-            let answer = found.unwrap_or(WebServer::Nginx);
-            // Cached so the probe costs one systemctl call per machine rather
-            // than one per vhost render. A failure to write is not a failure to
-            // answer: the probe already told us the truth, and refusing to
-            // render a vhost because a cache write failed would be worse than
-            // paying for the probe again.
-            if let Err(e) = ctx.db().set_setting(WEB_SERVER_SETTING, &answer).await {
-                tracing::warn!(error = %e, "could not record the web server this machine runs");
+        Ok(None) => match probe_active(ctx).await {
+            // A measurement. Cached, so the probe costs one systemctl call per
+            // machine rather than one per vhost render. A failure to write is
+            // not a failure to answer: the probe told us the truth, and
+            // refusing to render a vhost because a cache write failed would be
+            // worse than paying for the probe again.
+            Some(found) => {
+                if let Err(e) = ctx.db().set_setting(WEB_SERVER_SETTING, &found).await {
+                    tracing::warn!(error = %e, "could not record the web server this machine runs");
+                }
+                Ok(found)
             }
-            Ok(answer)
-        }
+            // Nothing was running, so nothing was measured — and **this branch
+            // writes no row**. It used to: `probe_active().unwrap_or(Nginx)`
+            // was written back whether it was an answer or a fallback, which
+            // turned one poll taken while no web server happened to be up into
+            // a permanent record. The row is durable and only a successful
+            // switch ever rewrites it, so the probe never ran again. On the
+            // machine this probe was added for — Apache installed from the
+            // Stack page, nothing to switch from — the very first Stack page
+            // load happens *before* Apache is installed, cached nginx, and the
+            // panel then wrote nginx vhosts for an Apache box and reported
+            // every site live. The reboot and package-upgrade windows are the
+            // same defect reached by another road.
+            //
+            // Nginx is still the answer, for the reason in the doc comment
+            // above: every machine this panel has provisioned runs it, and
+            // reading "cannot tell" as an error would break all of them at
+            // once. It is a guess, so it is not written down as a fact.
+            None => Ok(WebServer::Nginx),
+        },
         // Deliberately an error and not a fall back to nginx. A row that exists
         // and cannot be read is a machine that may be serving with Apache, and
         // guessing nginx there would write vhosts into a directory nothing is
@@ -721,9 +748,30 @@ impl TypedOperation for Switch {
         let _ = target.site_vhost("probe.invalid")?;
 
         let from = active(ctx).await?;
-        if from == target {
+        // Already serving is **not** the same as already set up, and reading it
+        // as "nothing to do" was this release's version of the 0.7 defect.
+        //
+        // The include that makes the target read the panel's tree is written in
+        // exactly one place: `write_hook`, from this operation. So a machine
+        // where Apache was installed by hand and never switched — the machine
+        // the probe in [`active`] was added for — has Apache serving, the panel
+        // correctly reporting Apache, vhosts rendered into
+        // `/etc/apache2/unihelm.d`, and *nothing including that directory*.
+        // `apachectl configtest` passes over a configuration that does not
+        // contain the file, the reload succeeds, and every site shows Active
+        // while Apache answers with the distribution's default page. The one
+        // operation that could repair it returned success without writing a
+        // byte, so the machine had no way out through the panel at all.
+        //
+        // It stays a cheap success where the footprint is already on disk,
+        // which is every ordinary machine. Where it is not, the switch does the
+        // work it would have done coming from the other server — minus the
+        // exchange, because there is nothing to hand port 80 over to.
+        let already_serving = from == target;
+        if already_serving && the_panel_has_a_footprint_in(target)? {
             ctx.log(format!(
-                "{} already serves this machine; nothing to do",
+                "{} already serves this machine and the panel's include is in its \
+                 configuration; nothing to do",
                 target.display_name()
             ));
             return Ok(SwitchOutput {
@@ -734,8 +782,24 @@ impl TypedOperation for Switch {
             });
         }
 
+        // Both refusals now guard the converge as well, and the first of them
+        // is why that matters on Red Hat: `active()` answers Apache there as
+        // readily as on Debian (httpd.service is the same `ManagedUnit`), and
+        // every `paths::apache_*` in this build is Debian's layout. Reached
+        // through the old early return, an EL machine serving with httpd got
+        // "nothing to do" and the panel went on writing /etc/apache2 files that
+        // httpd has never heard of.
         refuse_where_the_panel_writes_where_the_server_does_not_read(ctx, target)?;
         refuse_when_the_target_is_not_installed(ctx, target).await?;
+
+        if already_serving {
+            ctx.log(format!(
+                "{} serves this machine and the panel's include is not in its \
+                 configuration, so nothing the panel has written is being read; \
+                 writing it and re-rendering every vhost",
+                target.display_name()
+            ));
+        }
 
         let db = ctx.db();
         // Every site on the machine, not a tenant's page of them: a switch that
@@ -745,7 +809,14 @@ impl TypedOperation for Switch {
 
         let mut dropped = gaps(target, &sites);
         dropped.extend(server_gaps(ctx, target).await?);
-        if !dropped.is_empty() && !input.accept_gaps {
+        // Reported either way, refused only when this is a move. A converge is
+        // not costing the operator these controls — the machine is already on
+        // this server, so they are already not being applied — and refusing
+        // would leave the one repair path closed behind a question about a
+        // choice nobody is making. They still come back in `dropped`, which is
+        // what the page lists, and `webserver.gaps` answers the same question
+        // on demand.
+        if !dropped.is_empty() && !input.accept_gaps && !already_serving {
             let affected = dropped
                 .iter()
                 .filter_map(|g| g.domain.as_deref())
@@ -881,7 +952,26 @@ impl TypedOperation for Switch {
 
         // 6. The exchange. This is the only unsafe moment, and it is as short as
         //    two systemctl calls: they both want port 80.
-        exchange(ctx, from, target).await?;
+        //
+        //    Skipped on a converge, and it has to be: `exchange` disables the
+        //    incumbent before starting the target, and with the two the same
+        //    unit that is `systemctl disable --now apache2` on the machine
+        //    Apache is currently serving — this operation taking the site down
+        //    it was called to repair. What is worth doing instead is the half
+        //    that is not about port 80: `enable --now` on a unit that is
+        //    already up is a no-op except for the *enabled* bit, and an Apache
+        //    started by hand is exactly the one that is running and not enabled,
+        //    so the machine comes back from its next reboot serving nothing.
+        if already_serving {
+            let unit = target.unit()?.unit_name(ctx.distro().info.family);
+            ctx.distro().svc.enable(&unit, true).await?;
+            ctx.log(format!(
+                "{} left enabled, so it comes back after a reboot",
+                target.display_name()
+            ));
+        } else {
+            exchange(ctx, from, target).await?;
+        }
 
         // 7. Only now is it true, so only now is it written. A setting recorded
         //    before the unit started would have the panel render into a tree
@@ -1054,7 +1144,7 @@ fn runtime_account(server: WebServer, family: unihelm_distro::Family) -> Option<
 /// directories. A new group would mean re-owning all of them, which is a
 /// migration that can half-finish. The name reads oddly on an Apache machine —
 /// it is the web server's group, whatever it is called.
-async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()> {
+pub(crate) async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()> {
     let family = ctx.distro().info.family;
     let Some(account) = runtime_account(target, family) else {
         return Ok(());
@@ -1115,7 +1205,7 @@ async fn admit_to_the_web_group(ctx: &OpContext, target: WebServer) -> Result<()
 /// check earns its place anyway, because "loudly" here means a switch that
 /// stops halfway on a machine that was serving fine, and finding that out
 /// before anything is written is the whole point.
-async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
+pub(crate) async fn ensure_apache_modules(ctx: &OpContext) -> Result<()> {
     if ctx.distro().info.family != unihelm_distro::Family::Rhel {
         for (module, _) in APACHE_MODULES.iter().chain(APACHE_PREFERRED_MODULES) {
             // Failures are not fatal here. A module compiled in statically has
@@ -1248,8 +1338,24 @@ async fn refuse_when_the_target_is_not_installed(ctx: &OpContext, target: WebSer
     Ok(())
 }
 
+/// Whether this server's own configuration actually reaches the panel's files.
+///
+/// Two files and no memory of having written them, because the memory is the
+/// thing that was wrong: the panel recorded a switch and the include it depends
+/// on was written by that switch alone, so any other road to serving with a
+/// server — installed by hand, installed from the Stack page, or a switch that
+/// died between steps — arrived with the record set and the tree unreadable.
+///
+/// The hook is the include; without it the whole `unihelm.d` directory is a
+/// directory nothing parses. The catch-all is what answers for a hostname no
+/// site claims, and without it the first vhost parsed answers for every unknown
+/// name — one customer's site serving another's domain.
+fn the_panel_has_a_footprint_in(server: WebServer) -> Result<bool> {
+    Ok(server.hook()?.path().exists() && server.catchall()?.path().exists())
+}
+
 /// The include the target reads the panel's tree through.
-async fn write_hook(ctx: &OpContext, target: WebServer) -> Result<()> {
+pub(crate) async fn write_hook(ctx: &OpContext, target: WebServer) -> Result<()> {
     let hook = target.hook()?;
     let reloader = target.reloader(ctx.distro())?;
     ctx.config()
@@ -1511,15 +1617,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_machine_with_no_setting_is_already_on_nginx() {
-        // Every server this panel has ever installed. Switching to nginx has to
-        // be a success that does nothing rather than a conflict, or the first
-        // thing an operator tries on a fresh machine is an error.
+    async fn a_machine_with_no_setting_reads_as_nginx() {
+        // Every server this panel has ever installed runs nginx, so a missing
+        // row still reads as nginx rather than as an error.
         let ctx = op_ctx().await;
-        let out = switch_to(&ctx, "nginx", false).await.unwrap();
-        assert_eq!(out.from, "nginx");
-        assert_eq!(out.to, "nginx");
-        assert_eq!(out.sites, 0);
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
+    }
+
+    #[tokio::test]
+    async fn switching_to_the_incumbent_on_a_machine_it_is_not_installed_on_says_so() {
+        // This used to answer "nginx already serves this machine; nothing to
+        // do" on a machine with no nginx at all — the panel stating as fact
+        // something it had not checked, which is the failure this whole review
+        // exists for. The mock has no nginx.service, which is the state of a
+        // fresh server before anything is installed.
+        //
+        // It is not an error where it matters. A machine that actually serves
+        // with nginx has nginx installed, so it passes this check and stops at
+        // the footprint test above it.
+        let ctx = op_ctx().await;
+        let err = switch_to(&ctx, "nginx", false).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("not installed"), "{}", err.detail);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_could_not_tell_is_not_written_down_as_a_fact() {
+        // The defect: `probe_active().unwrap_or(Nginx)` was written to the
+        // settings table whether it was a measurement or a fallback. The row is
+        // durable and only a successful switch rewrites it, so one poll taken
+        // while nothing was running — a reboot, a package upgrade, or simply
+        // the first Stack page load on a machine where Apache had not been
+        // installed yet — pinned the panel to nginx for good. On the machine
+        // this probe was added for, that is nginx vhosts written for an Apache
+        // box with every site reported live.
+        let ctx = op_ctx().await;
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Nginx);
+        assert_eq!(
+            ctx.db()
+                .get_setting::<WebServer>(WEB_SERVER_SETTING)
+                .await
+                .unwrap(),
+            None,
+            "a fallback was recorded as though the machine had been measured"
+        );
+
+        // Apache comes up. The answer has to follow the machine, and it cannot
+        // once a guess has been cached.
+        let apache = WebServer::Apache
+            .unit()
+            .unwrap()
+            .unit_name(ctx.distro().info.family);
+        ctx.distro().svc.enable(&apache, true).await.unwrap();
+
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Apache);
+        assert_eq!(
+            ctx.db()
+                .get_setting::<WebServer>(WEB_SERVER_SETTING)
+                .await
+                .unwrap(),
+            Some(WebServer::Apache),
+            "a measurement is the one answer worth caching"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_include_is_not_a_machine_with_nothing_to_do() {
+        // The footprint is read off the disk, never off the setting. The record
+        // of which server serves and the files that server reads are written by
+        // different things, and every machine in the defect above has the first
+        // without the second.
+        for server in [WebServer::Nginx, WebServer::Apache] {
+            // Neither file exists under a test's `/`, which is the same shape
+            // as the machine this is about.
+            assert!(
+                !the_panel_has_a_footprint_in(server).unwrap(),
+                "{} reported a footprint that is not on disk",
+                server.display_name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apache_already_serving_is_never_reported_done_over_a_tree_it_does_not_read() {
+        // The 0.7 defect wearing new clothes. Apache installed by hand and
+        // never switched: `active()` now correctly answers Apache, `site.create`
+        // renders `apache/site.conf` into /etc/apache2/unihelm.d, `apachectl
+        // configtest` passes *because nothing includes that directory*, the
+        // reload succeeds and the panel marks the site live. Apache serves the
+        // distribution's default page for every domain on the machine.
+        //
+        // `webserver.switch --target apache` was the only operation that could
+        // have written the include, and it returned success with `sites: 0`
+        // without writing a byte. So the invariant here is the one that was
+        // broken: this operation either leaves the include in place or says
+        // why it could not. What it must never do again is report success over
+        // an Apache that reads none of what the panel wrote.
+        let ctx = op_ctx().await;
+        let apache = WebServer::Apache
+            .unit()
+            .unwrap()
+            .unit_name(ctx.distro().info.family);
+        ctx.distro().svc.enable(&apache, true).await.unwrap();
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Apache);
+        assert!(!the_panel_has_a_footprint_in(WebServer::Apache).unwrap());
+
+        match switch_to(&ctx, "apache", true).await {
+            Ok(out) => assert!(
+                the_panel_has_a_footprint_in(WebServer::Apache).unwrap(),
+                "reported success ({out:?}) over an Apache that includes none of the \
+                 configuration the panel writes"
+            ),
+            // The other honest answer, and the one a machine with no writable
+            // /etc/apache2 gets: it tried, it could not finish, and it said so.
+            // Anything that is not one of these two is the silent success this
+            // test exists to keep from coming back.
+            Err(e) => assert!(
+                !e.detail.contains("nothing to do"),
+                "still answering with a no-op: {}",
+                e.detail
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn apache_serving_a_red_hat_machine_is_refused_rather_than_called_done() {
+        // `ManagedUnit::Apache` is httpd.service on EL, so the probe answers
+        // Apache there as readily as on Debian — while every `paths::apache_*`
+        // in this build is /etc/apache2, which httpd has never heard of. The
+        // layout refusal guarded the switch and the switch alone returned early
+        // before reaching it, so this machine was told "nothing to do" and the
+        // panel went on writing files nothing reads.
+        let ctx = op_ctx_on(unihelm_distro::Family::Rhel).await;
+        let httpd = WebServer::Apache
+            .unit()
+            .unwrap()
+            .unit_name(ctx.distro().info.family);
+        assert_eq!(httpd.as_str(), "httpd.service");
+        ctx.distro().svc.enable(&httpd, true).await.unwrap();
+        assert_eq!(active(&ctx).await.unwrap(), WebServer::Apache);
+
+        let err = switch_to(&ctx, "apache", true).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotImplemented);
+        assert!(err.detail.contains("/etc/httpd"), "{}", err.detail);
     }
 
     #[tokio::test]

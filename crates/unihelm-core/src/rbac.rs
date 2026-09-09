@@ -90,7 +90,17 @@ impl Role {
                 CronManage,
                 NodeApps,
                 BackupManage,
-                DnsManage,
+                // Deliberately no `DnsManage`. It gated nothing until 0.8.0,
+                // and the operations it now gates spend the *operator's*
+                // Cloudflare credential over the *operator's* whole account —
+                // `dns_providers` has no owner column, so "whose token is this"
+                // is not merely unchecked, it is not expressible. Those
+                // operations refuse a non-global scope themselves; this keeps
+                // the panel from advertising a permission that grants a
+                // reseller nothing. A reseller who needs DNS written for a
+                // domain they own still has `cert.issue_wildcard`, which lends
+                // the token bounded to `_acme-challenge` under a domain the
+                // panel has already verified is theirs.
             ],
             Role::Customer => &[
                 TaskRead,

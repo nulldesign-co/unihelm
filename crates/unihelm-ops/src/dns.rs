@@ -2158,6 +2158,66 @@ impl TypedOperation for ProviderGet {
 // the zone and record editor
 // ---------------------------------------------------------------------------
 
+/// Refuse a caller whose scope is not the whole machine, naming what they asked
+/// for and why the panel will not spend the operator's credential on it.
+///
+/// **This is the guard the 0.8.0 release review found missing, and it is the
+/// entire boundary these five operations have.** `Permission::DnsManage` gated
+/// no operation at all before this release, and `Role::Reseller` holds it by
+/// default; the zone and record editor attached itself to that permission and
+/// then took the zone name straight out of the request. Any reseller — a tenant,
+/// not the operator — could therefore list every zone the operator's Cloudflare
+/// token administers and then create, repoint or delete any record in any of
+/// them: the A record of the panel's own domain, another reseller's customers'
+/// sites, an MX rewritten to intercept their mail, or an `_acme-challenge` TXT
+/// that mints a publicly-trusted certificate for a domain belonging to somebody
+/// else. The `confirm_name`/`confirm_content` pair on update and delete never
+/// helped: it compares against the *live* record, so it catches a stale row and
+/// says nothing about whose row it is.
+///
+/// The comment that justified the split cited `cert.issue_wildcard` as its
+/// precedent, and that precedent says the opposite. `IssueWildcard` also spends
+/// the operator's token for a tenant, but it takes a `site_id`, loads it through
+/// `db.sites(ctx.scope())` — `not_found` outside the caller's tenancy — and only
+/// then derives the apex. It acts on a name the panel already knows the caller
+/// owns. The five operations here took a bare string.
+///
+/// # Why "administrator only" and not "a zone some site of yours lives under"
+///
+/// The other candidate was to accept a zone when a site in `ctx.scope()` sits
+/// under it. It was rejected as a boundary that is wrong in an ordinary
+/// configuration: sub-domain hosting puts many tenants — and very often the
+/// panel's own hostname — under one apex, so "reseller A hosts `a.example.com`"
+/// would have handed A the whole of `example.com`, including B's records and the
+/// panel's. Editing one record in a zone is not a capability that can be split
+/// per tenant while `dns_providers` records no owner for the credential (see
+/// `unihelm_db::dns`): the token is the machine's, so its use is the machine
+/// operator's.
+///
+/// Nothing regresses by refusing. `DnsManage` gated nothing before 0.8.0, so no
+/// deployment has ever had these operations working for a tenant, and the
+/// operator keeps all five. A reseller who needs DNS written for a site they do
+/// own still has `cert.issue_wildcard`, which is the one place the panel lends
+/// this token to a tenant — bounded to `_acme-challenge` under a domain it has
+/// verified is theirs, and cleaned up afterwards.
+fn require_operator_scope(ctx: &OpContext, subject: &str) -> Result<()> {
+    if ctx.scope().is_global() {
+        return Ok(());
+    }
+    Err(UnihelmError::new(
+        ErrorCode::TenantScopeViolation,
+        format!(
+            "{subject} is administered by the Cloudflare credential this server's operator \
+             stored. That credential is a single machine-wide token and the panel records no \
+             owner for it, so it cannot tell which of the zones it reaches are yours — and it \
+             will not spend it on a zone you have not been shown to own. Ask the server \
+             operator to make this change. A certificate for a site of your own does not need \
+             it: `cert.issue_wildcard` lends the same token, for a domain the panel already \
+             knows is yours."
+        ),
+    ))
+}
+
 /// `dns.zones.list` — every zone the stored credentials can edit.
 pub struct ZonesList;
 
@@ -2190,13 +2250,20 @@ impl TypedOperation for ZonesList {
     type Output = ZonesListOutput;
 
     const NAME: &'static str = "dns.zones.list";
-    // `DnsManage`, not `ServerManage`. Storing the credential is an admin act;
-    // using it to edit a zone is what the reseller-held DNS permission is for —
-    // the same split `cert.issue_wildcard` already makes.
+    // `DnsManage` still, so that an operator can narrow an administrator account
+    // to "may look at the server, may not edit DNS" without also taking away
+    // `server.manage`. It is not the boundary: `Role::Reseller` holds this
+    // permission by default, and the one that keeps a tenant out is
+    // `require_operator_scope` below. Read its comment before moving either.
     const PERMISSION: Permission = Permission::DnsManage;
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        // Before any credential is decrypted: this list is every zone the
+        // operator's tokens administer, which on a white-label panel is every
+        // customer of every reseller.
+        require_operator_scope(ctx, "the list of zones this panel can edit")?;
+
         let mut zones = Vec::new();
         let mut unreachable = Vec::new();
 
@@ -2311,12 +2378,19 @@ impl TypedOperation for RecordsList {
     type Output = RecordsListOutput;
 
     const NAME: &'static str = "dns.records.list";
+    // See `ZonesList`: the permission is not the boundary, `require_operator_scope` is.
     const PERMISSION: Permission = Permission::DnsManage;
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
-        let (provider_label, zone, cloudflare) =
-            resolve_provider(ctx, &normalise_zone(&input.zone)?).await?;
+        let zone_name = normalise_zone(&input.zone)?;
+        // Before `resolve_provider`, which decrypts the operator's token and
+        // spends a Cloudflare call on it. Reading a zone is disclosure in its
+        // own right — every record id, name and content in it is what a delete
+        // or a repoint needs — so the refusal comes first.
+        require_operator_scope(ctx, &format!("the zone `{zone_name}`"))?;
+
+        let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
         let addresses = server_public_addresses(ctx).await;
         let hosted = hosted_domains(ctx).await?;
 
@@ -2401,11 +2475,17 @@ impl TypedOperation for RecordsCreate {
     type Output = RecordWriteOutput;
 
     const NAME: &'static str = "dns.records.create";
+    // See `ZonesList`: the permission is not the boundary, `require_operator_scope` is.
     const PERMISSION: Permission = Permission::DnsManage;
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let zone_name = normalise_zone(&input.zone)?;
+        // A create is how a tenant would write `_acme-challenge` into somebody
+        // else's zone and take out a publicly-trusted certificate for their
+        // domain. Refused before the token is opened.
+        require_operator_scope(ctx, &format!("the zone `{zone_name}`"))?;
+
         let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
 
         let draft = RecordDraft {
@@ -2472,11 +2552,17 @@ impl TypedOperation for RecordsUpdate {
     type Output = RecordWriteOutput;
 
     const NAME: &'static str = "dns.records.update";
+    // See `ZonesList`: the permission is not the boundary, `require_operator_scope` is.
     const PERMISSION: Permission = Permission::DnsManage;
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let zone_name = normalise_zone(&input.zone)?;
+        // Ahead of `record_as_shown`: that check compares against the live
+        // record and answers "is this still the row you were looking at", never
+        // "is this row yours". Both are needed and only one of them was here.
+        require_operator_scope(ctx, &format!("the zone `{zone_name}`"))?;
+
         let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
 
         let current = record_as_shown(
@@ -2555,11 +2641,17 @@ impl TypedOperation for RecordsDelete {
     type Output = RecordsDeleteOutput;
 
     const NAME: &'static str = "dns.records.delete";
+    // See `ZonesList`: the permission is not the boundary, `require_operator_scope` is.
     const PERMISSION: Permission = Permission::DnsManage;
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
         let zone_name = normalise_zone(&input.zone)?;
+        // The worst of the five: an id and two values read a second earlier from
+        // `dns.records.list` satisfied the staleness check, and the A record of
+        // the panel's own domain went out with it.
+        require_operator_scope(ctx, &format!("the zone `{zone_name}`"))?;
+
         let (provider_label, zone, cloudflare) = resolve_provider(ctx, &zone_name).await?;
 
         let current = record_as_shown(
@@ -4046,6 +4138,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reseller_cannot_touch_the_operators_zones_or_records() {
+        // The 0.8.0 release blocker, in one test. `dns_manage` gated nothing
+        // before this release and `Role::Reseller` holds it by default, so the
+        // five new operations were reachable by every tenant on the machine —
+        // list every zone the operator's token administers, then delete or
+        // repoint any record in any of them.
+        //
+        // **Nothing is stored here on purpose.** With no credential at all an
+        // unguarded `dns.zones.list` answers `Ok` with an empty list and an
+        // unguarded record operation answers `not_found` — "this *server* has no
+        // Cloudflare token", which is a fact about the operator's installation
+        // and is already the wrong answer to give a tenant. Both are the shape
+        // this test would have caught before the fix, and neither needs the
+        // network, so a revert fails here rather than hanging on a socket.
+        use crate::registry::testing::{auth_for, auth_for_scope, registry};
+        use unihelm_core::{Role, TenantScope, UserId};
+
+        let (reg, admin, customer) = registry().await;
+        let reseller = reg
+            .services()
+            .db
+            .users(&TenantScope::Global)
+            .create(unihelm_db::users::NewUser {
+                role: Role::Reseller,
+                email: unihelm_core::Email::parse("dns-reseller@example.com").unwrap(),
+                username: unihelm_core::Username::parse("dnsreseller").unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+        let reseller_id: UserId = reseller.id;
+
+        // Through `dispatch`, so the registry's own re-derivation of the caller
+        // is in the path — the same hop the HTTP route takes.
+        for (op, input) in [
+            ("dns.zones.list", serde_json::json!({})),
+            (
+                "dns.records.list",
+                serde_json::json!({ "zone": "victim.example" }),
+            ),
+            (
+                "dns.records.create",
+                serde_json::json!({
+                    "zone": "victim.example",
+                    "kind": "TXT",
+                    "name": "_acme-challenge",
+                    "content": "a-token-that-would-mint-a-certificate",
+                }),
+            ),
+            (
+                "dns.records.update",
+                serde_json::json!({
+                    "zone": "victim.example",
+                    "id": "rec1",
+                    "kind": "A",
+                    "name": "www",
+                    "content": "203.0.113.99",
+                    "confirm_name": "www.victim.example",
+                    "confirm_content": "203.0.113.10",
+                }),
+            ),
+            (
+                "dns.records.delete",
+                serde_json::json!({
+                    "zone": "victim.example",
+                    "id": "rec1",
+                    "confirm_name": "www.victim.example",
+                    "confirm_content": "203.0.113.10",
+                }),
+            ),
+        ] {
+            let err = reg
+                .dispatch(
+                    op,
+                    &auth_for(reseller_id, Role::Reseller),
+                    input.clone(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            // Two locks, and this asserts the reseller is stopped by *some*
+            // lock rather than pinning which. `Role::Reseller` no longer holds
+            // `dns_manage` at all — the panel should not advertise a permission
+            // that grants nothing — so today the registry's permission check
+            // refuses first, and the scope guard inside each operation is what
+            // holds if that default is ever widened again. Asserting the inner
+            // code alone would go red for the *right* reason and read as a
+            // regression; asserting refusal covers both.
+            assert!(
+                matches!(
+                    err.code,
+                    ErrorCode::TenantScopeViolation | ErrorCode::PermissionDenied
+                ),
+                "`{op}` must refuse a reseller, got {:?}: {}",
+                err.code,
+                err.detail
+            );
+            // The inner lock, tested against the caller it is actually for: an
+            // admin *impersonating* a tenant holds `dns_manage` and does not
+            // hold the machine, so the permission check passes and the scope
+            // guard is what refuses. That is the path whose message has to name
+            // the zone — an operator reading a support ticket cannot act on
+            // "permission denied" without knowing which zone was reached for.
+            let err = reg
+                .dispatch(
+                    op,
+                    &auth_for_scope(admin, Role::Admin, TenantScope::Reseller { reseller_id }),
+                    input.clone(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::TenantScopeViolation,
+                "`{op}` must refuse an impersonating admin: {}",
+                err.detail
+            );
+            if op != "dns.zones.list" {
+                assert!(
+                    err.detail.contains("victim.example"),
+                    "`{op}` must name the zone it refused: {}",
+                    err.detail
+                );
+            }
+
+            // A customer holds neither permission, and is stopped one step
+            // earlier — asserted so that removing `dns_manage` from the reseller
+            // role later does not quietly become the only thing holding here.
+            let err = reg
+                .dispatch(op, &auth_for(customer, Role::Customer), input, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::PermissionDenied,
+                "`{op}` for a customer"
+            );
+        }
+
+        // And the operator is not stranded: the same call, from the account that
+        // owns the credential, still runs. Zero stored credentials is the empty
+        // answer, not a refusal and not an error.
+        let admin_ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+        let zones = ZonesList.run(&admin_ctx, ZonesListInput {}).await.unwrap();
+        assert!(zones.zones.is_empty());
+        let err = RecordsList
+            .run(
+                &admin_ctx,
+                RecordsListInput {
+                    zone: "victim.example".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::NotFound,
+            "an admin reaches the credential lookup and is told there is none"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_whole_machine_is_a_wide_enough_scope_for_the_shared_token() {
+        // The boundary on its own, over every scope the panel builds. A
+        // `TenantScope` that is not `Global` is a tenant whatever role reached
+        // it — including an administrator who is impersonating one, which is the
+        // case a role check rather than a scope check would have missed.
+        use crate::registry::testing::registry;
+        use unihelm_core::{AuthContext, Role, SubscriptionId, TenantScope, UserId};
+
+        let (reg, admin, _) = registry().await;
+        let guard = |scope: TenantScope| {
+            let auth = AuthContext::from_role(admin, Role::Admin, scope, "req-test");
+            require_operator_scope(
+                &OpContext::new(reg.services().clone(), auth),
+                "the zone `example.com`",
+            )
+        };
+
+        assert!(guard(TenantScope::Global).is_ok());
+        for tenant in [
+            TenantScope::Reseller {
+                reseller_id: UserId(7),
+            },
+            TenantScope::Customer {
+                customer_id: UserId(8),
+            },
+            TenantScope::Subscription {
+                subscription_id: SubscriptionId(9),
+                customer_id: UserId(8),
+            },
+        ] {
+            let err = guard(tenant).unwrap_err();
+            assert_eq!(err.code, ErrorCode::TenantScopeViolation);
+            assert!(
+                err.detail.contains("example.com"),
+                "the refusal must name what was asked for: {}",
+                err.detail
+            );
+            assert!(
+                err.detail.contains("cert.issue_wildcard"),
+                "a refusal that names no alternative is a dead end: {}",
+                err.detail
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn issuing_a_wildcard_for_a_site_in_another_tenant_is_not_found() {
         use crate::registry::testing::{auth_for, registry};
         use unihelm_core::Role;
@@ -4694,12 +4998,14 @@ mod tests {
 
     #[test]
     fn reading_the_credential_is_an_admin_act_and_editing_records_is_a_dns_one() {
-        // The split this module already makes between `dns.provider.set` and
-        // `cert.issue_wildcard`, carried onto the new operations. The credential
-        // card's zone list is every domain this operator's customers own, so it
-        // stays with `server_manage`; a reseller holding `dns_manage` may edit
-        // records with the token but may not read the credential inventory or
-        // replace one. A customer holds neither.
+        // `dns_manage` separates "may look at this server" from "may write DNS
+        // with its token", so an operator can narrow an administrator account to
+        // one and not the other. It does *not* separate operator from tenant:
+        // `Role::Reseller` holds `dns_manage` by default, so the permission is
+        // asserted here only to pin the narrowing, and
+        // `a_reseller_cannot_touch_the_operators_zones_or_records` is the test
+        // that pins the boundary. The credential inventory stays at
+        // `server_manage`; a customer holds neither.
         assert_eq!(
             <ProviderGet as TypedOperation>::PERMISSION,
             <ProviderSet as TypedOperation>::PERMISSION,

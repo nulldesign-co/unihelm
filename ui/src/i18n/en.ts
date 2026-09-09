@@ -355,6 +355,8 @@ export const en = {
     stop: "Stop",
     startAria: "Start the {{name}} {{version}} service",
     stopAria: "Stop the {{name}} {{version}} service",
+    stopAnyway: "Stop anyway",
+    stopAnywayAria: "Stop the {{name}} {{version}} service and everything behind it",
     hostIncumbentTitle: "This engine is already installed on the host",
     hostIncumbent:
       "{{name}} is installed as packages on this server and holds its port. A container cannot start beside it — remove the host install first, or keep using it.",

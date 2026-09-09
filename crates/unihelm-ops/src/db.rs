@@ -614,12 +614,21 @@ pub fn sql_drop_user(engine: DbEngine, user: &DbName) -> String {
     }
 }
 
+/// `pg_ident`, not `as_str`: this was the one statement in the file that named
+/// a role unquoted, and it is the statement that hands the caller a password.
+/// `CREATE ROLE` quotes (so `MyApp` is a role called `MyApp`) while an
+/// unquoted `ALTER ROLE MyApp` folds to `myapp` — a different role, or none.
+/// Username uniqueness is BINARY, so `MyApp` and `myapp` can both exist under
+/// different owners: the reset either failed outright for every mixed-case
+/// role, or succeeded against somebody else's role and displayed that new
+/// password to the wrong tenant. Two statements in one flow must not disagree
+/// about which role they mean.
 pub fn sql_set_password(engine: DbEngine, user: &DbName, password: &str) -> Result<String> {
     let pw = quote_str(password)?;
     Ok(match engine {
         DbEngine::Mysql => format!("ALTER USER {} IDENTIFIED BY {};\n", mysql_account(user), pw),
         DbEngine::Postgres => {
-            format!("ALTER ROLE {} WITH PASSWORD {};\n", user.as_str(), pw)
+            format!("ALTER ROLE {} WITH PASSWORD {};\n", pg_ident(user), pw)
         }
     })
 }
@@ -1619,6 +1628,33 @@ mod tests {
     }
 
     #[test]
+    fn every_postgres_statement_naming_a_role_spells_it_the_same_way() {
+        // `MyApp` and `myapp` are distinct rows (username uniqueness is
+        // BINARY) and distinct Postgres roles (CREATE ROLE quotes). ALTER ROLE
+        // was the one statement that did not quote, so it folded to `myapp`:
+        // either an error for every mixed-case role, or a password reset
+        // landing on another owner's role and being displayed to the caller.
+        let user = DbName::parse("MyApp").unwrap();
+        assert_eq!(
+            sql_create_user(DbEngine::Postgres, &user, "s3cret").unwrap(),
+            "CREATE ROLE \"MyApp\" WITH LOGIN PASSWORD 's3cret';\n"
+        );
+        assert_eq!(
+            sql_set_password(DbEngine::Postgres, &user, "s3cret").unwrap(),
+            "ALTER ROLE \"MyApp\" WITH PASSWORD 's3cret';\n"
+        );
+        assert_eq!(
+            sql_drop_user(DbEngine::Postgres, &user),
+            "DROP ROLE IF EXISTS \"MyApp\";\n"
+        );
+        // MySQL names accounts as string literals, so case never folded there.
+        assert_eq!(
+            sql_set_password(DbEngine::Mysql, &user, "s3cret").unwrap(),
+            "ALTER USER 'MyApp'@'localhost' IDENTIFIED BY 's3cret';\n"
+        );
+    }
+
+    #[test]
     fn string_quoting_doubles_quotes_and_rejects_escape_material() {
         assert_eq!(quote_str("plain").unwrap(), "'plain'");
         assert_eq!(quote_str("a'b").unwrap(), "'a''b'");
@@ -2311,7 +2347,44 @@ mod tests {
         assert!(jobs[0].secret);
         assert_eq!(
             jobs[0].sql,
-            format!("ALTER ROLE rotate_rw WITH PASSWORD '{second}';\n")
+            format!("ALTER ROLE \"rotate_rw\" WITH PASSWORD '{second}';\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_alters_the_role_the_create_made_even_in_mixed_case() {
+        // The all-lowercase name above cannot tell the two spellings apart.
+        // With an uppercase letter the create quotes and the reset used not
+        // to, so one flow named two different Postgres roles: `Rotate_RW` on
+        // the way in, folded `rotate_rw` on the way out.
+        let (reg, _, customer, sh) = setup().await;
+        dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.user.create",
+            json!({ "username": "Rotate_RW", "engine": "postgres" }),
+        )
+        .await
+        .unwrap();
+        sh.clear();
+
+        let reset = dispatch(
+            &reg,
+            customer,
+            Role::Customer,
+            "db.user.password",
+            json!({ "username": "Rotate_RW" }),
+        )
+        .await
+        .unwrap();
+        let second = reset["password"].as_str().unwrap();
+
+        let jobs = sh.recorded();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].sql,
+            format!("ALTER ROLE \"Rotate_RW\" WITH PASSWORD '{second}';\n")
         );
     }
 

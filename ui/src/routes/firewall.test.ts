@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import { ApiError, type SentinelSettings } from "@/lib/api";
 
-import { isRouteMissing, portProblem, sentinelProblems } from "./firewall";
+import { isRouteMissing, panelPort, portProblem, presets, sentinelProblems } from "./firewall";
 
 describe("the open-port form", () => {
   it("accepts the shapes a real rule takes", () => {
@@ -112,5 +112,57 @@ describe("telling a missing route apart from a refusal", () => {
     });
     expect(isRouteMissing(real)).toBe(false);
     expect(isRouteMissing(new Error("network"))).toBe(false);
+  });
+});
+
+describe("the quick-open presets", () => {
+  // The preset labelled "Panel" filled the form with 8443 — a port nothing in
+  // this project has ever bound (the panel ships on 8088, and moves to 443
+  // behind its own vhost). An operator whose panel was unreachable pressed it,
+  // opened a hole to nothing, and came away believing they had opened the way
+  // back in.
+  it("never offers 8443, which is nobody's panel port", () => {
+    for (const loc of [
+      { protocol: "https:", hostname: "203.0.113.10", port: "8088" },
+      { protocol: "https:", hostname: "panel.example.com", port: "" },
+      { protocol: "http:", hostname: "localhost", port: "5173" },
+    ]) {
+      expect(presets(loc).map((p) => p.port)).not.toContain(8443);
+    }
+  });
+
+  it("offers the port this browser is reaching the panel on", () => {
+    const direct = presets({ protocol: "https:", hostname: "203.0.113.10", port: "8088" });
+    expect(direct.find((p) => p.key === "panel")?.port).toBe(8088);
+
+    // An operator who moved the panel is the one a hard-coded number strands.
+    const moved = presets({ protocol: "https:", hostname: "203.0.113.10", port: "9443" });
+    expect(moved.find((p) => p.key === "panel")?.port).toBe(9443);
+  });
+
+  it("falls back to the shipped port when the address is only the operator's own machine", () => {
+    // An ssh tunnel or the dev proxy: 5173 is a port on the laptop, and a rule
+    // for it on the server would open a hole to nothing.
+    expect(panelPort({ protocol: "http:", hostname: "localhost", port: "5173" })).toBe(8088);
+    expect(panelPort({ protocol: "https:", hostname: "127.0.0.1", port: "8443" })).toBe(8088);
+    expect(panelPort({ protocol: "https:", hostname: "[::1]", port: "9000" })).toBe(8088);
+  });
+
+  it("drops the panel button when the panel is on a port already listed", () => {
+    // Behind the managed vhost the answer is 443, which is HTTPS on this same
+    // row; two buttons with one number read as two ports to open.
+    const behindVhost = presets({ protocol: "https:", hostname: "panel.example.com", port: "" });
+    expect(behindVhost.map((p) => p.key)).toEqual(["ssh", "http", "https"]);
+    expect(panelPort({ protocol: "https:", hostname: "panel.example.com", port: "" })).toBe(443);
+  });
+
+  it("keeps the other three at the numbers their labels claim", () => {
+    const byKey = Object.fromEntries(
+      presets({ protocol: "https:", hostname: "203.0.113.10", port: "8088" }).map((p) => [
+        p.key,
+        p.port,
+      ]),
+    );
+    expect(byKey).toMatchObject({ ssh: 22, http: 80, https: 443 });
   });
 });

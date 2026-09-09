@@ -22,7 +22,10 @@
 //! stops, and so does the panel. [`RebootStatusOutput::sites`] is that list,
 //! and it hangs off the *read* operation so a confirmation can show it before
 //! anybody agrees to anything — the same reason `webserver.gaps` exists apart
-//! from `webserver.switch`.
+//! from `webserver.switch`. That list is every tenant's domains, which is why
+//! both operations refuse a caller whose [`unihelm_core::TenantScope`] is not
+//! the whole machine: see [`serving_domains`], and the 0.8.0 review finding it
+//! records.
 //!
 //! **It does not claim the machine came back.** The panel dies with it. A task
 //! would be the natural shape for slow work and would be a lie here:
@@ -145,13 +148,41 @@ fn confirms_hostname(typed: &str, hostname: &str) -> bool {
     typed.trim() == hostname
 }
 
-/// Every domain this machine serves, sorted.
+/// Every domain this machine serves, sorted — refused to anyone who is not the
+/// operator of the machine.
 ///
 /// `all_sites` rather than the caller's scope: a restart is server-wide, and a
-/// list that quietly omitted another tenant's sites would understate the cost
-/// of the very thing being confirmed. Both operations here require `server.*`
-/// permissions, which no customer holds.
+/// list that quietly omitted another tenant's sites would understate the cost of
+/// the very thing being confirmed. That is still the right list. What was wrong
+/// was who could ask for it.
+///
+/// **The 0.8.0 review found this.** The justification used to end "Both
+/// operations here require `server.*` permissions, which no customer holds" —
+/// true of `Role::Customer`, false of `Role::Reseller`, which holds `ServerRead`
+/// by default and is a *tenant*, one of several on a white-label box. The
+/// dashboard polls `server.reboot.status` for anybody with `server_read`, so
+/// every reseller was handed, on every visit and with no unusual action, the
+/// complete list of domains on the machine — their competitors' customers
+/// included. `site::List`, the same account's own site list, goes through
+/// `db.sites(ctx.scope())` and is confined to their tree, so this was the one
+/// place in the panel that answer could be got.
+///
+/// Scoping the list was the wrong repair: `site_count` is rendered as "N sites
+/// go down", and a reseller's own three sites is not what a restart costs. The
+/// number has to stay the machine's, so the reader has to be the machine's
+/// operator. A tenant gets a refusal instead — the dashboard simply does not
+/// render the restart notice, exactly as it already does not for a customer.
 async fn serving_domains(ctx: &OpContext) -> Result<Vec<String>> {
+    if !ctx.scope().is_global() {
+        return Err(UnihelmError::new(
+            ErrorCode::TenantScopeViolation,
+            "restarting this server stops every site on it, so what it would cost is counted \
+             across every tenant on the machine and shown only to an account whose scope is \
+             the whole machine. Your own sites are on the Sites page. If you need to know \
+             about scheduled downtime, ask the server operator.",
+        ));
+    }
+
     let mut domains: Vec<String> = ctx
         .db()
         .all_sites()
@@ -211,13 +242,24 @@ impl TypedOperation for RebootStatus {
     const NAME: &'static str = "server.reboot.status";
     // Read, not manage, for the reason `security.posture` uses the same one:
     // being told the running kernel is not the installed one is how an operator
-    // comes to act on it, and nothing here is disclosed that `/api/sites` would
-    // not already show the same account.
+    // comes to act on it, and that is not always the account allowed to take the
+    // machine down — an administrator narrowed to `server.read` still reads this
+    // and still cannot restart anything.
+    //
+    // The permission is not the tenant boundary. `Role::Reseller` holds
+    // `ServerRead` too, and the sentence that used to stand here — "nothing here
+    // is disclosed that `/api/sites` would not already show the same account" —
+    // was false for exactly that role: `/api/sites` is scoped to their tree and
+    // `sites` below is every domain on the box. `serving_domains` now refuses a
+    // caller whose scope is not the whole machine; read its comment.
     const PERMISSION: Permission = Permission::ServerRead;
     // A file read on Debian, one short command on EL, one query for the sites.
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, _input: Self::Input) -> Result<Self::Output> {
+        // First, so a tenant is refused before the machine's hostname is read.
+        // On a white-label panel the operator's real hostname is itself
+        // something a reseller has no business being shown.
         let sites = serving_domains(ctx).await?;
         let (hostname, hostname_error) = match self.machine.hostname() {
             Ok(name) => (Some(name), None),
@@ -531,6 +573,99 @@ mod tests {
             "the panel goes down with the machine and has to say so: {}",
             out.note
         );
+    }
+
+    #[tokio::test]
+    async fn a_reseller_is_not_handed_every_domain_on_the_machine() {
+        // The 0.8.0 release blocker. `Role::Reseller` holds `server_read` by
+        // default and the dashboard polls this endpoint for anyone who does, so
+        // every reseller was shown the complete domain list of a shared machine
+        // — including the customers of the reseller in the next tenancy — on
+        // every visit to their own home page.
+        //
+        // The existing assertions could not have caught it: `context()` builds
+        // an admin over a registry with no reseller and no sites, so
+        // `site_count == sites.len()` held trivially. This seeds two tenancies
+        // and asks as one of them.
+        use unihelm_core::{Role, TenantScope};
+        use unihelm_db::users::NewUser;
+
+        let (reg, admin, _) = registry().await;
+        let db = reg.services().db.clone();
+
+        let mut sites = Vec::new();
+        for (name, domain) in [("alpha", "a.test"), ("bravo", "b.test")] {
+            let reseller = db
+                .users(&TenantScope::Global)
+                .create(NewUser {
+                    role: Role::Reseller,
+                    email: unihelm_core::Email::parse(&format!("{name}@example.com")).unwrap(),
+                    username: unihelm_core::Username::parse(name).unwrap(),
+                    password: "a-long-enough-password".into(),
+                    reseller_id: None,
+                    full_name: None,
+                    locale: "en".into(),
+                })
+                .await
+                .unwrap();
+            let client = db
+                .users(&TenantScope::Global)
+                .create(NewUser {
+                    role: Role::Customer,
+                    email: unihelm_core::Email::parse(&format!("{name}-client@example.com"))
+                        .unwrap(),
+                    username: unihelm_core::Username::parse(&format!("{name}client")).unwrap(),
+                    password: "a-long-enough-password".into(),
+                    reseller_id: Some(reseller.id),
+                    full_name: None,
+                    locale: "en".into(),
+                })
+                .await
+                .unwrap();
+            let subscription = db.create_subscription(client.id).await.unwrap();
+            db.create_site(unihelm_db::NewSite {
+                subscription_id: subscription.id,
+                domain: unihelm_core::Domain::parse(domain).unwrap(),
+                site_type: unihelm_db::SiteType::Static,
+                php_version: None,
+                root_dir: format!("/home/{}/sites/{domain}/public", subscription.linux_user),
+                proxy_port: None,
+                redirect_target: None,
+            })
+            .await
+            .unwrap();
+            sites.push((reseller.id, domain));
+        }
+
+        let machine = FakeMachine::named("web-01");
+        for (reseller_id, _) in &sites {
+            let ctx = OpContext::new(
+                reg.services().clone(),
+                auth_for(*reseller_id, Role::Reseller),
+            );
+            let err = RebootStatus {
+                machine: machine.clone(),
+            }
+            .run(&ctx, RebootStatusInput {})
+            .await
+            .expect_err("a reseller is a tenant, not the operator of this machine");
+            assert_eq!(err.code, ErrorCode::TenantScopeViolation);
+            assert!(
+                err.detail.contains("Sites page"),
+                "a refusal has to say where the caller's own answer is: {}",
+                err.detail
+            );
+        }
+
+        // The operator still gets the whole cost, which is the only honest
+        // version of this number: a restart stops both tenancies.
+        let admin_ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+        let out = RebootStatus { machine }
+            .run(&admin_ctx, RebootStatusInput {})
+            .await
+            .unwrap();
+        assert_eq!(out.sites, ["a.test", "b.test"]);
+        assert_eq!(out.site_count, 2);
     }
 
     #[tokio::test]

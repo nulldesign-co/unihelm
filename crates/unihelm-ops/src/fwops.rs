@@ -905,16 +905,26 @@ impl TypedOperation for PortClose {
         let rule = port_rule(input.port, &input.proto, input.source.as_deref(), &comment)?;
         let fw = &ctx.distro().fw;
 
-        // The panel's own port is not closeable from the panel.
+        // The port the panel is *reached* on is not closeable from the panel.
         //
         // Not a warning, because there is no version of this the operator wants:
         // the request would succeed, the firewall would start dropping SYNs to
         // the port, and the browser tab that sent it would keep working off its
         // established connection until it was reloaded — so the mistake would
-        // not surface until the operator had already gone. The port is opened
-        // unconditionally when the firewall starts, and it stays open.
-        let panel_port = crate::panel::panel_listen_port();
-        if rule.port == panel_port && rule.proto == Proto::Tcp {
+        // not surface until the operator had already gone.
+        //
+        // `panel_port_reachable_from_network`, not `panel_listen_port`, and the
+        // difference is the whole finding: after `panel.tls.issue` narrows the
+        // listener the panel is still *bound* to 8088 while only this machine
+        // can dial it. Asking the bound-port question there refused every close
+        // of 8088 for the life of the install — with a sentence ("closing it
+        // would lock you out of the panel") that was false, no other route in
+        // the product to remove the rule, and the panel's own posture remedy
+        // telling the operator to do exactly what it refused.
+        if let Some(panel_port) = crate::panel::panel_port_reachable_from_network()
+            && rule.port == panel_port
+            && rule.proto == Proto::Tcp
+        {
             return Err(UnihelmError::new(
                 ErrorCode::Conflict,
                 format!(
@@ -1705,12 +1715,28 @@ async fn ensure_ssh_reachable(
 /// from is not something to offer as a choice. SSH is a separate question
 /// because a host may legitimately have no sshd, and because closing SSH is
 /// something an operator may actually want.
+///
+/// And it opens nothing once the panel is behind its own vhost. The question
+/// this asks is [`crate::panel::panel_port_reachable_from_network`] — "can the
+/// panel still be reached here" — not "which port is it bound to". It used to
+/// ask the second one, so on every server that had run `panel.tls.issue` the
+/// first `fw.enable` re-punched a world-open hole to a loopback-only listener,
+/// recorded it, and wrote a line into the task log saying that without it "the
+/// firewall would have shut the door it was switched on through" — which was
+/// not true. The door is 443, and [`ensure_web_reachable`] is what holds it.
 async fn ensure_panel_reachable(
     ctx: &OpContext,
     lifecycle: &Lifecycle,
     view: &AdmittingView,
 ) -> Result<Option<u16>> {
-    let port = crate::panel::panel_listen_port();
+    let Some(port) = crate::panel::panel_port_reachable_from_network() else {
+        ctx.log(
+            "the panel is bound to loopback and reached through its own vhost, so its direct \
+             port is not opened: a hole in front of a listener nothing outside can dial admits \
+             nothing and hides what the firewall is really doing",
+        );
+        return Ok(None);
+    };
 
     // Already reachable — by an explicit rule, or because something in this
     // ruleset already admits it. Nothing to do, and nothing to say.
@@ -1738,6 +1764,124 @@ async fn ensure_panel_reachable(
 /// Its own string so `fw.port.close` can recognise it and refuse: a rule an
 /// operator can delete is a lockout with an extra step.
 pub const PANEL_RULE_COMMENT: &str = "unihelm panel";
+
+/// The two ports a machine that serves the web is reached on, the names the rest
+/// of the project already writes on them (`stack::open_web_ports`), and what
+/// shutting each one actually costs.
+///
+/// 80 is not there for redirects. It is where every ACME HTTP-01 challenge on
+/// this machine is answered, the panel's own included — so a firewall that comes
+/// up without it does not break anything today and expires every certificate on
+/// the box in sixty days, which is the shape of failure this project has been
+/// bitten by before.
+const WEB_PORTS: [(u16, &str, &str); 2] = [
+    (
+        80,
+        "http",
+        "80/tcp is where Let's Encrypt fetches the renewal challenge for every certificate here, \
+         this panel's included",
+    ),
+    (
+        443,
+        "https",
+        "443/tcp is where every site on this machine is served — and this panel too, once it is \
+         behind its own vhost",
+    ),
+];
+
+/// Is anything on this host actually serving the web, and why does it matter
+/// here?
+///
+/// Asked of the machine rather than of `webserver.active`, which answers with a
+/// *setting* — and falls back to "nginx" on a host that has never had one, which
+/// would turn "does this box serve sites" into "yes" everywhere.
+///
+/// The second arm is the panel itself: once `panel.tls.issue` has narrowed the
+/// listener, 443 is not merely how sites are served, it is the only way into the
+/// panel at all.
+async fn serving_the_web(ctx: &OpContext) -> Option<String> {
+    for server in [
+        crate::webserver::WebServer::Nginx,
+        crate::webserver::WebServer::Apache,
+    ] {
+        // `unit()` refuses for a server the panel cannot drive; that is not a
+        // host serving the web through anything this function can name.
+        let Ok(unit) = server.unit() else { continue };
+        let name = unit.unit_name(ctx.distro().info.family);
+        if ctx
+            .distro()
+            .svc
+            .status(&name)
+            .await
+            .map(|s| s.is_active())
+            .unwrap_or(false)
+        {
+            return Some(format!("{} is serving on this host", server.display_name()));
+        }
+    }
+
+    if crate::panel::panel_port_reachable_from_network().is_none() {
+        return Some("this panel is reached through its own vhost".to_string());
+    }
+    None
+}
+
+/// Keep 80 and 443 open across the start of a default-deny firewall, on a host
+/// that serves the web.
+///
+/// The third companion to [`ensure_ssh_reachable`] and [`ensure_panel_reachable`],
+/// and the one whose absence was the widest outage of the three. `fw.enable`
+/// opened SSH and the panel's own port and nothing else, then started a firewall
+/// whose incoming policy is deny — so on any machine hosting sites the call
+/// returned `200 {active: true, opened: [8088]}`, the operator's tab kept
+/// working off its established connection, and every site on the box stopped
+/// answering the next request. With the panel already behind its vhost the panel
+/// went with them, leaving ssh or the provider's console as the only way back.
+/// Neither of the two places that open these ports runs here:
+/// `stack::open_web_ports` fires during a web-server install and only when a
+/// firewall is *already* active, and the installer's call is gated the same way.
+///
+/// Conditional, and it has to be: a host with no web server legitimately wants
+/// both ports shut, and opening them there would be the panel widening a ruleset
+/// nobody asked to widen. What it is *not* conditional on is `allow_ssh` or any
+/// other flag, for [`ensure_panel_reachable`]'s reason — turning a firewall on
+/// is a deliberate act; taking the machine off the web with it is not something
+/// to offer as a choice.
+async fn ensure_web_reachable(
+    ctx: &OpContext,
+    lifecycle: &Lifecycle,
+    view: &AdmittingView,
+) -> Result<Vec<u16>> {
+    let Some(why) = serving_the_web(ctx).await else {
+        ctx.log(
+            "nothing is serving the web on this host, so 80 and 443 were left as they are: \
+             a firewall that opens ports nothing listens on protects less than it claims",
+        );
+        return Ok(Vec::new());
+    };
+
+    let mut opened = Vec::new();
+    for (port, what, cost) in WEB_PORTS {
+        // The same "would this port be shut" question the SSH and panel guards
+        // ask, against the same view; the helper is named for its first caller.
+        if !unprotected_ssh_ports(&view.rules, &[port], None).contains(&port) {
+            continue;
+        }
+        let rule = PortRule::anywhere(port, Proto::Tcp, what);
+        // Backend first, record second — `fw.port.open`'s ordering, so a record
+        // cannot outlive a failed apply and show as drift for ever.
+        open_before_start(ctx, lifecycle, &rule).await?;
+        ctx.db()
+            .record_fw_rule(rule.port, rule.proto.as_str(), None, &rule.comment)
+            .await
+            .map_err(UnihelmError::from)?;
+        ctx.log(format!(
+            "opened {port}/tcp before starting the firewall: {why}, and {cost}"
+        ));
+        opened.push(port);
+    }
+    Ok(opened)
+}
 
 /// ufw's own switch.
 ///
@@ -1809,11 +1953,15 @@ pub struct EnableOutput {
 /// `fw.enable` — start the firewall, and refuse to do it in the one way that
 /// takes the operator's server away from them.
 ///
-/// The whole operation is the SSH check. A stopped ufw with a dozen recorded
-/// rules and a default incoming policy of deny is one command away from
-/// enforcing all of them, and if none of them is the port sshd answers on, the
-/// operator's next login is refused by a firewall they can now only reach
-/// through a console.
+/// Most of the operation is the checks in front of it. A stopped ufw with a
+/// dozen recorded rules and a default incoming policy of deny is one command
+/// away from enforcing all of them, and if none of them is the port sshd answers
+/// on, the operator's next login is refused by a firewall they can now only
+/// reach through a console. The same argument, one door along, is why 80 and 443
+/// are ensured on a host that serves the web ([`ensure_web_reachable`]): SSH
+/// surviving is not much comfort to an operator whose sites — and whose panel,
+/// once it lives behind its vhost — went dark on a press that answered `200
+/// {active: true}`.
 pub struct Enable;
 
 #[async_trait]
@@ -1862,7 +2010,11 @@ impl TypedOperation for Enable {
         let view = admitting_view(&lifecycle).await?;
         let mut opened =
             ensure_ssh_reachable(ctx, &lifecycle, &view, &ssh, client_ip, input.allow_ssh).await?;
-        // And the panel's own port, unconditionally. See the function.
+        // Then the ways in that are not SSH, in the order they matter. 80 and
+        // 443 on a host that serves the web — including this panel, once it is
+        // behind its own vhost — and the panel's direct port only while the
+        // network can still reach the panel on it. See both functions.
+        opened.extend(ensure_web_reachable(ctx, &lifecycle, &view).await?);
         if let Some(port) = ensure_panel_reachable(ctx, &lifecycle, &view).await? {
             opened.push(port);
         }
@@ -3506,6 +3658,218 @@ ufw allow 53\n";
         assert_eq!(err.code, ErrorCode::Conflict);
         assert!(err.detail.contains("lock you out"), "{}", err.detail);
         assert!(err.detail.contains("panel.listen"), "{}", err.detail);
+    }
+
+    /// A `panel.listen` the panel's own port questions are answered from.
+    ///
+    /// Both decisions below read the panel's configuration and nothing else, so
+    /// this is what makes "the panel is behind its vhost now" a state a test can
+    /// put them in — which nothing could do while they asked
+    /// `panel_listen_port()`, and is why they shipped asking the wrong question.
+    fn panel_listening_on(dir: &std::path::Path, listen: &str) -> crate::panel::testing::Guard {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, format!("[panel]\nlisten = \"{listen}\"\n")).expect("config written");
+        crate::panel::testing::panel_config_at(&path)
+    }
+
+    #[tokio::test]
+    async fn closing_the_panels_port_is_allowed_once_only_this_machine_can_reach_it() {
+        // After `panel.tls.issue` the panel is bound to 127.0.0.1:8088 and
+        // reached through its vhost on 443. The refusal above then said
+        // "8088/tcp is the port this panel is served on. Closing it would lock
+        // you out of the panel" — false in that state, with no other route in
+        // the product to remove a firewall rule, while the panel's own posture
+        // remedy told the operator to close exactly this port from this page.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _narrowed = panel_listening_on(dir.path(), "127.0.0.1:8088");
+
+        ctx.db()
+            .record_fw_rule(8088, "tcp", None, PANEL_RULE_COMMENT)
+            .await
+            .unwrap();
+
+        let out = PortClose
+            .run(
+                &ctx,
+                PortInput {
+                    port: 8088,
+                    proto: "tcp".into(),
+                    source: None,
+                    comment: None,
+                },
+            )
+            .await
+            .expect("a port nothing outside can reach is closeable");
+        assert_eq!(out.port, 8088);
+        assert!(
+            ctx.db().fw_rules().await.unwrap().is_empty(),
+            "and forgotten, so the page stops reporting a rule that admits nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_panels_direct_port_is_not_reopened_once_the_panel_is_behind_its_vhost() {
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Wide: the port is how the panel is reached, so the firewall must not
+        // come up in front of it. This is the case the guard was written for.
+        {
+            let _wide = panel_listening_on(dir.path(), "0.0.0.0:8088");
+            let opened = ensure_panel_reachable(&ctx, &Lifecycle::Ufw, &AdmittingView::default())
+                .await
+                .expect("the panel's port is opened before the firewall starts");
+            assert_eq!(opened, Some(8088));
+            let recorded = reg.services().db.fw_rules().await.unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].comment, PANEL_RULE_COMMENT);
+            reg.services()
+                .db
+                .forget_fw_rule(8088, "tcp", None)
+                .await
+                .unwrap();
+        }
+
+        // Narrowed: the same port, and nothing outside can dial it. Opening it
+        // admits nothing, undoes the hole `panel.tls.issue` had just closed, and
+        // writes a line into the task log saying that without it "the firewall
+        // would have shut the door it was switched on through" — which is not
+        // true. The door is the vhost on 443.
+        let narrowed = dir.path().join("narrowed");
+        std::fs::create_dir_all(&narrowed).unwrap();
+        let _narrowed = panel_listening_on(&narrowed, "127.0.0.1:8088");
+        let opened = ensure_panel_reachable(&ctx, &Lifecycle::Ufw, &AdmittingView::default())
+            .await
+            .expect("a loopback panel needs no hole");
+        assert_eq!(opened, None);
+        assert!(
+            reg.services().db.fw_rules().await.unwrap().is_empty(),
+            "nothing may be opened or recorded for a port nothing outside can reach"
+        );
+    }
+
+    /// Seed a web server as running, the way the machine would have it.
+    async fn serve_with(ctx: &OpContext, server: crate::webserver::WebServer) {
+        let unit = server
+            .unit()
+            .expect("a web server the panel can drive")
+            .unit_name(ctx.distro().info.family);
+        ctx.distro()
+            .svc
+            .action(&unit, unihelm_distro::svc::SvcAction::Start)
+            .await
+            .expect("the mock starts it");
+    }
+
+    #[tokio::test]
+    async fn starting_a_firewall_on_a_host_that_serves_the_web_keeps_80_and_443_open() {
+        // The outage this pins: `fw.enable` opened SSH and the panel's own port
+        // and started a deny-by-default firewall. The call returned
+        // `200 {active: true}`, the operator's tab kept working off its
+        // established connection, and every site on the machine stopped
+        // answering the next request — with the panel behind its vhost, the
+        // panel with them. Recovery was ssh or the provider's console.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _wide = panel_listening_on(dir.path(), "0.0.0.0:8088");
+        serve_with(&ctx, crate::webserver::WebServer::Nginx).await;
+
+        let view = AdmittingView::default();
+        let ssh = SshFacts::Ports {
+            ports: vec![22],
+            source: SshPortSource::SshdT,
+        };
+        let mut opened = ensure_ssh_reachable(&ctx, &Lifecycle::Ufw, &view, &ssh, None, true)
+            .await
+            .expect("allow_ssh opens 22");
+        opened.extend(
+            ensure_web_reachable(&ctx, &Lifecycle::Ufw, &view)
+                .await
+                .expect("a serving host keeps 80 and 443"),
+        );
+        if let Some(port) = ensure_panel_reachable(&ctx, &Lifecycle::Ufw, &view)
+            .await
+            .expect("the panel's port")
+        {
+            opened.push(port);
+        }
+
+        assert_eq!(opened, vec![22, 80, 443, 8088]);
+        let mut ports: Vec<u16> = reg
+            .services()
+            .db
+            .fw_rules()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.port)
+            .collect();
+        ports.sort_unstable();
+        assert_eq!(
+            ports,
+            vec![22, 80, 443, 8088],
+            "80 and 443 have to be in the ruleset before it starts being enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_serves_nothing_keeps_80_and_443_shut() {
+        // Conditional on purpose. A box with no web server legitimately wants
+        // both ports closed, and opening them there would be the panel widening
+        // a ruleset nobody asked it to widen.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _wide = panel_listening_on(dir.path(), "0.0.0.0:8088");
+
+        let opened = ensure_web_reachable(&ctx, &Lifecycle::Ufw, &AdmittingView::default())
+            .await
+            .expect("nothing to do is not a failure");
+        assert!(opened.is_empty());
+        assert!(reg.services().db.fw_rules().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panel_behind_its_own_vhost_needs_443_even_with_no_site_on_the_box() {
+        // The narrowing makes 443 the only way in. A firewall that comes up
+        // without it is the lockout `panel.tls.issue` was supposed to end.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _narrowed = panel_listening_on(dir.path(), "127.0.0.1:8088");
+
+        let opened = ensure_web_reachable(&ctx, &Lifecycle::Ufw, &AdmittingView::default())
+            .await
+            .expect("the panel's own vhost counts as serving the web");
+        assert_eq!(opened, vec![80, 443]);
+        assert!(
+            reg.services().db.fw_rules().await.unwrap().len() == 2,
+            "both are recorded, so the page shows why they are open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_web_port_something_already_admits_is_left_alone() {
+        // The guard widens nothing it does not have to: a rule the operator
+        // already wrote is the answer, and a second identical rule is drift.
+        let (reg, ..) = registry().await;
+        let ctx = context(&reg).await;
+        let dir = tempfile::tempdir().unwrap();
+        let _wide = panel_listening_on(dir.path(), "0.0.0.0:8088");
+        serve_with(&ctx, crate::webserver::WebServer::Apache).await;
+
+        let view = AdmittingView {
+            rules: parse_ufw_added("ufw allow 80/tcp\n"),
+            opaque: Vec::new(),
+        };
+        let opened = ensure_web_reachable(&ctx, &Lifecycle::Ufw, &view)
+            .await
+            .expect("443 alone");
+        assert_eq!(opened, vec![443]);
     }
 
     #[test]

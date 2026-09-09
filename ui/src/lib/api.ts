@@ -296,6 +296,8 @@ export interface StackComponentRequest {
 export interface StackServiceRequest {
   component: string;
   version?: string;
+  /** Said back to confirm a stop the agent has priced. See `stack.stop`. */
+  confirm?: string;
 }
 
 /** The unit's state after a start or a stop, read back rather than assumed. */

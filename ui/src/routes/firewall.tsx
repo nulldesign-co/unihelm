@@ -469,13 +469,71 @@ function StopControl({ data, backend }: { data: FirewallResponse; backend: strin
 // managed port rules
 // ---------------------------------------------------------------------------
 
-/** Common holes, so nobody has to remember that SSH is 22/tcp at 3 a.m. */
-const PRESETS: { key: string; port: number; proto: "tcp" }[] = [
-  { key: "ssh", port: 22, proto: "tcp" },
-  { key: "http", port: 80, proto: "tcp" },
-  { key: "https", port: 443, proto: "tcp" },
-  { key: "panel", port: 8443, proto: "tcp" },
-];
+export type Preset = { key: string; port: number; proto: "tcp" };
+
+/**
+ * The panel's shipped port, for when the browser's own address cannot say.
+ *
+ * 8088 in every authority in the project — `DEFAULT_PANEL_PORT` in `panel.rs`,
+ * `PanelConfig::default`, `installer/config.toml.example`. The preset offered
+ * **8443**, a port nothing here has ever bound, so an operator who could not
+ * reach their panel pressed the button labelled "Panel", wrote a rule for a port
+ * with nothing behind it, and came away believing they had opened the way back
+ * in. That is the one thing this page must never do.
+ */
+export const DEFAULT_PANEL_PORT = 8088;
+
+/**
+ * The port this browser is reaching the panel on.
+ *
+ * The page cannot read `panel.listen`: the firewall response carries the
+ * backend, the rules and the caller's address and nothing about the listener.
+ * It does not have to guess either — the address in the URL bar is by definition
+ * a port this panel answers on, right now, for the person about to press the
+ * button. Behind the managed vhost that is 443; reached directly it is 8088, or
+ * wherever the operator moved it, which `panel.rs` says is exactly the person a
+ * hard-coded number locks out.
+ *
+ * A loopback address is the one shape that says nothing about this server's
+ * firewall — an ssh tunnel or the dev proxy, where the port belongs to the
+ * operator's own machine — so it falls back to the shipped default rather than
+ * offering a hole to a port on the wrong computer.
+ */
+export function panelPort(loc?: { protocol: string; hostname: string; port: string }): number {
+  const at = loc ?? (typeof window === "undefined" ? null : window.location);
+  if (!at) return DEFAULT_PANEL_PORT;
+
+  const host = at.hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return DEFAULT_PANEL_PORT;
+
+  const explicit = Number(at.port);
+  if (Number.isInteger(explicit) && explicit > 0 && explicit <= 65535) return explicit;
+  // No port in the URL means the scheme's own.
+  if (at.protocol === "https:") return 443;
+  if (at.protocol === "http:") return 80;
+  return DEFAULT_PANEL_PORT;
+}
+
+/**
+ * Common holes, so nobody has to remember that SSH is 22/tcp at 3 a.m.
+ *
+ * A function rather than a constant because one of the four is not a constant:
+ * see `panelPort`.
+ */
+export function presets(loc?: { protocol: string; hostname: string; port: string }): Preset[] {
+  const common: Preset[] = [
+    { key: "ssh", port: 22, proto: "tcp" },
+    { key: "http", port: 80, proto: "tcp" },
+    { key: "https", port: 443, proto: "tcp" },
+  ];
+  const panel = panelPort(loc);
+  // Once the panel is behind its own vhost the answer is 443, which is already
+  // on this row as HTTPS. A second button with the same number under another
+  // name reads as a second port that also needs opening.
+  return common.some((preset) => preset.port === panel)
+    ? common
+    : [...common, { key: "panel", port: panel, proto: "tcp" }];
+}
 
 function RulesCard({ data }: { data: FirewallResponse }) {
   const { t } = useTranslation();
@@ -766,7 +824,7 @@ function OpenPortDialog({ open, onClose }: { open: boolean; onClose: () => void 
       }
     >
       <div className="mb-4 flex flex-wrap gap-2">
-        {PRESETS.map((preset) => (
+        {presets().map((preset) => (
           <Button
             key={preset.key}
             variant="outline"

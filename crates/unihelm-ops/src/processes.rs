@@ -42,6 +42,14 @@
 //! cost. [`ListOutput::refresh_seconds`] is the interval the server asks the
 //! client to use, so the page and the agent cannot drift apart about it.
 //!
+//! # Who this is for
+//!
+//! The operator, and only the operator. Both operations refuse any caller whose
+//! [`unihelm_core::TenantScope`] is narrower than the whole machine — see
+//! [`require_whole_machine_scope`], which the 0.8.0 review added after finding
+//! that `ServerRead` alone let one reseller read every other tenant's command
+//! lines. Permission says what kind of account; scope says whose machine.
+//!
 //! # The kill, and what it will not do
 //!
 //! Killing the wrong process takes the machine down. So [`Kill`] refuses three
@@ -882,6 +890,54 @@ pub struct ListOutput {
     pub tenant_lookup_error: Option<String>,
 }
 
+/// Refuse anyone whose scope is not the whole machine.
+///
+/// **The 0.8.0 review found this missing.** `ServerRead` reads like an
+/// administrator's permission and is not one: `Role::Reseller` holds it by
+/// default (`unihelm_core::rbac`), a reseller is a tenant — `TenantScope::Reseller`
+/// on a white-label panel with peers on the same box — and `Processes` is an
+/// ungated link in the sidebar. So every reseller could `GET /api/processes` and
+/// read, for the whole machine: verbatim `cmdline` for every process, which
+/// routinely carries a password (`mysql -p…`, `wp --dbpass=…`, a cron script
+/// with a token); every other tenant's Linux account name and `/home/uh_…`
+/// paths; and, through `attribute_tenants`, the subscription id behind each of
+/// them. `search` is applied to the whole sweep before the row limit, so
+/// `?search=uh_` enumerated every tenant on the box and `?search=mysql` went
+/// looking for the passwords. That is precisely the reseller-to-reseller
+/// isolation this panel documents as a defended property.
+///
+/// # Why a refusal and not a filtered list
+///
+/// There is no honest tenant-scoped process table. Most of what runs is nobody's
+/// tenant — kernel threads, nginx as `www-data` serving every site, the
+/// database, the panel itself — and the numbers that make the page worth having
+/// (`total`, `matched`, `cpu_cores`, the busiest-first ordering) are facts about
+/// the machine. Filtering the rows and keeping the totals would report a
+/// machine-wide fact to somebody shown a tenant-wide list; recomputing the
+/// totals over the filtered rows would answer "what is at 96%" with "nothing you
+/// own", which is the question the page exists to answer and a worse lie. The
+/// operation was written for the operator — the comment on `PERMISSION` said as
+/// much and only the permission disagreed — so it stays the operator's, and a
+/// tenant gets a refusal that says whose machine it is.
+///
+/// The operator is not narrowed by this. `TenantScope::Global` is every
+/// administrator, including one whose account has been narrowed to `server.read`
+/// with no `server.manage`: that account still reads the table and still cannot
+/// signal anything, which is the split `Kill` exists to make.
+fn require_whole_machine_scope(ctx: &OpContext) -> Result<()> {
+    if ctx.scope().is_global() {
+        return Ok(());
+    }
+    Err(UnihelmError::new(
+        ErrorCode::TenantScopeViolation,
+        "the process table, and the signals that act on it, belong to the whole machine — \
+         every tenant's programs, the command lines they were started with and the accounts \
+         they run as — so they are offered only to an account whose scope is the whole \
+         machine. Your own sites and what they are using are on the Sites page; if one of \
+         them is slow and you cannot see why, ask the server operator.",
+    ))
+}
+
 #[async_trait]
 impl TypedOperation for List {
     type Input = ListInput;
@@ -889,8 +945,10 @@ impl TypedOperation for List {
 
     const NAME: &'static str = "process.list";
     // Read, like `metrics.snapshot`: the same question the dashboard asks,
-    // broken down. It does name every process on the machine, which is why it
-    // stops at `ServerRead` and is not offered to a tenant role.
+    // broken down. `ServerRead` says *what kind* of account this is for — one
+    // that watches the machine rather than one that changes it — and
+    // `require_whole_machine_scope` says *whose* machine. The permission alone
+    // was the 0.8.0 defect: see the guard's comment.
     const PERMISSION: Permission = Permission::ServerRead;
     // One sweep of /proc against a sample the previous poll left behind. The
     // first call of a session also waits `SETTLE` for a second sample, which is
@@ -899,6 +957,10 @@ impl TypedOperation for List {
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        // First, before /proc is read at all: there is no partial answer to give
+        // a tenant here, so there is no work worth doing for one.
+        require_whole_machine_scope(ctx)?;
+
         let sweep = self.source.sweep().await?;
         let taken_at = Instant::now();
 
@@ -1131,11 +1193,19 @@ async fn attribute_tenants(
 
     let mut found: HashMap<String, Tenant> = HashMap::new();
     for candidate in candidates {
-        // The unscoped lookup on `Db`, the one `site::provision` uses. It is
-        // safe here for the reason this operation needs `server.read` at all: a
-        // listing that already names every process on the machine is not one a
-        // customer can reach, and an admin looking at a slow server has to be
-        // able to see whose process is eating it.
+        // The unscoped lookup on `Db`, the one `site::provision` uses: it
+        // resolves a Linux account to a subscription anywhere on the machine, so
+        // it must only ever run for a caller entitled to the whole machine.
+        //
+        // What used to stand here said this was safe because such a listing "is
+        // not one a customer can reach". True of `Role::Customer` and false of
+        // `Role::Reseller`, which also holds `server.read` — and that mistake is
+        // what handed one reseller another reseller's customers' subscription
+        // ids and Linux usernames. The premise is now enforced rather than
+        // assumed: `List::run` refuses anything but `TenantScope::Global` before
+        // a single row is built (`require_whole_machine_scope`), which is why an
+        // admin looking at a slow server can still see whose process is eating
+        // it. Do not call this function from anywhere that guard does not cover.
         let subscription = ctx
             .db()
             .subscription_by_linux_user(&candidate)
@@ -1271,6 +1341,12 @@ impl TypedOperation for Kill {
     const EXECUTION: Execution = Execution::Immediate;
 
     async fn run(&self, ctx: &OpContext, input: Self::Input) -> Result<Self::Output> {
+        // `ServerManage` is an administrator's permission today, so this guard
+        // refuses nobody `require`. It is here anyway: the pid namespace is the
+        // machine's, and the day somebody widens `ServerManage` the answer to
+        // "may a tenant signal another tenant's worker" must already be no.
+        require_whole_machine_scope(ctx)?;
+
         // Refused before the table is read, so a caller sending `0` or a value
         // that wraps to `-1` never reaches a lookup that might match something.
         signalable_pid(input.pid)?;
@@ -1868,6 +1944,123 @@ mod tests {
             "nginx serves every tenant as www-data; naming one of them would be a guess"
         );
         assert!(out.tenant_lookup_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reseller_is_not_shown_another_resellers_command_lines() {
+        // The 0.8.0 release blocker. `Role::Reseller` holds `server_read` by
+        // default and the Processes link is in the sidebar for everyone, so this
+        // whole table — verbatim argv, other tenants' Linux accounts, and the
+        // subscription id behind each of them — was one ordinary GET away from
+        // every reseller on a shared machine.
+        //
+        // Seeded so that the leak is concrete: the row at pid 900 runs as a
+        // subscription that belongs to nobody in the reseller's tree, and its
+        // command line carries a password the way a real one does.
+        let (reg, admin, customer) = registry().await;
+        let db = reg.services().db.clone();
+        let subscription = db.create_subscription(customer).await.unwrap();
+        let reseller = db
+            .users(&unihelm_core::TenantScope::Global)
+            .create(unihelm_db::users::NewUser {
+                role: Role::Reseller,
+                email: unihelm_core::Email::parse("peer@example.com").unwrap(),
+                username: unihelm_core::Username::parse("peer").unwrap(),
+                password: "a-long-enough-password".into(),
+                reseller_id: None,
+                full_name: None,
+                locale: "en".into(),
+            })
+            .await
+            .unwrap();
+
+        let secret = "/usr/bin/mysql -uroot -pTHE-ROOT-PASSWORD";
+        let rows = vec![RawProcess {
+            cmdline: Some(secret.to_string()),
+            ..process(900, "mysql", 1000)
+        }];
+        let source = Arc::new(FakeTable {
+            sweeps: Mutex::new(vec![rows.clone()].into()),
+            users: HashMap::from([(1000, subscription.linux_user.clone())]),
+            signalled: Mutex::new(Vec::new()),
+        });
+
+        // The seeded table first, because that is where the leak is visible: a
+        // reseller with no claim on this subscription asking with the search
+        // term that used to enumerate every tenant account on the box. Before
+        // the guard this returned `Ok` with the row below — argv and all.
+        for tenant in [
+            auth_for(reseller.id, Role::Reseller),
+            auth_for(customer, Role::Customer),
+        ] {
+            let ctx = OpContext::new(reg.services().clone(), tenant);
+            let err = List::over(source.clone())
+                .run(&ctx, listing(Sort::Cpu, None, Some("uh_")))
+                .await
+                .expect_err("no search term makes this table theirs");
+            assert_eq!(err.code, ErrorCode::TenantScopeViolation);
+            assert!(
+                err.detail.contains("whole machine"),
+                "the refusal has to say whose table this is: {}",
+                err.detail
+            );
+        }
+
+        // And through `dispatch`, the hop the HTTP route takes: it re-derives
+        // the caller from the users table and checks the permission — a
+        // permission this reseller genuinely holds, which is why the refusal
+        // cannot come from there. `dispatch` builds `List` over the live `/proc`
+        // reader, so before the guard this got as far as sweeping the real
+        // machine; the assertion is that it no longer gets that far.
+        assert!(auth_for(reseller.id, Role::Reseller).has(Permission::ServerRead));
+        let err = reg
+            .dispatch(
+                "process.list",
+                &auth_for(reseller.id, Role::Reseller),
+                serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect_err("a reseller is a tenant, not the operator of this machine");
+        assert_eq!(err.code, ErrorCode::TenantScopeViolation);
+
+        // And the operator still gets the answer the page exists for — argv,
+        // the tenant behind it, and all of it.
+        let admin_ctx = OpContext::new(reg.services().clone(), auth_for(admin, Role::Admin));
+        let out = List::over(source)
+            .run(&admin_ctx, listing(Sort::Cpu, None, None))
+            .await
+            .unwrap();
+        let row = out
+            .processes
+            .iter()
+            .find(|p| p.pid == 900)
+            .expect("the operator sees the machine");
+        assert_eq!(row.cmdline.as_deref(), Some(secret));
+        assert_eq!(
+            row.tenant.as_ref().map(|t| t.subscription_id),
+            Some(subscription.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_cannot_signal_a_process_either() {
+        // `ServerManage` already keeps every tenant out of `process.kill`, so
+        // this asserts the second lock rather than the first: if that permission
+        // is ever widened, the pid namespace is still the machine's.
+        let (reg, _admin, customer) = registry().await;
+        let ctx = OpContext::new(reg.services().clone(), auth_for(customer, Role::Customer));
+        let source = FakeTable::with(vec![process(900, "php", 1000)]);
+        let err = Kill::over(source.clone())
+            .run(&ctx, kill_input(900, "php", "uh_abc123"))
+            .await
+            .expect_err("a tenant does not signal processes on a shared machine");
+
+        assert_eq!(err.code, ErrorCode::TenantScopeViolation);
+        assert!(
+            source.signalled().is_empty(),
+            "a refused caller must not have signalled anything"
+        );
     }
 
     // -- the kill -----------------------------------------------------------

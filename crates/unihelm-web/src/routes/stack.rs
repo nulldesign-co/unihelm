@@ -227,6 +227,12 @@ pub struct ServiceRequest {
     /// Which version, for the entries that run several services at once.
     #[serde(default)]
     pub version: Option<String>,
+    /// The component's own slug, said back, for a stop that takes something
+    /// else down with it. The agent prices the stop, refuses, and its refusal
+    /// names the string to send — so the second click is an operator agreeing
+    /// to a stated cost rather than repeating a click that failed.
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 impl ServiceRequest {
@@ -235,6 +241,9 @@ impl ServiceRequest {
         m.insert("component".into(), json!(self.component));
         if let Some(v) = &self.version {
             m.insert("version".into(), json!(v));
+        }
+        if let Some(confirm) = &self.confirm {
+            m.insert("confirm".into(), json!(confirm));
         }
         serde_json::Value::Object(m)
     }

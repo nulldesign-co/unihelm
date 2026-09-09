@@ -7,6 +7,16 @@
 //! 96%. `POST /kill` takes something off the machine and needs `server_manage`,
 //! like stopping a service.
 //!
+//! Neither permission is the tenant boundary, and the 0.8.0 review found out the
+//! hard way that this file read as though it were. `server_read` is a
+//! `Role::Reseller` default and a reseller is a tenant with peers on the same
+//! box, so until `unihelm_ops::processes` started refusing any scope narrower
+//! than the whole machine, `GET /api/processes` handed one reseller every other
+//! tenant's verbatim command lines — passwords on argv included — their Linux
+//! accounts and their subscription ids. The refusal is `tenant_scope_violation`,
+//! it comes from the operation, and the sidebar link is not a gate: the answer
+//! has to be no at the endpoint whether or not a page offers the button.
+//!
 //! Neither route makes a judgement of its own. Which processes may be signalled
 //! is decided in `unihelm_ops::processes`, on the machine, from the uid and the
 //! cgroup it read there — this file could not re-derive any of it from an HTTP
@@ -63,7 +73,7 @@ pub struct ListQuery {
     responses(
         (status = 200, description = "Processes, busiest first, with the CPU window they were measured over, the interval to poll on, and — on any process the panel would refuse to signal — the reason it would refuse", body = serde_json::Value),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied`: needs `server_read`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied`: needs `server_read`; or `tenant_scope_violation`: the process table is the whole machine's, so only an account scoped to the whole machine is shown it", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),
     ),
 )]
@@ -139,7 +149,7 @@ pub struct KillRequest {
         (status = 200, description = "The signal was sent. The note says what that does and does not mean.", body = serde_json::Value),
         (status = 400, description = "`invalid_input`: the pid is not a single process, or the command and owner no longer match the process behind it", body = ApiErrorBody),
         (status = 401, description = "`session_invalid`", body = ApiErrorBody),
-        (status = 403, description = "`permission_denied` / `csrf_invalid`: needs `server_manage`", body = ApiErrorBody),
+        (status = 403, description = "`permission_denied` / `csrf_invalid`: needs `server_manage`; or `tenant_scope_violation`: the pid namespace is the whole machine's", body = ApiErrorBody),
         (status = 404, description = "`not_found`: nothing is running under that pid", body = ApiErrorBody),
         (status = 409, description = "`conflict`: the process belongs to init, to the panel, or to a system account, and the reason names which", body = ApiErrorBody),
         (status = 503, description = "`agent_unavailable`", body = ApiErrorBody),

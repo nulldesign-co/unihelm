@@ -216,7 +216,8 @@ pub struct Volume {
     pub size: Option<String>,
     /// The containers that mount it, running or stopped.
     ///
-    /// `None` — not an empty list — when the question could not be asked.
+    /// `None` — not an empty list — when the question could not be asked, or
+    /// was answered in a form that cannot be read (see [`mounts_to_users`]).
     /// "Nothing uses this" reads as permission to delete it and "the panel
     /// could not tell" does not, and collapsing the two into `[]` is the
     /// difference between an orphan and somebody's data.
@@ -970,9 +971,10 @@ async fn volumes(docker: &str, engines: &crate::engine::EngineRegistry) -> Vec<V
         .into_iter()
         .map(|r| Volume {
             size: sizes.as_ref().and_then(|m| m.get(&r[0]).cloned()),
-            // `used_by` is only ever a list when `docker ps` answered. Mapping a
-            // missing answer onto "no containers" would put an orphan badge on
-            // a volume a running database is writing to.
+            // `used_by` is only ever a list when `docker ps` answered and the
+            // answer could be read whole. Mapping a missing or cut-short answer
+            // onto "no containers" would put an orphan badge on a volume a
+            // running database is writing to.
             used_by: users
                 .as_ref()
                 .map(|m| m.get(&r[0]).cloned().unwrap_or_default()),
@@ -1014,11 +1016,12 @@ async fn volume_sizes(docker: &str) -> Option<BTreeMap<String, String>> {
     )
 }
 
-/// Read `docker ps`'s mount column into "which containers hold this volume".
+/// Read `docker ps`'s mount column into "which containers hold this volume",
+/// or `None` when the column cannot be believed.
 ///
-/// Its own function so a test can hold it: the two rules below are each one
+/// Its own function so a test can hold it: the three rules below are each one
 /// line and each invisible in their absence.
-fn mounts_to_users(text: &str) -> BTreeMap<String, Vec<String>> {
+fn mounts_to_users(text: &str) -> Option<BTreeMap<String, Vec<String>>> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for row in rows(text, 2) {
         for mount in row[1].split(',').map(str::trim).filter(|m| !m.is_empty()) {
@@ -1029,12 +1032,23 @@ fn mounts_to_users(text: &str) -> BTreeMap<String, Vec<String>> {
             if mount.starts_with('/') {
                 continue;
             }
+            // A cut-off name matches no volume, and a mount that cannot be
+            // named is a mount that cannot be ruled out: keying the map on it
+            // turns "a database is writing to this" into "nothing uses this",
+            // which is the licence-to-delete answer. `volume_users` asks with
+            // `--no-trunc` so this should never fire — and a volume name can
+            // hold neither of these characters, so if it does fire the flag
+            // has been lost and the only true answer left is that the panel
+            // could not tell.
+            if mount.ends_with('…') || mount.ends_with("...") {
+                return None;
+            }
             map.entry(mount.to_string())
                 .or_default()
                 .push(row[0].clone());
         }
     }
-    map
+    Some(map)
 }
 
 /// Which containers mount each volume, running or stopped.
@@ -1043,21 +1057,29 @@ fn mounts_to_users(text: &str) -> BTreeMap<String, Vec<String>> {
 /// like an orphan — the container is not in `docker ps` and the volume is still
 /// its data — and it is also the case Docker itself refuses a `volume rm` for.
 async fn volume_users(docker: &str) -> Option<BTreeMap<String, Vec<String>>> {
-    let text = run_docker(
-        docker,
-        &[
-            "ps",
-            "--all",
-            "--format",
-            // `.Mounts` is Docker's own list of what this container has
-            // attached: named volumes by name, bind mounts by host path.
-            "{{.Names}}\t{{.Mounts}}",
-        ],
-    )
-    .await?;
-
-    Some(mounts_to_users(&text))
+    let text = run_docker(docker, &VOLUME_USERS_ARGV).await?;
+    mounts_to_users(&text)
 }
+
+/// A const so a test can read it — see
+/// `the_mounts_column_is_asked_for_untruncated`.
+///
+/// `--no-trunc` is the load-bearing flag. Without it Docker cuts the Mounts
+/// column at 15 characters, in a custom `--format` template as much as in the
+/// default table, and every volume the panel creates is longer than that
+/// (`unihelm-postgres-16-data` is 24). Each one came back under a name that
+/// matched no volume, so the page reported "nothing uses this" for volumes a
+/// running database was writing to, and the removal dialog said the same. It is
+/// the one answer this module's own docs say must never be guessed at.
+const VOLUME_USERS_ARGV: [&str; 5] = [
+    "ps",
+    "--all",
+    "--no-trunc",
+    "--format",
+    // `.Mounts` is Docker's own list of what this container has attached: named
+    // volumes by name, bind mounts by host path.
+    "{{.Names}}\t{{.Mounts}}",
+];
 
 // ---------------------------------------------------------------------------
 // creating one
@@ -3153,10 +3175,14 @@ mod image_volume_and_conflict_tests {
     /// somebody's data, and the one Docker itself refuses a `volume rm` for.
     #[test]
     fn a_volume_names_every_container_that_mounts_it() {
+        // The names here are all short enough that `docker ps` would not have
+        // cut them, which is exactly why this test passed while the page was
+        // wrong about every volume the panel itself creates — see
+        // `a_mount_name_docker_cut_short_is_not_read_as_a_volume`.
         let ps = "shop_web_1\tapp_data,/etc/nginx/conf.d\n\
                   shop_db_1\tpg_data\n\
                   old_worker\tapp_data\n";
-        let users = mounts_to_users(ps);
+        let users = mounts_to_users(ps).expect("nothing here is truncated");
         assert_eq!(
             users.get("app_data").map(Vec::as_slice),
             Some(["shop_web_1".to_string(), "old_worker".to_string()].as_slice())
@@ -3173,8 +3199,63 @@ mod image_volume_and_conflict_tests {
     /// entry under the empty name.
     #[test]
     fn a_container_with_no_mounts_claims_no_volume() {
-        assert!(mounts_to_users("web\t\n").is_empty());
-        assert!(mounts_to_users("").is_empty());
+        assert!(
+            mounts_to_users("web\t\n")
+                .expect("not truncated")
+                .is_empty()
+        );
+        assert!(mounts_to_users("").expect("not truncated").is_empty());
+    }
+
+    /// `docker ps` cuts the Mounts column at 15 characters unless it is told
+    /// not to, in a custom `--format` template as much as in the default one.
+    ///
+    /// Every volume this panel creates is longer than that
+    /// (`unihelm-mariadb-11.8-data` is 25), so before `--no-trunc` the map was
+    /// keyed on `unihelm-mariad…`, the lookup for the real name missed, and the
+    /// page reported "nothing" for the volume its own database container was
+    /// writing to — with the removal dialog's wording following the same data.
+    /// The flag is the fix; refusing to key the map on a cut name is what keeps
+    /// the answer honest if the flag is ever lost again.
+    #[test]
+    fn a_mount_name_docker_cut_short_is_not_read_as_a_volume() {
+        assert_eq!(
+            mounts_to_users("unihelm-mariadb-11.8\tunihelm-mariad…\n"),
+            None
+        );
+        assert_eq!(mounts_to_users("web\tsome_long_name...\n"), None);
+        // One truncated container poisons the whole answer: a volume that
+        // looks unused may be the one that name was cut from.
+        assert_eq!(
+            mounts_to_users("shop_db_1\tpg_data\nshop_web_1\tunihelm-mariad…\n"),
+            None
+        );
+        // Exactly 15 characters is what Docker leaves alone, and it stays a
+        // perfectly ordinary volume name.
+        let ok = mounts_to_users("web\texactly15chars_\n").expect("not truncated");
+        assert_eq!(
+            ok.get("exactly15chars_").map(Vec::as_slice),
+            Some(["web".to_string()].as_slice())
+        );
+    }
+
+    /// The flag itself, pinned: the parsing above cannot recover a name Docker
+    /// already cut, so the only thing that keeps the column complete is asking
+    /// for it complete.
+    #[test]
+    fn the_mounts_column_is_asked_for_untruncated() {
+        assert!(
+            VOLUME_USERS_ARGV.contains(&"--no-trunc"),
+            "{VOLUME_USERS_ARGV:?}"
+        );
+        assert!(
+            VOLUME_USERS_ARGV.contains(&"--all"),
+            "{VOLUME_USERS_ARGV:?}"
+        );
+        assert!(
+            VOLUME_USERS_ARGV.contains(&"{{.Names}}\t{{.Mounts}}"),
+            "{VOLUME_USERS_ARGV:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

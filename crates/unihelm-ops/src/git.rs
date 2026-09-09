@@ -332,6 +332,62 @@ pub fn fast_forward_argv(root: &Path, branch: &str) -> Vec<OsString> {
     argv
 }
 
+/// Which branch a deploy may fast-forward, given what the site is attached to
+/// and what the checkout's HEAD is actually on — or the reason it may not.
+///
+/// [`fast_forward_argv`] merges into whatever HEAD is on. It cannot be told to
+/// merge into some other branch, and this module never checks a branch out. So
+/// when the attachment said `production` and HEAD was on `main`, the deploy
+/// merged production's tip into `main` and then reported `production` as
+/// deployed: the site served one branch's code under another branch's name.
+/// Where `main` was already ahead of production — the ordinary
+/// development-ahead-of-release shape — git answered "Already up to date", the
+/// pull reported success with the attached branch, and the site went on
+/// serving the branch nobody asked for. Nothing surfaced the disagreement:
+/// `remote_matches_attachment` compares the URL only, and the site page renders
+/// the attachment's branch, never the checkout's.
+///
+/// Refusing rather than checking the branch out is deliberate. Changing a
+/// site's deploy branch is Detach → Attach, which never touches the working
+/// tree, so arriving here means the panel's record and the checkout genuinely
+/// disagree and only the operator knows which one is right — and where the
+/// clone was `--single-branch`, the branch they named does not exist locally at
+/// all, so a checkout would fail with git's own raw text. The message names
+/// both branches and both ways out.
+fn resolve_pull_branch(root: &Path, attached: Option<&str>, head: Option<&str>) -> Result<String> {
+    match (attached, head) {
+        (Some(attached), Some(head)) if attached != head => Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "the checkout in {} is on branch `{head}`, but the site is attached to branch \
+                 `{attached}`. A deploy fast-forwards the branch that is checked out, so this \
+                 would have merged `{attached}` into `{head}` and served it under the wrong \
+                 name. Nothing was pulled. Check `{attached}` out in the checkout, or attach \
+                 `{head}` instead.",
+                root.display()
+            ),
+        )),
+        // They agree, or nothing was attached and the checkout's own branch is
+        // the only claim there is.
+        (Some(branch), Some(_)) => Ok(branch.to_string()),
+        (None, Some(head)) => Ok(head.to_string()),
+        // Detached HEAD. A merge would move HEAD and leave it detached still,
+        // which is not a branch and must not be reported as one.
+        (attached, None) => Err(UnihelmError::new(
+            ErrorCode::Conflict,
+            format!(
+                "the checkout in {} is not on a branch (detached HEAD), so there is no branch \
+                 to fast-forward. Check {} out in it, or remove the checkout and clone again.",
+                root.display(),
+                match attached {
+                    Some(branch) => format!("`{branch}`"),
+                    None => "a branch".to_string(),
+                }
+            ),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // what a caller is allowed to name
 // ---------------------------------------------------------------------------
@@ -1359,17 +1415,13 @@ impl TypedOperation for Pull {
             ));
         }
 
-        let Some(branch) = attachment.branch.clone().or_else(|| before.branch.clone()) else {
-            return Err(UnihelmError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "the checkout in {} is not on a branch (detached HEAD), so there is no \
-                     branch to fast-forward. Check out a branch in it, or remove the checkout \
-                     and clone again.",
-                    target.root.display()
-                ),
-            ));
-        };
+        // The branch the merge will actually move must be the branch this
+        // deploy claims to be deploying — see `resolve_pull_branch`.
+        let branch = resolve_pull_branch(
+            &target.root,
+            attachment.branch.as_deref(),
+            before.branch.as_deref(),
+        )?;
 
         ctx.log(format!("fetching {} for {}", attachment.repository, branch));
         let out = target
@@ -1637,6 +1689,50 @@ mod tests {
         );
         assert_eq!(argv[0], "-C");
         assert_eq!(argv[1], "/srv/p");
+    }
+
+    #[test]
+    fn a_deploy_refuses_when_the_checkout_is_on_a_different_branch_than_the_attachment() {
+        let root = Path::new("/var/www/example.com");
+
+        // The case that used to merge `production` into `main` and report
+        // `production` as deployed. Both names have to appear: the operator
+        // can see the attachment's branch on the site page and the checkout's
+        // nowhere, so a message naming only one of them is not actionable.
+        let err = resolve_pull_branch(root, Some("production"), Some("main")).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.detail.contains("production"), "{}", err.detail);
+        assert!(err.detail.contains("main"), "{}", err.detail);
+        assert!(err.detail.contains("Nothing was pulled"), "{}", err.detail);
+
+        // Everything that was already right stays right.
+        assert_eq!(
+            resolve_pull_branch(root, Some("main"), Some("main")).unwrap(),
+            "main"
+        );
+        assert_eq!(
+            resolve_pull_branch(root, None, Some("main")).unwrap(),
+            "main"
+        );
+
+        // Detached HEAD is still refused, and now names the branch to check
+        // out when the attachment knows one.
+        let detached = resolve_pull_branch(root, Some("production"), None).unwrap_err();
+        assert_eq!(detached.code, ErrorCode::Conflict);
+        assert!(
+            detached.detail.contains("detached HEAD"),
+            "{}",
+            detached.detail
+        );
+        assert!(
+            detached.detail.contains("production"),
+            "{}",
+            detached.detail
+        );
+        assert_eq!(
+            resolve_pull_branch(root, None, None).unwrap_err().code,
+            ErrorCode::Conflict
+        );
     }
 
     // -- reading the document root ------------------------------------------

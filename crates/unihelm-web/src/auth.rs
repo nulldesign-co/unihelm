@@ -8,11 +8,12 @@
 //! - state-changing requests must also present the session's CSRF token in a
 //!   header, which `SameSite=Strict` already makes hard to forge and this makes
 //!   pointless to try;
-//! - failed logins are counted per address and per (account, address) pair, so
-//!   neither a spray across accounts nor a focus on one gets an unlimited
-//!   budget — and every budget an attacker can spend is their own address's,
-//!   because a budget belonging to an *account* is a lockout anyone can impose
-//!   on anyone. What the account's own count still buys is a delay;
+//! - failed logins are counted per address, per (account, address) pair, and
+//!   per account from everywhere, so neither a spray across accounts nor a
+//!   focus on one gets an unlimited budget. The first two budgets belong to the
+//!   caller's own address; the third would be a lockout anyone could impose on
+//!   anyone, so it only ever refuses addresses that have never signed in to the
+//!   account — see [`check_rate_limits`];
 //! - an unknown username still costs a full argon2 verification, so response
 //!   time does not tell an attacker which accounts exist;
 //! - and because that verification is expensive on purpose, only a few may run
@@ -39,20 +40,37 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 /// How many failures from one address before it is refused, and over what window.
 const IP_FAILURE_LIMIT: i64 = 10;
 /// Per (account, address) limit, lower because a targeted attack is the more
-/// dangerous one. Both budgets belong to the caller's own address; see
-/// [`check_rate_limits`] for why no budget may belong to an account.
+/// dangerous one. Both of these budgets belong to the caller's own address; see
+/// [`check_rate_limits`] for why a budget belonging to an *account* may only
+/// ever refuse callers that account has never seen succeed.
 const ACCOUNT_FAILURE_LIMIT: i64 = 5;
 const FAILURE_WINDOW: Duration = Duration::minutes(15);
 
 /// Failures against one account, from anywhere, before answers start slowing.
 const ACCOUNT_SLOWDOWN_AFTER: i64 = ACCOUNT_FAILURE_LIMIT;
+
+/// Failures against one account, from anywhere, before the panel stops taking
+/// guesses from addresses it has never seen sign in to that account.
+///
+/// Ten addresses' worth of the per-pair budget, so nothing an operator can do
+/// by hand comes near it: reaching it takes at least ten distinct addresses
+/// inside fifteen minutes, because each pair is refused at five. A botnet
+/// reaches it in a second, which is the point — before this existed, a thousand
+/// addresses bought a thousand fresh budgets and the account had no ceiling at
+/// all.
+const ACCOUNT_DISTRIBUTED_LIMIT: i64 = ACCOUNT_FAILURE_LIMIT * 10;
 /// What each failure past that is worth, and the ceiling it stops at.
 ///
-/// 500 ms is invisible to somebody typing a password and ruinous to somebody
-/// spraying one account from a botnet, which is the whole trade. The cap is
-/// what keeps it a delay rather than a refusal in disguise: five seconds is a
-/// long pause on a login form and it is still a login, which "locked out" is
-/// not.
+/// 500 ms is invisible to somebody typing a password and expensive to a script
+/// working through a list one request at a time. It is **not** a bound on a
+/// concurrent attacker, whatever this comment used to imply: a sleep on a task
+/// is latency, and a hundred sleeping requests sleep in parallel, so throughput
+/// is still whatever [`PASSWORD_VERIFY_PERMITS`] allows. That is what
+/// [`ACCOUNT_DISTRIBUTED_LIMIT`] is for; this only buys time.
+///
+/// The cap is what keeps it a delay rather than a refusal in disguise: five
+/// seconds is a long pause on a login form and it is still a login, which
+/// "locked out" is not.
 const ACCOUNT_SLOWDOWN_STEP: std::time::Duration = std::time::Duration::from_millis(500);
 const ACCOUNT_SLOWDOWN_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -249,6 +267,31 @@ pub fn clearing_cookie(secure: bool) -> Cookie<'static> {
     cookie
 }
 
+/// The typed identifier, in a shape that is safe to quote back.
+///
+/// The refusals name it because the throttle counts the string that was typed
+/// rather than the account behind it, and an operator who does not know which
+/// spelling is throttled cannot unlock it. But that string is whatever the
+/// client sent: control characters would corrupt a terminal reading the panel's
+/// log or an operator pasting the message, and there is no length limit on the
+/// field, so the whole request body could otherwise come back inside an error.
+///
+/// Not an escaping function — the response is JSON and the UI renders text —
+/// just a bound and a scrub, so the message stays a message.
+fn shown_identifier(username: &str) -> String {
+    const MAX: usize = 64;
+    let cleaned: String = username
+        .chars()
+        .take(MAX)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if username.chars().nth(MAX).is_some() {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
 /// How long to make this caller wait for an account that is under attack.
 ///
 /// A pure function of the count, so the curve can be asserted without a clock.
@@ -261,25 +304,48 @@ pub fn account_slowdown(failures: i64) -> std::time::Duration {
 
 /// Refuse — or merely slow down — a login attempt that is part of a burst.
 ///
-/// **Every hard refusal is keyed on the caller's own address.** It used to be
-/// possible to refuse on an account's failures alone, counted from everywhere,
-/// and that is a lockout anybody could impose on anybody: five wrong passwords
-/// for `admin` every fifteen minutes — no account, no session, no session
-/// cookie needed — and the real admin could not sign in from any address on
-/// earth with the correct password, for as long as the attacker cared to keep
-/// it up. The budgets an attacker can spend are now their own: the (account,
-/// address) pair, and the address across all accounts.
+/// **No refusal is keyed on an account's failures alone.** It used to be
+/// possible to refuse on that number by itself, counted from everywhere, and
+/// that is a lockout anybody could impose on anybody: five wrong passwords for
+/// `admin` every fifteen minutes — no account, no session, no session cookie
+/// needed — and the real admin could not sign in from any address on earth with
+/// the correct password, for as long as the attacker cared to keep it up. The
+/// two budgets a caller spends are their own: the (account, address) pair, and
+/// the address across all accounts.
 ///
-/// **The account signal survives as a delay.** Ignoring it entirely would hand
-/// a botnet with a thousand addresses a thousand free budgets against one
-/// account. [`account_slowdown`] makes each failure past the threshold cost
-/// every later attempt a little more time, to a cap — so the spray gets slower
-/// and slower while a correct password from an address that is not itself over
-/// budget still gets in, which is the line between a defence and an outage.
+/// **The account's own count still has to stop something.** Removing the
+/// account-wide refusal and replacing it with nothing but [`account_slowdown`]
+/// left the account with no ceiling whatsoever: a thousand addresses bought a
+/// thousand fresh per-pair budgets, and the delay is latency rather than
+/// backpressure — sleeping requests sleep in parallel, so a concurrent attacker
+/// pays five seconds once and then guesses as fast as
+/// [`PASSWORD_VERIFY_PERMITS`] allows, for ever. The slowdown is kept because it
+/// is real against the ordinary sequential script, but it is not a bound.
 ///
-/// The refusal message is the same whichever budget ran out: both are about the
-/// caller's address, so saying which one would only tell an attacker how far
-/// along they are.
+/// **The bound is [`ACCOUNT_DISTRIBUTED_LIMIT`], and it may only refuse
+/// strangers.** What separates the operator from the attack is not where they
+/// are calling from — an operator travels and an attacker forges — it is that
+/// the operator has, at some point, typed the correct password. So past that
+/// many failures the panel refuses attempts from addresses that have never
+/// signed in to the account ([`Db::address_has_signed_in`]), and lets addresses
+/// that have straight through to their own per-pair budget. An attacker cannot
+/// join the second group without the password, and the operator cannot be
+/// pushed out of it by anything a stranger does. Both properties hold at once,
+/// which no single number could give.
+///
+/// Two more things keep this from becoming the lockout it replaced. The refusal
+/// is filed as throttled, so it cannot renew the count that caused it and the
+/// fifteen minutes really do end. And `unihelm user unlock` clears the count
+/// outright for an operator who has never signed in from anywhere yet — the
+/// fresh-install case, the one group this bound can genuinely catch, which is
+/// why that command had to start working (it was clearing nothing when the
+/// operator typed their email address).
+///
+/// The two refusals say different things because they *are* different things:
+/// telling an operator "too many failed sign-ins from your address" when their
+/// address has done nothing is the panel reporting something that is not true,
+/// and sends them hunting for a problem on their own machine. Neither message
+/// quotes a count — that would tell an attacker how far along they are.
 pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<()> {
     let by_ip = db
         .recent_failures_for_ip(ip, FAILURE_WINDOW)
@@ -306,15 +372,23 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
         // window means somebody waits two, fails again, and concludes their
         // password is wrong — which is what happened to the first person to
         // mistype a username on a fresh install.
+        //
+        // And name the identifier, because the throttle counts the string that
+        // was typed: the operator who typed the installer-printed address is
+        // locked out under `admin@example.com` while the command they are about
+        // to run says `admin`, which used to clear nothing and say it had
+        // worked. `unlock` takes either spelling and now clears both.
         return Err(ApiError::code(
             ErrorCode::RateLimited,
             format!(
                 "too many failed sign-ins from your address ({ip}), so this one was refused \
                  without the password being checked. The block is on this address alone — the \
                  account still works from anywhere else — and it lifts by itself {} minutes \
-                 after the last failed attempt. `unihelm user unlock <name>` on the server \
-                 clears an account's failed attempts and the addresses they came from.",
-                FAILURE_WINDOW.whole_minutes()
+                 after the last failed attempt. The attempts were filed under `{ident}`, which \
+                 is what you typed; `unihelm user unlock {ident}` on the server clears them and \
+                 the addresses they came from.",
+                FAILURE_WINDOW.whole_minutes(),
+                ident = shown_identifier(username),
             ),
         ));
     }
@@ -323,6 +397,52 @@ pub async fn check_rate_limits(db: &Db, ip: &str, username: &str) -> ApiResult<(
         .recent_failures_for_username(username, FAILURE_WINDOW)
         .await
         .map_err(ApiError::from)?;
+
+    // The account-wide bound. `address_has_signed_in` is the expensive half of
+    // the decision and the short circuit keeps it off every healthy login: it is
+    // only asked once an account is already past a threshold that takes ten
+    // addresses to reach.
+    //
+    // This also holds if the caller forged their address. A forged *fresh*
+    // address is a stranger and is refused here; forging one the account has
+    // seen succeed means guessing which, and buys only that pair's five
+    // attempts per fifteen minutes. Either way there is a ceiling, which is what
+    // was missing.
+    if by_account >= ACCOUNT_DISTRIBUTED_LIMIT
+        && !db
+            .address_has_signed_in(ip, username)
+            .await
+            .map_err(ApiError::from)?
+    {
+        tracing::warn!(
+            ip,
+            username,
+            by_account,
+            "login refused: account under distributed attack and this address has never signed in"
+        );
+        // Filed as throttled, for the same two reasons as above: Sentinel must
+        // keep seeing the attack, and the refusal must not count towards the
+        // number that produced it — otherwise the retries renew the bound and
+        // the fifteen minutes never end, which is the lockout this is written to
+        // avoid.
+        if let Err(e) = db.record_throttled_login_attempt(ip, username).await {
+            tracing::warn!(ip, error = %e, "could not record a throttled login attempt");
+        }
+        return Err(ApiError::code(
+            ErrorCode::RateLimited,
+            format!(
+                "`{ident}` is being guessed at from many addresses at once, so sign-ins from \
+                 addresses that have never signed in to it — including this one ({ip}) — are \
+                 being refused without the password being checked. An address that has signed \
+                 in before is not affected. This lifts by itself {} minutes after the last \
+                 attempt the panel actually checked; on the server, \
+                 `unihelm user unlock {ident}` lifts it now.",
+                FAILURE_WINDOW.whole_minutes(),
+                ident = shown_identifier(username),
+            ),
+        ));
+    }
+
     let slowdown = account_slowdown(by_account);
     if !slowdown.is_zero() {
         tracing::info!(
@@ -684,10 +804,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_account_sprayed_from_everywhere_is_slowed_and_never_refused() {
+    async fn an_account_sprayed_from_everywhere_is_slowed_before_it_is_bounded() {
         // A botnet with a thousand addresses gets a thousand fresh per-pair
         // budgets, so the account's own count still has to be worth something.
-        // What it is worth is time, not a refusal.
+        // Below ACCOUNT_DISTRIBUTED_LIMIT what it is worth is time, not a
+        // refusal — a fresh address is delayed and still gets in.
         // One failure past the threshold, so the assertion below costs the
         // suite one step and not the whole cap.
         let db = Db::open_memory().await.unwrap();
@@ -708,6 +829,203 @@ mod tests {
             started.elapsed() >= ACCOUNT_SLOWDOWN_STEP,
             "and it must have been made to wait on the way"
         );
+    }
+
+    /// Seed `count` failures against `username` from that many distinct
+    /// addresses, so no per-pair or per-address budget is spent on the way.
+    async fn spray_from_many_addresses(db: &Db, username: &str, count: i64) {
+        for i in 0..count {
+            db.record_login_attempt(&format!("198.51.{}.{}", i / 250, i % 250), username, false)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_distributed_attack_on_one_account_runs_out_of_guesses() {
+        // The regression this release introduced while removing the lockout:
+        // every hard refusal was keyed on the caller's address, so an attacker
+        // with a fresh address per attempt — a botnet, or one local process
+        // forging `X-Forwarded-For` — met no refusal at any point.
+        // `recent_failures_for_ip` and `recent_failures_for_ip_and_username`
+        // both saw zero for ever, and two hundred consecutive guesses against
+        // `admin` were refused exactly none of the time. The loop below is that
+        // exploit, and every iteration of it must now be refused.
+        let db = Db::open_memory().await.unwrap();
+        spray_from_many_addresses(&db, "admin", ACCOUNT_DISTRIBUTED_LIMIT).await;
+
+        for i in 0..200 {
+            let ip = format!("203.0.{}.{}", i / 250, i % 250);
+            assert!(
+                check_rate_limits(&db, &ip, "admin").await.is_err(),
+                "guess {i}, from an address the panel has never seen, was allowed"
+            );
+        }
+    }
+
+    // The property that keeps the account-wide bound from becoming the lockout
+    // it replaced. Each (account, address) pair is refused at
+    // ACCOUNT_FAILURE_LIMIT, so the account-wide figure cannot be reached from
+    // fewer than ten addresses — nothing an operator mistyping a password, or a
+    // small office behind one NAT, can do.
+    //
+    // A `const` block rather than a `#[test]`: these are relationships between
+    // compile-time constants, so the build should refuse them, not a test run.
+    // Somebody tuning the numbers finds out while they are editing.
+    const _: () = {
+        assert!(
+            ACCOUNT_DISTRIBUTED_LIMIT >= ACCOUNT_FAILURE_LIMIT * 10,
+            "a bound a few addresses could reach is a lockout anybody can impose"
+        );
+        assert!(
+            ACCOUNT_SLOWDOWN_AFTER < ACCOUNT_DISTRIBUTED_LIMIT,
+            "the delay must come first, so an account is slowed long before \
+             anything is refused on its behalf"
+        );
+    };
+
+    #[tokio::test]
+    async fn the_operator_still_gets_in_while_their_account_is_under_attack() {
+        // The other half, and the reason the bound is not simply back: an
+        // account-wide refusal that catches everybody is a lockout any stranger
+        // can impose on any account, which is what was removed. What the
+        // attacker cannot forge is a correct password, so the address that has
+        // signed in before is the one the bound must not touch.
+        let db = Db::open_memory().await.unwrap();
+        db.record_login_attempt("198.51.100.4", "admin", true)
+            .await
+            .unwrap();
+        spray_from_many_addresses(&db, "admin", ACCOUNT_DISTRIBUTED_LIMIT * 3).await;
+
+        assert!(
+            check_rate_limits(&db, "198.51.100.4", "admin")
+                .await
+                .is_ok(),
+            "an address that has signed in to this account must not be shut out \
+             by what strangers did to it"
+        );
+        assert!(
+            check_rate_limits(&db, "203.0.113.77", "admin")
+                .await
+                .is_err(),
+            "and an address that has not must be refused"
+        );
+        assert!(
+            check_rate_limits(&db, "203.0.113.77", "someone-else")
+                .await
+                .is_ok(),
+            "the bound belongs to the account under attack and to no other"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operators_own_wrong_password_still_only_costs_them_their_own_budget() {
+        // A known address is exempt from the account-wide bound, not from its
+        // own: otherwise one stolen laptop would have an unlimited budget.
+        let db = Db::open_memory().await.unwrap();
+        db.record_login_attempt("198.51.100.4", "admin", true)
+            .await
+            .unwrap();
+        for _ in 0..ACCOUNT_FAILURE_LIMIT {
+            db.record_login_attempt("198.51.100.4", "admin", false)
+                .await
+                .unwrap();
+        }
+        assert!(
+            check_rate_limits(&db, "198.51.100.4", "admin")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_wide_bound_lifts_instead_of_renewing_itself() {
+        // If a refused attempt counted towards the number that refused it, an
+        // attack would hold the account down for as long as it kept sending —
+        // permanently, for an operator who has never signed in from anywhere
+        // yet. Refusals are filed as throttled and so cannot.
+        let db = Db::open_memory().await.unwrap();
+        spray_from_many_addresses(&db, "admin", ACCOUNT_DISTRIBUTED_LIMIT).await;
+
+        for i in 0..5 {
+            assert!(
+                check_rate_limits(&db, &format!("203.0.113.{i}"), "admin")
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            db.recent_failures_for_username("admin", FAILURE_WINDOW)
+                .await
+                .unwrap(),
+            ACCOUNT_DISTRIBUTED_LIMIT,
+            "the refusals must not have spent the budget that produced them"
+        );
+
+        // And the documented cure works from a root shell, which is the escape
+        // hatch for the one operator this bound can catch: the one on a fresh
+        // install who has never signed in from anywhere.
+        assert!(db.clear_login_failures("admin").await.unwrap() > 0);
+        assert!(
+            check_rate_limits(&db, "203.0.113.77", "admin")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_spelling_that_is_actually_throttled() {
+        // The throttle counts the string that was typed, and the installer
+        // prints the address far more prominently than the username — so the
+        // person most likely to be locked out is locked out under
+        // `admin@example.com` while the command they are told to run says
+        // `admin`. A message that does not name the spelling sends them to run
+        // an unlock that clears nothing.
+        let db = Db::open_memory().await.unwrap();
+        for _ in 0..ACCOUNT_FAILURE_LIMIT {
+            db.record_login_attempt("10.0.0.6", "admin@example.com", false)
+                .await
+                .unwrap();
+        }
+
+        let err = check_rate_limits(&db, "10.0.0.6", "admin@example.com")
+            .await
+            .unwrap_err();
+        let message = err.inner.detail.clone();
+        assert!(
+            message.contains("`admin@example.com`"),
+            "the refusal must say which identifier is throttled: {message}"
+        );
+        assert!(
+            message.contains("unihelm user unlock admin@example.com"),
+            "and the command it prints must be one that clears it: {message}"
+        );
+
+        // The account-wide refusal names it too, and does not claim the
+        // caller's address is the problem when it is not.
+        let db = Db::open_memory().await.unwrap();
+        spray_from_many_addresses(&db, "admin@example.com", ACCOUNT_DISTRIBUTED_LIMIT).await;
+        let err = check_rate_limits(&db, "203.0.113.77", "admin@example.com")
+            .await
+            .unwrap_err();
+        let message = err.inner.detail.clone();
+        assert!(message.contains("`admin@example.com`"), "{message}");
+        assert!(
+            !message.contains("too many failed sign-ins from your address"),
+            "an address that has done nothing must not be told it is the cause: {message}"
+        );
+    }
+
+    #[test]
+    fn an_echoed_identifier_is_bounded_and_stripped_of_control_characters() {
+        // It is whatever the client sent, and it lands in an error body and in
+        // the panel's log.
+        assert_eq!(shown_identifier("admin@example.com"), "admin@example.com");
+        assert_eq!(shown_identifier("ad\nmin\u{7}"), "ad?min?");
+        let long = "a".repeat(500);
+        let shown = shown_identifier(&long);
+        assert_eq!(shown.chars().count(), 65, "64 characters and the ellipsis");
+        assert!(shown.ends_with('…'));
     }
 
     #[test]

@@ -25,6 +25,7 @@ import {
   type StackComponentRequest,
   type StackComponentView,
   type StackRuntime,
+  type StackServiceRequest,
 } from "@/lib/api";
 import { staggerStyle } from "@/lib/motion";
 
@@ -864,6 +865,24 @@ export function StackPage() {
   const startService = useMutation({ mutationFn: endpoints.startComponent, ...settleService });
   const stopService = useMutation({ mutationFn: endpoints.stopComponent, ...settleService });
 
+  // The stop the agent has priced and the operator has not yet agreed to.
+  //
+  // Keyed by row, so agreeing to stop Docker is not an agreement to stop
+  // anything else, and cleared by any outcome — the second click either works
+  // or comes back with a different refusal, and either way the button must not
+  // stay armed.
+  //
+  // The cost is not computed here. This page used to justify having no
+  // confirmation at all on the grounds that "the agent refuses the dangerous
+  // case", which was true for two of the six controllable rows: Stop beside
+  // Docker went straight through, and on a default install every database and
+  // cache is a container. The agent now refuses any stop that takes something
+  // down and names what — counted, by container and by domain — and that
+  // sentence arrives in this same click because the operation is immediate. So
+  // the page shows the agent's own answer and asks again, rather than keeping a
+  // second copy of what depends on what and getting it wrong.
+  const [pendingStop, setPendingStop] = useState<string | null>(null);
+
   // The machine's own survey of what is on `$PATH`, which the catalogue cannot
   // answer: it says what the panel can install, not what is there. Read rather
   // than polled — the survey shells out to every interpreter it finds for a
@@ -995,9 +1014,9 @@ export function StackPage() {
   // button does nothing (spec §10.1). Disabling every control on the page while
   // an install runs would put that rule back.
   const controlling = startService.isPending
-    ? `${startService.variables.component}@${startService.variables.version ?? ""}`
+    ? controlKey(startService.variables.component, startService.variables.version)
     : stopService.isPending
-      ? `${stopService.variables.component}@${stopService.variables.version ?? ""}`
+      ? controlKey(stopService.variables.component, stopService.variables.version)
       : null;
 
   return (
@@ -1078,6 +1097,7 @@ export function StackPage() {
                       starting={starting[entry.slug] === true}
                       acting={acting}
                       controlling={controlling}
+                      stopAwaiting={pendingStop}
                       dockerAnchor={dockerAnchor}
                       installed={installed}
                       activeWebServer={stack.data?.web_server ?? ""}
@@ -1135,12 +1155,36 @@ export function StackPage() {
                           },
                         )
                       }
-                      onControl={(action, version) =>
-                        (action === "start" ? startService : stopService).mutate({
+                      onControl={(action, version) => {
+                        if (action === "start") {
+                          setPendingStop(null);
+                          startService.mutate({ component: entry.slug, version });
+                          return;
+                        }
+                        // The second click sends `confirm`: the agent prices
+                        // the stop, refuses, and names the catalogue slug to
+                        // send back — which is the string this click already
+                        // has. So the confirmation is the operator agreeing to
+                        // a stated cost, not a repeat of a click that failed.
+                        const key = controlKey(entry.slug, version);
+                        const body: StackServiceRequest = {
                           component: entry.slug,
                           version,
-                        })
-                      }
+                        };
+                        if (pendingStop === key) body.confirm = entry.slug;
+                        stopService.mutate(body, {
+                          onSuccess: () => setPendingStop(null),
+                          // Armed only by the refusal that asks for it. Any
+                          // other failure — the web server that is serving, a
+                          // unit that would not stop — is not a question, and a
+                          // button that offered to press through it would be
+                          // offering something the agent will refuse again.
+                          onError: (e: unknown) =>
+                            setPendingStop(
+                              e instanceof ApiError && e.field === "confirm" ? key : null,
+                            ),
+                        });
+                      }}
                     />
                   );
                 })}
@@ -1305,6 +1349,18 @@ export function defaultCommandFor(
  */
 const CONTROLLABLE = new Set(["nginx", "apache", "php", "mariadb", "redis", "docker"]);
 
+/**
+ * One row's identity for the controls that act on it.
+ *
+ * Built in one place because three things compare it — which row is spinning,
+ * which row is waiting for a second click, and which row a click belongs to —
+ * and two of them spelling it differently is a Stop that arms one row and
+ * confirms another.
+ */
+export function controlKey(slug: string, version: string | undefined): string {
+  return `${slug}@${version ?? ""}`;
+}
+
 /** What a chip's service control would do, or `null` when it draws none. */
 export type ServiceControl = "start" | "stop";
 
@@ -1421,6 +1477,7 @@ function EntryRow({
   starting,
   acting,
   controlling,
+  stopAwaiting,
   dockerAnchor,
   installed,
   activeWebServer,
@@ -1450,6 +1507,11 @@ function EntryRow({
   acting: string | null;
   /** `slug@version` of the start or stop in flight, if any. */
   controlling: string | null;
+  /**
+   * `slug@version` of the stop the agent has priced and the operator has not
+   * agreed to yet, if any. See `pendingStop`.
+   */
+  stopAwaiting: string | null;
   /** Anchor of the row that installs Docker, when this catalogue has one. */
   dockerAnchor: string | null;
   /** The machine's survey of `$PATH`, for the bare-command badge. */
@@ -1574,7 +1636,8 @@ function EntryRow({
                   locked={locked}
                   pending={acting === rowKey(entry.slug, row.version, runtimeOf(row))}
                   control={serviceControlFor(entry, row)}
-                  controlPending={controlling === `${entry.slug}@${row.version}`}
+                  controlPending={controlling === controlKey(entry.slug, row.version)}
+                  awaitingStop={stopAwaiting === controlKey(entry.slug, row.version)}
                   onControl={(action) => onControl(action, row.version)}
                   command={defaultCommandFor(entry, row, installed)}
                   movingDefault={
@@ -1919,6 +1982,7 @@ function InstalledChip({
   pending,
   control,
   controlPending,
+  awaitingStop,
   command,
   movingDefault,
   onRemove,
@@ -1937,6 +2001,11 @@ function InstalledChip({
   control: ServiceControl | null;
   /** This version's service is being started or stopped right now. */
   controlPending: boolean;
+  /**
+   * The agent has refused this stop, said what it takes down, and asked for a
+   * confirmation. The next click sends it.
+   */
+  awaitingStop: boolean;
   /** The bare command this version owns or could own, or `null`. */
   command: DefaultCommand | null;
   /** This version's default is being moved right now. */
@@ -2022,29 +2091,52 @@ function InstalledChip({
           // lane exactly so a package install running for four minutes is not
           // why this button does nothing.
           //
-          // A stop carries danger weight rather than a confirmation step. What
-          // it costs depends on the machine, not on this chip, and the agent is
-          // the only thing that knows — it refuses a stop of the web server
-          // that is serving while any site is up, and the sentence it refuses
-          // with names them. That sentence arrives in this same click, because
-          // the operation is immediate.
+          // A stop's cost depends on the machine, not on this chip, and the
+          // agent is the only thing that knows it. What was wrong here was the
+          // sentence that followed: this comment used to say danger weight was
+          // enough *because* the agent "refuses a stop of the web server that
+          // is serving while any site is up" — which is one of the six rows
+          // this control is drawn on. Stop beside Docker went through
+          // unguarded and unconfirmed, and on a default install every database
+          // and cache is a container behind it.
+          //
+          // So the click asks and the agent answers. The first press sends the
+          // stop; a stop that takes something down comes back refused, with the
+          // Callout above naming what — "2 containerised engines:
+          // unihelm-mariadb-11.8, unihelm-redis-7" — and this button arms. The
+          // second press sends the confirmation. The counting stays in the
+          // agent, which is the only place that can do it honestly, and the
+          // page never has to guess what is behind a row.
           <Button
             variant={control === "stop" ? "danger" : "ghost"}
             size="sm"
             loading={controlPending}
             disabled={controlPending}
             onClick={() => onControl(control)}
-            aria-label={t(control === "stop" ? "stack.stopAria" : "stack.startAria", {
-              name: entry.display_name,
-              version: versionLabel(row.version, t),
-            })}
+            aria-label={t(
+              control === "start"
+                ? "stack.startAria"
+                : awaitingStop
+                  ? "stack.stopAnywayAria"
+                  : "stack.stopAria",
+              {
+                name: entry.display_name,
+                version: versionLabel(row.version, t),
+              },
+            )}
           >
             {control === "stop" ? (
               <Square className="h-3.5 w-3.5" aria-hidden />
             ) : (
               <Play className="h-3.5 w-3.5" aria-hidden />
             )}
-            {t(control === "stop" ? "stack.stop" : "stack.start")}
+            {t(
+              control === "start"
+                ? "stack.start"
+                : awaitingStop
+                  ? "stack.stopAnyway"
+                  : "stack.stop",
+            )}
           </Button>
         ) : null}
         {removable ? (
