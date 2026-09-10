@@ -1,6 +1,6 @@
 # UNIHELM — Modern Multi-Tenant Hosting Control Panel
 
-> **Master specification for Claude Code.** Read this file fully before writing any code.
+> **Master specification.** Read this file fully before writing any code.
 > Work phase-by-phase (see §14 Roadmap) and follow the working agreement in §16.
 > Codename `unihelm` (Latin for iron — the thing Rust grows on) is a placeholder; renaming it is a find-and-replace, do not block on it.
 
@@ -485,7 +485,7 @@ These are gates, not guidelines — CI and code review enforce them.
 
 ---
 
-## 14. Roadmap (phased — each phase ships something usable & is a natural Claude Code milestone)
+## 14. Roadmap (phased — each phase ships something usable & is a natural milestone)
 
 > Guiding rule: **reach a real, deployable single-server PHP host as early as possible (end of Phase 2)**, then widen. Never let the tree get so big it can't run.
 
@@ -540,7 +540,7 @@ unihelm/
 
 Testing expectations: unit tests in every crate; `unihelm-ops` gets a mock distro backend so ops are testable without root; integration harness runs the real thing in throwaway containers/VMs per distro; every bug fixed gets a regression test.
 
-## 16. Working agreement for Claude Code (read every session)
+## 16. Working agreement (read before every change)
 
 1. **Follow the phases.** Do not start Phase N+1 modules before Phase N's exit criteria pass. Keep `main` deployable.
 2. **Security invariants are non-negotiable:** no `sh -c`/string-interpolated commands anywhere; all privileged work goes through `unihelm-ops` with typed, validated inputs; web process never runs as root; agentd re-checks authorization; tenant fs ops run as the tenant uid.

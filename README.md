@@ -244,6 +244,5 @@ docs/              operator, developer and API documentation
 run a modified Unihelm for others over a network, they are entitled to your
 modifications' source.
 
-Built with [Claude Code](https://claude.com/claude-code). The commit history is
-the honest record of what was built, what broke, and what a live server taught
-us that the test suite could not.
+The commit history is the honest record of what was built, what broke, and what
+a live server taught us that the test suite could not.

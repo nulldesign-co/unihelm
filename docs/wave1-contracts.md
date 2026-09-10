@@ -104,9 +104,7 @@ HTTP routes: prefix by area — `/api/files/*`, `/api/databases/*`,
   must be a lazily imported chunk. For node_modules run `npm ci` in `ui/`.
 - Phase 2 external facts (repo pins, argv sequences, distro paths for MariaDB,
   PostgreSQL, quotas, cgroups, SFTP, Cloudflare, Adminer) were researched and
-  verified; the brief lives at
-  `/private/tmp/claude-501/-Users-farzamseyedhashem-Documents-Projects-panel-server/8e770d3f-ee21-461b-a685-d34d1ef59ee9/tasks/wudnts94f.output`
-  — grep it for your section and follow it. Where it marks something
+  verified. Where the research marks something
   UNVERIFIED, keep the code but gate it behind a pin-verification the way
   `repos.rs::UNVERIFIED_PINS` does.
 
